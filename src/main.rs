@@ -56,6 +56,7 @@ mod app {
     enum TmcRequest {
         Write { addr: u8, value: u32 },
         Read { oid: u8, addr: u8 },
+        SetEnable(bool),
     }
 
     const TMC_CHANNEL_SIZE: usize = 4;
@@ -343,15 +344,11 @@ mod app {
     /// Used by Klipper for timed motor enable/disable.
     #[klipper_command]
     pub fn queue_digital_out(context: &mut State, oid: u8, clock: u32, on_ticks: u32) {
+        let _ = clock;
         if let Some(&idx) = context.enable_by_oid.get(&oid) {
             let enabled = on_ticks != 0;
             context.steppers[idx].set_enabled(enabled);
-            defmt::info!(
-                "queue_digital_out: oid={} clock={} enabled={}",
-                oid,
-                clock,
-                enabled
-            );
+            tmc_send(TmcRequest::SetEnable(enabled));
         }
     }
 
@@ -359,7 +356,9 @@ mod app {
     #[klipper_command]
     pub fn update_digital_out(context: &mut State, oid: u8, value: u8) {
         if let Some(&idx) = context.enable_by_oid.get(&oid) {
-            context.steppers[idx].set_enabled(value != 0);
+            let enabled = value != 0;
+            context.steppers[idx].set_enabled(enabled);
+            tmc_send(TmcRequest::SetEnable(enabled));
         }
     }
 
@@ -451,15 +450,13 @@ mod app {
 
     // ---- TMC4671 register access commands ----
 
-    /// Write a TMC4671 register via SPI.
+    /// Send a request to the tmc_control task.
     ///
-    /// Queues the write request for the tmc_control task which owns
-    /// the SPI bus.
-    #[klipper_command]
-    pub fn tmc_write_register(_context: &mut State, _oid: u8, addr: u8, value: u32) {
-        // SAFETY: TMC_REQUEST_SENDER is initialised exactly once in init()
-        // before any task runs. After init, only command handlers access it,
-        // and they run sequentially within usb_receive.
+    /// # Safety
+    /// TMC_REQUEST_SENDER is initialised exactly once in init() before
+    /// any task runs. After init, only command handlers access it, and
+    /// they run sequentially within usb_receive.
+    fn tmc_send(req: TmcRequest) {
         let sender = unsafe {
             &mut *core::ptr::addr_of_mut!(TMC_REQUEST_SENDER).cast::<Sender<
                 'static,
@@ -467,23 +464,21 @@ mod app {
                 TMC_CHANNEL_SIZE,
             >>()
         };
-        let _ = sender.try_send(TmcRequest::Write { addr, value });
+        let _ = sender.try_send(req);
+    }
+
+    /// Write a TMC4671 register via SPI.
+    #[klipper_command]
+    pub fn tmc_write_register(_context: &mut State, _oid: u8, addr: u8, value: u32) {
+        tmc_send(TmcRequest::Write { addr, value });
     }
 
     /// Read a TMC4671 register via SPI.
     ///
-    /// Queues the read request for the tmc_control task. The response
-    /// is sent asynchronously as a tmc_register_value reply.
+    /// The response is sent asynchronously as a tmc_register_value reply.
     #[klipper_command]
     pub fn tmc_read_register(_context: &mut State, oid: u8, addr: u8) {
-        let sender = unsafe {
-            &mut *core::ptr::addr_of_mut!(TMC_REQUEST_SENDER).cast::<Sender<
-                'static,
-                TmcRequest,
-                TMC_CHANNEL_SIZE,
-            >>()
-        };
-        let _ = sender.try_send(TmcRequest::Read { oid, addr });
+        tmc_send(TmcRequest::Read { oid, addr });
     }
 
     /// SPI transfer stub (returns empty response).
@@ -504,6 +499,7 @@ mod app {
     struct Local {
         led: Output<'static>,
         tmc: Tmc4671Spi<TmcSpiDevice>,
+        tmc_enable: Output<'static>,
         tmc_rx: Receiver<'static, TmcRequest, TMC_CHANNEL_SIZE>,
         usb: UsbDevice<'static, HalUsbDriver>,
         usb_sender: embassy_usb::class::cdc_acm::Sender<'static, HalUsbDriver>,
@@ -579,6 +575,9 @@ mod app {
 
         // PD7: system status LED on OpenFFBoard
         let led = Output::new(p.PD7, Level::Low, Speed::Low);
+
+        // PE7: TMC4671 ENABLE pin (active high, start disabled)
+        let tmc_enable = Output::new(p.PE7, Level::Low, Speed::Low);
 
         // SPI1: TMC4671 communication at 2 MHz, Mode 3 (CPOL=1, CPHA=1)
         let mut spi_config = embassy_stm32::spi::Config::default();
@@ -677,6 +676,7 @@ mod app {
             Local {
                 led,
                 tmc,
+                tmc_enable,
                 tmc_rx,
                 usb,
                 usb_sender,
@@ -699,9 +699,10 @@ mod app {
     /// On startup, reads the TMC4671 chip identification register to verify
     /// SPI communication. Then processes register read/write requests from
     /// the protocol handler via the TMC request channel.
-    #[task(priority = 1, local = [tmc, tmc_rx])]
+    #[task(priority = 1, local = [tmc, tmc_enable, tmc_rx])]
     async fn tmc_control(ctx: tmc_control::Context) {
         let tmc = ctx.local.tmc;
+        let enable_pin = ctx.local.tmc_enable;
         let rx = ctx.local.tmc_rx;
 
         // Verify TMC4671 chip identity
@@ -749,6 +750,14 @@ mod app {
                                 defmt::error!("TMC4671 SPI read failed: addr={:#04x}", addr);
                             }
                         }
+                    }
+                    TmcRequest::SetEnable(enabled) => {
+                        if enabled {
+                            enable_pin.set_high();
+                        } else {
+                            enable_pin.set_low();
+                        }
+                        defmt::info!("TMC4671 enable: {}", enabled);
                     }
                 }
             }
