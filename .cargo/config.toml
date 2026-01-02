@@ -1,0 +1,11 @@
+[build]
+target = "thumbv7em-none-eabi"
+
+[target.thumbv7em-none-eabi]
+runner = "probe-rs run --chip STM32F407VGTx"
+rustflags = [
+    "-C", "link-arg=-Tdefmt.x",
+]
+
+[env]
+DEFMT_LOG = "info"

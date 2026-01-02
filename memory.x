@@ -1,0 +1,6 @@
+/* STM32F407VG with Katapult 32KB bootloader */
+MEMORY
+{
+  FLASH : ORIGIN = 0x08008000, LENGTH = 992K
+  RAM   : ORIGIN = 0x20000000, LENGTH = 128K
+}
