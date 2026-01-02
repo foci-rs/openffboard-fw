@@ -8,6 +8,8 @@ fn main() {
         .entry("src/main.rs")
         .set_version(env!("CARGO_PKG_VERSION"))
         .set_build_versions("")
+        .set_app("foci")
+        .set_license("MIT OR Apache-2.0")
         .build();
 
     // Copy memory.x to OUT_DIR so the linker can find it

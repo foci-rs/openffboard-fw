@@ -14,13 +14,20 @@ pub mod pac {
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [UART4, UART5, USART3])]
 mod app {
     use core::mem::MaybeUninit;
+    use core::ptr::addr_of_mut;
 
+    use anchor::*;
+    use bbqueue::BBBuffer;
+    use cortex_m::peripheral::DWT;
     use embassy_stm32::gpio::{Level, Output, Speed};
     use embassy_stm32::usb::Driver;
     use embassy_stm32::{bind_interrupts, peripherals, usb};
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use embassy_sync::signal::Signal;
     use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
-    use embassy_usb::driver::EndpointError;
     use embassy_usb::{Builder, Config as UsbConfig, UsbDevice};
+    use klipper_mcu::shutdown::McuState;
+    use klipper_mcu::state::State;
     use rtic_monotonics::systick::prelude::*;
 
     bind_interrupts!(struct Irqs {
@@ -55,8 +62,124 @@ mod app {
         }
     }
 
+    // ---- bbqueue TX buffer and transport output ----
+
+    const USB_TX_BUFFER_SIZE: usize = 512;
+
+    static mut USB_TX_PRODUCER: MaybeUninit<bbqueue::Producer<'static, USB_TX_BUFFER_SIZE>> =
+        MaybeUninit::uninit();
+    static USB_TX_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+    pub struct BufferTransportOutput;
+    pub const TRANSPORT_OUTPUT: BufferTransportOutput = BufferTransportOutput;
+
+    impl TransportOutput for BufferTransportOutput {
+        type Output = ScratchOutput;
+        fn output(&self, f: impl FnOnce(&mut Self::Output)) {
+            let mut scratch = ScratchOutput::new();
+            f(&mut scratch);
+            let output = scratch.result();
+
+            // SAFETY: USB_TX_PRODUCER is initialised exactly once in init() before
+            // any task runs. After init, only this function accesses the producer.
+            let producer = unsafe {
+                &mut *addr_of_mut!(USB_TX_PRODUCER)
+                    .cast::<bbqueue::Producer<'static, USB_TX_BUFFER_SIZE>>()
+            };
+            if let Ok(mut grant) = producer.grant_exact(output.len()) {
+                grant.buf().copy_from_slice(output);
+                grant.commit(output.len());
+                USB_TX_SIGNAL.signal(());
+            }
+        }
+    }
+
+    // ---- Klipper constants ----
+
+    #[klipper_constant]
+    const CLOCK_FREQ: u32 = 168_000_000;
+
+    #[klipper_constant]
+    const MCU: &str = "stm32f407xx";
+
+    #[klipper_constant]
+    const STEPPER_STEP_BOTH_EDGE: u32 = 1;
+
+    #[klipper_constant]
+    const RECEIVE_WINDOW: u32 = 192;
+
+    #[klipper_constant]
+    const STATS_SUMSQ_BASE: u32 = 256;
+
+    // ---- Klipper command handlers ----
+
+    #[klipper_command]
+    pub fn get_clock(_context: &mut State) {
+        let clock = DWT::cycle_count();
+        klipper_reply!(clock, clock: u32 = clock);
+    }
+
+    #[klipper_command]
+    pub fn get_uptime(_context: &mut State) {
+        let c = DWT::cycle_count() as u64;
+        klipper_reply!(
+            uptime,
+            high: u32 = (c >> 32) as u32,
+            clock: u32 = (c & 0xFFFF_FFFF) as u32
+        );
+    }
+
+    #[klipper_command]
+    pub fn get_config(context: &mut State) {
+        let is_config = context.config_crc.is_some();
+        let crc = context.config_crc.unwrap_or(0);
+        let is_shutdown = context.mcu_state.is_shutdown();
+        klipper_reply!(
+            config,
+            is_config: bool = is_config,
+            crc: u32 = crc,
+            is_shutdown: bool = is_shutdown,
+            move_count: u16 = 1024
+        );
+    }
+
+    #[klipper_command]
+    pub fn config_reset(context: &mut State) {
+        context.reset();
+    }
+
+    #[klipper_command]
+    pub fn finalize_config(context: &mut State, crc: u32) {
+        context.config_crc = Some(crc);
+        context.mcu_state = McuState::Running;
+        defmt::info!("Config finalized, CRC: {:#010x}", crc);
+    }
+
+    #[klipper_command]
+    pub fn allocate_oids(_count: u8) {
+        // No-op: we use static allocation
+    }
+
+    #[klipper_command]
+    pub fn emergency_stop(context: &mut State) {
+        context.mcu_state = McuState::Shutdown { reason: 0 };
+        defmt::error!("Emergency stop!");
+    }
+
+    #[klipper_command]
+    pub fn reset() {
+        cortex_m::peripheral::SCB::sys_reset();
+    }
+
+    #[klipper_command]
+    pub fn debug_nop() {}
+
+    // ---- RTIC resources ----
+
     #[shared]
-    struct Shared {}
+    struct Shared {
+        app_state: State,
+    }
 
     #[local]
     struct Local {
@@ -64,11 +187,34 @@ mod app {
         usb: UsbDevice<'static, HalUsbDriver>,
         usb_sender: embassy_usb::class::cdc_acm::Sender<'static, HalUsbDriver>,
         usb_receiver: embassy_usb::class::cdc_acm::Receiver<'static, HalUsbDriver>,
+        usb_tx_consumer: bbqueue::Consumer<'static, USB_TX_BUFFER_SIZE>,
+    }
+
+    /// Read the STM32 96-bit unique device ID and format as a hex string.
+    ///
+    /// The UID is at 0x1FFF_7A10 on STM32F4. Returns a 24-character hex string.
+    /// Read the STM32 96-bit unique device ID and format as a hex string.
+    ///
+    /// Reads the 12 raw bytes sequentially (matching Klipper/Katapult convention)
+    /// and outputs high nibble first for each byte.
+    fn read_stm32_uid(buf: &mut [u8; 24]) -> &str {
+        const UID_BASE: *const u8 = 0x1FFF_7A10 as *const u8;
+        let hex = b"0123456789ABCDEF";
+        for i in 0..12 {
+            // SAFETY: UID registers are always readable at this address on STM32F4
+            let b = unsafe { core::ptr::read_volatile(UID_BASE.add(i)) };
+            buf[i * 2] = hex[(b >> 4) as usize];
+            buf[i * 2 + 1] = hex[(b & 0x0F) as usize];
+        }
+        // SAFETY: buf contains only ASCII hex characters
+        unsafe { core::str::from_utf8_unchecked(buf) }
     }
 
     #[init(local = [
         usb_buf: UsbBuffers = UsbBuffers::new(),
         ep_out_buf: [u8; 256] = [0; 256],
+        usb_tx_queue: BBBuffer<USB_TX_BUFFER_SIZE> = BBBuffer::new(),
+        uid_str: [u8; 24] = [0; 24],
     ])]
     fn init(mut ctx: init::Context) -> (Shared, Local) {
         defmt::info!("FOCI OpenFFBoard starting");
@@ -109,7 +255,6 @@ mod app {
 
         // PD7: system status LED on OpenFFBoard
         let led = Output::new(p.PD7, Level::Low, Speed::Low);
-        blink::spawn().ok();
 
         // USB OTG FS driver setup
         // vbus_detection = true: OpenFFBoard has VBUS wired to PA9
@@ -129,7 +274,8 @@ mod app {
         let mut usb_config = UsbConfig::new(0x1D50, 0x614E);
         usb_config.manufacturer = Some("foci");
         usb_config.product = Some("FOCI OpenFFBoard");
-        usb_config.serial_number = Some("TODO_UID");
+        let uid = read_stm32_uid(ctx.local.uid_str);
+        usb_config.serial_number = Some(uid);
         usb_config.max_power = 100;
         usb_config.max_packet_size_0 = 64;
 
@@ -151,18 +297,31 @@ mod app {
         let usb = builder.build();
         let (usb_sender, usb_receiver) = class.split();
 
+        // Split bbqueue for TX output
+        let (usb_tx_prod, usb_tx_consumer) = ctx.local.usb_tx_queue.try_split().unwrap();
+        // SAFETY: init runs exactly once before any task is spawned, so no concurrent access.
+        unsafe {
+            addr_of_mut!(USB_TX_PRODUCER).write(MaybeUninit::new(usb_tx_prod));
+        }
+
+        // Spawn tasks
         usb_pump::spawn().ok();
-        usb_echo::spawn().ok();
+        usb_receive::spawn().ok();
+        usb_send::spawn().ok();
+        blink::spawn().ok();
 
         defmt::info!("FOCI OpenFFBoard initialized");
 
         (
-            Shared {},
+            Shared {
+                app_state: State::new(),
+            },
             Local {
                 led,
                 usb,
                 usb_sender,
                 usb_receiver,
+                usb_tx_consumer,
             },
         )
     }
@@ -189,32 +348,63 @@ mod app {
         ctx.local.usb.run().await;
     }
 
-    /// Echo task: loops received USB CDC-ACM bytes back to the host.
-    ///
-    /// This is a temporary placeholder; Task 4 will replace it with the
-    /// anchor protocol handler.
-    #[task(priority = 2, local = [usb_receiver, usb_sender])]
-    async fn usb_echo(ctx: usb_echo::Context) {
+    /// Receives USB packets and feeds them to the anchor protocol handler.
+    #[task(priority = 2, local = [usb_receiver], shared = [app_state])]
+    async fn usb_receive(mut ctx: usb_receive::Context) {
         let receiver = ctx.local.usb_receiver;
-        let sender = ctx.local.usb_sender;
         loop {
             receiver.wait_connection().await;
             defmt::info!("USB connected");
             loop {
-                let mut buf = [0u8; 64];
-                match receiver.read_packet(&mut buf).await {
+                let mut rcv_buf = FifoBuffer::<192>::new();
+                match receiver.read_packet(rcv_buf.receive_buffer()).await {
                     Ok(n) => {
-                        if let Err(EndpointError::Disabled) = sender.write_packet(&buf[..n]).await {
-                            defmt::warn!("USB send error: endpoint disabled");
-                            break;
+                        rcv_buf.advance(n);
+                        if !rcv_buf.is_empty() {
+                            let mut wrap = SliceInputBuffer::new(rcv_buf.data());
+                            ctx.shared.app_state.lock(|state| {
+                                crate::KLIPPER_TRANSPORT.receive(&mut wrap, state);
+                            });
+                            rcv_buf.pop(rcv_buf.len() - wrap.available());
                         }
                     }
-                    Err(EndpointError::Disabled) => {
+                    Err(_) => {
                         defmt::warn!("USB disconnected");
                         break;
                     }
-                    Err(EndpointError::BufferOverflow) => {
-                        defmt::warn!("USB RX buffer overflow");
+                }
+            }
+        }
+    }
+
+    /// Drains the bbqueue TX buffer and sends packets over USB.
+    #[task(priority = 2, local = [usb_sender, usb_tx_consumer])]
+    async fn usb_send(ctx: usb_send::Context) {
+        let sender = ctx.local.usb_sender;
+        loop {
+            sender.wait_connection().await;
+            let mut more = false;
+            loop {
+                if !more {
+                    USB_TX_SIGNAL.wait().await;
+                }
+                let grant = match ctx.local.usb_tx_consumer.read() {
+                    Ok(grant) => grant,
+                    Err(_) => {
+                        more = false;
+                        continue;
+                    }
+                };
+                let len = grant.buf().len();
+                let take = len.min(64);
+
+                match sender.write_packet(&grant.buf()[..take]).await {
+                    Ok(_) => {
+                        grant.release(take);
+                        more = len != take;
+                    }
+                    Err(_) => {
+                        defmt::warn!("USB send error");
                         break;
                     }
                 }
@@ -222,3 +412,9 @@ mod app {
         }
     }
 }
+
+use anchor::klipper_config_generate;
+klipper_config_generate!(
+    transport = crate::app::TRANSPORT_OUTPUT: crate::app::BufferTransportOutput,
+    context = &'ctx mut klipper_mcu::state::State,
+);
