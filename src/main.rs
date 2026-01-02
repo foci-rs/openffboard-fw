@@ -200,6 +200,237 @@ mod app {
         cortex_m::peripheral::SCB::sys_reset();
     }
 
+    // ---- Stepper commands ----
+
+    /// Register a stepper motor object.
+    ///
+    /// Pin parameters are accepted for protocol compatibility but ignored;
+    /// the TMC4671 handles stepping internally.
+    #[klipper_command]
+    pub fn config_stepper(
+        context: &mut State,
+        oid: u8,
+        _step_pin: u8,
+        _dir_pin: u8,
+        _invert_step: u8,
+        _step_pulse_ticks: u32,
+    ) {
+        let idx = context.steppers_by_oid.len();
+        if idx >= klipper_mcu::state::NUM_STEPPERS {
+            defmt::error!("config_stepper: no stepper slots available");
+            return;
+        }
+        if context.steppers_by_oid.insert(oid, idx).is_err() {
+            defmt::error!("config_stepper: OID map full");
+            return;
+        }
+        defmt::info!(
+            "config_stepper: oid={} idx={} (pins ignored, TMC4671 mode)",
+            oid,
+            idx
+        );
+    }
+
+    /// Enqueue a trapezoidal move segment for a stepper.
+    #[klipper_command]
+    pub fn queue_step(context: &mut State, oid: u8, interval: u32, count: u16, add: i16) {
+        if let Some(stepper) = context.stepper_mut(oid) {
+            let m = klipper_mcu::stepper::StepMove {
+                interval,
+                count,
+                add,
+            };
+            if stepper.queue_move(m).is_err() {
+                defmt::error!("queue_step: move queue overflow for oid={}", oid);
+            }
+        }
+    }
+
+    /// Set the direction for subsequent steps on a stepper.
+    ///
+    /// Klipper convention: `dir == 0` means forward, `dir == 1` means backward.
+    #[klipper_command]
+    pub fn set_next_step_dir(context: &mut State, oid: u8, dir: u8) {
+        if let Some(stepper) = context.stepper_mut(oid) {
+            stepper.set_direction(dir == 0);
+        }
+    }
+
+    /// Reset the step clock reference for a stepper.
+    #[klipper_command]
+    pub fn reset_step_clock(context: &mut State, oid: u8, clock: u32) {
+        if let Some(stepper) = context.stepper_mut(oid) {
+            stepper.reset_clock(clock);
+        }
+    }
+
+    /// Report the current position of a stepper.
+    #[klipper_command]
+    pub fn stepper_get_position(context: &mut State, oid: u8) {
+        let pos = context.stepper(oid).map(|s| s.position()).unwrap_or(0);
+        klipper_reply!(stepper_position, oid: u8 = oid, pos: i32 = pos);
+    }
+
+    /// Report the commanded (target) position of a stepper.
+    ///
+    /// For TMC4671 mode this is equivalent to `stepper_get_position` since
+    /// we track only the logical step count.
+    #[klipper_command]
+    pub fn stepper_get_commanded_position(context: &mut State, oid: u8) {
+        let pos = context.stepper(oid).map(|s| s.position()).unwrap_or(0);
+        klipper_reply!(stepper_position, oid: u8 = oid, pos: i32 = pos);
+    }
+
+    /// Stop a stepper on a trigger-sync event.
+    ///
+    /// TrSync is not implemented in Phase 1; accept the command silently.
+    #[klipper_command]
+    pub fn stepper_stop_on_trigger(context: &mut State, _oid: u8, _trsync_oid: u8) {
+        let _ = context;
+    }
+
+    // ---- Digital output commands (motor enable/disable) ----
+
+    /// Register a digital output object for motor enable/disable.
+    ///
+    /// Pin parameters are accepted for protocol compatibility but ignored;
+    /// the TMC4671 enable line is controlled directly.
+    #[klipper_command]
+    pub fn config_digital_out(
+        context: &mut State,
+        oid: u8,
+        _pin: u32,
+        _value: u8,
+        _default_value: u8,
+        _max_duration: u32,
+    ) {
+        let idx = context.enable_by_oid.len();
+        if idx < klipper_mcu::state::NUM_STEPPERS {
+            let _ = context.enable_by_oid.insert(oid, idx);
+        }
+        defmt::info!(
+            "config_digital_out: oid={} (enable control, pin ignored)",
+            oid
+        );
+    }
+
+    /// Schedule a digital output change at a given clock time.
+    ///
+    /// Used by Klipper for timed motor enable/disable.
+    #[klipper_command]
+    pub fn queue_digital_out(context: &mut State, oid: u8, clock: u32, on_ticks: u32) {
+        if let Some(&idx) = context.enable_by_oid.get(&oid) {
+            let enabled = on_ticks != 0;
+            context.steppers[idx].set_enabled(enabled);
+            defmt::info!(
+                "queue_digital_out: oid={} clock={} enabled={}",
+                oid,
+                clock,
+                enabled
+            );
+        }
+    }
+
+    /// Immediately update a digital output value.
+    #[klipper_command]
+    pub fn update_digital_out(context: &mut State, oid: u8, value: u8) {
+        if let Some(&idx) = context.enable_by_oid.get(&oid) {
+            context.steppers[idx].set_enabled(value != 0);
+        }
+    }
+
+    // ---- Stub commands for Klipper protocol compatibility ----
+
+    /// TrSync configuration stub (Phase 2).
+    #[klipper_command]
+    pub fn config_trsync(_oid: u8) {}
+
+    /// TrSync start stub (Phase 2).
+    ///
+    /// Immediately reports completion with the given expire_reason so
+    /// Klipper doesn't wait indefinitely for a trigger.
+    #[klipper_command]
+    pub fn trsync_start(
+        _context: &mut State,
+        oid: u8,
+        report_clock: u32,
+        _report_ticks: u32,
+        expire_reason: u8,
+    ) {
+        klipper_reply!(
+            trsync_state,
+            oid: u8 = oid,
+            can_trigger: u8 = 0,
+            trigger_reason: u8 = expire_reason,
+            clock: u32 = report_clock
+        );
+    }
+
+    /// TrSync timeout stub (Phase 2).
+    #[klipper_command]
+    pub fn trsync_set_timeout(_oid: u8, _clock: u32) {}
+
+    /// TrSync trigger stub (Phase 2).
+    #[klipper_command]
+    pub fn trsync_trigger(_oid: u8, _reason: u8) {}
+
+    /// Endstop configuration stub.
+    #[klipper_command]
+    pub fn config_endstop(_oid: u8, _pin: u8, _pull_up: u8) {}
+
+    /// Endstop homing stub.
+    #[klipper_command]
+    pub fn endstop_home(
+        _oid: u8,
+        _clock: u32,
+        _sample_ticks: u32,
+        _sample_count: u8,
+        _rest_ticks: u32,
+        _pin_value: u8,
+        _trsync_oid: u8,
+        _trigger_reason: u8,
+    ) {
+    }
+
+    /// Reply with endstop state (always "not triggered").
+    #[klipper_command]
+    pub fn endstop_query_state(_context: &mut State, oid: u8) {
+        klipper_reply!(
+            endstop_state,
+            oid: u8 = oid,
+            homing: u8 = 0,
+            next_clock: u32 = 0,
+            pin_value: u8 = 0
+        );
+    }
+
+    /// SPI configuration stub (TMC4671 SPI is handled internally).
+    #[klipper_command]
+    pub fn config_spi(_oid: u8, _pin: u32, _cs_active_high: u8) {}
+
+    /// SPI configuration without chip-select stub.
+    #[klipper_command]
+    pub fn config_spi_without_cs(_oid: u8) {}
+
+    /// SPI bus assignment stub.
+    #[klipper_command]
+    pub fn spi_set_bus(_oid: u8, _spi_bus: u32, _mode: u32, _rate: u32) {}
+
+    /// SPI shutdown message configuration stub.
+    #[klipper_command]
+    pub fn config_spi_shutdown(_oid: u8, _spi_oid: u8, _shutdown_msg: &[u8]) {}
+
+    /// SPI send stub (data is accepted but not forwarded).
+    #[klipper_command]
+    pub fn spi_send(_oid: u8, _data: &[u8]) {}
+
+    /// SPI transfer stub (returns empty response).
+    #[klipper_command]
+    pub fn spi_transfer(_oid: u8, _data: &[u8]) {
+        let empty: &[u8] = &[];
+        klipper_reply!(spi_transfer_response, oid: u8 = _oid, response: &[u8] = empty);
+    }
+
     // ---- RTIC resources ----
 
     #[shared]
@@ -464,6 +695,28 @@ mod app {
 }
 
 use anchor::klipper_config_generate;
+use anchor::klipper_enumeration;
+
+// Pin enumerations at crate root (outside mod app) so anchor_codegen
+// can discover them. TMC4671 handles all pins internally — these exist
+// only for Klipper config pin name resolution.
+klipper_enumeration!(
+    #[allow(non_camel_case_types)]
+    #[klipper_enumeration(name = "pin")]
+    enum Pins {
+        PA0, PA1, PA2, PA3, PA4, PA5, PA6, PA7,
+        PA8, PA9, PA10, PA11, PA12, PA13, PA14, PA15,
+        PB0, PB1, PB2, PB3, PB4, PB5, PB6, PB7,
+        PB8, PB9, PB10, PB11, PB12, PB13, PB14, PB15,
+        PC0, PC1, PC2, PC3, PC4, PC5, PC6, PC7,
+        PC8, PC9, PC10, PC11, PC12, PC13, PC14, PC15,
+        PD0, PD1, PD2, PD3, PD4, PD5, PD6, PD7,
+        PD8, PD9, PD10, PD11, PD12, PD13, PD14, PD15,
+        PE0, PE1, PE2, PE3, PE4, PE5, PE6, PE7,
+        PE8, PE9, PE10, PE11, PE12, PE13, PE14, PE15,
+    }
+);
+
 klipper_config_generate!(
     transport = crate::app::TRANSPORT_OUTPUT: crate::app::BufferTransportOutput,
     context = &'ctx mut klipper_mcu::state::State,
