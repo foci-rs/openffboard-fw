@@ -666,6 +666,7 @@ mod app {
         usb_send::spawn().ok();
         usb_control::spawn().ok();
         blink::spawn().ok();
+        stats::spawn().ok();
 
         defmt::info!("FOCI OpenFFBoard initialized");
 
@@ -773,6 +774,39 @@ mod app {
                 request_katapult_bootloader();
             }
             *ctx.local.dtr_was_set = dtr;
+        }
+    }
+
+    /// Periodic stats heartbeat sent to Klipper.
+    ///
+    /// Klipper requires regular stats messages to confirm the MCU is alive.
+    /// Sends `stats count=%u sum=%u sumsq=%u` every 5 seconds with basic
+    /// CPU usage metrics.
+    #[task(priority = 1)]
+    async fn stats(_ctx: stats::Context) {
+        let mut count: u32 = 0;
+        let mut sum: u32 = 0;
+        let mut sumsq: u32 = 0;
+        let mut last_clock = DWT::cycle_count();
+
+        loop {
+            Mono::delay(5000.millis()).await;
+
+            let now = DWT::cycle_count();
+            let elapsed = now.wrapping_sub(last_clock);
+            last_clock = now;
+
+            // Track one "iteration" per stats period with elapsed ticks
+            count += 1;
+            sum += elapsed;
+            let diff_scaled = elapsed / STATS_SUMSQ_BASE;
+            sumsq = sumsq.saturating_add(diff_scaled.saturating_mul(elapsed));
+
+            klipper_output!("stats count=%u sum=%u sumsq=%u", count, sum, sumsq);
+
+            count = 0;
+            sum = 0;
+            sumsq = 0;
         }
     }
 
