@@ -22,6 +22,7 @@ embassy-time = "0.5"
 embassy-usb = { version = "0.6", features = ["defmt"] }
 embassy-futures = "0.1"
 embassy-sync = "0.6"
+embedded-hal-bus = { version = "0.3", features = ["async"] }
 
 # Cortex-M
 cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }

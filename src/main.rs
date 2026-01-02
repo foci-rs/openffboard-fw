@@ -20,24 +20,45 @@ mod app {
     use bbqueue::BBBuffer;
     use cortex_m::peripheral::DWT;
     use embassy_stm32::gpio::{Level, Output, Speed};
+    use embassy_stm32::mode::Async as AsyncMode;
+    use embassy_stm32::spi::Spi;
     use embassy_stm32::usb::Driver;
     use embassy_stm32::{bind_interrupts, peripherals, usb};
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use embassy_sync::signal::Signal;
     use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
     use embassy_usb::{Builder, Config as UsbConfig, UsbDevice};
+    use embedded_hal_bus::spi::ExclusiveDevice;
     use klipper_mcu::shutdown::McuState;
     use klipper_mcu::state::State;
     use rtic_monotonics::systick::prelude::*;
+    use rtic_sync::channel::{Receiver, Sender};
+    use tmc4671::spi::Tmc4671Spi;
 
     bind_interrupts!(struct Irqs {
         OTG_FS => usb::InterruptHandler<peripherals::USB_OTG_FS>;
+        DMA2_STREAM2 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH2>;
+        DMA2_STREAM3 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH3>;
     });
 
     systick_monotonic!(Mono, 1000);
 
     /// USB HAL driver type alias for use throughout this module.
     type HalUsbDriver = Driver<'static, peripherals::USB_OTG_FS>;
+
+    /// SPI bus type for TMC4671 communication.
+    type Spi1Bus = Spi<'static, AsyncMode, embassy_stm32::spi::mode::Master>;
+
+    /// TMC4671 SPI device with exclusive bus access and software CS.
+    type TmcSpiDevice = ExclusiveDevice<Spi1Bus, Output<'static>, embedded_hal_bus::spi::NoDelay>;
+
+    /// Register access request from protocol handler to tmc_control task.
+    enum TmcRequest {
+        Write { addr: u8, value: u32 },
+        Read { oid: u8, addr: u8 },
+    }
+
+    const TMC_CHANNEL_SIZE: usize = 4;
 
     /// Static buffers required by the USB device stack.
     ///
@@ -69,6 +90,9 @@ mod app {
     static mut USB_TX_PRODUCER: MaybeUninit<bbqueue::Producer<'static, USB_TX_BUFFER_SIZE>> =
         MaybeUninit::uninit();
     static USB_TX_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+    static mut TMC_REQUEST_SENDER: MaybeUninit<Sender<'static, TmcRequest, TMC_CHANNEL_SIZE>> =
+        MaybeUninit::uninit();
 
     pub struct BufferTransportOutput;
     pub const TRANSPORT_OUTPUT: BufferTransportOutput = BufferTransportOutput;
@@ -380,6 +404,7 @@ mod app {
 
     /// Endstop homing stub.
     #[klipper_command]
+    #[allow(clippy::too_many_arguments)]
     pub fn endstop_home(
         _oid: u8,
         _clock: u32,
@@ -424,6 +449,43 @@ mod app {
     #[klipper_command]
     pub fn spi_send(_oid: u8, _data: &[u8]) {}
 
+    // ---- TMC4671 register access commands ----
+
+    /// Write a TMC4671 register via SPI.
+    ///
+    /// Queues the write request for the tmc_control task which owns
+    /// the SPI bus.
+    #[klipper_command]
+    pub fn tmc_write_register(_context: &mut State, _oid: u8, addr: u8, value: u32) {
+        // SAFETY: TMC_REQUEST_SENDER is initialised exactly once in init()
+        // before any task runs. After init, only command handlers access it,
+        // and they run sequentially within usb_receive.
+        let sender = unsafe {
+            &mut *core::ptr::addr_of_mut!(TMC_REQUEST_SENDER).cast::<Sender<
+                'static,
+                TmcRequest,
+                TMC_CHANNEL_SIZE,
+            >>()
+        };
+        let _ = sender.try_send(TmcRequest::Write { addr, value });
+    }
+
+    /// Read a TMC4671 register via SPI.
+    ///
+    /// Queues the read request for the tmc_control task. The response
+    /// is sent asynchronously as a tmc_register_value reply.
+    #[klipper_command]
+    pub fn tmc_read_register(_context: &mut State, oid: u8, addr: u8) {
+        let sender = unsafe {
+            &mut *core::ptr::addr_of_mut!(TMC_REQUEST_SENDER).cast::<Sender<
+                'static,
+                TmcRequest,
+                TMC_CHANNEL_SIZE,
+            >>()
+        };
+        let _ = sender.try_send(TmcRequest::Read { oid, addr });
+    }
+
     /// SPI transfer stub (returns empty response).
     #[klipper_command]
     pub fn spi_transfer(_oid: u8, _data: &[u8]) {
@@ -441,6 +503,8 @@ mod app {
     #[local]
     struct Local {
         led: Output<'static>,
+        tmc: Tmc4671Spi<TmcSpiDevice>,
+        tmc_rx: Receiver<'static, TmcRequest, TMC_CHANNEL_SIZE>,
         usb: UsbDevice<'static, HalUsbDriver>,
         usb_sender: embassy_usb::class::cdc_acm::Sender<'static, HalUsbDriver>,
         usb_receiver: embassy_usb::class::cdc_acm::Receiver<'static, HalUsbDriver>,
@@ -472,6 +536,8 @@ mod app {
         usb_buf: UsbBuffers = UsbBuffers::new(),
         ep_out_buf: [u8; 256] = [0; 256],
         usb_tx_queue: BBBuffer<USB_TX_BUFFER_SIZE> = BBBuffer::new(),
+        tmc_channel: rtic_sync::channel::Channel<TmcRequest, TMC_CHANNEL_SIZE> =
+            rtic_sync::channel::Channel::new(),
         uid_str: [u8; 24] = [0; 24],
     ])]
     fn init(mut ctx: init::Context) -> (Shared, Local) {
@@ -513,6 +579,37 @@ mod app {
 
         // PD7: system status LED on OpenFFBoard
         let led = Output::new(p.PD7, Level::Low, Speed::Low);
+
+        // SPI1: TMC4671 communication at 2 MHz, Mode 3 (CPOL=1, CPHA=1)
+        let mut spi_config = embassy_stm32::spi::Config::default();
+        spi_config.mode = embassy_stm32::spi::Mode {
+            polarity: embassy_stm32::spi::Polarity::IdleHigh,
+            phase: embassy_stm32::spi::Phase::CaptureOnSecondTransition,
+        };
+        spi_config.frequency = embassy_stm32::time::Hertz(2_000_000);
+
+        let spi1 = Spi::new(
+            p.SPI1, p.PA5,      // SCK
+            p.PA7,      // MOSI
+            p.PA6,      // MISO
+            p.DMA2_CH3, // TX DMA
+            p.DMA2_CH2, // RX DMA
+            Irqs, spi_config,
+        );
+
+        // PA4: TMC4671 chip select (active low)
+        let spi_cs = Output::new(p.PA4, Level::High, Speed::VeryHigh);
+        let spi_dev = ExclusiveDevice::new_no_delay(spi1, spi_cs).unwrap();
+        let tmc = Tmc4671Spi::new(spi_dev);
+
+        // TMC register request channel
+        let (tmc_tx, tmc_rx) = ctx.local.tmc_channel.split();
+        // SAFETY: init runs exactly once before any task is spawned.
+        unsafe {
+            addr_of_mut!(TMC_REQUEST_SENDER).write(MaybeUninit::new(tmc_tx));
+        }
+
+        defmt::info!("SPI1 configured: 2 MHz, Mode 3, DMA");
 
         // USB OTG FS driver setup
         // vbus_detection = true: OpenFFBoard has VBUS wired to PA9
@@ -563,6 +660,7 @@ mod app {
         }
 
         // Spawn tasks
+        tmc_control::spawn().ok();
         usb_pump::spawn().ok();
         usb_receive::spawn().ok();
         usb_send::spawn().ok();
@@ -577,6 +675,8 @@ mod app {
             },
             Local {
                 led,
+                tmc,
+                tmc_rx,
                 usb,
                 usb_sender,
                 usb_receiver,
@@ -593,6 +693,67 @@ mod app {
         }
     }
 
+    /// TMC4671 control task. Runs at priority 1 (preempted by protocol tasks).
+    ///
+    /// On startup, reads the TMC4671 chip identification register to verify
+    /// SPI communication. Then processes register read/write requests from
+    /// the protocol handler via the TMC request channel.
+    #[task(priority = 1, local = [tmc, tmc_rx])]
+    async fn tmc_control(ctx: tmc_control::Context) {
+        let tmc = ctx.local.tmc;
+        let rx = ctx.local.tmc_rx;
+
+        // Verify TMC4671 chip identity
+        match tmc
+            .read_sub_register(tmc4671::registers::CHIPINFO_SI_TYPE)
+            .await
+        {
+            Ok(chip_id) => {
+                if chip_id == 0x3436_3731 {
+                    defmt::info!("TMC4671 chip ID verified: {:#010x}", chip_id);
+                } else {
+                    defmt::error!(
+                        "TMC4671 chip ID mismatch: expected 0x34363731, got {:#010x}",
+                        chip_id
+                    );
+                }
+            }
+            Err(_) => {
+                defmt::error!("TMC4671 SPI communication failed");
+            }
+        }
+
+        // Process register read/write requests from the host
+        loop {
+            if let Ok(req) = rx.recv().await {
+                match req {
+                    TmcRequest::Write { addr, value } => {
+                        let reg = tmc4671::registers::Register::new(addr);
+                        if tmc.write_register(reg, value).await.is_err() {
+                            defmt::error!("TMC4671 SPI write failed: addr={:#04x}", addr);
+                        }
+                    }
+                    TmcRequest::Read { oid, addr } => {
+                        let reg = tmc4671::registers::Register::new(addr);
+                        match tmc.read_register(reg).await {
+                            Ok(value) => {
+                                klipper_reply!(
+                                    tmc_register_value,
+                                    oid: u8 = oid,
+                                    addr: u8 = addr,
+                                    value: u32 = value
+                                );
+                            }
+                            Err(_) => {
+                                defmt::error!("TMC4671 SPI read failed: addr={:#04x}", addr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Monitors CDC-ACM control line changes for bootloader entry.
     ///
     /// Katapult's flashtool requests bootloader entry by setting DTR,
@@ -604,11 +765,12 @@ mod app {
         loop {
             ctx.local.usb_control.control_changed().await;
             let dtr = ctx.local.usb_control.dtr();
-            if *ctx.local.dtr_was_set && !dtr {
-                if ctx.local.usb_control.line_coding().data_rate() == 1200 {
-                    defmt::info!("1200 baud + DTR drop: entering Katapult bootloader");
-                    request_katapult_bootloader();
-                }
+            if *ctx.local.dtr_was_set
+                && !dtr
+                && ctx.local.usb_control.line_coding().data_rate() == 1200
+            {
+                defmt::info!("1200 baud + DTR drop: entering Katapult bootloader");
+                request_katapult_bootloader();
             }
             *ctx.local.dtr_was_set = dtr;
         }
@@ -704,16 +866,86 @@ klipper_enumeration!(
     #[allow(non_camel_case_types)]
     #[klipper_enumeration(name = "pin")]
     enum Pins {
-        PA0, PA1, PA2, PA3, PA4, PA5, PA6, PA7,
-        PA8, PA9, PA10, PA11, PA12, PA13, PA14, PA15,
-        PB0, PB1, PB2, PB3, PB4, PB5, PB6, PB7,
-        PB8, PB9, PB10, PB11, PB12, PB13, PB14, PB15,
-        PC0, PC1, PC2, PC3, PC4, PC5, PC6, PC7,
-        PC8, PC9, PC10, PC11, PC12, PC13, PC14, PC15,
-        PD0, PD1, PD2, PD3, PD4, PD5, PD6, PD7,
-        PD8, PD9, PD10, PD11, PD12, PD13, PD14, PD15,
-        PE0, PE1, PE2, PE3, PE4, PE5, PE6, PE7,
-        PE8, PE9, PE10, PE11, PE12, PE13, PE14, PE15,
+        PA0,
+        PA1,
+        PA2,
+        PA3,
+        PA4,
+        PA5,
+        PA6,
+        PA7,
+        PA8,
+        PA9,
+        PA10,
+        PA11,
+        PA12,
+        PA13,
+        PA14,
+        PA15,
+        PB0,
+        PB1,
+        PB2,
+        PB3,
+        PB4,
+        PB5,
+        PB6,
+        PB7,
+        PB8,
+        PB9,
+        PB10,
+        PB11,
+        PB12,
+        PB13,
+        PB14,
+        PB15,
+        PC0,
+        PC1,
+        PC2,
+        PC3,
+        PC4,
+        PC5,
+        PC6,
+        PC7,
+        PC8,
+        PC9,
+        PC10,
+        PC11,
+        PC12,
+        PC13,
+        PC14,
+        PC15,
+        PD0,
+        PD1,
+        PD2,
+        PD3,
+        PD4,
+        PD5,
+        PD6,
+        PD7,
+        PD8,
+        PD9,
+        PD10,
+        PD11,
+        PD12,
+        PD13,
+        PD14,
+        PD15,
+        PE0,
+        PE1,
+        PE2,
+        PE3,
+        PE4,
+        PE5,
+        PE6,
+        PE7,
+        PE8,
+        PE9,
+        PE10,
+        PE11,
+        PE12,
+        PE13,
+        PE14,
+        PE15,
     }
 );
 
