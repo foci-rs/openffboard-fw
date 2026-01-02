@@ -168,11 +168,37 @@ mod app {
 
     #[klipper_command]
     pub fn reset() {
-        cortex_m::peripheral::SCB::sys_reset();
+        request_katapult_bootloader();
     }
 
     #[klipper_command]
     pub fn debug_nop() {}
+
+    /// Request reboot into Katapult bootloader.
+    ///
+    /// Writes the Katapult magic signature to the RAM address pointed to by
+    /// the bootloader's initial stack pointer (first word of the vector table
+    /// at 0x08000000). Katapult checks this on boot and stays in bootloader
+    /// mode instead of jumping to the application.
+    fn request_katapult_bootloader() {
+        const KATAPULT_BOOT_ADDRESS: u32 = 0x0800_0000;
+        const KATAPULT_MAGIC: u64 = 0x5984_E3FA_6CA1_589B;
+
+        cortex_m::interrupt::disable();
+
+        // SAFETY: The bootloader vector table at KATAPULT_BOOT_ADDRESS is
+        // always readable. Its first entry is the initial SP value, which
+        // points to a valid RAM address. We write the magic signature there
+        // so Katapult detects a bootloader request on the next reset.
+        unsafe {
+            let bl_vectors = KATAPULT_BOOT_ADDRESS as *const u32;
+            let initial_sp = core::ptr::read_volatile(bl_vectors);
+            let req_sig = initial_sp as *mut u64;
+            core::ptr::write_volatile(req_sig, KATAPULT_MAGIC);
+        }
+
+        cortex_m::peripheral::SCB::sys_reset();
+    }
 
     // ---- RTIC resources ----
 
@@ -187,6 +213,7 @@ mod app {
         usb: UsbDevice<'static, HalUsbDriver>,
         usb_sender: embassy_usb::class::cdc_acm::Sender<'static, HalUsbDriver>,
         usb_receiver: embassy_usb::class::cdc_acm::Receiver<'static, HalUsbDriver>,
+        usb_control: embassy_usb::class::cdc_acm::ControlChanged<'static>,
         usb_tx_consumer: bbqueue::Consumer<'static, USB_TX_BUFFER_SIZE>,
     }
 
@@ -295,7 +322,7 @@ mod app {
         let cdc_state = usb_buf.cdc_state.write(CdcState::new());
         let class = CdcAcmClass::new(&mut builder, cdc_state, 64);
         let usb = builder.build();
-        let (usb_sender, usb_receiver) = class.split();
+        let (usb_sender, usb_receiver, usb_control) = class.split_with_control();
 
         // Split bbqueue for TX output
         let (usb_tx_prod, usb_tx_consumer) = ctx.local.usb_tx_queue.try_split().unwrap();
@@ -308,6 +335,7 @@ mod app {
         usb_pump::spawn().ok();
         usb_receive::spawn().ok();
         usb_send::spawn().ok();
+        usb_control::spawn().ok();
         blink::spawn().ok();
 
         defmt::info!("FOCI OpenFFBoard initialized");
@@ -321,6 +349,7 @@ mod app {
                 usb,
                 usb_sender,
                 usb_receiver,
+                usb_control,
                 usb_tx_consumer,
             },
         )
@@ -330,6 +359,27 @@ mod app {
     fn idle(_: idle::Context) -> ! {
         loop {
             rtic::export::wfi();
+        }
+    }
+
+    /// Monitors CDC-ACM control line changes for bootloader entry.
+    ///
+    /// Katapult's flashtool requests bootloader entry by setting DTR,
+    /// changing baud to 1200, then dropping DTR. We detect the DTR
+    /// high-to-low transition with 1200 baud to avoid false triggers
+    /// from normal Klipper serial port handling.
+    #[task(priority = 2, local = [usb_control, dtr_was_set: bool = false])]
+    async fn usb_control(ctx: usb_control::Context) {
+        loop {
+            ctx.local.usb_control.control_changed().await;
+            let dtr = ctx.local.usb_control.dtr();
+            if *ctx.local.dtr_was_set && !dtr {
+                if ctx.local.usb_control.line_coding().data_rate() == 1200 {
+                    defmt::info!("1200 baud + DTR drop: entering Katapult bootloader");
+                    request_katapult_bootloader();
+                }
+            }
+            *ctx.local.dtr_was_set = dtr;
         }
     }
 
