@@ -23,6 +23,7 @@ mod app {
     use embassy_stm32::mode::Async as AsyncMode;
     use embassy_stm32::spi::Spi;
     use embassy_stm32::usb::Driver;
+    use embassy_stm32::wdg::IndependentWatchdog;
     use embassy_stm32::{bind_interrupts, peripherals, usb};
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use embassy_sync::signal::Signal;
@@ -501,6 +502,7 @@ mod app {
         tmc: Tmc4671Spi<TmcSpiDevice>,
         tmc_enable: Output<'static>,
         tmc_rx: Receiver<'static, TmcRequest, TMC_CHANNEL_SIZE>,
+        wdg: IndependentWatchdog<'static, peripherals::IWDG>,
         usb: UsbDevice<'static, HalUsbDriver>,
         usb_sender: embassy_usb::class::cdc_acm::Sender<'static, HalUsbDriver>,
         usb_receiver: embassy_usb::class::cdc_acm::Receiver<'static, HalUsbDriver>,
@@ -578,6 +580,11 @@ mod app {
 
         // PE7: TMC4671 ENABLE pin (active high, start disabled)
         let tmc_enable = Output::new(p.PE7, Level::Low, Speed::Low);
+
+        // IWDG: 10-second timeout, kicked by the stats task every 5 seconds
+        let mut wdg = IndependentWatchdog::new(p.IWDG, 10_000_000);
+        wdg.unleash();
+        defmt::info!("IWDG started: 10s timeout");
 
         // SPI1: TMC4671 communication at 2 MHz, Mode 3 (CPOL=1, CPHA=1)
         let mut spi_config = embassy_stm32::spi::Config::default();
@@ -678,6 +685,7 @@ mod app {
                 tmc,
                 tmc_enable,
                 tmc_rx,
+                wdg,
                 usb,
                 usb_sender,
                 usb_receiver,
@@ -790,9 +798,9 @@ mod app {
     ///
     /// Klipper requires regular stats messages to confirm the MCU is alive.
     /// Sends `stats count=%u sum=%u sumsq=%u` every 5 seconds with basic
-    /// CPU usage metrics.
-    #[task(priority = 1)]
-    async fn stats(_ctx: stats::Context) {
+    /// CPU usage metrics. Also kicks the IWDG watchdog.
+    #[task(priority = 1, local = [wdg])]
+    async fn stats(ctx: stats::Context) {
         let mut count: u32 = 0;
         let mut sum: u32 = 0;
         let mut sumsq: u32 = 0;
@@ -812,6 +820,7 @@ mod app {
             sumsq = sumsq.saturating_add(diff_scaled.saturating_mul(elapsed));
 
             klipper_output!("stats count=%u sum=%u sumsq=%u", count, sum, sumsq);
+            ctx.local.wdg.pet();
 
             count = 0;
             sum = 0;
