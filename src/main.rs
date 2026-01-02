@@ -188,8 +188,18 @@ mod app {
 
     #[klipper_command]
     pub fn emergency_stop(context: &mut State) {
+        enter_shutdown(context, klipper_mcu::shutdown::reasons::COMMAND_REQUEST);
+    }
+
+    /// Transition to shutdown state: disable motor, notify host.
+    fn enter_shutdown(context: &mut State, reason: &str) {
+        if context.mcu_state.is_shutdown() {
+            return;
+        }
         context.mcu_state = McuState::Shutdown { reason: 0 };
-        defmt::error!("Emergency stop!");
+        tmc_send(TmcRequest::SetEnable(false));
+        defmt::error!("Shutdown: {}", reason);
+        klipper_output!("shutdown static_string_id=%hu", 0u16);
     }
 
     #[klipper_command]
