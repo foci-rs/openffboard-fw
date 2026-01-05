@@ -58,9 +58,11 @@ mod app {
         Write { addr: u8, value: u32 },
         Read { oid: u8, addr: u8 },
         SetEnable(bool),
+        Init,
+        TestSpin { revolutions: u8 },
     }
 
-    const TMC_CHANNEL_SIZE: usize = 4;
+    const TMC_CHANNEL_SIZE: usize = 8;
 
     /// Static buffers required by the USB device stack.
     ///
@@ -147,12 +149,12 @@ mod app {
 
     #[klipper_command]
     pub fn get_uptime(_context: &mut State) {
-        let c = DWT::cycle_count() as u64;
-        klipper_reply!(
-            uptime,
-            high: u32 = (c >> 32) as u32,
-            clock: u32 = (c & 0xFFFF_FFFF) as u32
-        );
+        // DWT CYCCNT is 32-bit, wraps every ~25s at 168MHz.
+        // For now, report high=0. Klipper uses get_uptime for session
+        // management, not precision timing. TODO: track 64-bit uptime
+        // via overflow counter in a periodic task.
+        let clock = DWT::cycle_count();
+        klipper_reply!(uptime, high: u32 = 0, clock: u32 = clock);
     }
 
     #[klipper_command]
@@ -478,6 +480,18 @@ mod app {
         let _ = sender.try_send(req);
     }
 
+    /// Trigger TMC4671 initialization sequence.
+    #[klipper_command]
+    pub fn tmc_init(_context: &mut State, _oid: u8) {
+        tmc_send(TmcRequest::Init);
+    }
+
+    /// Test motor rotation by sweeping PHI_E_EXT through N revolutions.
+    #[klipper_command]
+    pub fn tmc_test_spin(_context: &mut State, _oid: u8, revolutions: u8) {
+        tmc_send(TmcRequest::TestSpin { revolutions });
+    }
+
     /// Write a TMC4671 register via SPI.
     #[klipper_command]
     pub fn tmc_write_register(_context: &mut State, _oid: u8, addr: u8, value: u32) {
@@ -723,6 +737,9 @@ mod app {
         let enable_pin = ctx.local.tmc_enable;
         let rx = ctx.local.tmc_rx;
 
+        // NOTE: auto-init disabled - motor current regulation not yet safe
+        // tmc_init_open_loop(tmc, enable_pin).await;
+
         // Verify TMC4671 chip identity
         match tmc
             .read_sub_register(tmc4671::registers::CHIPINFO_SI_TYPE)
@@ -777,8 +794,206 @@ mod app {
                         }
                         defmt::info!("TMC4671 enable: {}", enabled);
                     }
+                    TmcRequest::Init => {
+                        defmt::info!("TMC4671 init: starting open-loop stepper config");
+                        tmc_init_open_loop(tmc, enable_pin).await;
+                    }
+                    TmcRequest::TestSpin { revolutions } => {
+                        do_test_spin(tmc, revolutions).await;
+                    }
                 }
             }
+        }
+    }
+
+    /// Sweep PHI_E_EXT through N full mechanical revolutions.
+    ///
+    /// With 50 pole pairs, one mechanical revolution = 50 electrical
+    /// cycles. Each electrical cycle sweeps PHI_E_EXT from 0 to 65535.
+    /// Uses whatever voltage/mode settings were configured by tmc_init.
+    async fn do_test_spin(tmc: &mut Tmc4671Spi<TmcSpiDevice>, revolutions: u8) {
+        use tmc4671::registers::*;
+
+        let total_steps = revolutions as u32 * 50 * 256; // 256 microsteps per e-cycle
+        defmt::info!(
+            "Spinning {} revolutions ({} steps)",
+            revolutions,
+            total_steps
+        );
+
+        for step in 0..total_steps {
+            let angle = (step * 256) % 65536;
+            let _ = tmc.write_register(PHI_E_EXT, angle).await;
+            Mono::delay(1.millis()).await;
+        }
+
+        // Return to angle 0
+        let _ = tmc.write_register(PHI_E_EXT, 0).await;
+        defmt::info!("Spin complete");
+    }
+
+    /// Configure TMC4671 for open-loop stepper operation with current regulation.
+    ///
+    /// Sequence:
+    /// 1. Stop motor, configure PWM and ADC
+    /// 2. Calibrate ADC offsets (motor should be disconnected or idle)
+    /// 3. Set up torque mode with current limit
+    /// 4. PHI_E_EXT for open-loop angle control
+    ///
+    /// Register values verified against TMC4671-LA datasheet rev 2.08.
+    async fn tmc_init_open_loop(
+        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
+        enable_pin: &mut Output<'static>,
+    ) {
+        use tmc4671::registers::*;
+
+        // 1. SAFETY FIRST: stop motor, disable outputs, set voltage limit
+        // The power-on default PIDOUT_UQ_UD_LIMITS is 32767 (full voltage).
+        // We MUST set a safe limit before ANYTHING else touches the motor.
+        enable_pin.set_low();
+        let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x0000_0000).await;
+        let voltage_limit: u32 = 1024;
+        let _ = tmc.write_register(PIDOUT_UQ_UD_LIMITS, voltage_limit).await;
+        // Verify the write took effect
+        let readback = tmc.read_register(PIDOUT_UQ_UD_LIMITS).await.unwrap_or(0);
+        defmt::info!(
+            "PIDOUT_UQ_UD_LIMITS: wrote={}, read={}",
+            voltage_limit,
+            readback
+        );
+        // Also zero the torque target to prevent any current drive
+        let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+        // And zero the UQ/UD external values
+        let _ = tmc.write_register(UQ_UD_EXT, 0).await;
+
+        // 2. PWM configuration (chopping disabled for ADC calibration)
+        let _ = tmc.write_register(PWM_POLARITIES, 0).await;
+        let _ = tmc.write_register(PWM_MAXCNT, 3999).await; // 25kHz
+        let _ = tmc.write_register(PWM_BBM_H_BBM_L, (10 << 8) | 10).await;
+        // PWM_SV=0 (SVPWM off per DS 4.9.7 - stepper only), CHOP=0 for ADC cal
+        let _ = tmc.write_register(PWM_SV_CHOP, 0).await;
+
+        // 3. ADC configuration
+        // DSADC_MCFG: leave at power-on default (ANALOG mode, internal ADC)
+        let mdec: u32 = 331;
+        let _ = tmc
+            .write_register(DSADC_MDEC_B_MDEC_A, (mdec << 16) | mdec)
+            .await;
+        // bits[29:28] ADC_I_WY_SELECT=1 (WY phase current from ADC_I1)
+        // bits[27:26] ADC_I_V_SELECT=0  (V unused for stepper FOC2)
+        // bits[25:24] ADC_I_UX_SELECT=0 (UX phase current from ADC_I0, default)
+        // bits[15:8]  ADC_I1_SELECT=1   (I1 sourced from internal DSADC ch1)
+        let _ = tmc.write_register(ADC_I_SELECT, (1 << 28) | (1 << 8)).await;
+
+        // 4. Motor type: 2-phase stepper (type 2 per datasheet), 50 pole pairs
+        let _ = tmc
+            .write_register(MOTOR_TYPE_N_POLE_PAIRS, (2 << 16) | 50)
+            .await;
+
+        // 5. ADC offset calibration
+        // With PWM_CHOP=0, no current flows even with motor connected.
+        // This matches the Python driver's _calibrate_adc() method.
+        let _ = tmc.write_register(ADC_I0_SCALE_OFFSET, 256 << 16).await;
+        let _ = tmc.write_register(ADC_I1_SCALE_OFFSET, 256 << 16).await;
+
+        // Enable to power the ADC, but CHOP=0 means no PWM switching
+        enable_pin.set_high();
+        Mono::delay(250.millis()).await;
+
+        // Sample ADC values 128 times and average for offset
+        let mut sum_i0: i32 = 0;
+        let mut sum_i1: i32 = 0;
+        const N_SAMPLES: i32 = 128;
+        for _ in 0..N_SAMPLES {
+            if let Ok(raw) = tmc.read_register(ADC_IWY_IUX).await {
+                let i_ux = (raw & 0xFFFF) as i16 as i32;
+                let i_wy = ((raw >> 16) & 0xFFFF) as i16 as i32;
+                sum_i0 += i_ux;
+                sum_i1 += i_wy;
+            }
+            Mono::delay(1.millis()).await;
+        }
+        // Cast via i16 to u16: negative values wrap correctly for the
+        // TMC4671's unsigned offset subtraction register.
+        let offset_i0 = (sum_i0 / N_SAMPLES) as i16 as u16;
+        let offset_i1 = (sum_i1 / N_SAMPLES) as i16 as u16;
+
+        let _ = tmc
+            .write_register(ADC_I0_SCALE_OFFSET, (256 << 16) | offset_i0 as u32)
+            .await;
+        let _ = tmc
+            .write_register(ADC_I1_SCALE_OFFSET, (256 << 16) | offset_i1 as u32)
+            .await;
+
+        defmt::info!(
+            "ADC calibrated: I0 offset={}, I1 offset={}",
+            offset_i0,
+            offset_i1
+        );
+
+        // 6. Re-enable PWM chopping after calibration (SVPWM stays off for stepper)
+        let _ = tmc.write_register(PWM_SV_CHOP, 7).await;
+
+        // 7. PID gains for torque (current) control
+        // Conservative Q8.8 PID gains: P = 1.577 * 256 = 404, I = 0.1 * 256 = 26.
+        let pid_pi: u32 = (404 << 16) | 26;
+        let _ = tmc.write_register(PID_FLUX_P_FLUX_I, pid_pi).await;
+        let _ = tmc.write_register(PID_TORQUE_P_TORQUE_I, pid_pi).await;
+
+        // 9. Current limit via PID_TORQUE_FLUX_LIMITS
+        // Both torque and flux limited to 433 counts (~0.5A with 1.155 mA/LSB).
+        // Flux limit must be nonzero so the flux PID can actively regulate
+        // the D-axis current to zero (reject disturbances).
+        let current_limit: u32 = 433;
+        let _ = tmc
+            .write_register(
+                PID_TORQUE_FLUX_LIMITS,
+                (current_limit << 16) | current_limit,
+            )
+            .await;
+
+        // 10. PHI_E source: external angle register (open-loop)
+        let _ = tmc.write_register(PHI_E_SELECTION, 1).await;
+        let _ = tmc.write_register(PHI_E_EXT, 0).await;
+
+        // 11. Set torque target: 200 counts (~0.23A, conservative)
+        let torque_target: u32 = 200;
+        let _ = tmc
+            .write_register(PID_TORQUE_FLUX_TARGET, torque_target << 16)
+            .await;
+
+        // 12. Motion mode: TORQUE mode with current regulation
+        // MODE_PID_TYPE=1 (bit 31), MODE_MOTION=1 (torque)
+        let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0001).await;
+
+        // Verify critical registers after enabling torque mode
+        let v_limit_final = tmc.read_register(PIDOUT_UQ_UD_LIMITS).await.unwrap_or(0);
+        let mode_final = tmc.read_register(MODE_RAMP_MODE_MOTION).await.unwrap_or(0);
+        let target_final = tmc.read_register(PID_TORQUE_FLUX_TARGET).await.unwrap_or(0);
+        defmt::info!(
+            "TMC4671 init done: V_limit={}, mode=0x{:08X}, target=0x{:08X}",
+            v_limit_final,
+            mode_final,
+            target_final
+        );
+
+        // Diagnostic: log PID state for 5 seconds after enabling
+        for i in 0..10u32 {
+            Mono::delay(500.millis()).await;
+            let actual = tmc.read_register(PID_TORQUE_FLUX_ACTUAL).await.unwrap_or(0);
+            let adc = tmc.read_register(ADC_IWY_IUX).await.unwrap_or(0);
+            let torque_actual = ((actual >> 16) & 0xFFFF) as i16;
+            let flux_actual = (actual & 0xFFFF) as i16;
+            let i_ux = (adc & 0xFFFF) as i16;
+            let i_wy = ((adc >> 16) & 0xFFFF) as i16;
+            defmt::info!(
+                "[{}] PID: torque={} flux={} | ADC: ux={} wy={}",
+                i,
+                torque_actual,
+                flux_actual,
+                i_ux,
+                i_wy
+            );
         }
     }
 
@@ -829,6 +1044,7 @@ mod app {
             let diff_scaled = elapsed / STATS_SUMSQ_BASE;
             sumsq = sumsq.saturating_add(diff_scaled.saturating_mul(elapsed));
 
+            defmt::info!("stats tick");
             klipper_output!("stats count=%u sum=%u sumsq=%u", count, sum, sumsq);
             ctx.local.wdg.pet();
 
