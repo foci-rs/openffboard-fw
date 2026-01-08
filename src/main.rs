@@ -171,9 +171,17 @@ mod app {
         );
     }
 
+    /// Clear shutdown state, allowing normal command processing to resume.
+    ///
+    /// Matches Klipper C `command_clear_shutdown` (basecmd.c). If called
+    /// when not in shutdown, triggers a shutdown instead.
     #[klipper_command(in_shutdown)]
-    pub fn config_reset(context: &mut State) {
-        context.reset();
+    pub fn clear_shutdown(context: &mut State) {
+        if !context.mcu_state.is_shutdown() {
+            enter_shutdown(context, "Shutdown cleared when not shutdown");
+            return;
+        }
+        context.mcu_state = McuState::Running;
     }
 
     #[klipper_command]
@@ -204,35 +212,52 @@ mod app {
         klipper_output!("shutdown static_string_id=%hu", 0u16);
     }
 
+    /// Reset the MCU. Matches Klipper's `command_reset` (armcm_reset.c).
+    ///
+    /// Writes `CANBOOT_BYPASS` to Katapult's request signature so the
+    /// bootloader skips straight to the application after reset. This is
+    /// used by `FIRMWARE_RESTART`.
     #[klipper_command(in_shutdown)]
     pub fn reset() {
-        request_katapult_bootloader();
+        katapult_reset(KATAPULT_BYPASS);
     }
 
     #[klipper_command(in_shutdown)]
     pub fn debug_nop() {}
 
-    /// Request reboot into Katapult bootloader.
+    // Katapult bootloader constants (from Klipper armcm_reset.c).
+    const KATAPULT_BOOT_ADDRESS: u32 = 0x0800_0000;
+    const KATAPULT_SIGNATURE: u64 = 0x2174_6f6f_426e_6143; // "CanBoot!"
+    const KATAPULT_REQUEST: u64 = 0x5984_E3FA_6CA1_589B; // stay in bootloader
+    const KATAPULT_BYPASS: u64 = 0x7b06_ec45_a9a8_243d; // skip bootloader
+
+    /// Write a Katapult request signature and perform a system reset.
     ///
-    /// Writes the Katapult magic signature to the RAM address pointed to by
-    /// the bootloader's initial stack pointer (first word of the vector table
-    /// at 0x08000000). Katapult checks this on boot and stays in bootloader
-    /// mode instead of jumping to the application.
-    fn request_katapult_bootloader() {
-        const KATAPULT_BOOT_ADDRESS: u32 = 0x0800_0000;
-        const KATAPULT_MAGIC: u64 = 0x5984_E3FA_6CA1_589B;
-
-        cortex_m::interrupt::disable();
-
+    /// `KATAPULT_REQUEST`: stay in bootloader (for reflashing via 1200-baud DTR).
+    /// `KATAPULT_BYPASS`: skip bootloader, boot application (for FIRMWARE_RESTART).
+    ///
+    /// Matches Klipper's `canboot_reset()` in armcm_reset.c. Verifies the
+    /// bootloader signature before writing, no-ops if no bootloader is present.
+    fn katapult_reset(req_signature: u64) {
         // SAFETY: The bootloader vector table at KATAPULT_BOOT_ADDRESS is
-        // always readable. Its first entry is the initial SP value, which
-        // points to a valid RAM address. We write the magic signature there
-        // so Katapult detects a bootloader request on the next reset.
+        // always readable. We verify the Katapult signature before writing.
         unsafe {
             let bl_vectors = KATAPULT_BOOT_ADDRESS as *const u32;
-            let initial_sp = core::ptr::read_volatile(bl_vectors);
-            let req_sig = initial_sp as *mut u64;
-            core::ptr::write_volatile(req_sig, KATAPULT_MAGIC);
+            let reset_handler = core::ptr::read_volatile(bl_vectors.add(1));
+            let boot_sig_addr = (reset_handler - 9) as *const u64;
+            let req_sig_addr = core::ptr::read_volatile(bl_vectors) as *mut u64;
+
+            // Verify alignment and signature
+            if boot_sig_addr as usize % 8 != 0
+                || core::ptr::read_volatile(boot_sig_addr) != KATAPULT_SIGNATURE
+                || req_sig_addr as usize % 8 != 0
+            {
+                // No valid bootloader — just reset
+                cortex_m::peripheral::SCB::sys_reset();
+            }
+
+            cortex_m::interrupt::disable();
+            core::ptr::write_volatile(req_sig_addr, req_signature);
         }
 
         cortex_m::peripheral::SCB::sys_reset();
@@ -1013,7 +1038,7 @@ mod app {
                 && ctx.local.usb_control.line_coding().data_rate() == 1200
             {
                 defmt::info!("1200 baud + DTR drop: entering Katapult bootloader");
-                request_katapult_bootloader();
+                katapult_reset(KATAPULT_REQUEST);
             }
             *ctx.local.dtr_was_set = dtr;
         }
