@@ -141,13 +141,13 @@ mod app {
 
     // ---- Klipper command handlers ----
 
-    #[klipper_command]
+    #[klipper_command(in_shutdown)]
     pub fn get_clock(_context: &mut State) {
         let clock = DWT::cycle_count();
         klipper_reply!(clock, clock: u32 = clock);
     }
 
-    #[klipper_command]
+    #[klipper_command(in_shutdown)]
     pub fn get_uptime(_context: &mut State) {
         // DWT CYCCNT is 32-bit, wraps every ~25s at 168MHz.
         // For now, report high=0. Klipper uses get_uptime for session
@@ -157,7 +157,7 @@ mod app {
         klipper_reply!(uptime, high: u32 = 0, clock: u32 = clock);
     }
 
-    #[klipper_command]
+    #[klipper_command(in_shutdown)]
     pub fn get_config(context: &mut State) {
         let is_config = context.config_crc.is_some();
         let crc = context.config_crc.unwrap_or(0);
@@ -171,7 +171,7 @@ mod app {
         );
     }
 
-    #[klipper_command]
+    #[klipper_command(in_shutdown)]
     pub fn config_reset(context: &mut State) {
         context.reset();
     }
@@ -188,7 +188,7 @@ mod app {
         // No-op: we use static allocation
     }
 
-    #[klipper_command]
+    #[klipper_command(in_shutdown)]
     pub fn emergency_stop(context: &mut State) {
         enter_shutdown(context, klipper_mcu::shutdown::reasons::COMMAND_REQUEST);
     }
@@ -204,12 +204,12 @@ mod app {
         klipper_output!("shutdown static_string_id=%hu", 0u16);
     }
 
-    #[klipper_command]
+    #[klipper_command(in_shutdown)]
     pub fn reset() {
         request_katapult_bootloader();
     }
 
-    #[klipper_command]
+    #[klipper_command(in_shutdown)]
     pub fn debug_nop() {}
 
     /// Request reboot into Katapult bootloader.
