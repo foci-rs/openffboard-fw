@@ -95,6 +95,11 @@ mod app {
         MaybeUninit::uninit();
     static USB_TX_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+    /// Emergency motor disable signal. Set by enter_shutdown(), consumed
+    /// by tmc_control. Uses a Signal so tmc_control wakes immediately
+    /// even if blocked on an empty channel.
+    static TMC_DISABLE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
     static mut TMC_REQUEST_SENDER: MaybeUninit<Sender<'static, TmcRequest, TMC_CHANNEL_SIZE>> =
         MaybeUninit::uninit();
 
@@ -207,7 +212,7 @@ mod app {
             return;
         }
         context.mcu_state = McuState::Shutdown { reason: 0 };
-        tmc_send(TmcRequest::SetEnable(false));
+        TMC_DISABLE_SIGNAL.signal(());
         defmt::error!("Shutdown: {}", reason);
         klipper_output!("shutdown static_string_id=%hu", 0u16);
     }
@@ -248,9 +253,9 @@ mod app {
             let req_sig_addr = core::ptr::read_volatile(bl_vectors) as *mut u64;
 
             // Verify alignment and signature
-            if boot_sig_addr as usize % 8 != 0
+            if !(boot_sig_addr as usize).is_multiple_of(8)
                 || core::ptr::read_volatile(boot_sig_addr) != KATAPULT_SIGNATURE
-                || req_sig_addr as usize % 8 != 0
+                || !(req_sig_addr as usize).is_multiple_of(8)
             {
                 // No valid bootloader — just reset
                 cortex_m::peripheral::SCB::sys_reset();
@@ -785,10 +790,14 @@ mod app {
             }
         }
 
-        // Process register read/write requests from the host
+        // Process register read/write requests from the host.
+        // Use select to race between channel recv and emergency disable
+        // signal, ensuring motor disable is never dropped.
         loop {
-            if let Ok(req) = rx.recv().await {
-                match req {
+            use embassy_futures::select::{select, Either};
+
+            match select(rx.recv(), TMC_DISABLE_SIGNAL.wait()).await {
+                Either::First(Ok(req)) => match req {
                     TmcRequest::Write { addr, value } => {
                         let reg = tmc4671::registers::Register::new(addr);
                         if tmc.write_register(reg, value).await.is_err() {
@@ -826,6 +835,11 @@ mod app {
                     TmcRequest::TestSpin { revolutions } => {
                         do_test_spin(tmc, revolutions).await;
                     }
+                },
+                Either::First(Err(_)) => {}
+                Either::Second(()) => {
+                    enable_pin.set_low();
+                    defmt::warn!("TMC4671 emergency disable");
                 }
             }
         }
