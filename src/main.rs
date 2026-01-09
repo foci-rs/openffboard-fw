@@ -195,6 +195,20 @@ mod app {
         context.mcu_state = McuState::Running;
     }
 
+    /// Full config reset: clear all OIDs, steppers, and shutdown state.
+    ///
+    /// Matches Klipper C `config_reset` (basecmd.c:262). Only available
+    /// during shutdown. The host uses this as a fallback restart mechanism
+    /// when hardware `reset` is not available (linux/PRU platforms).
+    #[klipper_command(in_shutdown)]
+    pub fn config_reset(context: &mut State) {
+        if !context.mcu_state.is_shutdown() {
+            enter_shutdown(context, "config_reset only available when shutdown");
+            return;
+        }
+        context.reset();
+    }
+
     #[klipper_command]
     pub fn finalize_config(context: &mut State, crc: u32) {
         context.config_crc = Some(crc);
