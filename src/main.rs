@@ -96,6 +96,13 @@ mod app {
         Mutex::new(RefCell::new(None));
     static USB_TX_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+    /// 64-bit uptime tracking. Updated by the stats task every 5 seconds.
+    /// `stats_send_time` is the CYCCNT value at last stats send.
+    /// `stats_send_time_high` counts 32-bit CYCCNT wraps (~25.5s at 168MHz).
+    static STATS_SEND_TIME: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static STATS_SEND_TIME_HIGH: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+
     /// Emergency motor disable signal. Set by enter_shutdown(), consumed
     /// by tmc_control. Uses a Signal so tmc_control wakes immediately
     /// even if blocked on an empty channel.
@@ -154,12 +161,11 @@ mod app {
 
     #[klipper_command(in_shutdown)]
     pub fn get_uptime(_context: &mut State) {
-        // DWT CYCCNT is 32-bit, wraps every ~25s at 168MHz.
-        // For now, report high=0. Klipper uses get_uptime for session
-        // management, not precision timing. TODO: track 64-bit uptime
-        // via overflow counter in a periodic task.
-        let clock = DWT::cycle_count();
-        klipper_reply!(uptime, high: u32 = 0, clock: u32 = clock);
+        use core::sync::atomic::Ordering::Relaxed;
+        let cur = DWT::cycle_count();
+        let high =
+            STATS_SEND_TIME_HIGH.load(Relaxed) + u32::from(cur < STATS_SEND_TIME.load(Relaxed));
+        klipper_reply!(uptime, high: u32 = high, clock: u32 = cur);
     }
 
     #[klipper_command(in_shutdown)]
@@ -1073,6 +1079,17 @@ mod app {
             sum += elapsed;
             let diff_scaled = elapsed / STATS_SUMSQ_BASE;
             sumsq = sumsq.saturating_add(diff_scaled.saturating_mul(elapsed));
+
+            // Track 32-bit clock wraps for get_uptime high word.
+            // Store time before incrementing high to avoid a race with
+            // get_uptime (P2) preempting between the two updates.
+            {
+                use core::sync::atomic::Ordering::Relaxed;
+                let prev = STATS_SEND_TIME.swap(now, Relaxed);
+                if now < prev {
+                    STATS_SEND_TIME_HIGH.fetch_add(1, Relaxed);
+                }
+            }
 
             defmt::info!("stats tick");
             klipper_output!("stats count=%u sum=%u sumsq=%u", count, sum, sumsq);
