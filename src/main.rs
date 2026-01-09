@@ -13,12 +13,13 @@ pub mod pac {
 
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [UART4, UART5, USART3])]
 mod app {
+    use core::cell::RefCell;
     use core::mem::MaybeUninit;
-    use core::ptr::addr_of_mut;
 
     use anchor::*;
     use bbqueue::BBBuffer;
     use cortex_m::peripheral::DWT;
+    use critical_section::Mutex;
     use embassy_stm32::gpio::{Level, Output, Speed};
     use embassy_stm32::mode::Async as AsyncMode;
     use embassy_stm32::spi::Spi;
@@ -91,8 +92,8 @@ mod app {
 
     const USB_TX_BUFFER_SIZE: usize = 512;
 
-    static mut USB_TX_PRODUCER: MaybeUninit<bbqueue::Producer<'static, USB_TX_BUFFER_SIZE>> =
-        MaybeUninit::uninit();
+    static USB_TX_PRODUCER: Mutex<RefCell<Option<bbqueue::Producer<'static, USB_TX_BUFFER_SIZE>>>> =
+        Mutex::new(RefCell::new(None));
     static USB_TX_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
     /// Emergency motor disable signal. Set by enter_shutdown(), consumed
@@ -100,8 +101,9 @@ mod app {
     /// even if blocked on an empty channel.
     static TMC_DISABLE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-    static mut TMC_REQUEST_SENDER: MaybeUninit<Sender<'static, TmcRequest, TMC_CHANNEL_SIZE>> =
-        MaybeUninit::uninit();
+    static TMC_REQUEST_SENDER: Mutex<
+        RefCell<Option<Sender<'static, TmcRequest, TMC_CHANNEL_SIZE>>>,
+    > = Mutex::new(RefCell::new(None));
 
     pub struct BufferTransportOutput;
     pub const TRANSPORT_OUTPUT: BufferTransportOutput = BufferTransportOutput;
@@ -113,17 +115,15 @@ mod app {
             f(&mut scratch);
             let output = scratch.result();
 
-            // SAFETY: USB_TX_PRODUCER is initialised exactly once in init() before
-            // any task runs. After init, only this function accesses the producer.
-            let producer = unsafe {
-                &mut *addr_of_mut!(USB_TX_PRODUCER)
-                    .cast::<bbqueue::Producer<'static, USB_TX_BUFFER_SIZE>>()
-            };
-            if let Ok(mut grant) = producer.grant_exact(output.len()) {
-                grant.buf().copy_from_slice(output);
-                grant.commit(output.len());
-                USB_TX_SIGNAL.signal(());
-            }
+            critical_section::with(|cs| {
+                if let Some(producer) = USB_TX_PRODUCER.borrow(cs).borrow_mut().as_mut() {
+                    if let Ok(mut grant) = producer.grant_exact(output.len()) {
+                        grant.buf().copy_from_slice(output);
+                        grant.commit(output.len());
+                        USB_TX_SIGNAL.signal(());
+                    }
+                }
+            });
         }
     }
 
@@ -494,20 +494,13 @@ mod app {
     // ---- TMC4671 register access commands ----
 
     /// Send a request to the tmc_control task.
-    ///
-    /// # Safety
-    /// TMC_REQUEST_SENDER is initialised exactly once in init() before
-    /// any task runs. After init, only command handlers access it, and
-    /// they run sequentially within usb_receive.
+    /// Send a request to the tmc_control task.
     fn tmc_send(req: TmcRequest) {
-        let sender = unsafe {
-            &mut *core::ptr::addr_of_mut!(TMC_REQUEST_SENDER).cast::<Sender<
-                'static,
-                TmcRequest,
-                TMC_CHANNEL_SIZE,
-            >>()
-        };
-        let _ = sender.try_send(req);
+        critical_section::with(|cs| {
+            if let Some(sender) = TMC_REQUEST_SENDER.borrow(cs).borrow_mut().as_mut() {
+                let _ = sender.try_send(req);
+            }
+        });
     }
 
     /// Trigger TMC4671 initialization sequence.
@@ -664,10 +657,9 @@ mod app {
 
         // TMC register request channel
         let (tmc_tx, tmc_rx) = ctx.local.tmc_channel.split();
-        // SAFETY: init runs exactly once before any task is spawned.
-        unsafe {
-            addr_of_mut!(TMC_REQUEST_SENDER).write(MaybeUninit::new(tmc_tx));
-        }
+        critical_section::with(|cs| {
+            TMC_REQUEST_SENDER.borrow(cs).replace(Some(tmc_tx));
+        });
 
         defmt::info!("SPI1 configured: 2 MHz, Mode 3, DMA");
 
@@ -714,10 +706,9 @@ mod app {
 
         // Split bbqueue for TX output
         let (usb_tx_prod, usb_tx_consumer) = ctx.local.usb_tx_queue.try_split().unwrap();
-        // SAFETY: init runs exactly once before any task is spawned, so no concurrent access.
-        unsafe {
-            addr_of_mut!(USB_TX_PRODUCER).write(MaybeUninit::new(usb_tx_prod));
-        }
+        critical_section::with(|cs| {
+            USB_TX_PRODUCER.borrow(cs).replace(Some(usb_tx_prod));
+        });
 
         // Spawn tasks
         tmc_control::spawn().ok();
