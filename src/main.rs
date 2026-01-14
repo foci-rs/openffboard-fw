@@ -61,9 +61,14 @@ mod app {
         SetEnable(bool),
         Init,
         TestSpin { revolutions: u8 },
+        SetCurrent { run_ma: u32 },
     }
 
     const TMC_CHANNEL_SIZE: usize = 8;
+
+    /// Current scaling for OpenFFBoard: milliamps per ADC least significant bit.
+    /// Derived from sense resistor value and ADC configuration.
+    const CURRENT_SCALE_MA_PER_LSB: f32 = 1.155;
 
     /// Static buffers required by the USB device stack.
     ///
@@ -549,6 +554,14 @@ mod app {
         tmc_send(TmcRequest::Read { oid, addr });
     }
 
+    /// Set motor run current. The firmware converts milliamps to
+    /// PID_TORQUE_FLUX_LIMITS register counts using the board-specific
+    /// current scaling factor.
+    #[klipper_command]
+    pub fn tmc_set_current(_context: &mut State, _oid: u8, run_ma: u32) {
+        tmc_send(TmcRequest::SetCurrent { run_ma });
+    }
+
     /// SPI transfer stub (returns empty response).
     #[klipper_command]
     pub fn spi_transfer(_oid: u8, _data: &[u8]) {
@@ -845,6 +858,15 @@ mod app {
                     }
                     TmcRequest::TestSpin { revolutions } => {
                         do_test_spin(tmc, revolutions).await;
+                    }
+                    TmcRequest::SetCurrent { run_ma } => {
+                        use tmc4671::registers::*;
+                        let counts = (run_ma as f32 / CURRENT_SCALE_MA_PER_LSB) as u32;
+                        let limit = (counts << 16) | counts;
+                        if tmc.write_register(PID_TORQUE_FLUX_LIMITS, limit).await.is_err() {
+                            defmt::error!("TMC4671 SPI write failed: PID_TORQUE_FLUX_LIMITS");
+                        }
+                        defmt::info!("TMC4671 current: {}mA -> {} counts", run_ma, counts);
                     }
                 },
                 Either::First(Err(_)) => {}
