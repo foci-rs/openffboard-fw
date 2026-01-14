@@ -56,15 +56,27 @@ mod app {
 
     /// Register access request from protocol handler to tmc_control task.
     enum TmcRequest {
-        Write { addr: u8, value: u32 },
-        Read { oid: u8, addr: u8 },
+        Write {
+            addr: u8,
+            value: u32,
+        },
+        Read {
+            oid: u8,
+            addr: u8,
+        },
         SetEnable(bool),
         #[cfg(feature = "dev-commands")]
         Init,
         #[cfg(feature = "dev-commands")]
-        TestSpin { revolutions: u8 },
-        SetCurrent { run_ma: u32 },
-        SetEncoder { ppr: u32 },
+        TestSpin {
+            revolutions: u8,
+        },
+        SetCurrent {
+            run_ma: u32,
+        },
+        SetEncoder {
+            ppr: u32,
+        },
         SelfTest,
     }
 
@@ -805,8 +817,13 @@ mod app {
     /// On startup, reads the TMC4671 chip identification register to verify
     /// SPI communication. Then processes register read/write requests from
     /// the protocol handler via the TMC request channel.
-    #[task(priority = 1, local = [tmc, tmc_enable, tmc_rx])]
-    async fn tmc_control(ctx: tmc_control::Context) {
+    ///
+    /// The 10 kHz position update tick (100 us period) advances the EmulatedStepper
+    /// move queue and writes the resulting position target to PID_POSITION_TARGET.
+    /// The lock on `app_state` is held only for the pure-arithmetic advance() and
+    /// position_target() calls (~1-2 us); the SPI write runs outside the lock.
+    #[task(priority = 1, local = [tmc, tmc_enable, tmc_rx], shared = [app_state])]
+    async fn tmc_control(mut ctx: tmc_control::Context) {
         let tmc = ctx.local.tmc;
         let enable_pin = ctx.local.tmc_enable;
         let rx = ctx.local.tmc_rx;
@@ -834,14 +851,25 @@ mod app {
             }
         }
 
-        // Process register read/write requests from the host.
-        // Use select to race between channel recv and emergency disable
-        // signal, ensuring motor disable is never dropped.
-        loop {
-            use embassy_futures::select::{select, Either};
+        // Track whether the motor is enabled so the 10 kHz tick knows when
+        // to write position targets. Only set to true after the full enable
+        // sequence (ADC cal, encoder alignment, closed-loop entry) completes.
+        let mut motor_enabled = false;
 
-            match select(rx.recv(), TMC_DISABLE_SIGNAL.wait()).await {
-                Either::First(Ok(req)) => match req {
+        // Process register read/write requests from the host.
+        // Use select3 to race between channel recv, emergency disable signal,
+        // and a 100 us periodic tick for position target updates.
+        loop {
+            use embassy_futures::select::{select3, Either3};
+
+            match select3(
+                rx.recv(),
+                TMC_DISABLE_SIGNAL.wait(),
+                Mono::delay(100.micros()),
+            )
+            .await
+            {
+                Either3::First(Ok(req)) => match req {
                     TmcRequest::Write { addr, value } => {
                         let reg = tmc4671::registers::Register::new(addr);
                         if tmc.write_register(reg, value).await.is_err() {
@@ -866,11 +894,21 @@ mod app {
                     }
                     TmcRequest::SetEnable(enabled) => {
                         if enabled {
-                            enable_pin.set_high();
+                            tmc_adc_calibrate(tmc, enable_pin).await;
+                            tmc_align_encoder(tmc).await;
+                            tmc_enter_closedloop(tmc).await;
+                            motor_enabled = true;
+                            defmt::info!("TMC4671 motor enabled: closed-loop position mode");
                         } else {
+                            motor_enabled = false;
+                            use tmc4671::registers::*;
+                            let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x0000_0000).await;
+                            let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+                            let _ = tmc.write_register(UQ_UD_EXT, 0).await;
+                            let _ = tmc.write_register(PWM_SV_CHOP, 0).await;
                             enable_pin.set_low();
+                            defmt::info!("TMC4671 motor disabled");
                         }
-                        defmt::info!("TMC4671 enable: {}", enabled);
                     }
                     #[cfg(feature = "dev-commands")]
                     TmcRequest::Init => {
@@ -885,7 +923,11 @@ mod app {
                         use tmc4671::registers::*;
                         let counts = (run_ma as f32 / CURRENT_SCALE_MA_PER_LSB) as u32;
                         let limit = (counts << 16) | counts;
-                        if tmc.write_register(PID_TORQUE_FLUX_LIMITS, limit).await.is_err() {
+                        if tmc
+                            .write_register(PID_TORQUE_FLUX_LIMITS, limit)
+                            .await
+                            .is_err()
+                        {
                             defmt::error!("TMC4671 SPI write failed: PID_TORQUE_FLUX_LIMITS");
                         }
                         defmt::info!("TMC4671 current: {}mA -> {} counts", run_ma, counts);
@@ -893,7 +935,11 @@ mod app {
                     TmcRequest::SetEncoder { ppr } => {
                         use tmc4671::registers::*;
                         let quadrature_ppr = ppr * 4;
-                        if tmc.write_register(ABN_DECODER_PPR, quadrature_ppr).await.is_err() {
+                        if tmc
+                            .write_register(ABN_DECODER_PPR, quadrature_ppr)
+                            .await
+                            .is_err()
+                        {
                             defmt::error!("TMC4671 SPI write failed: ABN_DECODER_PPR");
                         }
                         defmt::info!(
@@ -918,10 +964,7 @@ mod app {
                                 defmt::error!("TMC4671 self-test: chip ID read failed");
                             }
                         }
-                        match tmc
-                            .read_register(tmc4671::registers::STATUS_FLAGS)
-                            .await
-                        {
+                        match tmc.read_register(tmc4671::registers::STATUS_FLAGS).await {
                             Ok(status) => {
                                 defmt::info!("TMC4671 self-test: status_flags={:#010x}", status);
                             }
@@ -932,10 +975,23 @@ mod app {
                         defmt::info!("TMC4671 self-test: complete (Phase 1 stub)");
                     }
                 },
-                Either::First(Err(_)) => {}
-                Either::Second(()) => {
+                Either3::First(Err(_)) => {}
+                Either3::Second(()) => {
+                    motor_enabled = false;
                     enable_pin.set_low();
                     defmt::warn!("TMC4671 emergency disable");
+                }
+                Either3::Third(()) => {
+                    if motor_enabled {
+                        let target = ctx.shared.app_state.lock(|state| {
+                            let clock = cortex_m::peripheral::DWT::cycle_count();
+                            state.steppers[0].advance(clock);
+                            state.steppers[0].position_target()
+                        });
+                        let _ = tmc
+                            .write_register(tmc4671::registers::PID_POSITION_TARGET, target as u32)
+                            .await;
+                    }
                 }
             }
         }
@@ -1153,6 +1209,99 @@ mod app {
                 i_wy
             );
         }
+    }
+
+    /// Align the ABN encoder to the D-axis by applying a known voltage vector,
+    /// waiting for the rotor to settle, then zeroing the encoder count.
+    ///
+    /// Steps:
+    /// 1. Set PHI_E_SELECTION=1 (external) and PHI_E_EXT=0
+    /// 2. Drive D-axis: UQ_UD_EXT with UD=1000 for alignment torque
+    /// 3. Enter UQ_UD_EXT mode (MODE_RAMP_MODE_MOTION = 0x8000_0008)
+    /// 4. Wait 500 ms for rotor to settle against D-axis flux
+    /// 5. Read and log ABN_DECODER_COUNT, then write 0 to zero it
+    /// 6. Zero ABN_DECODER_PHI_E_PHI_M_OFFSET
+    /// 7. Stop drive (UQ_UD_EXT=0, MODE=0)
+    ///
+    /// After this call the encoder count=0 corresponds to electrical angle 0.
+    async fn tmc_align_encoder(tmc: &mut Tmc4671Spi<TmcSpiDevice>) {
+        use tmc4671::registers::*;
+
+        // 1. PHI_E source: external, angle = 0
+        let _ = tmc.write_register(PHI_E_SELECTION, 1).await;
+        let _ = tmc.write_register(PHI_E_EXT, 0).await;
+
+        // 2. D-axis voltage: UD=1000, UQ=0
+        // UQ_UD_EXT layout: bits[31:16] = UQ, bits[15:0] = UD
+        let _ = tmc.write_register(UQ_UD_EXT, 1000u32).await;
+
+        // 3. Enter UQ_UD_EXT motion mode (MODE_PID_TYPE=1, MODE_MOTION=8)
+        let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0008).await;
+
+        // 4. Wait for rotor to settle against the D-axis flux
+        Mono::delay(500.millis()).await;
+
+        // 5. Read encoder count, then zero it
+        let old_count = tmc.read_register(ABN_DECODER_COUNT).await.unwrap_or(0);
+        let _ = tmc.write_register(ABN_DECODER_COUNT, 0).await;
+
+        // 6. Zero the encoder electrical/mechanical angle offset
+        let _ = tmc.write_register(ABN_DECODER_PHI_E_PHI_M_OFFSET, 0).await;
+
+        // 7. Stop drive
+        let _ = tmc.write_register(UQ_UD_EXT, 0).await;
+        let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x0000_0000).await;
+
+        defmt::info!("encoder aligned: old_count={}", old_count);
+    }
+
+    /// Configure TMC4671 for closed-loop position mode with ABN encoder feedback.
+    ///
+    /// Steps:
+    /// 1. Set flux/torque PID: P=404, I=26
+    /// 2. Set velocity PID: P=100, I=10
+    /// 3. Set position PID: P=100, I=0
+    /// 4. Set PID_VELOCITY_LIMIT = 0x7FFF_FFFF
+    /// 5. Set PHI_E_SELECTION=3 (ABN encoder)
+    /// 6. Set PID_POSITION_TARGET=0
+    /// 7. Enter position mode: MODE_RAMP_MODE_MOTION = 0x8000_0003
+    ///
+    /// Assumes tmc_adc_calibrate and tmc_align_encoder have already been called.
+    async fn tmc_enter_closedloop(tmc: &mut Tmc4671Spi<TmcSpiDevice>) {
+        use tmc4671::registers::*;
+
+        // 1. Flux and torque PID: P=404 (1.577*256), I=26 (0.1*256)
+        let flux_torque_pi: u32 = (404 << 16) | 26;
+        let _ = tmc.write_register(PID_FLUX_P_FLUX_I, flux_torque_pi).await;
+        let _ = tmc
+            .write_register(PID_TORQUE_P_TORQUE_I, flux_torque_pi)
+            .await;
+
+        // 2. Velocity PID: P=100, I=10
+        let velocity_pi: u32 = (100 << 16) | 10;
+        let _ = tmc
+            .write_register(PID_VELOCITY_P_VELOCITY_I, velocity_pi)
+            .await;
+
+        // 3. Position PID: P=100, I=0
+        let position_pi: u32 = 100 << 16;
+        let _ = tmc
+            .write_register(PID_POSITION_P_POSITION_I, position_pi)
+            .await;
+
+        // 4. Velocity limit: unconstrained for now
+        let _ = tmc.write_register(PID_VELOCITY_LIMIT, 0x7FFF_FFFF).await;
+
+        // 5. PHI_E source: ABN encoder feedback (selection=3)
+        let _ = tmc.write_register(PHI_E_SELECTION, 3).await;
+
+        // 6. Position target: hold current position (0 after encoder zeroing)
+        let _ = tmc.write_register(PID_POSITION_TARGET, 0).await;
+
+        // 7. Enter position mode: MODE_PID_TYPE=1 (bit 31), MODE_MOTION=3 (position)
+        let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0003).await;
+
+        defmt::info!("TMC4671 closed-loop position mode active");
     }
 
     /// Monitors CDC-ACM control line changes for bootloader entry.
