@@ -45,5 +45,8 @@ panic-probe = { version = "1.0", features = ["print-defmt"] }
 heapless.workspace = true
 bbqueue.workspace = true
 
+[features]
+dev-commands = []
+
 [build-dependencies]
 anchor_codegen.workspace = true

@@ -59,7 +59,9 @@ mod app {
         Write { addr: u8, value: u32 },
         Read { oid: u8, addr: u8 },
         SetEnable(bool),
+        #[cfg(feature = "dev-commands")]
         Init,
+        #[cfg(feature = "dev-commands")]
         TestSpin { revolutions: u8 },
         SetCurrent { run_ma: u32 },
         SetEncoder { ppr: u32 },
@@ -531,12 +533,14 @@ mod app {
     }
 
     /// Trigger TMC4671 initialization sequence.
+    #[cfg(feature = "dev-commands")]
     #[klipper_command]
     pub fn tmc_init(_context: &mut State, _oid: u8) {
         tmc_send(TmcRequest::Init);
     }
 
     /// Test motor rotation by sweeping PHI_E_EXT through N revolutions.
+    #[cfg(feature = "dev-commands")]
     #[klipper_command]
     pub fn tmc_test_spin(_context: &mut State, _oid: u8, revolutions: u8) {
         tmc_send(TmcRequest::TestSpin { revolutions });
@@ -868,10 +872,12 @@ mod app {
                         }
                         defmt::info!("TMC4671 enable: {}", enabled);
                     }
+                    #[cfg(feature = "dev-commands")]
                     TmcRequest::Init => {
                         defmt::info!("TMC4671 init: starting open-loop stepper config");
-                        tmc_init_open_loop(tmc, enable_pin).await;
+                        tmc_enter_openloop(tmc, enable_pin).await;
                     }
+                    #[cfg(feature = "dev-commands")]
                     TmcRequest::TestSpin { revolutions } => {
                         do_test_spin(tmc, revolutions).await;
                     }
@@ -940,6 +946,7 @@ mod app {
     /// With 50 pole pairs, one mechanical revolution = 50 electrical
     /// cycles. Each electrical cycle sweeps PHI_E_EXT from 0 to 65535.
     /// Uses whatever voltage/mode settings were configured by tmc_init.
+    #[cfg(feature = "dev-commands")]
     async fn do_test_spin(tmc: &mut Tmc4671Spi<TmcSpiDevice>, revolutions: u8) {
         use tmc4671::registers::*;
 
@@ -970,7 +977,8 @@ mod app {
     /// 4. PHI_E_EXT for open-loop angle control
     ///
     /// Register values verified against TMC4671-LA datasheet rev 2.08.
-    async fn tmc_init_open_loop(
+    #[cfg(feature = "dev-commands")]
+    async fn tmc_enter_openloop(
         tmc: &mut Tmc4671Spi<TmcSpiDevice>,
         enable_pin: &mut Output<'static>,
     ) {
