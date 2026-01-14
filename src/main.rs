@@ -63,6 +63,7 @@ mod app {
         TestSpin { revolutions: u8 },
         SetCurrent { run_ma: u32 },
         SetEncoder { ppr: u32 },
+        SelfTest,
     }
 
     const TMC_CHANNEL_SIZE: usize = 8;
@@ -570,6 +571,13 @@ mod app {
         tmc_send(TmcRequest::SetEncoder { ppr });
     }
 
+    /// Trigger TMC4671 self-test diagnostic. Results are reported via
+    /// defmt RTT logging. Full klipper_output reporting is Phase 2.
+    #[klipper_command]
+    pub fn tmc_selftest(_context: &mut State, _oid: u8) {
+        tmc_send(TmcRequest::SelfTest);
+    }
+
     /// SPI transfer stub (returns empty response).
     #[klipper_command]
     pub fn spi_transfer(_oid: u8, _data: &[u8]) {
@@ -887,6 +895,35 @@ mod app {
                             ppr,
                             quadrature_ppr
                         );
+                    }
+                    TmcRequest::SelfTest => {
+                        defmt::info!("TMC4671 self-test: starting");
+                        match tmc
+                            .read_sub_register(tmc4671::registers::CHIPINFO_SI_TYPE)
+                            .await
+                        {
+                            Ok(chip_id) => {
+                                defmt::info!(
+                                    "TMC4671 self-test: chip_id={:#010x} (expected 0x34363731)",
+                                    chip_id
+                                );
+                            }
+                            Err(_) => {
+                                defmt::error!("TMC4671 self-test: chip ID read failed");
+                            }
+                        }
+                        match tmc
+                            .read_register(tmc4671::registers::STATUS_FLAGS)
+                            .await
+                        {
+                            Ok(status) => {
+                                defmt::info!("TMC4671 self-test: status_flags={:#010x}", status);
+                            }
+                            Err(_) => {
+                                defmt::error!("TMC4671 self-test: STATUS_FLAGS read failed");
+                            }
+                        }
+                        defmt::info!("TMC4671 self-test: complete (Phase 1 stub)");
                     }
                 },
                 Either::First(Err(_)) => {}
