@@ -62,6 +62,7 @@ mod app {
         Init,
         TestSpin { revolutions: u8 },
         SetCurrent { run_ma: u32 },
+        SetEncoder { ppr: u32 },
     }
 
     const TMC_CHANNEL_SIZE: usize = 8;
@@ -562,6 +563,13 @@ mod app {
         tmc_send(TmcRequest::SetCurrent { run_ma });
     }
 
+    /// Configure ABN encoder resolution. The firmware writes
+    /// ppr * 4 to ABN_DECODER_PPR (ABN quadrature counts all 4 edges).
+    #[klipper_command]
+    pub fn tmc_set_encoder(_context: &mut State, _oid: u8, ppr: u32) {
+        tmc_send(TmcRequest::SetEncoder { ppr });
+    }
+
     /// SPI transfer stub (returns empty response).
     #[klipper_command]
     pub fn spi_transfer(_oid: u8, _data: &[u8]) {
@@ -867,6 +875,18 @@ mod app {
                             defmt::error!("TMC4671 SPI write failed: PID_TORQUE_FLUX_LIMITS");
                         }
                         defmt::info!("TMC4671 current: {}mA -> {} counts", run_ma, counts);
+                    }
+                    TmcRequest::SetEncoder { ppr } => {
+                        use tmc4671::registers::*;
+                        let quadrature_ppr = ppr * 4;
+                        if tmc.write_register(ABN_DECODER_PPR, quadrature_ppr).await.is_err() {
+                            defmt::error!("TMC4671 SPI write failed: ABN_DECODER_PPR");
+                        }
+                        defmt::info!(
+                            "TMC4671 encoder: {} PPR -> {} quadrature counts",
+                            ppr,
+                            quadrature_ppr
+                        );
                     }
                 },
                 Either::First(Err(_)) => {}
