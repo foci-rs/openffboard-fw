@@ -968,17 +968,22 @@ mod app {
         defmt::info!("Spin complete");
     }
 
-    /// Configure TMC4671 for open-loop stepper operation with current regulation.
+    /// Perform TMC4671 hardware safety shutdown, PWM/ADC configuration, and ADC
+    /// offset calibration.
     ///
-    /// Sequence:
-    /// 1. Stop motor, configure PWM and ADC
-    /// 2. Calibrate ADC offsets (motor should be disconnected or idle)
-    /// 3. Set up torque mode with current limit
-    /// 4. PHI_E_EXT for open-loop angle control
+    /// Steps:
+    /// 1. Safety shutdown: enable_pin low, MODE=0, voltage limit=1024, zero targets
+    /// 2. PWM config: polarities=0, 25 kHz, BBM=10/10, CHOP=0 for calibration
+    /// 3. ADC config: DSADC decimation 331, ADC_I_SELECT for 2-phase routing
+    /// 4. Motor type: 2-phase stepper (type 2), 50 pole pairs
+    /// 5. ADC offset calibration: scale=256, enable, wait 250 ms, sample 128x, write offsets
+    /// 6. Re-enable PWM chopping: PWM_SV_CHOP=7
+    ///
+    /// This function is shared by both the dev open-loop path and the production
+    /// closed-loop enable sequence.
     ///
     /// Register values verified against TMC4671-LA datasheet rev 2.08.
-    #[cfg(feature = "dev-commands")]
-    async fn tmc_enter_openloop(
+    async fn tmc_adc_calibrate(
         tmc: &mut Tmc4671Spi<TmcSpiDevice>,
         enable_pin: &mut Output<'static>,
     ) {
@@ -1070,6 +1075,22 @@ mod app {
 
         // 6. Re-enable PWM chopping after calibration (SVPWM stays off for stepper)
         let _ = tmc.write_register(PWM_SV_CHOP, 7).await;
+    }
+
+    /// Configure TMC4671 for open-loop stepper operation with current regulation.
+    ///
+    /// Calls `tmc_adc_calibrate` for hardware init and ADC offset calibration,
+    /// then configures torque mode with PHI_E_EXT for open-loop angle control.
+    ///
+    /// Register values verified against TMC4671-LA datasheet rev 2.08.
+    #[cfg(feature = "dev-commands")]
+    async fn tmc_enter_openloop(
+        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
+        enable_pin: &mut Output<'static>,
+    ) {
+        use tmc4671::registers::*;
+
+        tmc_adc_calibrate(tmc, enable_pin).await;
 
         // 7. PID gains for torque (current) control
         // Conservative Q8.8 PID gains: P = 1.577 * 256 = 404, I = 0.1 * 256 = 26.
