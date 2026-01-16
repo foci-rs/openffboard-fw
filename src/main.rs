@@ -43,7 +43,7 @@ mod app {
         DMA2_STREAM3 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH3>;
     });
 
-    systick_monotonic!(Mono, 1000);
+    systick_monotonic!(Mono, 1_000);
 
     /// USB HAL driver type alias for use throughout this module.
     type HalUsbDriver = Driver<'static, peripherals::USB_OTG_FS>;
@@ -857,8 +857,7 @@ mod app {
         let mut motor_enabled = false;
 
         // Process register read/write requests from the host.
-        // Use select3 to race between channel recv, emergency disable signal,
-        // and a 100 us periodic tick for position target updates.
+        // select3 races channel recv, emergency disable, and 10kHz position tick.
         loop {
             use embassy_futures::select::{select3, Either3};
 
@@ -984,12 +983,16 @@ mod app {
                 Either3::Third(()) => {
                     if motor_enabled {
                         let target = ctx.shared.app_state.lock(|state| {
-                            let clock = cortex_m::peripheral::DWT::cycle_count();
+                            let clock =
+                                cortex_m::peripheral::DWT::cycle_count();
                             state.steppers[0].advance(clock);
                             state.steppers[0].position_target()
                         });
                         let _ = tmc
-                            .write_register(tmc4671::registers::PID_POSITION_TARGET, target as u32)
+                            .write_register(
+                                tmc4671::registers::PID_POSITION_TARGET,
+                                target as u32,
+                            )
                             .await;
                     }
                 }
@@ -1542,6 +1545,12 @@ klipper_enumeration!(
         PE13,
         PE14,
         PE15,
+        // Virtual pins for FOCI stepper control.
+        // STEP/DIR are handled internally (no GPIO toggle).
+        // ENA maps to the TMC4671 enable pin (PE7 on OpenFFBoard).
+        STEP0,
+        DIR0,
+        ENA0,
     }
 );
 
