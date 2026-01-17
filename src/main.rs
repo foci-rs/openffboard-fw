@@ -812,18 +812,109 @@ mod app {
         }
     }
 
+    /// Handle a TMC request that does not require main-loop state (motor_enabled, enable_pin).
+    ///
+    /// SetEnable, Init, and TestSpin are handled inline by the tmc_control main loop.
+    async fn handle_tmc_request(req: TmcRequest, tmc: &mut Tmc4671Spi<TmcSpiDevice>) {
+        match req {
+            TmcRequest::Write { addr, value } => {
+                let reg = tmc4671::registers::Register::new(addr);
+                if tmc.write_register(reg, value).await.is_err() {
+                    defmt::error!("TMC4671 SPI write failed: addr={:#04x}", addr);
+                }
+            }
+            TmcRequest::Read { oid, addr } => {
+                let reg = tmc4671::registers::Register::new(addr);
+                match tmc.read_register(reg).await {
+                    Ok(value) => {
+                        klipper_reply!(
+                            tmc_register_value,
+                            oid: u8 = oid,
+                            addr: u8 = addr,
+                            value: u32 = value
+                        );
+                    }
+                    Err(_) => {
+                        defmt::error!("TMC4671 SPI read failed: addr={:#04x}", addr);
+                    }
+                }
+            }
+            TmcRequest::SetCurrent { run_ma } => {
+                use tmc4671::registers::*;
+                let counts = (run_ma as f32 / CURRENT_SCALE_MA_PER_LSB) as u32;
+                let limit = (counts << 16) | counts;
+                if tmc
+                    .write_register(PID_TORQUE_FLUX_LIMITS, limit)
+                    .await
+                    .is_err()
+                {
+                    defmt::error!("TMC4671 SPI write failed: PID_TORQUE_FLUX_LIMITS");
+                }
+                defmt::info!("TMC4671 current: {}mA -> {} counts", run_ma, counts);
+            }
+            TmcRequest::SetEncoder { ppr } => {
+                use tmc4671::registers::*;
+                let quadrature_ppr = ppr * 4;
+                if tmc
+                    .write_register(ABN_DECODER_PPR, quadrature_ppr)
+                    .await
+                    .is_err()
+                {
+                    defmt::error!("TMC4671 SPI write failed: ABN_DECODER_PPR");
+                }
+                defmt::info!(
+                    "TMC4671 encoder: {} PPR -> {} quadrature counts",
+                    ppr,
+                    quadrature_ppr
+                );
+            }
+            TmcRequest::SelfTest => {
+                defmt::info!("TMC4671 self-test: starting");
+                match tmc
+                    .read_sub_register(tmc4671::registers::CHIPINFO_SI_TYPE)
+                    .await
+                {
+                    Ok(chip_id) => {
+                        defmt::info!(
+                            "TMC4671 self-test: chip_id={:#010x} (expected 0x34363731)",
+                            chip_id
+                        );
+                    }
+                    Err(_) => {
+                        defmt::error!("TMC4671 self-test: chip ID read failed");
+                    }
+                }
+                match tmc.read_register(tmc4671::registers::STATUS_FLAGS).await {
+                    Ok(status) => {
+                        defmt::info!("TMC4671 self-test: status_flags={:#010x}", status);
+                    }
+                    Err(_) => {
+                        defmt::error!("TMC4671 self-test: STATUS_FLAGS read failed");
+                    }
+                }
+                defmt::info!("TMC4671 self-test: complete (Phase 1 stub)");
+            }
+            TmcRequest::SetEnable(_) => {
+                defmt::warn!("handle_tmc_request: SetEnable handled by main loop");
+            }
+            #[cfg(feature = "dev-commands")]
+            TmcRequest::Init => {
+                defmt::warn!("handle_tmc_request: Init handled by main loop");
+            }
+            #[cfg(feature = "dev-commands")]
+            TmcRequest::TestSpin { .. } => {
+                defmt::warn!("handle_tmc_request: TestSpin handled by main loop");
+            }
+        }
+    }
+
     /// TMC4671 control task. Runs at priority 1 (preempted by protocol tasks).
     ///
     /// On startup, reads the TMC4671 chip identification register to verify
     /// SPI communication. Then processes register read/write requests from
     /// the protocol handler via the TMC request channel.
-    ///
-    /// The 10 kHz position update tick (100 us period) advances the EmulatedStepper
-    /// move queue and writes the resulting position target to PID_POSITION_TARGET.
-    /// The lock on `app_state` is held only for the pure-arithmetic advance() and
-    /// position_target() calls (~1-2 us); the SPI write runs outside the lock.
-    #[task(priority = 1, local = [tmc, tmc_enable, tmc_rx], shared = [app_state])]
-    async fn tmc_control(mut ctx: tmc_control::Context) {
+    #[task(priority = 1, local = [tmc, tmc_enable, tmc_rx])]
+    async fn tmc_control(ctx: tmc_control::Context) {
         let tmc = ctx.local.tmc;
         let enable_pin = ctx.local.tmc_enable;
         let rx = ctx.local.tmc_rx;
@@ -851,46 +942,17 @@ mod app {
             }
         }
 
-        // Track whether the motor is enabled so the 10 kHz tick knows when
-        // to write position targets. Only set to true after the full enable
-        // sequence (ADC cal, encoder alignment, closed-loop entry) completes.
+        // Track whether the motor is enabled. Only set to true after the full
+        // enable sequence (ADC cal, encoder alignment, closed-loop entry) completes.
         let mut motor_enabled = false;
 
         // Process register read/write requests from the host.
-        // select3 races channel recv, emergency disable, and 10kHz position tick.
+        // 2-way select: channel recv + emergency disable signal.
         loop {
-            use embassy_futures::select::{select3, Either3};
+            use embassy_futures::select::{select, Either};
 
-            match select3(
-                rx.recv(),
-                TMC_DISABLE_SIGNAL.wait(),
-                Mono::delay(100.micros()),
-            )
-            .await
-            {
-                Either3::First(Ok(req)) => match req {
-                    TmcRequest::Write { addr, value } => {
-                        let reg = tmc4671::registers::Register::new(addr);
-                        if tmc.write_register(reg, value).await.is_err() {
-                            defmt::error!("TMC4671 SPI write failed: addr={:#04x}", addr);
-                        }
-                    }
-                    TmcRequest::Read { oid, addr } => {
-                        let reg = tmc4671::registers::Register::new(addr);
-                        match tmc.read_register(reg).await {
-                            Ok(value) => {
-                                klipper_reply!(
-                                    tmc_register_value,
-                                    oid: u8 = oid,
-                                    addr: u8 = addr,
-                                    value: u32 = value
-                                );
-                            }
-                            Err(_) => {
-                                defmt::error!("TMC4671 SPI read failed: addr={:#04x}", addr);
-                            }
-                        }
-                    }
+            match select(rx.recv(), TMC_DISABLE_SIGNAL.wait()).await {
+                Either::First(Ok(req)) => match req {
                     TmcRequest::SetEnable(enabled) => {
                         if enabled {
                             tmc_adc_calibrate(tmc, enable_pin).await;
@@ -918,83 +980,15 @@ mod app {
                     TmcRequest::TestSpin { revolutions } => {
                         do_test_spin(tmc, revolutions).await;
                     }
-                    TmcRequest::SetCurrent { run_ma } => {
-                        use tmc4671::registers::*;
-                        let counts = (run_ma as f32 / CURRENT_SCALE_MA_PER_LSB) as u32;
-                        let limit = (counts << 16) | counts;
-                        if tmc
-                            .write_register(PID_TORQUE_FLUX_LIMITS, limit)
-                            .await
-                            .is_err()
-                        {
-                            defmt::error!("TMC4671 SPI write failed: PID_TORQUE_FLUX_LIMITS");
-                        }
-                        defmt::info!("TMC4671 current: {}mA -> {} counts", run_ma, counts);
-                    }
-                    TmcRequest::SetEncoder { ppr } => {
-                        use tmc4671::registers::*;
-                        let quadrature_ppr = ppr * 4;
-                        if tmc
-                            .write_register(ABN_DECODER_PPR, quadrature_ppr)
-                            .await
-                            .is_err()
-                        {
-                            defmt::error!("TMC4671 SPI write failed: ABN_DECODER_PPR");
-                        }
-                        defmt::info!(
-                            "TMC4671 encoder: {} PPR -> {} quadrature counts",
-                            ppr,
-                            quadrature_ppr
-                        );
-                    }
-                    TmcRequest::SelfTest => {
-                        defmt::info!("TMC4671 self-test: starting");
-                        match tmc
-                            .read_sub_register(tmc4671::registers::CHIPINFO_SI_TYPE)
-                            .await
-                        {
-                            Ok(chip_id) => {
-                                defmt::info!(
-                                    "TMC4671 self-test: chip_id={:#010x} (expected 0x34363731)",
-                                    chip_id
-                                );
-                            }
-                            Err(_) => {
-                                defmt::error!("TMC4671 self-test: chip ID read failed");
-                            }
-                        }
-                        match tmc.read_register(tmc4671::registers::STATUS_FLAGS).await {
-                            Ok(status) => {
-                                defmt::info!("TMC4671 self-test: status_flags={:#010x}", status);
-                            }
-                            Err(_) => {
-                                defmt::error!("TMC4671 self-test: STATUS_FLAGS read failed");
-                            }
-                        }
-                        defmt::info!("TMC4671 self-test: complete (Phase 1 stub)");
+                    other => {
+                        handle_tmc_request(other, tmc).await;
                     }
                 },
-                Either3::First(Err(_)) => {}
-                Either3::Second(()) => {
+                Either::First(Err(_)) => {}
+                Either::Second(()) => {
                     motor_enabled = false;
                     enable_pin.set_low();
                     defmt::warn!("TMC4671 emergency disable");
-                }
-                Either3::Third(()) => {
-                    if motor_enabled {
-                        let target = ctx.shared.app_state.lock(|state| {
-                            let clock =
-                                cortex_m::peripheral::DWT::cycle_count();
-                            state.steppers[0].advance(clock);
-                            state.steppers[0].position_target()
-                        });
-                        let _ = tmc
-                            .write_register(
-                                tmc4671::registers::PID_POSITION_TARGET,
-                                target as u32,
-                            )
-                            .await;
-                    }
                 }
             }
         }
