@@ -111,7 +111,7 @@ mod app {
 
     // ---- bbqueue TX buffer and transport output ----
 
-    const USB_TX_BUFFER_SIZE: usize = 512;
+    const USB_TX_BUFFER_SIZE: usize = 4096;
 
     static USB_TX_PRODUCER: Mutex<RefCell<Option<bbqueue::Producer<'static, USB_TX_BUFFER_SIZE>>>> =
         Mutex::new(RefCell::new(None));
@@ -129,6 +129,13 @@ mod app {
     /// even if blocked on an empty channel.
     static TMC_DISABLE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+    /// Stepper position target, updated by usb_receive (P2) after each
+    /// protocol dispatch, read by tmc_control (P1) for SPI writes.
+    /// Lockfree: AtomicI32 avoids priority ceiling lock that would
+    /// block P2 protocol tasks.
+    static STEPPER_POSITION_TARGET: core::sync::atomic::AtomicI32 =
+        core::sync::atomic::AtomicI32::new(0);
+
     static TMC_REQUEST_SENDER: Mutex<
         RefCell<Option<Sender<'static, TmcRequest, TMC_CHANNEL_SIZE>>>,
     > = Mutex::new(RefCell::new(None));
@@ -144,11 +151,21 @@ mod app {
             let output = scratch.result();
 
             critical_section::with(|cs| {
-                if let Some(producer) = USB_TX_PRODUCER.borrow(cs).borrow_mut().as_mut() {
-                    if let Ok(mut grant) = producer.grant_exact(output.len()) {
-                        grant.buf().copy_from_slice(output);
-                        grant.commit(output.len());
-                        USB_TX_SIGNAL.signal(());
+                if let Some(producer) =
+                    USB_TX_PRODUCER.borrow(cs).borrow_mut().as_mut()
+                {
+                    match producer.grant_exact(output.len()) {
+                        Ok(mut grant) => {
+                            grant.buf().copy_from_slice(output);
+                            grant.commit(output.len());
+                            USB_TX_SIGNAL.signal(());
+                        }
+                        Err(_) => {
+                            defmt::warn!(
+                                "TX bbqueue full: dropped {} bytes",
+                                output.len()
+                            );
+                        }
                     }
                 }
             });
@@ -693,7 +710,7 @@ mod app {
         // PE7: TMC4671 ENABLE pin (active high, start disabled)
         let tmc_enable = Output::new(p.PE7, Level::Low, Speed::Low);
 
-        // IWDG: 10-second timeout, kicked by the stats task every 5 seconds
+        // IWDG: 10-second timeout, kicked by the stats task every 5 seconds.
         let mut wdg = IndependentWatchdog::new(p.IWDG, 10_000_000);
         wdg.unleash();
         defmt::info!("IWDG started: 10s timeout");
@@ -913,8 +930,8 @@ mod app {
     /// On startup, reads the TMC4671 chip identification register to verify
     /// SPI communication. Then processes register read/write requests from
     /// the protocol handler via the TMC request channel.
-    #[task(priority = 1, local = [tmc, tmc_enable, tmc_rx], shared = [app_state])]
-    async fn tmc_control(mut ctx: tmc_control::Context) {
+    #[task(priority = 1, local = [tmc, tmc_enable, tmc_rx])]
+    async fn tmc_control(ctx: tmc_control::Context) {
         let tmc = ctx.local.tmc;
         let enable_pin = ctx.local.tmc_enable;
         let rx = ctx.local.tmc_rx;
@@ -946,13 +963,16 @@ mod app {
         // enable sequence (ADC cal, encoder alignment, closed-loop entry) completes.
         let mut motor_enabled = false;
 
-        // Poll loop: drain channel, check emergency disable, update position.
-        // Runs at ~10kHz (100us yield). Avoids select3 which overflows the
-        // RTIC interrupt stack.
+        // Main loop: wait for channel message or 1ms timeout.
+        // On message: handle request. On timeout: write position target.
+        // Position is read from STEPPER_POSITION_TARGET atomic (updated
+        // by usb_receive at P2) — no shared resource lock needed.
         loop {
-            // Drain all pending channel messages (non-blocking).
-            while let Ok(req) = rx.try_recv() {
-                match req {
+            use embassy_futures::select::{select, Either};
+
+            match select(rx.recv(), Mono::delay(1.millis())).await {
+                // Channel message received
+                Either::First(Ok(req)) => match req {
                     TmcRequest::SetEnable(enabled) => {
                         if enabled {
                             {
@@ -960,8 +980,11 @@ mod app {
                                     rx: &mut *rx,
                                     tmc: &mut *tmc,
                                 };
-                                tmc_adc_calibrate(&mut delay_ctx, enable_pin)
-                                    .await;
+                                tmc_adc_calibrate(
+                                    &mut delay_ctx,
+                                    enable_pin,
+                                )
+                                .await;
                                 tmc_align_encoder(&mut delay_ctx).await;
                                 tmc_enter_closedloop(delay_ctx.tmc).await;
                             }
@@ -974,11 +997,13 @@ mod app {
                             use tmc4671::registers::*;
                             let _ = tmc
                                 .write_register(
-                                    MODE_RAMP_MODE_MOTION, 0x0000_0000,
+                                    MODE_RAMP_MODE_MOTION, 0,
                                 )
                                 .await;
                             let _ = tmc
-                                .write_register(PID_TORQUE_FLUX_TARGET, 0)
+                                .write_register(
+                                    PID_TORQUE_FLUX_TARGET, 0,
+                                )
                                 .await;
                             let _ = tmc
                                 .write_register(UQ_UD_EXT, 0)
@@ -999,7 +1024,8 @@ mod app {
                             rx: &mut *rx,
                             tmc: &mut *tmc,
                         };
-                        tmc_enter_openloop(&mut delay_ctx, enable_pin).await;
+                        tmc_enter_openloop(&mut delay_ctx, enable_pin)
+                            .await;
                     }
                     #[cfg(feature = "dev")]
                     TmcRequest::TestSpin { revolutions } => {
@@ -1008,24 +1034,24 @@ mod app {
                     other => {
                         handle_tmc_request(other, tmc).await;
                     }
-                }
+                },
+                Either::First(Err(_)) => {}
+                // 1ms timeout — write position target via SPI
+                Either::Second(()) => {}
             }
 
-            // Check emergency disable signal (non-blocking, consume signal).
+            // Check emergency disable (non-blocking).
             if TMC_DISABLE_SIGNAL.try_take().is_some() {
                 motor_enabled = false;
                 enable_pin.set_low();
                 defmt::warn!("TMC4671 emergency disable");
             }
 
-            // 10kHz position target update.
+            // Write position target to TMC4671 (1kHz, lockfree).
             if motor_enabled {
-                let target = ctx.shared.app_state.lock(|state| {
-                    let clock =
-                        cortex_m::peripheral::DWT::cycle_count();
-                    state.steppers[0].advance(clock);
-                    state.steppers[0].position_target()
-                });
+                let target = STEPPER_POSITION_TARGET.load(
+                    core::sync::atomic::Ordering::Relaxed,
+                );
                 let _ = tmc
                     .write_register(
                         tmc4671::registers::PID_POSITION_TARGET,
@@ -1033,9 +1059,6 @@ mod app {
                     )
                     .await;
             }
-
-            // Yield for ~100us (10kHz tick rate).
-            Mono::delay(100.micros()).await;
         }
     }
 
@@ -1526,9 +1549,25 @@ mod app {
                             let mut wrap = SliceInputBuffer::new(rcv_buf.data());
                             ctx.shared.app_state.lock(|state| {
                                 crate::KLIPPER_TRANSPORT.receive(&mut wrap, state);
+                                // Advance stepper and publish position target.
+                                // Done here at P2 so tmc_control (P1) doesn't
+                                // need a shared resource lock for the hot path.
+                                let clock =
+                                    cortex_m::peripheral::DWT::cycle_count();
+                                state.steppers[0].advance(clock);
+                                let target =
+                                    state.steppers[0].position_target();
+                                STEPPER_POSITION_TARGET.store(
+                                    target,
+                                    core::sync::atomic::Ordering::Relaxed,
+                                );
                             });
                             rcv_buf.pop(rcv_buf.len() - wrap.available());
                         }
+                        // Yield to let usb_pump and usb_send run.
+                        // Without this, a burst of queue_step commands
+                        // starves the USB state machine and TX drain.
+                        embassy_futures::yield_now().await;
                     }
                     Err(_) => {
                         defmt::warn!("USB disconnected");
@@ -1543,31 +1582,42 @@ mod app {
     #[task(priority = 2, local = [usb_sender, usb_tx_consumer])]
     async fn usb_send(ctx: usb_send::Context) {
         let sender = ctx.local.usb_sender;
+        defmt::info!("usb_send task started");
+        let mut total_bytes: u32 = 0;
+        let mut total_packets: u32 = 0;
         loop {
             sender.wait_connection().await;
-            let mut more = false;
+            defmt::info!("usb_send: connected");
             loop {
-                if !more {
-                    USB_TX_SIGNAL.wait().await;
-                }
-                let grant = match ctx.local.usb_tx_consumer.read() {
-                    Ok(grant) => grant,
-                    Err(_) => {
-                        more = false;
-                        continue;
-                    }
-                };
-                let len = grant.buf().len();
-                let take = len.min(64);
+                // Wait for data signal, then drain everything available.
+                USB_TX_SIGNAL.wait().await;
+                loop {
+                    let grant = match ctx.local.usb_tx_consumer.read() {
+                        Ok(grant) => grant,
+                        Err(_) => break, // Empty, go back to signal wait
+                    };
+                    let len = grant.buf().len();
+                    let take = len.min(64);
 
-                match sender.write_packet(&grant.buf()[..take]).await {
-                    Ok(_) => {
-                        grant.release(take);
-                        more = len != take;
-                    }
-                    Err(_) => {
-                        defmt::warn!("USB send error");
-                        break;
+                    match sender.write_packet(&grant.buf()[..take]).await {
+                        Ok(_) => {
+                            grant.release(take);
+                            total_bytes += take as u32;
+                            total_packets += 1;
+                            if total_packets % 100 == 0 {
+                                defmt::info!(
+                                    "usb_send: {} packets, {} bytes",
+                                    total_packets,
+                                    total_bytes
+                                );
+                            }
+                        }
+                        Err(_) => {
+                            defmt::warn!("USB send error");
+                            // Release the grant to avoid bbqueue stall
+                            grant.release(0);
+                            break;
+                        }
                     }
                 }
             }
