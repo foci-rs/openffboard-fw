@@ -12,9 +12,18 @@ fn main() {
         .set_license("MIT OR Apache-2.0")
         .build();
 
-    // Copy memory.x to OUT_DIR so the linker can find it
+    // Copy the appropriate memory layout to OUT_DIR.
+    // Default: Katapult bootloader offset (0x08008000).
+    // With --features dev-flash: direct flash at 0x08000000 for probe-rs.
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    fs::copy("memory.x", out_dir.join("memory.x")).unwrap();
+    // Default: Katapult bootloader offset (0x08008000).
+    // With --features dev: direct flash at 0x08000000 for probe-rs + dev commands.
+    let memory_x = if env::var("CARGO_FEATURE_DEV").is_ok() {
+        "memory-dev.x"
+    } else {
+        "memory.x"
+    };
+    fs::copy(memory_x, out_dir.join("memory.x")).unwrap();
     println!("cargo:rustc-link-search={}", out_dir.display());
 
     // Linker configuration
@@ -22,5 +31,6 @@ fn main() {
     println!("cargo:rustc-link-arg-bins=-Tlink.x");
     println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
     println!("cargo:rerun-if-changed=memory.x");
+    println!("cargo:rerun-if-changed=memory-dev.x");
     println!("cargo:rerun-if-changed=build.rs");
 }

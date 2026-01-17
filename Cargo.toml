@@ -46,7 +46,7 @@ heapless.workspace = true
 bbqueue.workspace = true
 
 [features]
-dev-commands = []
+dev = []
 
 [build-dependencies]
 anchor_codegen.workspace = true
