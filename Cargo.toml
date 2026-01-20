@@ -19,7 +19,6 @@ embassy-stm32 = { version = "0.6", features = [
     "time-driver-tim4",
 ] }
 embassy-time = "0.5"
-embassy-usb = { version = "0.6", features = ["defmt"] }
 embassy-futures = "0.1"
 embassy-sync = "0.6"
 embedded-hal-bus = { version = "0.3", features = ["async"] }
@@ -35,6 +34,7 @@ anchor.workspace = true
 # Project crates
 tmc4671 = { path = "../tmc4671" }
 klipper-mcu = { path = "../klipper-mcu" }
+klipper-usb = { path = "../klipper-usb" }
 
 # Logging
 defmt.workspace = true
@@ -43,7 +43,6 @@ panic-probe = { version = "1.0", features = ["print-defmt"] }
 
 # no_std utilities
 heapless.workspace = true
-bbqueue.workspace = true
 
 [features]
 dev = []

@@ -14,22 +14,17 @@ pub mod pac {
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [UART4, UART5, USART3])]
 mod app {
     use core::cell::RefCell;
-    use core::mem::MaybeUninit;
 
     use anchor::*;
-    use bbqueue::BBBuffer;
     use cortex_m::peripheral::DWT;
     use critical_section::Mutex;
     use embassy_stm32::gpio::{Level, Output, Speed};
     use embassy_stm32::mode::Async as AsyncMode;
     use embassy_stm32::spi::Spi;
-    use embassy_stm32::usb::Driver;
     use embassy_stm32::wdg::IndependentWatchdog;
-    use embassy_stm32::{bind_interrupts, peripherals, usb};
+    use embassy_stm32::{bind_interrupts, peripherals};
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use embassy_sync::signal::Signal;
-    use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
-    use embassy_usb::{Builder, Config as UsbConfig, UsbDevice};
     use embedded_hal_bus::spi::ExclusiveDevice;
     use klipper_mcu::shutdown::McuState;
     use klipper_mcu::state::State;
@@ -38,15 +33,11 @@ mod app {
     use tmc4671::spi::Tmc4671Spi;
 
     bind_interrupts!(struct Irqs {
-        OTG_FS => usb::InterruptHandler<peripherals::USB_OTG_FS>;
         DMA2_STREAM2 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH2>;
         DMA2_STREAM3 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH3>;
     });
 
     systick_monotonic!(Mono, 1_000);
-
-    /// USB HAL driver type alias for use throughout this module.
-    type HalUsbDriver = Driver<'static, peripherals::USB_OTG_FS>;
 
     /// SPI bus type for TMC4671 communication.
     type Spi1Bus = Spi<'static, AsyncMode, embassy_stm32::spi::mode::Master>;
@@ -86,36 +77,8 @@ mod app {
     /// Derived from sense resistor value and ADC configuration.
     const CURRENT_SCALE_MA_PER_LSB: f32 = 1.155;
 
-    /// Static buffers required by the USB device stack.
-    ///
-    /// Held in `#[init(local = [...])]` storage so they obtain `'static` lifetime.
-    struct UsbBuffers {
-        config_descriptor: [u8; 256],
-        bos_descriptor: [u8; 256],
-        msos_descriptor: [u8; 0],
-        control_buf: [u8; 64],
-        cdc_state: MaybeUninit<CdcState<'static>>,
-    }
-
-    impl UsbBuffers {
-        const fn new() -> Self {
-            Self {
-                config_descriptor: [0; 256],
-                bos_descriptor: [0; 256],
-                msos_descriptor: [],
-                control_buf: [0; 64],
-                cdc_state: MaybeUninit::uninit(),
-            }
-        }
-    }
-
-    // ---- bbqueue TX buffer and transport output ----
-
-    const USB_TX_BUFFER_SIZE: usize = 4096;
-
-    static USB_TX_PRODUCER: Mutex<RefCell<Option<bbqueue::Producer<'static, USB_TX_BUFFER_SIZE>>>> =
-        Mutex::new(RefCell::new(None));
-    static USB_TX_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+    /// USB wake signal. The OTG_FS ISR signals this to wake usb_task.
+    static USB_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
     /// 64-bit uptime tracking. Updated by the stats task every 5 seconds.
     /// `stats_send_time` is the CYCCNT value at last stats send.
@@ -149,26 +112,10 @@ mod app {
             let mut scratch = ScratchOutput::new();
             f(&mut scratch);
             let output = scratch.result();
-
-            critical_section::with(|cs| {
-                if let Some(producer) =
-                    USB_TX_PRODUCER.borrow(cs).borrow_mut().as_mut()
-                {
-                    match producer.grant_exact(output.len()) {
-                        Ok(mut grant) => {
-                            grant.buf().copy_from_slice(output);
-                            grant.commit(output.len());
-                            USB_TX_SIGNAL.signal(());
-                        }
-                        Err(_) => {
-                            defmt::warn!(
-                                "TX bbqueue full: dropped {} bytes",
-                                output.len()
-                            );
-                        }
-                    }
-                }
-            });
+            klipper_usb::tx_write(output);
+            // Wake usb_task to drain TX buffer. Critical for data
+            // generated outside usb_task (stats output from P1).
+            USB_WAKE.signal(());
         }
     }
 
@@ -291,6 +238,7 @@ mod app {
     // Katapult bootloader constants (from Klipper armcm_reset.c).
     const KATAPULT_BOOT_ADDRESS: u32 = 0x0800_0000;
     const KATAPULT_SIGNATURE: u64 = 0x2174_6f6f_426e_6143; // "CanBoot!"
+    #[allow(dead_code)] // Used by klipper-usb's check_reboot() path
     const KATAPULT_REQUEST: u64 = 0x5984_E3FA_6CA1_589B; // stay in bootloader
     const KATAPULT_BYPASS: u64 = 0x7b06_ec45_a9a8_243d; // skip bootloader
 
@@ -632,11 +580,6 @@ mod app {
         tmc_enable: Output<'static>,
         tmc_rx: Receiver<'static, TmcRequest, TMC_CHANNEL_SIZE>,
         wdg: IndependentWatchdog<'static, peripherals::IWDG>,
-        usb: UsbDevice<'static, HalUsbDriver>,
-        usb_sender: embassy_usb::class::cdc_acm::Sender<'static, HalUsbDriver>,
-        usb_receiver: embassy_usb::class::cdc_acm::Receiver<'static, HalUsbDriver>,
-        usb_control: embassy_usb::class::cdc_acm::ControlChanged<'static>,
-        usb_tx_consumer: bbqueue::Consumer<'static, USB_TX_BUFFER_SIZE>,
     }
 
     /// Read the STM32 96-bit unique device ID and format as a hex string.
@@ -660,9 +603,6 @@ mod app {
     }
 
     #[init(local = [
-        usb_buf: UsbBuffers = UsbBuffers::new(),
-        ep_out_buf: [u8; 256] = [0; 256],
-        usb_tx_queue: BBBuffer<USB_TX_BUFFER_SIZE> = BBBuffer::new(),
         tmc_channel: rtic_sync::channel::Channel<TmcRequest, TMC_CHANNEL_SIZE> =
             rtic_sync::channel::Channel::new(),
         uid_str: [u8; 24] = [0; 24],
@@ -745,59 +685,48 @@ mod app {
 
         defmt::info!("SPI1 configured: 2 MHz, Mode 3, DMA");
 
-        // USB OTG FS driver setup
-        // vbus_detection = true: OpenFFBoard has VBUS wired to PA9
-        let mut usb_hw_config = usb::Config::default();
-        usb_hw_config.vbus_detection = true;
+        // USB OTG FS: configure D+/D- GPIO pins (PA11=D-, PA12=D+)
+        // Alternate function 10 for USB OTG FS on STM32F4
+        {
+            use embassy_stm32::gpio::{AfType, Flex, Pull};
+            let mut dm = Flex::new(p.PA11);
+            dm.set_as_af_unchecked(10, AfType::input(Pull::None));
+            let mut dp = Flex::new(p.PA12);
+            dp.set_as_af_unchecked(10, AfType::input(Pull::None));
+            // Pins must stay configured — don't drop the Flex handles
+            core::mem::forget(dm);
+            core::mem::forget(dp);
+        }
 
-        let driver = Driver::new_fs(
-            p.USB_OTG_FS,
-            Irqs,
-            p.PA12, // D+
-            p.PA11, // D-
-            ctx.local.ep_out_buf,
-            usb_hw_config,
-        );
+        // Enable USB OTG FS peripheral clock
+        embassy_stm32::pac::RCC
+            .ahb2enr()
+            .modify(|w| w.set_usb_otg_fsen(true));
+        // Brief delay for clock to stabilize
+        cortex_m::asm::delay(100);
 
-        // USB device descriptor configuration — Klipper VID/PID
-        let mut usb_config = UsbConfig::new(0x1D50, 0x614E);
-        usb_config.manufacturer = Some("foci");
-        usb_config.product = Some("FOCI OpenFFBoard");
         let uid = read_stm32_uid(ctx.local.uid_str);
-        usb_config.serial_number = Some(uid);
-        usb_config.max_power = 100;
-        usb_config.max_packet_size_0 = 64;
 
-        let usb_buf = ctx.local.usb_buf;
-
-        let mut builder = Builder::new(
-            driver,
-            usb_config,
-            &mut usb_buf.config_descriptor,
-            &mut usb_buf.bos_descriptor,
-            &mut usb_buf.msos_descriptor,
-            &mut usb_buf.control_buf,
-        );
-
-        // SAFETY: cdc_state is uninit storage; write() initialises it exactly once
-        // here before the reference escapes. No other code accesses this slot.
-        let cdc_state = usb_buf.cdc_state.write(CdcState::new());
-        let class = CdcAcmClass::new(&mut builder, cdc_state, 64);
-        let usb = builder.build();
-        let (usb_sender, usb_receiver, usb_control) = class.split_with_control();
-
-        // Split bbqueue for TX output
-        let (usb_tx_prod, usb_tx_consumer) = ctx.local.usb_tx_queue.try_split().unwrap();
-        critical_section::with(|cs| {
-            USB_TX_PRODUCER.borrow(cs).replace(Some(usb_tx_prod));
-        });
+        // SAFETY: Called exactly once, before any other klipper-usb function.
+        // base_addr is the USB_OTG_FS peripheral base on STM32F407.
+        unsafe {
+            klipper_usb::usb_init(&klipper_usb::UsbConfig {
+                base_addr: 0x5000_0000,
+                irq_num: 67,
+                trdt: 6,
+                vbus_detection: false,  // F407 uses NOVBUSSENS, not GOTGCTL BVAL
+                double_buffer_tx: true,
+                vid: 0x1D50,
+                pid: 0x614E,
+                manufacturer: "foci",
+                product: "FOCI OpenFFBoard",
+                serial: uid,
+            });
+        }
 
         // Spawn tasks
         tmc_control::spawn().ok();
-        usb_pump::spawn().ok();
-        usb_receive::spawn().ok();
-        usb_send::spawn().ok();
-        usb_control::spawn().ok();
+        usb_task::spawn().ok();
         blink::spawn().ok();
         stats::spawn().ok();
 
@@ -813,11 +742,6 @@ mod app {
                 tmc_enable,
                 tmc_rx,
                 wdg,
-                usb,
-                usb_sender,
-                usb_receiver,
-                usb_control,
-                usb_tx_consumer,
             },
         )
     }
@@ -980,52 +904,31 @@ mod app {
                                     rx: &mut *rx,
                                     tmc: &mut *tmc,
                                 };
-                                tmc_adc_calibrate(
-                                    &mut delay_ctx,
-                                    enable_pin,
-                                )
-                                .await;
+                                tmc_adc_calibrate(&mut delay_ctx, enable_pin).await;
                                 tmc_align_encoder(&mut delay_ctx).await;
                                 tmc_enter_closedloop(delay_ctx.tmc).await;
                             }
                             motor_enabled = true;
-                            defmt::info!(
-                                "TMC4671 motor enabled: closed-loop position mode"
-                            );
+                            defmt::info!("TMC4671 motor enabled: closed-loop position mode");
                         } else {
                             motor_enabled = false;
                             use tmc4671::registers::*;
-                            let _ = tmc
-                                .write_register(
-                                    MODE_RAMP_MODE_MOTION, 0,
-                                )
-                                .await;
-                            let _ = tmc
-                                .write_register(
-                                    PID_TORQUE_FLUX_TARGET, 0,
-                                )
-                                .await;
-                            let _ = tmc
-                                .write_register(UQ_UD_EXT, 0)
-                                .await;
-                            let _ = tmc
-                                .write_register(PWM_SV_CHOP, 0)
-                                .await;
+                            let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+                            let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+                            let _ = tmc.write_register(UQ_UD_EXT, 0).await;
+                            let _ = tmc.write_register(PWM_SV_CHOP, 0).await;
                             enable_pin.set_low();
                             defmt::info!("TMC4671 motor disabled");
                         }
                     }
                     #[cfg(feature = "dev")]
                     TmcRequest::Init => {
-                        defmt::info!(
-                            "TMC4671 init: starting open-loop stepper config"
-                        );
+                        defmt::info!("TMC4671 init: starting open-loop stepper config");
                         let mut delay_ctx = ChannelDrainDelay {
                             rx: &mut *rx,
                             tmc: &mut *tmc,
                         };
-                        tmc_enter_openloop(&mut delay_ctx, enable_pin)
-                            .await;
+                        tmc_enter_openloop(&mut delay_ctx, enable_pin).await;
                     }
                     #[cfg(feature = "dev")]
                     TmcRequest::TestSpin { revolutions } => {
@@ -1049,14 +952,9 @@ mod app {
 
             // Write position target to TMC4671 (1kHz, lockfree).
             if motor_enabled {
-                let target = STEPPER_POSITION_TARGET.load(
-                    core::sync::atomic::Ordering::Relaxed,
-                );
+                let target = STEPPER_POSITION_TARGET.load(core::sync::atomic::Ordering::Relaxed);
                 let _ = tmc
-                    .write_register(
-                        tmc4671::registers::PID_POSITION_TARGET,
-                        target as u32,
-                    )
+                    .write_register(tmc4671::registers::PID_POSITION_TARGET, target as u32)
                     .await;
             }
         }
@@ -1450,25 +1348,57 @@ mod app {
         defmt::info!("TMC4671 closed-loop position mode active");
     }
 
-    /// Monitors CDC-ACM control line changes for bootloader entry.
+    /// USB OTG FS interrupt handler. Masks interrupt sources and wakes usb_task.
     ///
-    /// Katapult's flashtool requests bootloader entry by setting DTR,
-    /// changing baud to 1200, then dropping DTR. We detect the DTR
-    /// high-to-low transition with 1200 baud to avoid false triggers
-    /// from normal Klipper serial port handling.
-    #[task(priority = 2, local = [usb_control, dtr_was_set: bool = false])]
-    async fn usb_control(ctx: usb_control::Context) {
+    /// Priority 3: must be above P2 protocol tasks so the ISR always runs
+    /// immediately. The handler only masks and signals — no FIFO access.
+    #[task(binds = OTG_FS, priority = 3)]
+    fn otg_fs_irq(_ctx: otg_fs_irq::Context) {
+        klipper_usb::irq_handler();
+        USB_WAKE.signal(());
+    }
+
+    /// Single USB task replacing usb_pump, usb_receive, usb_send, usb_control.
+    ///
+    /// Handles EP0 setup, bulk RX, protocol dispatch, and bulk TX in one pass.
+    /// No scheduling gap between receiving commands and sending acks.
+    /// Katapult 1200-baud DTR detection is handled by klipper-usb internally.
+    #[task(priority = 2, shared = [app_state])]
+    async fn usb_task(mut ctx: usb_task::Context) {
         loop {
-            ctx.local.usb_control.control_changed().await;
-            let dtr = ctx.local.usb_control.dtr();
-            if *ctx.local.dtr_was_set
-                && !dtr
-                && ctx.local.usb_control.line_coding().data_rate() == 1200
-            {
-                defmt::info!("1200 baud + DTR drop: entering Katapult bootloader");
-                katapult_reset(KATAPULT_REQUEST);
+            USB_WAKE.wait().await;
+
+            // Process ALL pending USB events. Keep polling until
+            // no more data is available — klipper-usb internal wake
+            // flags don't signal USB_WAKE.
+            while klipper_usb::poll() {
+                let data = klipper_usb::rx_data();
+                if data.is_empty() {
+                    break;
+                }
+                let len = data.len().min(128);
+                let mut local_buf = [0u8; 128];
+                local_buf[..len].copy_from_slice(&data[..len]);
+
+                // Feed to protocol — only consume what transport processed.
+                // Partial frames at the end must stay in the RX buffer.
+                let mut input = SliceInputBuffer::new(&local_buf[..len]);
+                ctx.shared.app_state.lock(|state| {
+                    crate::KLIPPER_TRANSPORT.receive(&mut input, state);
+                    let clock = cortex_m::peripheral::DWT::cycle_count();
+                    state.steppers[0].advance(clock);
+                    let target = state.steppers[0].position_target();
+                    STEPPER_POSITION_TARGET.store(
+                        target,
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                });
+                let consumed = len - input.available();
+                klipper_usb::rx_consume(consumed);
+                // poll() at top of loop sends acks before reading more
             }
-            *ctx.local.dtr_was_set = dtr;
+            // Final poll to flush any remaining TX
+            klipper_usb::poll();
         }
     }
 
@@ -1524,103 +1454,6 @@ mod app {
         loop {
             ctx.local.led.toggle();
             Mono::delay(500.millis()).await;
-        }
-    }
-
-    /// Drives the USB device state machine; must run continuously.
-    #[task(priority = 2, local = [usb])]
-    async fn usb_pump(ctx: usb_pump::Context) {
-        ctx.local.usb.run().await;
-    }
-
-    /// Receives USB packets and feeds them to the anchor protocol handler.
-    #[task(priority = 2, local = [usb_receiver], shared = [app_state])]
-    async fn usb_receive(mut ctx: usb_receive::Context) {
-        let receiver = ctx.local.usb_receiver;
-        loop {
-            receiver.wait_connection().await;
-            defmt::info!("USB connected");
-            loop {
-                let mut rcv_buf = FifoBuffer::<192>::new();
-                match receiver.read_packet(rcv_buf.receive_buffer()).await {
-                    Ok(n) => {
-                        rcv_buf.advance(n);
-                        if !rcv_buf.is_empty() {
-                            let mut wrap = SliceInputBuffer::new(rcv_buf.data());
-                            ctx.shared.app_state.lock(|state| {
-                                crate::KLIPPER_TRANSPORT.receive(&mut wrap, state);
-                                // Advance stepper and publish position target.
-                                // Done here at P2 so tmc_control (P1) doesn't
-                                // need a shared resource lock for the hot path.
-                                let clock =
-                                    cortex_m::peripheral::DWT::cycle_count();
-                                state.steppers[0].advance(clock);
-                                let target =
-                                    state.steppers[0].position_target();
-                                STEPPER_POSITION_TARGET.store(
-                                    target,
-                                    core::sync::atomic::Ordering::Relaxed,
-                                );
-                            });
-                            rcv_buf.pop(rcv_buf.len() - wrap.available());
-                        }
-                        // Yield to let usb_pump and usb_send run.
-                        // Without this, a burst of queue_step commands
-                        // starves the USB state machine and TX drain.
-                        embassy_futures::yield_now().await;
-                    }
-                    Err(_) => {
-                        defmt::warn!("USB disconnected");
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Drains the bbqueue TX buffer and sends packets over USB.
-    #[task(priority = 2, local = [usb_sender, usb_tx_consumer])]
-    async fn usb_send(ctx: usb_send::Context) {
-        let sender = ctx.local.usb_sender;
-        defmt::info!("usb_send task started");
-        let mut total_bytes: u32 = 0;
-        let mut total_packets: u32 = 0;
-        loop {
-            sender.wait_connection().await;
-            defmt::info!("usb_send: connected");
-            loop {
-                // Wait for data signal, then drain everything available.
-                USB_TX_SIGNAL.wait().await;
-                loop {
-                    let grant = match ctx.local.usb_tx_consumer.read() {
-                        Ok(grant) => grant,
-                        Err(_) => break, // Empty, go back to signal wait
-                    };
-                    let len = grant.buf().len();
-                    let take = len.min(64);
-
-                    match sender.write_packet(&grant.buf()[..take]).await {
-                        Ok(_) => {
-                            grant.release(take);
-                            total_bytes += take as u32;
-                            total_packets += 1;
-                            if total_packets % 100 == 0 {
-                                defmt::info!(
-                                    "usb_send: {} packets, {} bytes",
-                                    total_packets,
-                                    total_bytes
-                                );
-                            }
-                        }
-                        Err(_) => {
-                            defmt::warn!("USB send error");
-                            // Release the grant to avoid bbqueue stall
-                            grant.release(0);
-                            break;
-                        }
-                    }
-                }
-            }
         }
     }
 }
