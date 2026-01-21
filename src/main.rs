@@ -177,7 +177,9 @@ mod app {
     #[klipper_command(in_shutdown)]
     pub fn clear_shutdown(context: &mut State) {
         if !context.mcu_state.is_shutdown() {
-            enter_shutdown(context, "Shutdown cleared when not shutdown");
+            if enter_shutdown(context) {
+                klipper_shutdown!("Shutdown cleared when not shutdown", DWT::cycle_count());
+            }
             return;
         }
         context.mcu_state = McuState::Running;
@@ -191,7 +193,9 @@ mod app {
     #[klipper_command(in_shutdown)]
     pub fn config_reset(context: &mut State) {
         if !context.mcu_state.is_shutdown() {
-            enter_shutdown(context, "config_reset only available when shutdown");
+            if enter_shutdown(context) {
+                klipper_shutdown!("config_reset only available when shutdown", DWT::cycle_count());
+            }
             return;
         }
         context.reset();
@@ -211,18 +215,24 @@ mod app {
 
     #[klipper_command(in_shutdown)]
     pub fn emergency_stop(context: &mut State) {
-        enter_shutdown(context, klipper_mcu::shutdown::reasons::COMMAND_REQUEST);
+        if enter_shutdown(context) {
+            klipper_shutdown!("Command request", DWT::cycle_count());
+        }
     }
 
     /// Transition to shutdown state: disable motor, notify host.
-    fn enter_shutdown(context: &mut State, reason: &str) {
+    ///
+    /// Returns `true` if this call actually entered shutdown (first call).
+    /// Returns `false` if already in shutdown. The caller should send
+    /// `klipper_shutdown!` only when this returns `true`, so each call
+    /// site provides a unique static string reason.
+    fn enter_shutdown(context: &mut State) -> bool {
         if context.mcu_state.is_shutdown() {
-            return;
+            return false;
         }
         context.mcu_state = McuState::Shutdown { reason: 0 };
         TMC_DISABLE_SIGNAL.signal(());
-        defmt::error!("Shutdown: {}", reason);
-        klipper_output!("shutdown static_string_id=%hu", 0u16);
+        true
     }
 
     /// Reset the MCU. Matches Klipper's `command_reset` (armcm_reset.c).
@@ -675,6 +685,15 @@ mod app {
         // PE7: TMC4671 ENABLE pin (active high, start disabled)
         let tmc_enable = Output::new(p.PE7, Level::Low, Speed::Low);
 
+        // PE8: TMC4671 STATUS pin (input, active high).
+        // Pin mode configured here; EXTI interrupt enabled later in
+        // tmc_control after STATUS_MASK is written to the TMC4671.
+        {
+            use embassy_stm32::gpio::{Input, Pull};
+            let _status_pin = Input::new(p.PE8, Pull::Down);
+            core::mem::forget(_status_pin);
+        }
+
         // IWDG: 10-second timeout, kicked by the stats task every 5 seconds.
         let mut wdg = IndependentWatchdog::new(p.IWDG, 10_000_000);
         wdg.unleash();
@@ -925,9 +944,36 @@ mod app {
             }
         }
 
+        // Configure STATUS_MASK: route critical fault flags to the STATUS
+        // output pin (PE8 EXTI). Only PLL lock loss and ADC current clipping
+        // warrant immediate hardware interrupt — other flags are polled.
+        {
+            use tmc4671::registers::*;
+            const STATUS_NOT_PLL_LOCKED: u32 = 1 << 19;
+            const STATUS_ADC_I_CLIPPED: u32 = 1 << 26;
+            let mask = STATUS_NOT_PLL_LOCKED | STATUS_ADC_I_CLIPPED;
+            let _ = tmc.write_register(STATUS_MASK, mask).await;
+            // Clear pending STATUS flags from power-on, then configure
+            // PE8 EXTI for rising edge interrupt on STATUS assertion.
+            let _ = tmc.read_register(STATUS_FLAGS).await;
+            let _ = tmc.write_register(STATUS_FLAGS, 0).await;
+            let syscfg = embassy_stm32::pac::SYSCFG;
+            // EXTICR3[3:0] = 4 selects port E for EXTI line 8.
+            syscfg.exticr(2).modify(|w| w.set_exti(0, 4));
+            let exti = embassy_stm32::pac::EXTI;
+            exti.rtsr(0).modify(|w| w.set_line(8, true));
+            exti.ftsr(0).modify(|w| w.set_line(8, false));
+            exti.pr(0).write(|w| w.set_line(8, true)); // Clear pending
+            exti.imr(0).modify(|w| w.set_line(8, true)); // Unmask
+            defmt::info!("TMC4671 STATUS_MASK: {:#010x}, EXTI8 enabled", mask);
+        }
+
         // Track whether the motor is enabled. Only set to true after the full
         // enable sequence (ADC cal, encoder alignment, closed-loop entry) completes.
         let mut motor_enabled = false;
+
+        // Counter for 1s STATUS_FLAGS poll (1000 * 1ms ticks).
+        let mut status_poll_counter: u16 = 0;
 
         // Main loop: wait for channel message or 1ms timeout.
         // On message: handle request. On timeout: write position target.
@@ -985,11 +1031,34 @@ mod app {
                 Either::Second(()) => {}
             }
 
-            // Check emergency disable (non-blocking).
+            // Check emergency disable (non-blocking). Triggered by EXTI
+            // STATUS interrupt or enter_shutdown. Disables motor and reports
+            // the fault to Klipper so the host knows the MCU is down.
             if TMC_DISABLE_SIGNAL.try_take().is_some() {
                 motor_enabled = false;
                 enable_pin.set_low();
-                defmt::warn!("TMC4671 emergency disable");
+                // Read STATUS_FLAGS to identify the fault cause.
+                let flags = tmc
+                    .read_register(tmc4671::registers::STATUS_FLAGS)
+                    .await
+                    .unwrap_or(0);
+                defmt::error!("TMC4671 emergency disable: STATUS={:#010x}", flags);
+                // Report shutdown to Klipper with a specific reason.
+                const NOT_PLL_LOCKED: u32 = 1 << 19;
+                const ADC_I_CLIPPED: u32 = 1 << 26;
+                ctx.shared.app_state.lock(|state| {
+                    if flags & NOT_PLL_LOCKED != 0 {
+                        if enter_shutdown(state) {
+                            klipper_shutdown!("TMC4671: PLL not locked (clock lost)", DWT::cycle_count());
+                        }
+                    } else if flags & ADC_I_CLIPPED != 0 {
+                        if enter_shutdown(state) {
+                            klipper_shutdown!("TMC4671: ADC current clipped (overcurrent)", DWT::cycle_count());
+                        }
+                    } else if enter_shutdown(state) {
+                        klipper_shutdown!("TMC4671 fault", DWT::cycle_count());
+                    }
+                });
             }
 
             // Advance emulated stepper and write position target (1kHz).
@@ -1012,6 +1081,26 @@ mod app {
                 let _ = tmc
                     .write_register(tmc4671::registers::PID_POSITION_TARGET, target as u32)
                     .await;
+            }
+
+            // Poll STATUS_FLAGS every ~1 second for warning-level flags.
+            // Critical faults (PLL lost, ADC clipped) are handled by EXTI.
+            status_poll_counter += 1;
+            if status_poll_counter >= 1000 {
+                status_poll_counter = 0;
+                if let Ok(flags) = tmc.read_register(tmc4671::registers::STATUS_FLAGS).await {
+                    // Warning flags: PID output limits (position, velocity, current)
+                    const PID_LIMIT_MASK: u32 = 0x0000_FFFF; // bits 0-15
+                    const PWM_LIMIT_MASK: u32 = (1 << 24) | (1 << 25); // pwm_min, pwm_max
+                    const FAULT_MASK: u32 = (1 << 19) | (1 << 26); // not_PLL_locked, adc_i_clipped
+
+                    if flags & FAULT_MASK != 0 {
+                        defmt::error!("TMC4671 STATUS fault: {:#010x}", flags);
+                        TMC_DISABLE_SIGNAL.signal(());
+                    } else if motor_enabled && flags & (PID_LIMIT_MASK | PWM_LIMIT_MASK) != 0 {
+                        defmt::warn!("TMC4671 STATUS: {:#010x}", flags);
+                    }
+                }
             }
         }
     }
@@ -1412,6 +1501,19 @@ mod app {
     fn otg_fs_irq(_ctx: otg_fs_irq::Context) {
         klipper_usb::irq_handler();
         USB_WAKE.signal(());
+    }
+
+    /// TMC4671 STATUS pin interrupt (PE8, EXTI line 8).
+    ///
+    /// Fires when any STATUS_MASK-enabled flag is asserted (not_PLL_locked,
+    /// adc_i_clipped). Signals immediate motor disable; tmc_control reads
+    /// STATUS_FLAGS on next tick to log the cause.
+    #[task(binds = EXTI9_5, priority = 3)]
+    fn tmc_status_irq(_ctx: tmc_status_irq::Context) {
+        let exti = embassy_stm32::pac::EXTI;
+        exti.pr(0).write(|w| w.set_line(8, true));
+        TMC_DISABLE_SIGNAL.signal(());
+        defmt::warn!("TMC4671 STATUS interrupt: fault detected");
     }
 
     /// Single USB task replacing usb_pump, usb_receive, usb_send, usb_control.
