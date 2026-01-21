@@ -68,6 +68,9 @@ mod app {
         SetEncoder {
             ppr: u32,
         },
+        SetEncoderDir {
+            invert: bool,
+        },
         SelfTest,
     }
 
@@ -554,6 +557,14 @@ mod app {
         tmc_send(TmcRequest::SetEncoder { ppr });
     }
 
+    /// Set ABN encoder count direction. Inverted=1 flips the count
+    /// direction so the position PID has correct (negative) feedback.
+    /// Depends on motor/encoder wiring — not board-specific.
+    #[klipper_command]
+    pub fn tmc_set_encoder_dir(_context: &mut State, _oid: u8, _channel: u8, invert: u8) {
+        tmc_send(TmcRequest::SetEncoderDir { invert: invert != 0 });
+    }
+
     /// Trigger TMC4671 self-test diagnostic. Results are reported via
     /// defmt RTT logging. Full klipper_output reporting is Phase 2.
     #[klipper_command]
@@ -809,6 +820,17 @@ mod app {
                     "TMC4671 encoder: {} PPR -> {} quadrature counts",
                     ppr,
                     quadrature_ppr
+                );
+            }
+            TmcRequest::SetEncoderDir { invert } => {
+                use tmc4671::registers::*;
+                let mode = if invert { 1u32 << 12 } else { 0 };
+                if tmc.write_register(ABN_DECODER_MODE, mode).await.is_err() {
+                    defmt::error!("TMC4671 SPI write failed: ABN_DECODER_MODE");
+                }
+                defmt::info!(
+                    "TMC4671 encoder direction: {}",
+                    if invert { "reversed" } else { "default" }
                 );
             }
             TmcRequest::SelfTest => {
