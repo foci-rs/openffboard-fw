@@ -550,10 +550,22 @@ mod app {
         tmc_send(TmcRequest::SetCurrent { run_ma });
     }
 
-    /// Configure ABN encoder resolution. The firmware writes
-    /// ppr * 4 to ABN_DECODER_PPR (ABN quadrature counts all 4 edges).
+    /// Configure ABN encoder resolution and compute step width.
+    ///
+    /// `channel` maps to the stepper index (STEP0=0, STEP1=1) so the
+    /// correct EmulatedStepper gets the step_width. The TMC4671 position
+    /// PID operates on phi_e, not encoder counts:
+    ///   step_width = 65536 * pole_pairs / quadrature_ppr
     #[klipper_command]
-    pub fn tmc_set_encoder(_context: &mut State, _oid: u8, ppr: u32) {
+    pub fn tmc_set_encoder(context: &mut State, _oid: u8, channel: u8, ppr: u32) {
+        let quad_ppr = ppr * 4;
+        // 50 pole pairs for 200-step 2-phase stepper (MOTOR_TYPE=2).
+        let pole_pairs: u32 = 50;
+        let step_width = (65536u64 * pole_pairs as u64 / quad_ppr as u64) as i32;
+        if (channel as usize) < klipper_mcu::state::NUM_STEPPERS {
+            context.steppers[channel as usize].set_step_width(step_width);
+        }
+        defmt::info!("channel={} step_width={}", channel, step_width);
         tmc_send(TmcRequest::SetEncoder { ppr });
     }
 
@@ -816,10 +828,10 @@ mod app {
                 {
                     defmt::error!("TMC4671 SPI write failed: ABN_DECODER_PPR");
                 }
+                let step_width = 65536u64 * 50 / quadrature_ppr as u64;
                 defmt::info!(
-                    "TMC4671 encoder: {} PPR -> {} quadrature counts",
-                    ppr,
-                    quadrature_ppr
+                    "TMC4671 encoder: {} PPR, step_width={}",
+                    ppr, step_width
                 );
             }
             TmcRequest::SetEncoderDir { invert } => {
