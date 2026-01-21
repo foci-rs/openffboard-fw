@@ -856,8 +856,14 @@ mod app {
     /// On startup, reads the TMC4671 chip identification register to verify
     /// SPI communication. Then processes register read/write requests from
     /// the protocol handler via the TMC request channel.
-    #[task(priority = 1, local = [tmc, tmc_enable, tmc_rx])]
-    async fn tmc_control(ctx: tmc_control::Context) {
+    ///
+    /// The 1ms loop also advances the emulated stepper, converting queued
+    /// step commands into position target updates. This must run on a timer
+    /// rather than only on USB receive — Klipper sends queue_step commands
+    /// ahead of time and expects the MCU to process them at the scheduled
+    /// clock values, even when no USB traffic is arriving.
+    #[task(priority = 1, shared = [app_state], local = [tmc, tmc_enable, tmc_rx])]
+    async fn tmc_control(mut ctx: tmc_control::Context) {
         let tmc = ctx.local.tmc;
         let enable_pin = ctx.local.tmc_enable;
         let rx = ctx.local.tmc_rx;
@@ -952,8 +958,22 @@ mod app {
                 defmt::warn!("TMC4671 emergency disable");
             }
 
-            // Write position target to TMC4671 (1kHz, lockfree).
+            // Advance emulated stepper and write position target (1kHz).
+            //
+            // Processes all queued steps whose scheduled time has passed.
+            // Steps queued during calibration (~1.5s) are consumed instantly
+            // on the first tick — the TMC4671 position PID handles smooth
+            // motion to the target position.
             if motor_enabled {
+                let clock = DWT::cycle_count();
+                ctx.shared.app_state.lock(|state| {
+                    state.steppers[0].advance(clock);
+                    let target = state.steppers[0].position_target();
+                    STEPPER_POSITION_TARGET.store(
+                        target,
+                        core::sync::atomic::Ordering::Relaxed,
+                    );
+                });
                 let target = STEPPER_POSITION_TARGET.load(core::sync::atomic::Ordering::Relaxed);
                 let _ = tmc
                     .write_register(tmc4671::registers::PID_POSITION_TARGET, target as u32)
@@ -1387,13 +1407,6 @@ mod app {
                 let mut input = SliceInputBuffer::new(&local_buf[..len]);
                 ctx.shared.app_state.lock(|state| {
                     crate::KLIPPER_TRANSPORT.receive(&mut input, state);
-                    let clock = cortex_m::peripheral::DWT::cycle_count();
-                    state.steppers[0].advance(clock);
-                    let target = state.steppers[0].position_target();
-                    STEPPER_POSITION_TARGET.store(
-                        target,
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
                 });
                 let consumed = len - input.available();
                 klipper_usb::rx_consume(consumed);
