@@ -322,11 +322,13 @@ mod app {
 
     /// Set the direction for subsequent steps on a stepper.
     ///
-    /// Klipper convention: `dir == 0` means forward, `dir == 1` means backward.
+    /// In Klipper's stepcompress, `dir=0` means negative direction
+    /// and `dir=1` means positive direction. Map to our EmulatedStepper's
+    /// forward/backward accordingly.
     #[klipper_command]
     pub fn set_next_step_dir(context: &mut State, oid: u8, dir: u8) {
         if let Some(stepper) = context.stepper_mut(oid) {
-            stepper.set_direction(dir == 0);
+            stepper.set_direction(dir != 0);
         }
     }
 
