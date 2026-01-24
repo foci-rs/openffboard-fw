@@ -370,12 +370,23 @@ mod app {
         klipper_reply!(stepper_position, oid: u8 = oid, pos: i32 = pos);
     }
 
-    /// Stop a stepper on a trigger-sync event.
+    /// Link a stepper to a TrSync so the stepper stops when the TrSync triggers.
     ///
-    /// TrSync is not implemented in Phase 1; accept the command silently.
+    /// Multiple steppers can be linked to the same TrSync. When a trigger fires,
+    /// all linked steppers are stopped.
     #[klipper_command]
-    pub fn stepper_stop_on_trigger(context: &mut State, _oid: u8, _trsync_oid: u8) {
-        let _ = context;
+    pub fn stepper_stop_on_trigger(context: &mut State, oid: u8, trsync_oid: u8) {
+        if context
+            .stepper_trsync_links
+            .push((oid, trsync_oid))
+            .is_err()
+        {
+            defmt::error!(
+                "stepper_stop_on_trigger: link table full (oid={}, trsync_oid={})",
+                oid,
+                trsync_oid
+            );
+        }
     }
 
     // ---- Digital output commands (motor enable/disable) ----
@@ -426,68 +437,157 @@ mod app {
         }
     }
 
-    // ---- Stub commands for Klipper protocol compatibility ----
+    // ---- TrSync and Endstop commands ----
 
-    /// TrSync configuration stub (Phase 2).
-    #[klipper_command]
-    pub fn config_trsync(_oid: u8) {}
-
-    /// TrSync start stub (Phase 2).
+    /// Register a TrSync (trigger synchronization) object.
     ///
-    /// Immediately reports completion with the given expire_reason so
-    /// Klipper doesn't wait indefinitely for a trigger.
+    /// Allocates the next free TrSync slot and maps the Klipper OID to it.
+    #[klipper_command]
+    pub fn config_trsync(context: &mut State, oid: u8) {
+        let idx = context.trsync_by_oid.len();
+        if idx >= klipper_mcu::state::NUM_TRSYNC {
+            defmt::error!("config_trsync: no TrSync slots available");
+            return;
+        }
+        if context.trsync_by_oid.insert(oid, idx).is_err() {
+            defmt::error!("config_trsync: OID map full");
+            return;
+        }
+        defmt::info!("config_trsync: oid={} idx={}", oid, idx);
+    }
+
+    /// Arm a TrSync for synchronized triggering.
+    ///
+    /// Configures the reporting interval and timeout reason, then transitions
+    /// the TrSync to the Armed state.
     #[klipper_command]
     pub fn trsync_start(
-        _context: &mut State,
+        context: &mut State,
         oid: u8,
         report_clock: u32,
-        _report_ticks: u32,
+        report_ticks: u32,
         expire_reason: u8,
     ) {
-        klipper_reply!(
-            trsync_state,
-            oid: u8 = oid,
-            can_trigger: u8 = 0,
-            trigger_reason: u8 = expire_reason,
-            clock: u32 = report_clock
+        // Clear old stepper links for this trsync (matches C trsync_clear behavior).
+        // Without this, links accumulate across homing cycles and overflow the Vec.
+        context
+            .stepper_trsync_links
+            .retain(|&(_, ts_oid)| ts_oid != oid);
+        if let Some(ts) = context.trsync_mut(oid) {
+            ts.arm(report_clock, report_ticks, expire_reason);
+        }
+    }
+
+    /// Update the expiry deadline for a TrSync.
+    ///
+    /// The TrSync will auto-trigger with the configured expire_reason if
+    /// the clock reaches this value before a manual trigger.
+    #[klipper_command]
+    pub fn trsync_set_timeout(context: &mut State, oid: u8, clock: u32) {
+        if let Some(ts) = context.trsync_mut(oid) {
+            ts.set_timeout(clock);
+        }
+    }
+
+    /// Manually trigger a TrSync with the given reason code.
+    ///
+    /// If the trigger is accepted (TrSync was Armed), stops all steppers
+    /// linked to this TrSync OID via stepper_stop_on_trigger.
+    #[klipper_command]
+    pub fn trsync_trigger(context: &mut State, oid: u8, reason: u8) {
+        let accepted = context
+            .trsync_mut(oid)
+            .map(|ts| ts.trigger(reason))
+            .unwrap_or(false);
+        if accepted {
+            stop_linked_steppers(context, oid);
+        }
+    }
+
+    /// Stop all steppers linked to the given TrSync OID.
+    ///
+    /// Iterates `stepper_trsync_links` and calls `stop()` on each stepper
+    /// whose entry matches `trsync_oid`. Uses direct field access for split
+    /// borrows (links + steppers_by_oid are read, steppers array is written).
+    fn stop_linked_steppers(state: &mut State, trsync_oid: u8) {
+        for i in 0..state.stepper_trsync_links.len() {
+            let (stepper_oid, linked_trsync) = state.stepper_trsync_links[i];
+            if linked_trsync == trsync_oid {
+                if let Some(&s_idx) = state.steppers_by_oid.get(&stepper_oid) {
+                    state.steppers[s_idx].stop();
+                }
+            }
+        }
+    }
+
+    /// Register an endstop object.
+    ///
+    /// Allocates the next free Endstop slot and maps the Klipper OID to it.
+    /// GPIO pin configuration is deferred to Task 6; the pin number is accepted
+    /// for protocol compatibility but not used for hardware access yet.
+    #[klipper_command]
+    pub fn config_endstop(context: &mut State, oid: u8, _pin: u8, _pull_up: u8) {
+        let idx = context.endstop_by_oid.len();
+        if idx >= klipper_mcu::state::NUM_ENDSTOPS {
+            defmt::error!("config_endstop: no endstop slots available");
+            return;
+        }
+        if context.endstop_by_oid.insert(oid, idx).is_err() {
+            defmt::error!("config_endstop: OID map full");
+            return;
+        }
+        defmt::info!(
+            "config_endstop: oid={} idx={} (pin config deferred)",
+            oid,
+            idx
         );
     }
 
-    /// TrSync timeout stub (Phase 2).
-    #[klipper_command]
-    pub fn trsync_set_timeout(_oid: u8, _clock: u32) {}
-
-    /// TrSync trigger stub (Phase 2).
-    #[klipper_command]
-    pub fn trsync_trigger(_oid: u8, _reason: u8) {}
-
-    /// Endstop configuration stub.
-    #[klipper_command]
-    pub fn config_endstop(_oid: u8, _pin: u8, _pull_up: u8) {}
-
-    /// Endstop homing stub.
+    /// Arm an endstop for homing.
+    ///
+    /// Configures sampling parameters and links to a TrSync for trigger
+    /// notification. Actual GPIO sampling runs in the tmc_control 1ms loop.
     #[klipper_command]
     #[allow(clippy::too_many_arguments)]
     pub fn endstop_home(
-        _oid: u8,
-        _clock: u32,
-        _sample_ticks: u32,
-        _sample_count: u8,
-        _rest_ticks: u32,
-        _pin_value: u8,
-        _trsync_oid: u8,
-        _trigger_reason: u8,
+        context: &mut State,
+        oid: u8,
+        clock: u32,
+        sample_ticks: u32,
+        sample_count: u8,
+        rest_ticks: u32,
+        pin_value: u8,
+        trsync_oid: u8,
+        trigger_reason: u8,
     ) {
+        if let Some(endstop) = context.endstop_mut(oid) {
+            endstop.start_homing(
+                clock,
+                sample_ticks,
+                sample_count,
+                rest_ticks,
+                pin_value != 0,
+                trsync_oid,
+                trigger_reason,
+            );
+        }
     }
 
-    /// Reply with endstop state (always "not triggered").
+    /// Query the current state of an endstop.
+    ///
+    /// Returns homing status, next sample clock, and current pin value.
+    /// Pin value is always 0 until GPIO reading is implemented in Task 6.
     #[klipper_command]
-    pub fn endstop_query_state(_context: &mut State, oid: u8) {
+    pub fn endstop_query_state(context: &mut State, oid: u8) {
+        let (homing, next_clock) = context
+            .endstop(oid)
+            .map(|e| e.query_state())
+            .unwrap_or((false, 0));
         klipper_reply!(
             endstop_state,
             oid: u8 = oid,
-            homing: u8 = 0,
-            next_clock: u32 = 0,
+            homing: u8 = u8::from(homing),
+            next_clock: u32 = next_clock,
             pin_value: u8 = 0
         );
     }
@@ -514,7 +614,6 @@ mod app {
 
     // ---- TMC4671 register access commands ----
 
-    /// Send a request to the tmc_control task.
     /// Send a request to the tmc_control task.
     fn tmc_send(req: TmcRequest) {
         critical_section::with(|cs| {
@@ -1082,6 +1181,63 @@ mod app {
                     .write_register(tmc4671::registers::PID_POSITION_TARGET, target as u32)
                     .await;
             }
+
+            // TrSync: check timeouts and send periodic status reports.
+            //
+            // Runs every 1ms tick. For each active TrSync:
+            // - check_timeout: auto-triggers if the expiry clock has passed
+            // - report_due: sends trsync_state to the host at the configured interval
+            //
+            // Split into two passes to satisfy the borrow checker: first collect
+            // OID-index pairs from the map, then process each TrSync using direct
+            // field access (split borrows on State's distinct fields).
+            {
+                use klipper_mcu::trsync::TrSyncState;
+                let now_clock = DWT::cycle_count();
+                ctx.shared.app_state.lock(|state| {
+                    // Collect OID-index pairs (max NUM_TRSYNC = 4)
+                    let mut pairs: [(u8, usize); klipper_mcu::state::NUM_TRSYNC] =
+                        [(0, 0); klipper_mcu::state::NUM_TRSYNC];
+                    let count = state.trsync_by_oid.len();
+                    for (i, (&oid, &idx)) in state.trsync_by_oid.iter().enumerate() {
+                        pairs[i] = (oid, idx);
+                    }
+
+                    for &(oid, idx) in &pairs[..count] {
+                        // Check timeout — if expired, stop linked steppers
+                        if state.trsync[idx].check_timeout(now_clock) {
+                            for &(stepper_oid, linked_trsync) in state.stepper_trsync_links.iter() {
+                                if linked_trsync == oid {
+                                    if let Some(&s_idx) = state.steppers_by_oid.get(&stepper_oid) {
+                                        state.steppers[s_idx].stop();
+                                    }
+                                }
+                            }
+                        }
+
+                        // Send periodic status report if due
+                        if state.trsync[idx].report_due(now_clock) {
+                            let (can_trigger, trigger_reason) = match state.trsync[idx].state() {
+                                TrSyncState::Idle => (0u8, 0u8),
+                                TrSyncState::Armed => (1u8, 0u8),
+                                TrSyncState::Triggered(reason) => (0u8, reason),
+                            };
+                            klipper_reply!(
+                                trsync_state,
+                                oid: u8 = oid,
+                                can_trigger: u8 = can_trigger,
+                                trigger_reason: u8 = trigger_reason,
+                                clock: u32 = now_clock
+                            );
+                        }
+                    }
+                });
+            }
+
+            // Endstop: sample pins when homing.
+            // Actual GPIO pin reading is deferred to Task 6. For now, endstops
+            // are armed but never trigger from pin state (only TrSync timeout
+            // or manual trigger will end the homing cycle).
 
             // Poll STATUS_FLAGS every ~1 second for warning-level flags.
             // Critical faults (PLL lost, ADC clipped) are handled by EXTI.
