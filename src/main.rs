@@ -139,6 +139,28 @@ mod app {
     #[klipper_constant]
     const STATS_SUMSQ_BASE: u32 = 256;
 
+    // ---- Reserved pin constants ----
+    // Tells the Klipper host which pins are firmware-owned and must not be
+    // assigned to user-facing config sections (steppers, heaters, fans, etc.).
+
+    #[klipper_constant]
+    const RESERVE_PINS_USB: &str = "PA9,PA11,PA12";
+
+    #[klipper_constant]
+    const RESERVE_PINS_SPI: &str = "PA4,PA5,PA6,PA7";
+
+    #[klipper_constant]
+    const RESERVE_PINS_TMC: &str = "PE7,PE8,PE10,PE12";
+
+    #[klipper_constant]
+    const RESERVE_PINS_LED: &str = "PD7,PE0,PE1";
+
+    #[klipper_constant]
+    const RESERVE_PINS_SWD: &str = "PA13,PA14";
+
+    #[klipper_constant]
+    const RESERVE_PINS_DRV: &str = "PB0,PB1,PC4,PC5";
+
     // ---- Klipper command handlers ----
 
     #[klipper_command(in_shutdown)]
@@ -199,6 +221,10 @@ mod app {
             return;
         }
         context.reset();
+        // Clear firmware-side endstop pin assignments
+        for pin_id in &ENDSTOP_PIN_IDS {
+            pin_id.store(0xFF, core::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     #[klipper_command]
@@ -437,6 +463,94 @@ mod app {
         }
     }
 
+    // ---- GPIO infrastructure for endstop pin reading ----
+
+    /// Number of GPIO ports (A..E) on the STM32F407.
+    const GPIO_NUM_PORTS: u8 = 5;
+
+    /// Pin enum value representing the first non-GPIO virtual pin.
+    /// Pin enum: PA0=0..PA15=15, PB0=16..PB15=31, ..., PE0=64..PE15=79.
+    const GPIO_MAX_PIN_VALUE: u8 = GPIO_NUM_PORTS * 16;
+
+    /// Per-endstop pin identifier (enum value from `config_endstop`).
+    /// `0xFF` means no pin configured.
+    static ENDSTOP_PIN_IDS: [core::sync::atomic::AtomicU8; klipper_mcu::state::NUM_ENDSTOPS] = [
+        core::sync::atomic::AtomicU8::new(0xFF),
+        core::sync::atomic::AtomicU8::new(0xFF),
+        core::sync::atomic::AtomicU8::new(0xFF),
+        core::sync::atomic::AtomicU8::new(0xFF),
+    ];
+
+    /// Get the PAC GPIO port for the given port index (0=A, 1=B, ..., 4=E).
+    ///
+    /// Returns `None` for out-of-range port indices.
+    fn gpio_port(port: u8) -> Option<embassy_stm32::pac::gpio::Gpio> {
+        match port {
+            0 => Some(embassy_stm32::pac::GPIOA),
+            1 => Some(embassy_stm32::pac::GPIOB),
+            2 => Some(embassy_stm32::pac::GPIOC),
+            3 => Some(embassy_stm32::pac::GPIOD),
+            4 => Some(embassy_stm32::pac::GPIOE),
+            _ => None,
+        }
+    }
+
+    /// Configure a GPIO pin as input with optional pull-up.
+    ///
+    /// Enables the GPIO port clock, sets the pin to input mode, and configures
+    /// the pull-up/pull-down resistor. Uses raw PAC register access to avoid
+    /// the type-erasure problem with embassy-stm32 `Input` pins.
+    ///
+    /// `pin_value` is the pin enum value (PA0=0, PB0=16, etc.).
+    fn gpio_configure_input(pin_value: u8, pull_up: bool) {
+        let port_idx = pin_value / 16;
+        let pin_idx = (pin_value % 16) as usize;
+
+        // Enable GPIO port clock on AHB1
+        let rcc = embassy_stm32::pac::RCC;
+        rcc.ahb1enr().modify(|w| match port_idx {
+            0 => w.set_gpioaen(true),
+            1 => w.set_gpioben(true),
+            2 => w.set_gpiocen(true),
+            3 => w.set_gpioden(true),
+            4 => w.set_gpioeen(true),
+            _ => {}
+        });
+        // Brief delay for clock to stabilize
+        cortex_m::asm::delay(2);
+
+        if let Some(gpio) = gpio_port(port_idx) {
+            use embassy_stm32::pac::gpio::vals;
+            // Set pin as input
+            gpio.moder()
+                .modify(|w| w.set_moder(pin_idx, vals::Moder::INPUT));
+            // Configure pull-up or floating
+            let pull = if pull_up {
+                vals::Pupdr::PULL_UP
+            } else {
+                vals::Pupdr::FLOATING
+            };
+            gpio.pupdr().modify(|w| w.set_pupdr(pin_idx, pull));
+        }
+    }
+
+    /// Read the current state of a GPIO pin.
+    ///
+    /// `pin_value` is the pin enum value (PA0=0, PB0=16, etc.).
+    /// Returns `false` if the pin value is out of range.
+    fn gpio_read_pin(pin_value: u8) -> bool {
+        if pin_value >= GPIO_MAX_PIN_VALUE {
+            return false;
+        }
+        let port_idx = pin_value / 16;
+        let pin_idx = (pin_value % 16) as usize;
+
+        gpio_port(port_idx).is_some_and(|gpio| {
+            use embassy_stm32::pac::gpio::vals;
+            gpio.idr().read().idr(pin_idx) == vals::Idr::HIGH
+        })
+    }
+
     // ---- TrSync and Endstop commands ----
 
     /// Register a TrSync (trigger synchronization) object.
@@ -523,10 +637,10 @@ mod app {
     /// Register an endstop object.
     ///
     /// Allocates the next free Endstop slot and maps the Klipper OID to it.
-    /// GPIO pin configuration is deferred to Task 6; the pin number is accepted
-    /// for protocol compatibility but not used for hardware access yet.
+    /// Configures the specified GPIO pin as input with optional pull-up
+    /// resistor for endstop switch reading.
     #[klipper_command]
-    pub fn config_endstop(context: &mut State, oid: u8, _pin: u8, _pull_up: u8) {
+    pub fn config_endstop(context: &mut State, oid: u8, pin: u8, pull_up: u8) {
         let idx = context.endstop_by_oid.len();
         if idx >= klipper_mcu::state::NUM_ENDSTOPS {
             defmt::error!("config_endstop: no endstop slots available");
@@ -536,11 +650,27 @@ mod app {
             defmt::error!("config_endstop: OID map full");
             return;
         }
-        defmt::info!(
-            "config_endstop: oid={} idx={} (pin config deferred)",
-            oid,
-            idx
-        );
+
+        // Configure GPIO pin as input (only for real GPIO pins, not virtual)
+        if pin < GPIO_MAX_PIN_VALUE {
+            gpio_configure_input(pin, pull_up != 0);
+            ENDSTOP_PIN_IDS[idx].store(pin, core::sync::atomic::Ordering::Relaxed);
+            defmt::info!(
+                "config_endstop: oid={} idx={} pin=P{}{}{}",
+                oid,
+                idx,
+                ['A', 'B', 'C', 'D', 'E'][(pin / 16) as usize],
+                pin % 16,
+                if pull_up != 0 { " (pull-up)" } else { "" }
+            );
+        } else {
+            defmt::info!(
+                "config_endstop: oid={} idx={} pin={} (virtual, no GPIO)",
+                oid,
+                idx,
+                pin
+            );
+        }
     }
 
     /// Arm an endstop for homing.
@@ -576,19 +706,31 @@ mod app {
     /// Query the current state of an endstop.
     ///
     /// Returns homing status, next sample clock, and current pin value.
-    /// Pin value is always 0 until GPIO reading is implemented in Task 6.
     #[klipper_command]
     pub fn endstop_query_state(context: &mut State, oid: u8) {
         let (homing, next_clock) = context
             .endstop(oid)
             .map(|e| e.query_state())
             .unwrap_or((false, 0));
+        // Read the live GPIO pin state for the endstop
+        let pin_state = context
+            .endstop_by_oid
+            .get(&oid)
+            .map(|&idx| {
+                let pin_id = ENDSTOP_PIN_IDS[idx].load(core::sync::atomic::Ordering::Relaxed);
+                if pin_id != 0xFF {
+                    gpio_read_pin(pin_id)
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
         klipper_reply!(
             endstop_state,
             oid: u8 = oid,
             homing: u8 = u8::from(homing),
             next_clock: u32 = next_clock,
-            pin_value: u8 = 0
+            pin_value: u8 = u8::from(pin_state)
         );
     }
 
@@ -1234,10 +1376,75 @@ mod app {
                 });
             }
 
-            // Endstop: sample pins when homing.
-            // Actual GPIO pin reading is deferred to Task 6. For now, endstops
-            // are armed but never trigger from pin state (only TrSync timeout
-            // or manual trigger will end the homing cycle).
+            // Endstop: sample configured GPIO pins when homing is active.
+            //
+            // For each active endstop whose sample clock has been reached, read
+            // the GPIO pin state and feed it to the endstop state machine. If
+            // the endstop triggers, fire the linked TrSync and stop steppers.
+            {
+                use klipper_mcu::endstop::SampleResult;
+                let now_clock = DWT::cycle_count();
+                ctx.shared.app_state.lock(|state| {
+                    // Collect OID-index pairs (max NUM_ENDSTOPS = 4)
+                    let mut pairs: [(u8, usize); klipper_mcu::state::NUM_ENDSTOPS] =
+                        [(0, 0); klipper_mcu::state::NUM_ENDSTOPS];
+                    let count = state.endstop_by_oid.len();
+                    for (i, (&oid, &idx)) in state.endstop_by_oid.iter().enumerate() {
+                        pairs[i] = (oid, idx);
+                    }
+
+                    for &(oid, idx) in &pairs[..count] {
+                        if !state.endstops[idx].is_homing() {
+                            continue;
+                        }
+
+                        // Check if it is time for the next sample
+                        let next = state.endstops[idx].next_sample_clock();
+                        let elapsed = now_clock.wrapping_sub(next);
+                        if elapsed > 0x8000_0000 {
+                            // next_sample_clock is in the future; skip
+                            continue;
+                        }
+
+                        // Read GPIO pin state
+                        let pin_id =
+                            ENDSTOP_PIN_IDS[idx].load(core::sync::atomic::Ordering::Relaxed);
+                        let pin_state = if pin_id != 0xFF {
+                            gpio_read_pin(pin_id)
+                        } else {
+                            false
+                        };
+
+                        match state.endstops[idx].sample(pin_state, now_clock) {
+                            SampleResult::Triggered { reason, trsync_oid } => {
+                                // Fire TrSync trigger and stop linked steppers
+                                if let Some(&ts_idx) = state.trsync_by_oid.get(&trsync_oid) {
+                                    state.trsync[ts_idx].trigger(reason);
+                                    // Stop linked steppers
+                                    for &(stepper_oid, linked_trsync) in
+                                        state.stepper_trsync_links.iter()
+                                    {
+                                        if linked_trsync == trsync_oid {
+                                            if let Some(&s_idx) =
+                                                state.steppers_by_oid.get(&stepper_oid)
+                                            {
+                                                state.steppers[s_idx].stop();
+                                            }
+                                        }
+                                    }
+                                }
+                                defmt::info!(
+                                    "endstop oid={} triggered: reason={} trsync_oid={}",
+                                    oid,
+                                    reason,
+                                    trsync_oid
+                                );
+                            }
+                            SampleResult::Continue | SampleResult::NotHoming => {}
+                        }
+                    }
+                });
+            }
 
             // Poll STATUS_FLAGS every ~1 second for warning-level flags.
             // Critical faults (PLL lost, ADC clipped) are handled by EXTI.
