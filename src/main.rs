@@ -56,6 +56,9 @@ mod app {
             addr: u8,
         },
         SetEnable(bool),
+        Calibrate {
+            oid: u8,
+        },
         #[cfg(feature = "dev")]
         Init,
         #[cfg(feature = "dev")]
@@ -835,6 +838,15 @@ mod app {
         tmc_send(TmcRequest::SelfTest);
     }
 
+    /// Calibrate the TMC4671: ADC offset calibration, encoder alignment,
+    /// and closed-loop entry. Sends `foci_calibrate_response` when complete.
+    ///
+    /// Must be called before motor enable. Rejected if motor is already enabled.
+    #[klipper_command]
+    pub fn foci_calibrate(_context: &mut State, oid: u8) {
+        tmc_send(TmcRequest::Calibrate { oid });
+    }
+
     /// SPI transfer stub (returns empty response).
     #[klipper_command]
     pub fn spi_transfer(_oid: u8, _data: &[u8]) {
@@ -1134,6 +1146,9 @@ mod app {
             TmcRequest::SetEnable(_) => {
                 defmt::warn!("handle_tmc_request: SetEnable handled by main loop");
             }
+            TmcRequest::Calibrate { .. } => {
+                defmt::warn!("handle_tmc_request: Calibrate handled by main loop");
+            }
             #[cfg(feature = "dev")]
             TmcRequest::Init => {
                 defmt::warn!("handle_tmc_request: Init handled by main loop");
@@ -1213,6 +1228,10 @@ mod app {
         // enable sequence (ADC cal, encoder alignment, closed-loop entry) completes.
         let mut motor_enabled = false;
 
+        // Track whether calibration has been completed. Motor enable is
+        // rejected unless calibrated. Reset on disable or shutdown.
+        let mut calibrated = false;
+
         // Counter for 1s STATUS_FLAGS poll (1000 * 1ms ticks).
         let mut status_poll_counter: u16 = 0;
 
@@ -1228,19 +1247,23 @@ mod app {
                 Either::First(Ok(req)) => match req {
                     TmcRequest::SetEnable(enabled) => {
                         if enabled {
-                            {
-                                let mut delay_ctx = ChannelDrainDelay {
-                                    rx: &mut *rx,
-                                    tmc: &mut *tmc,
-                                };
-                                tmc_adc_calibrate(&mut delay_ctx, enable_pin).await;
-                                tmc_align_encoder(&mut delay_ctx).await;
-                                tmc_enter_closedloop(delay_ctx.tmc).await;
+                            if !calibrated {
+                                defmt::error!("Motor enable rejected: not calibrated");
+                                ctx.shared.app_state.lock(|state| {
+                                    if enter_shutdown(state) {
+                                        klipper_shutdown!(
+                                            "Motor enable rejected: not calibrated",
+                                            DWT::cycle_count()
+                                        );
+                                    }
+                                });
+                                continue;
                             }
                             motor_enabled = true;
-                            defmt::info!("TMC4671 motor enabled: closed-loop position mode");
+                            defmt::info!("Motor enabled (calibrated)");
                         } else {
                             motor_enabled = false;
+                            calibrated = false;
                             use tmc4671::registers::*;
                             let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
                             let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
@@ -1249,6 +1272,45 @@ mod app {
                             enable_pin.set_low();
                             defmt::info!("TMC4671 motor disabled");
                         }
+                    }
+                    TmcRequest::Calibrate { oid } => {
+                        // Status codes for foci_calibrate_response
+                        const STATUS_OK: u8 = 0;
+                        const STATUS_ALREADY_ENABLED: u8 = 5;
+
+                        if motor_enabled {
+                            defmt::warn!("foci_calibrate rejected: motor already enabled");
+                            klipper_reply!(
+                                foci_calibrate_response,
+                                oid: u8 = oid,
+                                status: u8 = STATUS_ALREADY_ENABLED,
+                                adc_i0: u16 = 0,
+                                adc_i1: u16 = 0,
+                                encoder_count: u32 = 0
+                            );
+                            continue;
+                        }
+                        // Run the three-stage calibration sequence
+                        {
+                            let mut delay_ctx = ChannelDrainDelay {
+                                rx: &mut *rx,
+                                tmc: &mut *tmc,
+                            };
+                            tmc_adc_calibrate(&mut delay_ctx, enable_pin).await;
+                            tmc_align_encoder(&mut delay_ctx).await;
+                            tmc_enter_closedloop(delay_ctx.tmc).await;
+                        }
+                        calibrated = true;
+
+                        defmt::info!("foci_calibrate complete: oid={}", oid);
+                        klipper_reply!(
+                            foci_calibrate_response,
+                            oid: u8 = oid,
+                            status: u8 = STATUS_OK,
+                            adc_i0: u16 = 0,
+                            adc_i1: u16 = 0,
+                            encoder_count: u32 = 0
+                        );
                     }
                     #[cfg(feature = "dev")]
                     TmcRequest::Init => {
@@ -1277,6 +1339,7 @@ mod app {
             // the fault to Klipper so the host knows the MCU is down.
             if TMC_DISABLE_SIGNAL.try_take().is_some() {
                 motor_enabled = false;
+                calibrated = false;
                 enable_pin.set_low();
                 // Read STATUS_FLAGS to identify the fault cause.
                 let flags = tmc
