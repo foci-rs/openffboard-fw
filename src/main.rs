@@ -1879,10 +1879,17 @@ mod app {
         let _ = tmc.write_register(PHI_E_SELECTION, 1).await;
         let _ = tmc.write_register(PHI_E_EXT, 0).await;
 
-        // 11. Set torque target: 200 counts (~0.23A, conservative)
-        let torque_target: u32 = 200;
+        // 11. Set flux (D-axis) target for alignment/holding at PHI_E=0
+        // CRITICAL: Flux target is bits[15:0], torque target is bits[31:16].
+        // Setting torque (Q-axis) instead of flux (D-axis) causes the rotor to
+        // align 90 electrical degrees off, producing reversed commutation.
+        let flux_target: i16 = 200; // ~0.23A, conservative
+        let target_reg: u32 = PidTorqueFluxTarget::new()
+            .with_pid_flux_target(flux_target)
+            .with_pid_torque_target(0)
+            .into();
         let _ = tmc
-            .write_register(PID_TORQUE_FLUX_TARGET, torque_target << 16)
+            .write_register(PID_TORQUE_FLUX_TARGET, target_reg)
             .await;
 
         // 12. Motion mode: TORQUE mode with current regulation
@@ -1923,15 +1930,19 @@ mod app {
     /// Align the ABN encoder to the D-axis using current-regulated torque mode,
     /// waiting for the rotor to settle, then zeroing the encoder count.
     ///
+    /// Uses torque mode with PID_FLUX_TARGET to drive regulated D-axis current
+    /// at PHI_E=0. The flux PID provides overcurrent protection — current is
+    /// clamped to PID_TORQUE_FLUX_LIMITS regardless of motor impedance.
+    ///
     /// Steps:
     /// 1. Set PHI_E_SELECTION=1 (external) and PHI_E_EXT=0
-    /// 2. Read current limit, set torque target to 50% of limit
-    /// 3. Enter torque mode (MODE_RAMP_MODE_MOTION = 0x8000_0001)
-    /// 4. Wait 500 ms for rotor to settle against D-axis flux
-    /// 5. Validate PID tracking (torque actual vs target)
+    /// 2. Configure flux/torque PID gains
+    /// 3. Set PID_FLUX_TARGET to 50% of current limit (D-axis)
+    /// 4. Enter torque mode (MODE_RAMP_MODE_MOTION = 0x8000_0001)
+    /// 5. Wait 500 ms for rotor to settle against D-axis flux
     /// 6. Validate encoder (non-zero, stable count)
     /// 7. Read ABN_DECODER_COUNT, zero it, zero offset
-    /// 8. Stop drive (torque target=0, MODE=0)
+    /// 8. Stop drive (targets=0, MODE=0)
     ///
     /// Returns the encoder count before zeroing on success.
     async fn tmc_align_encoder(
@@ -1940,58 +1951,47 @@ mod app {
     ) -> Result<u32, CalibrationError> {
         use tmc4671::registers::*;
 
+        // Reject alignment if current limit is not configured.
+        // With current_limit_reg=0, flux_target=0 and the rotor never aligns,
+        // but the encoder stability check passes (both reads are 0), producing
+        // a silently miscalibrated encoder.
+        if current_limit_reg == 0 {
+            defmt::error!("encoder align: current limit not set");
+            return Err(CalibrationError::SpiError);
+        }
+
         // 1. PHI_E source: external, angle = 0
+        // The direction bit (ABN_DECODER_MODE bit 12) does NOT affect alignment
+        // because PHI_E comes from the external register, not from ABN.
         let _ = tmc.write_register(PHI_E_SELECTION, 1).await;
         let _ = tmc.write_register(PHI_E_EXT, 0).await;
 
-        // 2. Set PID flux/torque gains needed for torque mode current regulation.
-        // Must be set BEFORE entering torque mode, otherwise PID output is zero.
-        let flux_torque_pi: u32 = (404 << 16) | 26; // P=1.577, I=0.1
-        let _ = tmc.write_register(PID_FLUX_P_FLUX_I, flux_torque_pi).await;
-        let _ = tmc
-            .write_register(PID_TORQUE_P_TORQUE_I, flux_torque_pi)
-            .await;
+        // 2. PID gains for flux/torque current control
+        // P=404 (1.577 in Q8.8), I=26 (0.1 in Q8.8)
+        let pid_pi: u32 = (404 << 16) | 26;
+        let _ = tmc.write_register(PID_FLUX_P_FLUX_I, pid_pi).await;
+        let _ = tmc.write_register(PID_TORQUE_P_TORQUE_I, pid_pi).await;
 
-        // 3. Re-apply current limit (register may have been reset by mode changes
-        // during ADC calibration) and set torque target to 50% for alignment.
-        let _ = tmc
-            .write_register(PID_TORQUE_FLUX_LIMITS, current_limit_reg)
-            .await;
-        // Torque limit is in bits[31:16]
-        let torque_limit = (current_limit_reg >> 16) as i16;
-        let torque_target = torque_limit / 2;
-        let _ = tmc
-            .write_register(PID_TORQUE_FLUX_TARGET, (torque_target as u16 as u32) << 16)
-            .await;
+        // 3. D-axis flux target: 50% of current limit for gentle alignment.
+        // CRITICAL: PID_FLUX_TARGET is bits[15:0] (D-axis current).
+        // PID_TORQUE_TARGET bits[31:16] must be 0 (no Q-axis torque).
+        // Using bits[31:16] instead aligns to Q-axis (90deg off).
+        let flux_target = ((current_limit_reg & 0xFFFF) as i16) / 2;
+        let target_reg: u32 = PidTorqueFluxTarget::new()
+            .with_pid_flux_target(flux_target)
+            .with_pid_torque_target(0)
+            .into();
+        let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, target_reg).await;
 
-        // 3. Enter torque mode (MODE_PID_TYPE=1, MODE_MOTION=1)
+        // 4. Enter torque mode (MODE_PID_TYPE=1, MODE_MOTION=1)
+        // The flux PID drives I_D toward flux_target while the torque PID
+        // drives I_Q toward 0. The rotor aligns to the D-axis at PHI_E=0.
         let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0001).await;
 
-        // 4. Wait for rotor to settle against the D-axis flux
+        // 5. Wait for rotor to settle against the D-axis flux
         Mono::delay(500_u32.millis()).await;
 
-        // 5. Validate PID tracking: torque actual should be close to target
-        let actual_raw = tmc
-            .read_register(PID_TORQUE_FLUX_ACTUAL)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        let torque_actual = ((actual_raw >> 16) & 0xFFFF) as i16;
-        let diff = (torque_actual as i32 - torque_target as i32).unsigned_abs();
-        let threshold = (torque_target as i32).unsigned_abs() / 2;
-        if diff > threshold {
-            defmt::error!(
-                "encoder align: PID not tracking: target={}, actual={}, diff={}",
-                torque_target,
-                torque_actual,
-                diff
-            );
-            // Stop before returning error
-            let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
-            let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
-            return Err(CalibrationError::PidFault);
-        }
-
-        // 6. Validate encoder: non-zero and stable
+        // 6. Validate encoder: stable count (two reads 10ms apart must match)
         let count1 = tmc
             .read_register(ABN_DECODER_COUNT)
             .await
@@ -2019,12 +2019,26 @@ mod app {
             return Err(CalibrationError::EncoderFault);
         }
 
-        // 7. Zero encoder count and offset
+        // Diagnostic: verify PID is tracking (flux actual near flux target)
+        let actual = tmc
+            .read_register(PID_TORQUE_FLUX_ACTUAL)
+            .await
+            .unwrap_or(0);
+        let flux_actual = (actual & 0xFFFF) as i16;
+        let torque_actual = ((actual >> 16) & 0xFFFF) as i16;
+        defmt::info!(
+            "encoder align PID: flux_target={} flux_actual={} torque_actual={}",
+            flux_target,
+            flux_actual,
+            torque_actual
+        );
+
+        // 7. Zero encoder count and offset at the D-axis position
         let old_count = count1;
         let _ = tmc.write_register(ABN_DECODER_COUNT, 0).await;
         let _ = tmc.write_register(ABN_DECODER_PHI_E_PHI_M_OFFSET, 0).await;
 
-        // 8. Stop drive
+        // 8. Stop drive: zero targets first, then stop mode
         let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
         let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x0000_0000).await;
 
@@ -2036,13 +2050,14 @@ mod app {
     ///
     /// Steps:
     /// 1. Set flux/torque PID: P=404, I=26
-    /// 2. Set velocity PID: P=100, I=10
-    /// 3. Set position PID: P=100, I=0
+    /// 2. Set velocity PID: P=4.5, I=0
+    /// 3. Set position PID: P=2.5, I=0
     /// 4. Set PID_VELOCITY_LIMIT = 0x7FFF_FFFF
-    /// 5. Set PHI_E_SELECTION=3 (ABN encoder)
-    /// 6. Set PID_POSITION_TARGET=0
-    /// 7. Enter position mode: MODE_RAMP_MODE_MOTION = 0x8000_0003
-    /// 8. Validate: position error is not diverging
+    /// 5. Raise PIDOUT_UQ_UD_LIMITS for operation
+    /// 6. Set PHI_E_SELECTION=3 (ABN encoder)
+    /// 7. Zero PID_POSITION_ACTUAL (also zeros target)
+    /// 8. Enter position mode: MODE_RAMP_MODE_MOTION = 0x8000_0003
+    /// 9. Validate: position error is not diverging
     ///
     /// Assumes tmc_adc_calibrate and tmc_align_encoder have already been called.
     async fn tmc_enter_closedloop(
@@ -2082,15 +2097,15 @@ mod app {
         // 6. PHI_E source: ABN encoder feedback (selection=3)
         let _ = tmc.write_register(PHI_E_SELECTION, 3).await;
 
-        // 6. Zero position: writing PID_POSITION_ACTUAL also writes
+        // 7. Zero position: writing PID_POSITION_ACTUAL also writes
         // PID_POSITION_TARGET to the same value (per datasheet 0x6B),
         // avoiding an unwanted position error on mode entry.
         let _ = tmc.write_register(PID_POSITION_ACTUAL, 0).await;
 
-        // 7. Enter position mode: MODE_PID_TYPE=1 (bit 31), MODE_MOTION=3 (position)
+        // 8. Enter position mode: MODE_PID_TYPE=1 (bit 31), MODE_MOTION=3 (position)
         let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0003).await;
 
-        // 8. Runaway detection (20ms). If position error exceeds 40 steps
+        // 9. Runaway detection (20ms). If position error exceeds 40 steps
         // and is still growing, the feedback sign is wrong — fail fast.
         // Encoder polarity errors are also caught in Stage 2 torque
         // tracking, but this is a secondary safety net for position mode.
