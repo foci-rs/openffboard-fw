@@ -255,7 +255,10 @@ mod app {
     pub fn config_reset(context: &mut State) {
         if !context.mcu_state.is_shutdown() {
             if enter_shutdown(context) {
-                klipper_shutdown!("config_reset only available when shutdown", DWT::cycle_count());
+                klipper_shutdown!(
+                    "config_reset only available when shutdown",
+                    DWT::cycle_count()
+                );
             }
             return;
         }
@@ -867,7 +870,9 @@ mod app {
     /// Depends on motor/encoder wiring — not board-specific.
     #[klipper_command]
     pub fn tmc_set_encoder_dir(_context: &mut State, _oid: u8, _channel: u8, invert: u8) {
-        tmc_send(TmcRequest::SetEncoderDir { invert: invert != 0 });
+        tmc_send(TmcRequest::SetEncoderDir {
+            invert: invert != 0,
+        });
     }
 
     /// Trigger TMC4671 self-test diagnostic. Results are reported via
@@ -1048,7 +1053,7 @@ mod app {
                 base_addr: 0x5000_0000,
                 irq_num: 67,
                 trdt: 6,
-                vbus_detection: false,  // F407 uses NOVBUSSENS, not GOTGCTL BVAL
+                vbus_detection: false, // F407 uses NOVBUSSENS, not GOTGCTL BVAL
                 double_buffer_tx: true,
                 vid: 0x1D50,
                 pid: 0x614E,
@@ -1139,10 +1144,7 @@ mod app {
                     defmt::error!("TMC4671 SPI write failed: ABN_DECODER_PPR");
                 }
                 let step_width = 65536u64 * 50 / quadrature_ppr as u64;
-                defmt::info!(
-                    "TMC4671 encoder: {} PPR, step_width={}",
-                    ppr, step_width
-                );
+                defmt::info!("TMC4671 encoder: {} PPR, step_width={}", ppr, step_width);
             }
             TmcRequest::SetEncoderDir { invert } => {
                 use tmc4671::registers::*;
@@ -1287,16 +1289,34 @@ mod app {
                     TmcRequest::SetEnable(enabled) => {
                         if enabled {
                             if !calibrated {
-                                defmt::error!("Motor enable rejected: not calibrated");
-                                ctx.shared.app_state.lock(|state| {
-                                    if enter_shutdown(state) {
-                                        klipper_shutdown!(
-                                            "Motor enable rejected: not calibrated",
-                                            DWT::cycle_count()
-                                        );
+                                // Auto-calibrate: Klipper may send enable before
+                                // the Python module's foci_calibrate arrives due
+                                // to queue_digital_out timing. Run calibration
+                                // in-place instead of shutting down.
+                                let current_limit =
+                                    CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
+                                if current_limit == 0 {
+                                    defmt::error!("Motor enable rejected: current limit not set");
+                                    continue;
+                                }
+                                defmt::info!("Auto-calibrating on enable");
+                                match tmc_run_calibration(tmc, enable_pin, current_limit).await {
+                                    Ok(_) => {
+                                        calibrated = true;
                                     }
-                                });
-                                continue;
+                                    Err(e) => {
+                                        defmt::error!("Auto-calibration failed: {}", e);
+                                        ctx.shared.app_state.lock(|state| {
+                                            if enter_shutdown(state) {
+                                                klipper_shutdown!(
+                                                    "Calibration failed on enable",
+                                                    DWT::cycle_count()
+                                                );
+                                            }
+                                        });
+                                        continue;
+                                    }
+                                }
                             }
                             motor_enabled = true;
                             enable_pin.set_high();
@@ -1310,6 +1330,13 @@ mod app {
                             let _ = tmc.write_register(UQ_UD_EXT, 0).await;
                             let _ = tmc.write_register(PWM_SV_CHOP, 0).await;
                             enable_pin.set_low();
+                            // Zero stepper accumulator to prevent stale steps
+                            // from causing a violent jump on recalibration.
+                            // Calibration zeros the TMC4671 PID_POSITION_ACTUAL,
+                            // so the firmware-side accumulator must match.
+                            ctx.shared.app_state.lock(|state| {
+                                state.steppers[0].reset_position();
+                            });
                             defmt::info!("TMC4671 motor disabled");
                         }
                     }
@@ -1427,11 +1454,17 @@ mod app {
                 ctx.shared.app_state.lock(|state| {
                     if flags & NOT_PLL_LOCKED != 0 {
                         if enter_shutdown(state) {
-                            klipper_shutdown!("TMC4671: PLL not locked (clock lost)", DWT::cycle_count());
+                            klipper_shutdown!(
+                                "TMC4671: PLL not locked (clock lost)",
+                                DWT::cycle_count()
+                            );
                         }
                     } else if flags & ADC_I_CLIPPED != 0 {
                         if enter_shutdown(state) {
-                            klipper_shutdown!("TMC4671: ADC current clipped (overcurrent)", DWT::cycle_count());
+                            klipper_shutdown!(
+                                "TMC4671: ADC current clipped (overcurrent)",
+                                DWT::cycle_count()
+                            );
                         }
                     } else if enter_shutdown(state) {
                         klipper_shutdown!("TMC4671 fault", DWT::cycle_count());
@@ -1453,10 +1486,7 @@ mod app {
                     queue_empty = state.steppers[0].move_queue_empty();
                     stepped = state.steppers[0].advance(clock);
                     let target = state.steppers[0].position_target();
-                    STEPPER_POSITION_TARGET.store(
-                        target,
-                        core::sync::atomic::Ordering::Relaxed,
-                    );
+                    STEPPER_POSITION_TARGET.store(target, core::sync::atomic::Ordering::Relaxed);
                 });
                 let target = STEPPER_POSITION_TARGET.load(core::sync::atomic::Ordering::Relaxed);
                 if stepped {
@@ -1888,9 +1918,7 @@ mod app {
             .with_pid_flux_target(flux_target)
             .with_pid_torque_target(0)
             .into();
-        let _ = tmc
-            .write_register(PID_TORQUE_FLUX_TARGET, target_reg)
-            .await;
+        let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, target_reg).await;
 
         // 12. Motion mode: TORQUE mode with current regulation
         // MODE_PID_TYPE=1 (bit 31), MODE_MOTION=1 (torque)
@@ -1937,9 +1965,9 @@ mod app {
     /// Steps:
     /// 1. Set PHI_E_SELECTION=1 (external) and PHI_E_EXT=0
     /// 2. Configure flux/torque PID gains
-    /// 3. Set PID_FLUX_TARGET to 50% of current limit (D-axis)
-    /// 4. Enter torque mode (MODE_RAMP_MODE_MOTION = 0x8000_0001)
-    /// 5. Wait 500 ms for rotor to settle against D-axis flux
+    /// 3. Enter torque mode with zero flux target
+    /// 4. Ramp PID_FLUX_TARGET from 0 to 50% of current limit over 500ms
+    /// 5. Hold at full target for 200ms settling
     /// 6. Validate encoder (non-zero, stable count)
     /// 7. Read ABN_DECODER_COUNT, zero it, zero offset
     /// 8. Stop drive (targets=0, MODE=0)
@@ -1960,9 +1988,10 @@ mod app {
             return Err(CalibrationError::SpiError);
         }
 
-        // 1. PHI_E source: external, angle = 0
-        // The direction bit (ABN_DECODER_MODE bit 12) does NOT affect alignment
-        // because PHI_E comes from the external register, not from ABN.
+        // 1. PHI_E source: external, angle = 0 (D-axis).
+        // The D-axis is at phi_e=0 in the 16-bit electrical angle space.
+        // With 50 pole pairs, the rotor travels at most half a pole pitch
+        // (0.2mm) to reach the nearest D-axis alignment point.
         let _ = tmc.write_register(PHI_E_SELECTION, 1).await;
         let _ = tmc.write_register(PHI_E_EXT, 0).await;
 
@@ -1972,7 +2001,7 @@ mod app {
         let _ = tmc.write_register(PID_FLUX_P_FLUX_I, pid_pi).await;
         let _ = tmc.write_register(PID_TORQUE_P_TORQUE_I, pid_pi).await;
 
-        // 3. D-axis flux target: 50% of current limit for gentle alignment.
+        // 3. Set flux target: half of current limit on the D-axis.
         // CRITICAL: PID_FLUX_TARGET is bits[15:0] (D-axis current).
         // PID_TORQUE_TARGET bits[31:16] must be 0 (no Q-axis torque).
         // Using bits[31:16] instead aligns to Q-axis (90deg off).
@@ -1984,11 +2013,9 @@ mod app {
         let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, target_reg).await;
 
         // 4. Enter torque mode (MODE_PID_TYPE=1, MODE_MOTION=1)
-        // The flux PID drives I_D toward flux_target while the torque PID
-        // drives I_Q toward 0. The rotor aligns to the D-axis at PHI_E=0.
         let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0001).await;
 
-        // 5. Wait for rotor to settle against the D-axis flux
+        // 5. Hold for settling (rotor aligns to nearest D-axis pole)
         Mono::delay(500_u32.millis()).await;
 
         // 6. Validate encoder: stable count (two reads 10ms apart must match)
@@ -2020,10 +2047,7 @@ mod app {
         }
 
         // Diagnostic: verify PID is tracking (flux actual near flux target)
-        let actual = tmc
-            .read_register(PID_TORQUE_FLUX_ACTUAL)
-            .await
-            .unwrap_or(0);
+        let actual = tmc.read_register(PID_TORQUE_FLUX_ACTUAL).await.unwrap_or(0);
         let flux_actual = (actual & 0xFFFF) as i16;
         let torque_actual = ((actual >> 16) & 0xFFFF) as i16;
         defmt::info!(
