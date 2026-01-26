@@ -83,6 +83,31 @@ mod app {
     /// Derived from sense resistor value and ADC configuration.
     const CURRENT_SCALE_MA_PER_LSB: f32 = 1.155;
 
+    /// Errors that can occur during the TMC4671 calibration sequence.
+    #[derive(Debug, defmt::Format)]
+    enum CalibrationError {
+        /// SPI communication or register verification failed.
+        SpiError,
+        /// ADC offset values are out of the expected range (30000..=36000).
+        AdcFault,
+        /// ABN encoder not responding or count stuck at zero.
+        EncoderFault,
+        /// PID loop not tracking target (torque or position diverging).
+        PidFault,
+    }
+
+    impl CalibrationError {
+        /// Map to a numeric status code for `foci_calibrate_response`.
+        fn status_code(&self) -> u8 {
+            match self {
+                Self::SpiError => 1,
+                Self::AdcFault => 2,
+                Self::EncoderFault => 3,
+                Self::PidFault => 4,
+            }
+        }
+    }
+
     /// USB wake signal. The OTG_FS ISR signals this to wake usb_task.
     static USB_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
@@ -104,6 +129,17 @@ mod app {
     /// block P2 protocol tasks.
     static STEPPER_POSITION_TARGET: core::sync::atomic::AtomicI32 =
         core::sync::atomic::AtomicI32::new(0);
+
+    /// Current limit for PID_TORQUE_FLUX_LIMITS (0x5E).
+    /// Datasheet: single u16 field at bits[15:0]; upper 16 bits ignored by hardware.
+    /// Set by tmc_set_current, re-applied during calibration to ensure
+    /// the limit is correct regardless of TMC4671 register state.
+    static CURRENT_LIMIT_REG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    /// Whether the encoder direction is reversed (set by tmc_set_encoder_dir).
+    /// When true, position targets are negated before writing to the TMC4671.
+    static ENCODER_REVERSED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
 
     static TMC_REQUEST_SENDER: Mutex<
         RefCell<Option<Sender<'static, TmcRequest, TMC_CHANNEL_SIZE>>>,
@@ -359,6 +395,8 @@ mod app {
             if stepper.queue_move(m).is_err() {
                 defmt::error!("queue_step: move queue overflow for oid={}", oid);
             }
+        } else {
+            defmt::error!("queue_step: unknown oid={}", oid);
         }
     }
 
@@ -377,6 +415,7 @@ mod app {
     /// Reset the step clock reference for a stepper.
     #[klipper_command]
     pub fn reset_step_clock(context: &mut State, oid: u8, clock: u32) {
+        defmt::info!("reset_step_clock: oid={} clock={}", oid, clock);
         if let Some(stepper) = context.stepper_mut(oid) {
             stepper.reset_clock(clock);
         }
@@ -873,8 +912,6 @@ mod app {
     /// Read the STM32 96-bit unique device ID and format as a hex string.
     ///
     /// The UID is at 0x1FFF_7A10 on STM32F4. Returns a 24-character hex string.
-    /// Read the STM32 96-bit unique device ID and format as a hex string.
-    ///
     /// Reads the 12 raw bytes sequentially (matching Klipper/Katapult convention)
     /// and outputs high nibble first for each byte.
     fn read_stm32_uid(buf: &mut [u8; 24]) -> &str {
@@ -1081,6 +1118,7 @@ mod app {
                 use tmc4671::registers::*;
                 let counts = (run_ma as f32 / CURRENT_SCALE_MA_PER_LSB) as u32;
                 let limit = (counts << 16) | counts;
+                CURRENT_LIMIT_REG.store(limit, core::sync::atomic::Ordering::Relaxed);
                 if tmc
                     .write_register(PID_TORQUE_FLUX_LIMITS, limit)
                     .await
@@ -1112,6 +1150,7 @@ mod app {
                 if tmc.write_register(ABN_DECODER_MODE, mode).await.is_err() {
                     defmt::error!("TMC4671 SPI write failed: ABN_DECODER_MODE");
                 }
+                ENCODER_REVERSED.store(invert, core::sync::atomic::Ordering::Relaxed);
                 defmt::info!(
                     "TMC4671 encoder direction: {}",
                     if invert { "reversed" } else { "default" }
@@ -1260,6 +1299,7 @@ mod app {
                                 continue;
                             }
                             motor_enabled = true;
+                            enable_pin.set_high();
                             defmt::info!("Motor enabled (calibrated)");
                         } else {
                             motor_enabled = false;
@@ -1290,36 +1330,70 @@ mod app {
                             );
                             continue;
                         }
-                        // Run the three-stage calibration sequence
-                        {
-                            let mut delay_ctx = ChannelDrainDelay {
-                                rx: &mut *rx,
-                                tmc: &mut *tmc,
-                            };
-                            tmc_adc_calibrate(&mut delay_ctx, enable_pin).await;
-                            tmc_align_encoder(&mut delay_ctx).await;
-                            tmc_enter_closedloop(delay_ctx.tmc).await;
-                        }
-                        calibrated = true;
 
-                        defmt::info!("foci_calibrate complete: oid={}", oid);
-                        klipper_reply!(
-                            foci_calibrate_response,
-                            oid: u8 = oid,
-                            status: u8 = STATUS_OK,
-                            adc_i0: u16 = 0,
-                            adc_i1: u16 = 0,
-                            encoder_count: u32 = 0
-                        );
+                        // Pre-flight: verify TMC4671 is alive before calibration
+                        let chip_id = tmc
+                            .read_sub_register(tmc4671::registers::CHIPINFO_SI_TYPE)
+                            .await
+                            .unwrap_or(0);
+                        if chip_id != tmc4671::CHIP_ID {
+                            defmt::error!("foci_calibrate: chip ID mismatch: {:#010x}", chip_id);
+                            klipper_reply!(
+                                foci_calibrate_response,
+                                oid: u8 = oid,
+                                status: u8 = CalibrationError::SpiError.status_code(),
+                                adc_i0: u16 = 0,
+                                adc_i1: u16 = 0,
+                                encoder_count: u32 = 0
+                            );
+                            continue;
+                        }
+
+                        // Run the three-stage calibration sequence
+                        let result = tmc_run_calibration(
+                            tmc,
+                            enable_pin,
+                            CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed),
+                        )
+                        .await;
+
+                        match result {
+                            Ok((adc_i0, adc_i1, encoder_count)) => {
+                                calibrated = true;
+                                defmt::info!("foci_calibrate complete: oid={}", oid);
+                                klipper_reply!(
+                                    foci_calibrate_response,
+                                    oid: u8 = oid,
+                                    status: u8 = STATUS_OK,
+                                    adc_i0: u16 = adc_i0,
+                                    adc_i1: u16 = adc_i1,
+                                    encoder_count: u32 = encoder_count
+                                );
+                            }
+                            Err(e) => {
+                                // Safety shutdown on calibration failure
+                                calibrated = false;
+                                use tmc4671::registers::*;
+                                let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+                                let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+                                let _ = tmc.write_register(PWM_SV_CHOP, 0).await;
+                                enable_pin.set_low();
+                                defmt::error!("foci_calibrate failed: oid={} error={}", oid, e);
+                                klipper_reply!(
+                                    foci_calibrate_response,
+                                    oid: u8 = oid,
+                                    status: u8 = e.status_code(),
+                                    adc_i0: u16 = 0,
+                                    adc_i1: u16 = 0,
+                                    encoder_count: u32 = 0
+                                );
+                            }
+                        }
                     }
                     #[cfg(feature = "dev")]
                     TmcRequest::Init => {
                         defmt::info!("TMC4671 init: starting open-loop stepper config");
-                        let mut delay_ctx = ChannelDrainDelay {
-                            rx: &mut *rx,
-                            tmc: &mut *tmc,
-                        };
-                        tmc_enter_openloop(&mut delay_ctx, enable_pin).await;
+                        tmc_enter_openloop(tmc, enable_pin).await;
                     }
                     #[cfg(feature = "dev")]
                     TmcRequest::TestSpin { revolutions } => {
@@ -1373,8 +1447,11 @@ mod app {
             // motion to the target position.
             if motor_enabled {
                 let clock = DWT::cycle_count();
+                let mut stepped = false;
+                let mut queue_empty = true;
                 ctx.shared.app_state.lock(|state| {
-                    state.steppers[0].advance(clock);
+                    queue_empty = state.steppers[0].move_queue_empty();
+                    stepped = state.steppers[0].advance(clock);
                     let target = state.steppers[0].position_target();
                     STEPPER_POSITION_TARGET.store(
                         target,
@@ -1382,9 +1459,32 @@ mod app {
                     );
                 });
                 let target = STEPPER_POSITION_TARGET.load(core::sync::atomic::Ordering::Relaxed);
+                if stepped {
+                    status_poll_counter = status_poll_counter.wrapping_add(1);
+                    if status_poll_counter % 100 == 1 {
+                        ctx.shared.app_state.lock(|state| {
+                            defmt::info!(
+                                "pos: raw={} target={} step_width={}",
+                                state.steppers[0].position(),
+                                target,
+                                target / core::cmp::max(state.steppers[0].position(), 1)
+                            );
+                        });
+                    }
+                }
+                // Negate when encoder is reversed: the TMC4671 position PID
+                // accumulates opposite to Klipper's step convention.
+                let adjusted = if ENCODER_REVERSED.load(core::sync::atomic::Ordering::Relaxed) {
+                    -target
+                } else {
+                    target
+                };
                 let _ = tmc
-                    .write_register(tmc4671::registers::PID_POSITION_TARGET, target as u32)
+                    .write_register(tmc4671::registers::PID_POSITION_TARGET, adjusted as u32)
                     .await;
+                // Note: PID_TORQUE_FLUX_LIMITS (0x5E) is a single u16 field
+                // per the datasheet. Both torque and flux share one limit.
+                // The value 692 (set by tmc_set_current) is correct.
             }
 
             // TrSync: check timeouts and send periodic status reports.
@@ -1558,41 +1658,32 @@ mod app {
         defmt::info!("Spin complete");
     }
 
-    /// Abstraction for delays during calibration sequences.
+    /// Run the full three-stage calibration sequence: ADC calibration,
+    /// encoder alignment, and closed-loop entry.
     ///
-    /// Implementations can process messages or perform other work while waiting,
-    /// preventing communication timeouts during long calibration waits.
-    trait CalibrationDelay {
-        async fn delay_ms(&mut self, ms: u32);
-    }
+    /// Returns `(adc_i0, adc_i1, encoder_count)` on success, or
+    /// `CalibrationError` on any stage failure.
+    async fn tmc_run_calibration(
+        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
+        enable_pin: &mut Output<'static>,
+        current_limit_reg: u32,
+    ) -> Result<(u16, u16, u32), CalibrationError> {
+        let (adc_i0, adc_i1) = tmc_adc_calibrate(tmc, enable_pin).await?;
+        let encoder_count = tmc_align_encoder(tmc, current_limit_reg).await?;
+        tmc_enter_closedloop(tmc).await?;
 
-    /// Processes TmcRequest messages while waiting during calibration.
-    ///
-    /// During calibration waits (ADC settling, encoder alignment), this polls
-    /// the channel for incoming requests and handles them via `handle_tmc_request`.
-    /// This prevents Klipper from losing communication during the ~880ms
-    /// calibration sequence.
-    struct ChannelDrainDelay<'a> {
-        rx: &'a mut Receiver<'static, TmcRequest, TMC_CHANNEL_SIZE>,
-        tmc: &'a mut Tmc4671Spi<TmcSpiDevice>,
-    }
+        // Re-apply current limit AFTER closed-loop entry. The TMC4671
+        // resets PID_TORQUE_FLUX_LIMITS during mode changes, clearing the
+        // torque limit field. Without this, the motor has zero torque
+        // capacity in position mode.
+        let _ = tmc
+            .write_register(
+                tmc4671::registers::PID_TORQUE_FLUX_LIMITS,
+                current_limit_reg,
+            )
+            .await;
 
-    impl CalibrationDelay for ChannelDrainDelay<'_> {
-        async fn delay_ms(&mut self, ms: u32) {
-            let deadline = Mono::now() + ms.millis();
-            loop {
-                if Mono::now() >= deadline {
-                    break;
-                }
-                use embassy_futures::select::{select, Either};
-                match select(self.rx.recv(), Mono::delay(1_u32.millis())).await {
-                    Either::First(Ok(req)) => {
-                        handle_tmc_request(req, self.tmc).await;
-                    }
-                    _ => {}
-                }
-            }
-        }
+        Ok((adc_i0, adc_i1, encoder_count))
     }
 
     /// Perform TMC4671 hardware safety shutdown, PWM/ADC configuration, and ADC
@@ -1606,108 +1697,133 @@ mod app {
     /// 5. ADC offset calibration: scale=256, enable, wait 250 ms, sample 128x, write offsets
     /// 6. Re-enable PWM chopping: PWM_SV_CHOP=7
     ///
+    /// Returns `(offset_i0, offset_i1)` on success. Critical register writes are
+    /// verified by read-back; ADC offsets are range-checked.
+    ///
     /// This function is shared by both the dev open-loop path and the production
     /// closed-loop enable sequence.
     ///
     /// Register values verified against TMC4671-LA datasheet rev 2.08.
-    async fn tmc_adc_calibrate(ctx: &mut ChannelDrainDelay<'_>, enable_pin: &mut Output<'static>) {
+    async fn tmc_adc_calibrate(
+        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
+        enable_pin: &mut Output<'static>,
+    ) -> Result<(u16, u16), CalibrationError> {
         use tmc4671::registers::*;
 
         // 1. SAFETY FIRST: stop motor, disable outputs, set voltage limit
         // The power-on default PIDOUT_UQ_UD_LIMITS is 32767 (full voltage).
         // We MUST set a safe limit before ANYTHING else touches the motor.
         enable_pin.set_low();
-        let _ = ctx
-            .tmc
-            .write_register(MODE_RAMP_MODE_MOTION, 0x0000_0000)
-            .await;
+        tmc.write_register(MODE_RAMP_MODE_MOTION, 0x0000_0000)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
         let voltage_limit: u32 = 1024;
-        let _ = ctx
-            .tmc
-            .write_register(PIDOUT_UQ_UD_LIMITS, voltage_limit)
-            .await;
-        // Verify the write took effect
-        let readback = ctx
-            .tmc
+        tmc.write_register(PIDOUT_UQ_UD_LIMITS, voltage_limit)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+        // Verify voltage limit write
+        let readback = tmc
             .read_register(PIDOUT_UQ_UD_LIMITS)
             .await
-            .unwrap_or(0);
-        defmt::info!(
-            "PIDOUT_UQ_UD_LIMITS: wrote={}, read={}",
-            voltage_limit,
-            readback
-        );
+            .map_err(|_| CalibrationError::SpiError)?;
+        if readback != voltage_limit {
+            defmt::error!(
+                "PIDOUT_UQ_UD_LIMITS verify failed: wrote={}, read={}",
+                voltage_limit,
+                readback
+            );
+            return Err(CalibrationError::SpiError);
+        }
         // Also zero the torque target to prevent any current drive
-        let _ = ctx.tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+        let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
         // And zero the UQ/UD external values
-        let _ = ctx.tmc.write_register(UQ_UD_EXT, 0).await;
+        let _ = tmc.write_register(UQ_UD_EXT, 0).await;
 
         // 2. PWM configuration (chopping disabled for ADC calibration)
-        let _ = ctx.tmc.write_register(PWM_POLARITIES, 0).await;
-        let _ = ctx.tmc.write_register(PWM_MAXCNT, 3999).await; // 25kHz
-        let _ = ctx
-            .tmc
-            .write_register(PWM_BBM_H_BBM_L, (10 << 8) | 10)
-            .await;
+        let _ = tmc.write_register(PWM_POLARITIES, 0).await;
+        let _ = tmc.write_register(PWM_MAXCNT, 3999).await; // 25kHz
+        let _ = tmc.write_register(PWM_BBM_H_BBM_L, (10 << 8) | 10).await;
         // PWM_SV=0 (SVPWM off per DS 4.9.7 - stepper only), CHOP=0 for ADC cal
-        let _ = ctx.tmc.write_register(PWM_SV_CHOP, 0).await;
+        tmc.write_register(PWM_SV_CHOP, 0)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+        // Verify MODE=0 and PWM_SV_CHOP=0 — critical for safe ADC calibration
+        let mode_rb = tmc
+            .read_register(MODE_RAMP_MODE_MOTION)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+        let chop_rb = tmc
+            .read_register(PWM_SV_CHOP)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+        if mode_rb != 0 || chop_rb != 0 {
+            defmt::error!(
+                "ADC cal pre-check failed: MODE={:#010x}, PWM_SV_CHOP={}",
+                mode_rb,
+                chop_rb
+            );
+            return Err(CalibrationError::SpiError);
+        }
 
         // 3. ADC configuration
         // DSADC_MCFG: leave at power-on default (ANALOG mode, internal ADC)
         let mdec: u32 = 331;
-        let _ = ctx
-            .tmc
+        let _ = tmc
             .write_register(DSADC_MDEC_B_MDEC_A, (mdec << 16) | mdec)
             .await;
         // bits[29:28] ADC_I_WY_SELECT=1 (WY phase current from ADC_I1)
         // bits[27:26] ADC_I_V_SELECT=0  (V unused for stepper FOC2)
         // bits[25:24] ADC_I_UX_SELECT=0 (UX phase current from ADC_I0, default)
         // bits[15:8]  ADC_I1_SELECT=1   (I1 sourced from internal DSADC ch1)
-        let _ = ctx
-            .tmc
-            .write_register(ADC_I_SELECT, (1 << 28) | (1 << 8))
-            .await;
+        let _ = tmc.write_register(ADC_I_SELECT, (1 << 28) | (1 << 8)).await;
 
         // 4. Motor type: 2-phase stepper (type 2 per datasheet), 50 pole pairs
-        let _ = ctx
-            .tmc
+        let _ = tmc
             .write_register(MOTOR_TYPE_N_POLE_PAIRS, (2 << 16) | 50)
             .await;
 
         // 5. ADC offset calibration
         // With PWM_CHOP=0, no current flows even with motor connected.
         // This matches the Python driver's _calibrate_adc() method.
-        let _ = ctx.tmc.write_register(ADC_I0_SCALE_OFFSET, 256 << 16).await;
-        let _ = ctx.tmc.write_register(ADC_I1_SCALE_OFFSET, 256 << 16).await;
+        let _ = tmc.write_register(ADC_I0_SCALE_OFFSET, 256 << 16).await;
+        let _ = tmc.write_register(ADC_I1_SCALE_OFFSET, 256 << 16).await;
 
         // Enable to power the ADC, but CHOP=0 means no PWM switching
         enable_pin.set_high();
-        ctx.delay_ms(250).await;
+        Mono::delay(250_u32.millis()).await;
 
         // Sample ADC values 128 times and average for offset
         let mut sum_i0: i32 = 0;
         let mut sum_i1: i32 = 0;
         const N_SAMPLES: i32 = 128;
         for _ in 0..N_SAMPLES {
-            if let Ok(raw) = ctx.tmc.read_register(ADC_IWY_IUX).await {
+            if let Ok(raw) = tmc.read_register(ADC_IWY_IUX).await {
                 let i_ux = (raw & 0xFFFF) as i16 as i32;
                 let i_wy = ((raw >> 16) & 0xFFFF) as i16 as i32;
                 sum_i0 += i_ux;
                 sum_i1 += i_wy;
             }
-            ctx.delay_ms(1).await;
+            Mono::delay(1_u32.millis()).await;
         }
         // Cast via i16 to u16: negative values wrap correctly for the
         // TMC4671's unsigned offset subtraction register.
         let offset_i0 = (sum_i0 / N_SAMPLES) as i16 as u16;
         let offset_i1 = (sum_i1 / N_SAMPLES) as i16 as u16;
 
-        let _ = ctx
-            .tmc
+        // Validate ADC offsets are in expected range (centered around 33000)
+        if !(30000..=36000).contains(&offset_i0) || !(30000..=36000).contains(&offset_i1) {
+            defmt::error!(
+                "ADC offset out of range: I0={}, I1={} (expected 30000..=36000)",
+                offset_i0,
+                offset_i1
+            );
+            return Err(CalibrationError::AdcFault);
+        }
+
+        let _ = tmc
             .write_register(ADC_I0_SCALE_OFFSET, (256 << 16) | offset_i0 as u32)
             .await;
-        let _ = ctx
-            .tmc
+        let _ = tmc
             .write_register(ADC_I1_SCALE_OFFSET, (256 << 16) | offset_i1 as u32)
             .await;
 
@@ -1718,7 +1834,9 @@ mod app {
         );
 
         // 6. Re-enable PWM chopping after calibration (SVPWM stays off for stepper)
-        let _ = ctx.tmc.write_register(PWM_SV_CHOP, 7).await;
+        let _ = tmc.write_register(PWM_SV_CHOP, 7).await;
+
+        Ok((offset_i0, offset_i1))
     }
 
     /// Configure TMC4671 for open-loop stepper operation with current regulation.
@@ -1728,24 +1846,29 @@ mod app {
     ///
     /// Register values verified against TMC4671-LA datasheet rev 2.08.
     #[cfg(feature = "dev")]
-    async fn tmc_enter_openloop(ctx: &mut ChannelDrainDelay<'_>, enable_pin: &mut Output<'static>) {
+    async fn tmc_enter_openloop(
+        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
+        enable_pin: &mut Output<'static>,
+    ) {
         use tmc4671::registers::*;
 
-        tmc_adc_calibrate(ctx, enable_pin).await;
+        if let Err(e) = tmc_adc_calibrate(tmc, enable_pin).await {
+            defmt::error!("ADC calibration failed in open-loop init: {}", e);
+            return;
+        }
 
         // 7. PID gains for torque (current) control
         // Conservative Q8.8 PID gains: P = 1.577 * 256 = 404, I = 0.1 * 256 = 26.
         let pid_pi: u32 = (404 << 16) | 26;
-        let _ = ctx.tmc.write_register(PID_FLUX_P_FLUX_I, pid_pi).await;
-        let _ = ctx.tmc.write_register(PID_TORQUE_P_TORQUE_I, pid_pi).await;
+        let _ = tmc.write_register(PID_FLUX_P_FLUX_I, pid_pi).await;
+        let _ = tmc.write_register(PID_TORQUE_P_TORQUE_I, pid_pi).await;
 
         // 9. Current limit via PID_TORQUE_FLUX_LIMITS
         // Both torque and flux limited to 433 counts (~0.5A with 1.155 mA/LSB).
         // Flux limit must be nonzero so the flux PID can actively regulate
         // the D-axis current to zero (reject disturbances).
         let current_limit: u32 = 433;
-        let _ = ctx
-            .tmc
+        let _ = tmc
             .write_register(
                 PID_TORQUE_FLUX_LIMITS,
                 (current_limit << 16) | current_limit,
@@ -1753,39 +1876,23 @@ mod app {
             .await;
 
         // 10. PHI_E source: external angle register (open-loop)
-        let _ = ctx.tmc.write_register(PHI_E_SELECTION, 1).await;
-        let _ = ctx.tmc.write_register(PHI_E_EXT, 0).await;
+        let _ = tmc.write_register(PHI_E_SELECTION, 1).await;
+        let _ = tmc.write_register(PHI_E_EXT, 0).await;
 
         // 11. Set torque target: 200 counts (~0.23A, conservative)
         let torque_target: u32 = 200;
-        let _ = ctx
-            .tmc
+        let _ = tmc
             .write_register(PID_TORQUE_FLUX_TARGET, torque_target << 16)
             .await;
 
         // 12. Motion mode: TORQUE mode with current regulation
         // MODE_PID_TYPE=1 (bit 31), MODE_MOTION=1 (torque)
-        let _ = ctx
-            .tmc
-            .write_register(MODE_RAMP_MODE_MOTION, 0x8000_0001)
-            .await;
+        let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0001).await;
 
         // Verify critical registers after enabling torque mode
-        let v_limit_final = ctx
-            .tmc
-            .read_register(PIDOUT_UQ_UD_LIMITS)
-            .await
-            .unwrap_or(0);
-        let mode_final = ctx
-            .tmc
-            .read_register(MODE_RAMP_MODE_MOTION)
-            .await
-            .unwrap_or(0);
-        let target_final = ctx
-            .tmc
-            .read_register(PID_TORQUE_FLUX_TARGET)
-            .await
-            .unwrap_or(0);
+        let v_limit_final = tmc.read_register(PIDOUT_UQ_UD_LIMITS).await.unwrap_or(0);
+        let mode_final = tmc.read_register(MODE_RAMP_MODE_MOTION).await.unwrap_or(0);
+        let target_final = tmc.read_register(PID_TORQUE_FLUX_TARGET).await.unwrap_or(0);
         defmt::info!(
             "TMC4671 init done: V_limit={}, mode=0x{:08X}, target=0x{:08X}",
             v_limit_final,
@@ -1796,12 +1903,8 @@ mod app {
         // Diagnostic: log PID state for 5 seconds after enabling
         for i in 0..10u32 {
             Mono::delay(500.millis()).await;
-            let actual = ctx
-                .tmc
-                .read_register(PID_TORQUE_FLUX_ACTUAL)
-                .await
-                .unwrap_or(0);
-            let adc = ctx.tmc.read_register(ADC_IWY_IUX).await.unwrap_or(0);
+            let actual = tmc.read_register(PID_TORQUE_FLUX_ACTUAL).await.unwrap_or(0);
+            let adc = tmc.read_register(ADC_IWY_IUX).await.unwrap_or(0);
             let torque_actual = ((actual >> 16) & 0xFFFF) as i16;
             let flux_actual = (actual & 0xFFFF) as i16;
             let i_ux = (adc & 0xFFFF) as i16;
@@ -1817,57 +1920,116 @@ mod app {
         }
     }
 
-    /// Align the ABN encoder to the D-axis by applying a known voltage vector,
+    /// Align the ABN encoder to the D-axis using current-regulated torque mode,
     /// waiting for the rotor to settle, then zeroing the encoder count.
     ///
     /// Steps:
     /// 1. Set PHI_E_SELECTION=1 (external) and PHI_E_EXT=0
-    /// 2. Drive D-axis: UQ_UD_EXT with UD=1000 for alignment torque
-    /// 3. Enter UQ_UD_EXT mode (MODE_RAMP_MODE_MOTION = 0x8000_0008)
+    /// 2. Read current limit, set torque target to 50% of limit
+    /// 3. Enter torque mode (MODE_RAMP_MODE_MOTION = 0x8000_0001)
     /// 4. Wait 500 ms for rotor to settle against D-axis flux
-    /// 5. Read and log ABN_DECODER_COUNT, then write 0 to zero it
-    /// 6. Zero ABN_DECODER_PHI_E_PHI_M_OFFSET
-    /// 7. Stop drive (UQ_UD_EXT=0, MODE=0)
+    /// 5. Validate PID tracking (torque actual vs target)
+    /// 6. Validate encoder (non-zero, stable count)
+    /// 7. Read ABN_DECODER_COUNT, zero it, zero offset
+    /// 8. Stop drive (torque target=0, MODE=0)
     ///
-    /// After this call the encoder count=0 corresponds to electrical angle 0.
-    async fn tmc_align_encoder(ctx: &mut ChannelDrainDelay<'_>) {
+    /// Returns the encoder count before zeroing on success.
+    async fn tmc_align_encoder(
+        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
+        current_limit_reg: u32,
+    ) -> Result<u32, CalibrationError> {
         use tmc4671::registers::*;
 
         // 1. PHI_E source: external, angle = 0
-        let _ = ctx.tmc.write_register(PHI_E_SELECTION, 1).await;
-        let _ = ctx.tmc.write_register(PHI_E_EXT, 0).await;
+        let _ = tmc.write_register(PHI_E_SELECTION, 1).await;
+        let _ = tmc.write_register(PHI_E_EXT, 0).await;
 
-        // 2. D-axis voltage: UD=1000, UQ=0
-        // UQ_UD_EXT layout: bits[31:16] = UQ, bits[15:0] = UD
-        let _ = ctx.tmc.write_register(UQ_UD_EXT, 1000u32).await;
-
-        // 3. Enter UQ_UD_EXT motion mode (MODE_PID_TYPE=1, MODE_MOTION=8)
-        let _ = ctx
-            .tmc
-            .write_register(MODE_RAMP_MODE_MOTION, 0x8000_0008)
+        // 2. Set PID flux/torque gains needed for torque mode current regulation.
+        // Must be set BEFORE entering torque mode, otherwise PID output is zero.
+        let flux_torque_pi: u32 = (404 << 16) | 26; // P=1.577, I=0.1
+        let _ = tmc.write_register(PID_FLUX_P_FLUX_I, flux_torque_pi).await;
+        let _ = tmc
+            .write_register(PID_TORQUE_P_TORQUE_I, flux_torque_pi)
             .await;
+
+        // 3. Re-apply current limit (register may have been reset by mode changes
+        // during ADC calibration) and set torque target to 50% for alignment.
+        let _ = tmc
+            .write_register(PID_TORQUE_FLUX_LIMITS, current_limit_reg)
+            .await;
+        // Torque limit is in bits[31:16]
+        let torque_limit = (current_limit_reg >> 16) as i16;
+        let torque_target = torque_limit / 2;
+        let _ = tmc
+            .write_register(PID_TORQUE_FLUX_TARGET, (torque_target as u16 as u32) << 16)
+            .await;
+
+        // 3. Enter torque mode (MODE_PID_TYPE=1, MODE_MOTION=1)
+        let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0001).await;
 
         // 4. Wait for rotor to settle against the D-axis flux
-        ctx.delay_ms(500).await;
+        Mono::delay(500_u32.millis()).await;
 
-        // 5. Read encoder count, then zero it
-        let old_count = ctx.tmc.read_register(ABN_DECODER_COUNT).await.unwrap_or(0);
-        let _ = ctx.tmc.write_register(ABN_DECODER_COUNT, 0).await;
+        // 5. Validate PID tracking: torque actual should be close to target
+        let actual_raw = tmc
+            .read_register(PID_TORQUE_FLUX_ACTUAL)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+        let torque_actual = ((actual_raw >> 16) & 0xFFFF) as i16;
+        let diff = (torque_actual as i32 - torque_target as i32).unsigned_abs();
+        let threshold = (torque_target as i32).unsigned_abs() / 2;
+        if diff > threshold {
+            defmt::error!(
+                "encoder align: PID not tracking: target={}, actual={}, diff={}",
+                torque_target,
+                torque_actual,
+                diff
+            );
+            // Stop before returning error
+            let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+            let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+            return Err(CalibrationError::PidFault);
+        }
 
-        // 6. Zero the encoder electrical/mechanical angle offset
-        let _ = ctx
-            .tmc
-            .write_register(ABN_DECODER_PHI_E_PHI_M_OFFSET, 0)
-            .await;
+        // 6. Validate encoder: non-zero and stable
+        let count1 = tmc
+            .read_register(ABN_DECODER_COUNT)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+        Mono::delay(10_u32.millis()).await;
+        let count2 = tmc
+            .read_register(ABN_DECODER_COUNT)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
 
-        // 7. Stop drive
-        let _ = ctx.tmc.write_register(UQ_UD_EXT, 0).await;
-        let _ = ctx
-            .tmc
-            .write_register(MODE_RAMP_MODE_MOTION, 0x0000_0000)
-            .await;
+        if count1 == 0 && count2 == 0 {
+            defmt::error!("encoder align: no encoder pulses (disconnected?)");
+            let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+            let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+            return Err(CalibrationError::EncoderFault);
+        }
+        if count1 != count2 {
+            defmt::error!(
+                "encoder align: encoder unstable: count1={}, count2={}",
+                count1,
+                count2
+            );
+            let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+            let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+            return Err(CalibrationError::EncoderFault);
+        }
+
+        // 7. Zero encoder count and offset
+        let old_count = count1;
+        let _ = tmc.write_register(ABN_DECODER_COUNT, 0).await;
+        let _ = tmc.write_register(ABN_DECODER_PHI_E_PHI_M_OFFSET, 0).await;
+
+        // 8. Stop drive
+        let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+        let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x0000_0000).await;
 
         defmt::info!("encoder aligned: old_count={}", old_count);
+        Ok(old_count)
     }
 
     /// Configure TMC4671 for closed-loop position mode with ABN encoder feedback.
@@ -1880,9 +2042,12 @@ mod app {
     /// 5. Set PHI_E_SELECTION=3 (ABN encoder)
     /// 6. Set PID_POSITION_TARGET=0
     /// 7. Enter position mode: MODE_RAMP_MODE_MOTION = 0x8000_0003
+    /// 8. Validate: position error is not diverging
     ///
     /// Assumes tmc_adc_calibrate and tmc_align_encoder have already been called.
-    async fn tmc_enter_closedloop(tmc: &mut Tmc4671Spi<TmcSpiDevice>) {
+    async fn tmc_enter_closedloop(
+        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
+    ) -> Result<(), CalibrationError> {
         use tmc4671::registers::*;
 
         // 1. Flux and torque PID: P=404 (1.577*256), I=26 (0.1*256)
@@ -1892,14 +2057,16 @@ mod app {
             .write_register(PID_TORQUE_P_TORQUE_I, flux_torque_pi)
             .await;
 
-        // 2. Velocity PID: P=100, I=10
-        let velocity_pi: u32 = (100 << 16) | 10;
+        // 2. Velocity PID: P=4.5 (Q8.8 = 1152), I=0
+        // Q8.8 format per datasheet 4.7.8: value = real * 256.
+        // Used in advanced PID mode (MODE_PID_TYPE=1, bit 31 set).
+        let velocity_pi: u32 = 1152 << 16;
         let _ = tmc
             .write_register(PID_VELOCITY_P_VELOCITY_I, velocity_pi)
             .await;
 
-        // 3. Position PID: P=100, I=0
-        let position_pi: u32 = 100 << 16;
+        // 3. Position PID: P=2.5 (Q8.8 = 640), I=0
+        let position_pi: u32 = 640 << 16;
         let _ = tmc
             .write_register(PID_POSITION_P_POSITION_I, position_pi)
             .await;
@@ -1907,16 +2074,52 @@ mod app {
         // 4. Velocity limit: unconstrained for now
         let _ = tmc.write_register(PID_VELOCITY_LIMIT, 0x7FFF_FFFF).await;
 
-        // 5. PHI_E source: ABN encoder feedback (selection=3)
+        // 5. Raise voltage limit for actual operation. ADC cal sets it to
+        // 1024 as a safety measure, but position PID needs headroom to drive
+        // motion. 16000 tested working in Phase 1 (up to 200+ mm/s).
+        let _ = tmc.write_register(PIDOUT_UQ_UD_LIMITS, 16000).await;
+
+        // 6. PHI_E source: ABN encoder feedback (selection=3)
         let _ = tmc.write_register(PHI_E_SELECTION, 3).await;
 
-        // 6. Position target: hold current position (0 after encoder zeroing)
-        let _ = tmc.write_register(PID_POSITION_TARGET, 0).await;
+        // 6. Zero position: writing PID_POSITION_ACTUAL also writes
+        // PID_POSITION_TARGET to the same value (per datasheet 0x6B),
+        // avoiding an unwanted position error on mode entry.
+        let _ = tmc.write_register(PID_POSITION_ACTUAL, 0).await;
 
         // 7. Enter position mode: MODE_PID_TYPE=1 (bit 31), MODE_MOTION=3 (position)
         let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0003).await;
 
+        // 8. Runaway detection (20ms). If position error exceeds 40 steps
+        // and is still growing, the feedback sign is wrong — fail fast.
+        // Encoder polarity errors are also caught in Stage 2 torque
+        // tracking, but this is a secondary safety net for position mode.
+        // Settling is NOT checked: P-only position control has steady-state
+        // offset and normal PID oscillation would cause false positives.
+        const RUNAWAY_THRESHOLD: u32 = 32760; // ~40 steps
+
+        Mono::delay(10.millis()).await;
+        let pos1 = tmc
+            .read_register(PID_POSITION_ACTUAL)
+            .await
+            .map_err(|_| CalibrationError::SpiError)? as i32;
+        Mono::delay(10.millis()).await;
+        let pos2 = tmc
+            .read_register(PID_POSITION_ACTUAL)
+            .await
+            .map_err(|_| CalibrationError::SpiError)? as i32;
+        if pos2.unsigned_abs() > RUNAWAY_THRESHOLD && pos2.unsigned_abs() > pos1.unsigned_abs() {
+            defmt::error!(
+                "closed-loop: runaway detected: pos1={}, pos2={}",
+                pos1,
+                pos2
+            );
+            let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+            return Err(CalibrationError::PidFault);
+        }
+
         defmt::info!("TMC4671 closed-loop position mode active");
+        Ok(())
     }
 
     /// USB OTG FS interrupt handler. Masks interrupt sources and wakes usb_task.
