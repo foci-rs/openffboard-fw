@@ -390,11 +390,7 @@ mod app {
     #[klipper_command]
     pub fn queue_step(context: &mut State, oid: u8, interval: u32, count: u16, add: i16) {
         if let Some(stepper) = context.stepper_mut(oid) {
-            let m = klipper_mcu::stepper::StepMove {
-                interval,
-                count,
-                add,
-            };
+            let m = klipper_mcu::stepper::StepMove::new(interval, count, add);
             if stepper.queue_move(m).is_err() {
                 defmt::error!("queue_step: move queue overflow for oid={}", oid);
             }
