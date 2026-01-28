@@ -26,7 +26,6 @@ mod app {
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use embassy_sync::signal::Signal;
     use embedded_hal_bus::spi::ExclusiveDevice;
-    use klipper_mcu::shutdown::McuState;
     use klipper_mcu::state::State;
     use rtic_monotonics::systick::prelude::*;
     use rtic_sync::channel::{Receiver, Sender};
@@ -45,37 +44,7 @@ mod app {
     /// TMC4671 SPI device with exclusive bus access and software CS.
     type TmcSpiDevice = ExclusiveDevice<Spi1Bus, Output<'static>, embedded_hal_bus::spi::NoDelay>;
 
-    /// Register access request from protocol handler to tmc_control task.
-    enum TmcRequest {
-        Write {
-            addr: u8,
-            value: u32,
-        },
-        Read {
-            oid: u8,
-            addr: u8,
-        },
-        SetEnable(bool),
-        Calibrate {
-            oid: u8,
-        },
-        #[cfg(feature = "dev")]
-        Init,
-        #[cfg(feature = "dev")]
-        TestSpin {
-            revolutions: u8,
-        },
-        SetCurrent {
-            run_ma: u32,
-        },
-        SetEncoder {
-            ppr: u32,
-        },
-        SetEncoderDir {
-            invert: bool,
-        },
-        SelfTest,
-    }
+    use foci_core::tmc::TmcRequest;
 
     const TMC_CHANNEL_SIZE: usize = 8;
 
@@ -219,15 +188,14 @@ mod app {
 
     #[klipper_command(in_shutdown)]
     pub fn get_config(context: &mut State) {
-        let is_config = context.config_crc.is_some();
-        let crc = context.config_crc.unwrap_or(0);
-        let is_shutdown = context.mcu_state.is_shutdown();
+        let (is_config, crc, is_shutdown, move_count) =
+            klipper_mcu::commands::lifecycle::get_config(context);
         klipper_reply!(
             config,
             is_config: bool = is_config,
             crc: u32 = crc,
             is_shutdown: bool = is_shutdown,
-            move_count: u16 = 1024
+            move_count: u16 = move_count
         );
     }
 
@@ -237,13 +205,11 @@ mod app {
     /// when not in shutdown, triggers a shutdown instead.
     #[klipper_command(in_shutdown)]
     pub fn clear_shutdown(context: &mut State) {
-        if !context.mcu_state.is_shutdown() {
-            if enter_shutdown(context) {
-                klipper_shutdown!("Shutdown cleared when not shutdown", DWT::cycle_count());
-            }
-            return;
+        if klipper_mcu::commands::lifecycle::clear_shutdown(context).is_err()
+            && enter_shutdown(context)
+        {
+            klipper_shutdown!("Shutdown cleared when not shutdown", DWT::cycle_count());
         }
-        context.mcu_state = McuState::Running;
     }
 
     /// Full config reset: clear all OIDs, steppers, and shutdown state.
@@ -262,7 +228,7 @@ mod app {
             }
             return;
         }
-        context.reset();
+        klipper_mcu::commands::lifecycle::config_reset(context);
         // Clear firmware-side endstop pin assignments
         for pin_id in &ENDSTOP_PIN_IDS {
             pin_id.store(0xFF, core::sync::atomic::Ordering::Relaxed);
@@ -271,14 +237,13 @@ mod app {
 
     #[klipper_command]
     pub fn finalize_config(context: &mut State, crc: u32) {
-        context.config_crc = Some(crc);
-        context.mcu_state = McuState::Running;
+        klipper_mcu::commands::lifecycle::finalize_config(context, crc);
         defmt::info!("Config finalized, CRC: {:#010x}", crc);
     }
 
     #[klipper_command]
     pub fn allocate_oids(_count: u8) {
-        // No-op: we use static allocation
+        klipper_mcu::commands::lifecycle::allocate_oids(_count);
     }
 
     #[klipper_command(in_shutdown)]
@@ -295,12 +260,11 @@ mod app {
     /// `klipper_shutdown!` only when this returns `true`, so each call
     /// site provides a unique static string reason.
     fn enter_shutdown(context: &mut State) -> bool {
-        if context.mcu_state.is_shutdown() {
-            return false;
+        let entered = klipper_mcu::commands::lifecycle::enter_shutdown(context);
+        if entered {
+            TMC_DISABLE_SIGNAL.signal(());
         }
-        context.mcu_state = McuState::Shutdown { reason: 0 };
-        TMC_DISABLE_SIGNAL.signal(());
-        true
+        entered
     }
 
     /// Reset the MCU. Matches Klipper's `command_reset` (armcm_reset.c).
@@ -370,32 +334,20 @@ mod app {
         _invert_step: u8,
         _step_pulse_ticks: u32,
     ) {
-        let idx = context.steppers_by_oid.len();
-        if idx >= klipper_mcu::state::NUM_STEPPERS {
-            defmt::error!("config_stepper: no stepper slots available");
+        if let Err(e) = klipper_mcu::commands::stepper::config_stepper(context, oid) {
+            defmt::error!("config_stepper: {}", e);
             return;
         }
-        if context.steppers_by_oid.insert(oid, idx).is_err() {
-            defmt::error!("config_stepper: OID map full");
-            return;
-        }
-        defmt::info!(
-            "config_stepper: oid={} idx={} (pins ignored, TMC4671 mode)",
-            oid,
-            idx
-        );
+        defmt::info!("config_stepper: oid={} (pins ignored, TMC4671 mode)", oid);
     }
 
     /// Enqueue a trapezoidal move segment for a stepper.
     #[klipper_command]
     pub fn queue_step(context: &mut State, oid: u8, interval: u32, count: u16, add: i16) {
-        if let Some(stepper) = context.stepper_mut(oid) {
-            let m = klipper_mcu::stepper::StepMove::new(interval, count, add);
-            if stepper.queue_move(m).is_err() {
-                defmt::error!("queue_step: move queue overflow for oid={}", oid);
-            }
-        } else {
-            defmt::error!("queue_step: unknown oid={}", oid);
+        if let Err(e) =
+            klipper_mcu::commands::stepper::queue_step(context, oid, interval, count, add)
+        {
+            defmt::error!("queue_step: oid={} {}", oid, e);
         }
     }
 
@@ -406,24 +358,20 @@ mod app {
     /// forward/backward accordingly.
     #[klipper_command]
     pub fn set_next_step_dir(context: &mut State, oid: u8, dir: u8) {
-        if let Some(stepper) = context.stepper_mut(oid) {
-            stepper.set_direction(dir != 0);
-        }
+        klipper_mcu::commands::stepper::set_next_step_dir(context, oid, dir);
     }
 
     /// Reset the step clock reference for a stepper.
     #[klipper_command]
     pub fn reset_step_clock(context: &mut State, oid: u8, clock: u32) {
         defmt::info!("reset_step_clock: oid={} clock={}", oid, clock);
-        if let Some(stepper) = context.stepper_mut(oid) {
-            stepper.reset_clock(clock);
-        }
+        klipper_mcu::commands::stepper::reset_step_clock(context, oid, clock);
     }
 
     /// Report the current position of a stepper.
     #[klipper_command]
     pub fn stepper_get_position(context: &mut State, oid: u8) {
-        let pos = context.stepper(oid).map(|s| s.position()).unwrap_or(0);
+        let pos = klipper_mcu::commands::stepper::stepper_get_position(context, oid);
         klipper_reply!(stepper_position, oid: u8 = oid, pos: i32 = pos);
     }
 
@@ -433,7 +381,7 @@ mod app {
     /// we track only the logical step count.
     #[klipper_command]
     pub fn stepper_get_commanded_position(context: &mut State, oid: u8) {
-        let pos = context.stepper(oid).map(|s| s.position()).unwrap_or(0);
+        let pos = klipper_mcu::commands::stepper::stepper_get_commanded_position(context, oid);
         klipper_reply!(stepper_position, oid: u8 = oid, pos: i32 = pos);
     }
 
@@ -443,15 +391,14 @@ mod app {
     /// all linked steppers are stopped.
     #[klipper_command]
     pub fn stepper_stop_on_trigger(context: &mut State, oid: u8, trsync_oid: u8) {
-        if context
-            .stepper_trsync_links
-            .push((oid, trsync_oid))
-            .is_err()
+        if let Err(e) =
+            klipper_mcu::commands::stepper::stepper_stop_on_trigger(context, oid, trsync_oid)
         {
             defmt::error!(
-                "stepper_stop_on_trigger: link table full (oid={}, trsync_oid={})",
+                "stepper_stop_on_trigger: oid={} trsync_oid={} {}",
                 oid,
-                trsync_oid
+                trsync_oid,
+                e
             );
         }
     }
@@ -471,9 +418,9 @@ mod app {
         _default_value: u8,
         _max_duration: u32,
     ) {
-        let idx = context.enable_by_oid.len();
-        if idx < klipper_mcu::state::NUM_STEPPERS {
-            let _ = context.enable_by_oid.insert(oid, idx);
+        if let Err(e) = klipper_mcu::commands::digital_out::config_digital_out(context, oid) {
+            defmt::error!("config_digital_out: {}", e);
+            return;
         }
         defmt::info!(
             "config_digital_out: oid={} (enable control, pin ignored)",
@@ -487,20 +434,18 @@ mod app {
     #[klipper_command]
     pub fn queue_digital_out(context: &mut State, oid: u8, clock: u32, on_ticks: u32) {
         let _ = clock;
-        if let Some(&idx) = context.enable_by_oid.get(&oid) {
-            let enabled = on_ticks != 0;
-            context.steppers[idx].set_enabled(enabled);
-            tmc_send(TmcRequest::SetEnable(enabled));
+        match klipper_mcu::commands::digital_out::queue_digital_out(context, oid, on_ticks) {
+            Ok(enabled) => tmc_send(TmcRequest::SetEnable(enabled)),
+            Err(e) => defmt::error!("queue_digital_out: {}", e),
         }
     }
 
     /// Immediately update a digital output value.
     #[klipper_command]
     pub fn update_digital_out(context: &mut State, oid: u8, value: u8) {
-        if let Some(&idx) = context.enable_by_oid.get(&oid) {
-            let enabled = value != 0;
-            context.steppers[idx].set_enabled(enabled);
-            tmc_send(TmcRequest::SetEnable(enabled));
+        match klipper_mcu::commands::digital_out::update_digital_out(context, oid, value) {
+            Ok(enabled) => tmc_send(TmcRequest::SetEnable(enabled)),
+            Err(e) => defmt::error!("update_digital_out: {}", e),
         }
     }
 
@@ -599,16 +544,11 @@ mod app {
     /// Allocates the next free TrSync slot and maps the Klipper OID to it.
     #[klipper_command]
     pub fn config_trsync(context: &mut State, oid: u8) {
-        let idx = context.trsync_by_oid.len();
-        if idx >= klipper_mcu::state::NUM_TRSYNC {
-            defmt::error!("config_trsync: no TrSync slots available");
+        if let Err(e) = klipper_mcu::commands::trsync::config_trsync(context, oid) {
+            defmt::error!("config_trsync: {}", e);
             return;
         }
-        if context.trsync_by_oid.insert(oid, idx).is_err() {
-            defmt::error!("config_trsync: OID map full");
-            return;
-        }
-        defmt::info!("config_trsync: oid={} idx={}", oid, idx);
+        defmt::info!("config_trsync: oid={}", oid);
     }
 
     /// Arm a TrSync for synchronized triggering.
@@ -623,14 +563,13 @@ mod app {
         report_ticks: u32,
         expire_reason: u8,
     ) {
-        // Clear old stepper links for this trsync (matches C trsync_clear behavior).
-        // Without this, links accumulate across homing cycles and overflow the Vec.
-        context
-            .stepper_trsync_links
-            .retain(|&(_, ts_oid)| ts_oid != oid);
-        if let Some(ts) = context.trsync_mut(oid) {
-            ts.arm(report_clock, report_ticks, expire_reason);
-        }
+        klipper_mcu::commands::trsync::trsync_start(
+            context,
+            oid,
+            report_clock,
+            report_ticks,
+            expire_reason,
+        );
     }
 
     /// Update the expiry deadline for a TrSync.
@@ -639,9 +578,7 @@ mod app {
     /// the clock reaches this value before a manual trigger.
     #[klipper_command]
     pub fn trsync_set_timeout(context: &mut State, oid: u8, clock: u32) {
-        if let Some(ts) = context.trsync_mut(oid) {
-            ts.set_timeout(clock);
-        }
+        klipper_mcu::commands::trsync::trsync_set_timeout(context, oid, clock);
     }
 
     /// Manually trigger a TrSync with the given reason code.
@@ -650,29 +587,7 @@ mod app {
     /// linked to this TrSync OID via stepper_stop_on_trigger.
     #[klipper_command]
     pub fn trsync_trigger(context: &mut State, oid: u8, reason: u8) {
-        let accepted = context
-            .trsync_mut(oid)
-            .map(|ts| ts.trigger(reason))
-            .unwrap_or(false);
-        if accepted {
-            stop_linked_steppers(context, oid);
-        }
-    }
-
-    /// Stop all steppers linked to the given TrSync OID.
-    ///
-    /// Iterates `stepper_trsync_links` and calls `stop()` on each stepper
-    /// whose entry matches `trsync_oid`. Uses direct field access for split
-    /// borrows (links + steppers_by_oid are read, steppers array is written).
-    fn stop_linked_steppers(state: &mut State, trsync_oid: u8) {
-        for i in 0..state.stepper_trsync_links.len() {
-            let (stepper_oid, linked_trsync) = state.stepper_trsync_links[i];
-            if linked_trsync == trsync_oid {
-                if let Some(&s_idx) = state.steppers_by_oid.get(&stepper_oid) {
-                    state.steppers[s_idx].stop();
-                }
-            }
-        }
+        klipper_mcu::commands::trsync::trsync_trigger(context, oid, reason);
     }
 
     /// Register an endstop object.
@@ -683,12 +598,8 @@ mod app {
     #[klipper_command]
     pub fn config_endstop(context: &mut State, oid: u8, pin: u8, pull_up: u8) {
         let idx = context.endstop_by_oid.len();
-        if idx >= klipper_mcu::state::NUM_ENDSTOPS {
-            defmt::error!("config_endstop: no endstop slots available");
-            return;
-        }
-        if context.endstop_by_oid.insert(oid, idx).is_err() {
-            defmt::error!("config_endstop: OID map full");
+        if let Err(e) = klipper_mcu::commands::endstop::config_endstop(context, oid) {
+            defmt::error!("config_endstop: {}", e);
             return;
         }
 
@@ -731,17 +642,17 @@ mod app {
         trsync_oid: u8,
         trigger_reason: u8,
     ) {
-        if let Some(endstop) = context.endstop_mut(oid) {
-            endstop.start_homing(
-                clock,
-                sample_ticks,
-                sample_count,
-                rest_ticks,
-                pin_value != 0,
-                trsync_oid,
-                trigger_reason,
-            );
-        }
+        klipper_mcu::commands::endstop::endstop_home(
+            context,
+            oid,
+            clock,
+            sample_ticks,
+            sample_count,
+            rest_ticks,
+            pin_value != 0,
+            trsync_oid,
+            trigger_reason,
+        );
     }
 
     /// Query the current state of an endstop.
@@ -749,10 +660,8 @@ mod app {
     /// Returns homing status, next sample clock, and current pin value.
     #[klipper_command]
     pub fn endstop_query_state(context: &mut State, oid: u8) {
-        let (homing, next_clock) = context
-            .endstop(oid)
-            .map(|e| e.query_state())
-            .unwrap_or((false, 0));
+        let (homing, next_clock) =
+            klipper_mcu::commands::endstop::endstop_query_state(context, oid);
         // Read the live GPIO pin state for the endstop
         let pin_state = context
             .endstop_by_oid
@@ -777,23 +686,33 @@ mod app {
 
     /// SPI configuration stub (TMC4671 SPI is handled internally).
     #[klipper_command]
-    pub fn config_spi(_oid: u8, _pin: u32, _cs_active_high: u8) {}
+    pub fn config_spi(_oid: u8, _pin: u32, _cs_active_high: u8) {
+        klipper_mcu::commands::spi::config_spi(_oid, _pin, _cs_active_high);
+    }
 
     /// SPI configuration without chip-select stub.
     #[klipper_command]
-    pub fn config_spi_without_cs(_oid: u8) {}
+    pub fn config_spi_without_cs(_oid: u8) {
+        klipper_mcu::commands::spi::config_spi_without_cs(_oid);
+    }
 
     /// SPI bus assignment stub.
     #[klipper_command]
-    pub fn spi_set_bus(_oid: u8, _spi_bus: u32, _mode: u32, _rate: u32) {}
+    pub fn spi_set_bus(_oid: u8, _spi_bus: u32, _mode: u32, _rate: u32) {
+        klipper_mcu::commands::spi::spi_set_bus(_oid, _spi_bus, _mode, _rate);
+    }
 
     /// SPI shutdown message configuration stub.
     #[klipper_command]
-    pub fn config_spi_shutdown(_oid: u8, _spi_oid: u8, _shutdown_msg: &[u8]) {}
+    pub fn config_spi_shutdown(_oid: u8, _spi_oid: u8, _shutdown_msg: &[u8]) {
+        klipper_mcu::commands::spi::config_spi_shutdown(_oid, _spi_oid, _shutdown_msg);
+    }
 
     /// SPI send stub (data is accepted but not forwarded).
     #[klipper_command]
-    pub fn spi_send(_oid: u8, _data: &[u8]) {}
+    pub fn spi_send(_oid: u8, _data: &[u8]) {
+        klipper_mcu::commands::spi::spi_send(_oid, _data);
+    }
 
     // ---- TMC4671 register access commands ----
 
@@ -810,28 +729,30 @@ mod app {
     #[cfg(feature = "dev")]
     #[klipper_command]
     pub fn tmc_init(_context: &mut State, _oid: u8) {
-        tmc_send(TmcRequest::Init);
+        tmc_send(foci_core::tmc::tmc_init());
     }
 
     /// Test motor rotation by sweeping PHI_E_EXT through N revolutions.
     #[cfg(feature = "dev")]
     #[klipper_command]
     pub fn tmc_test_spin(_context: &mut State, _oid: u8, revolutions: u8) {
-        tmc_send(TmcRequest::TestSpin { revolutions });
+        tmc_send(foci_core::tmc::tmc_test_spin(revolutions));
     }
 
     /// Write a TMC4671 register via SPI.
+    #[cfg(feature = "dev")]
     #[klipper_command]
     pub fn tmc_write_register(_context: &mut State, _oid: u8, addr: u8, value: u32) {
-        tmc_send(TmcRequest::Write { addr, value });
+        tmc_send(foci_core::tmc::tmc_write_register(addr, value));
     }
 
     /// Read a TMC4671 register via SPI.
     ///
     /// The response is sent asynchronously as a tmc_register_value reply.
+    #[cfg(feature = "dev")]
     #[klipper_command]
     pub fn tmc_read_register(_context: &mut State, oid: u8, addr: u8) {
-        tmc_send(TmcRequest::Read { oid, addr });
+        tmc_send(foci_core::tmc::tmc_read_register(oid, addr));
     }
 
     /// Set motor run current. The firmware converts milliamps to
@@ -839,7 +760,7 @@ mod app {
     /// current scaling factor.
     #[klipper_command]
     pub fn tmc_set_current(_context: &mut State, _oid: u8, run_ma: u32) {
-        tmc_send(TmcRequest::SetCurrent { run_ma });
+        tmc_send(foci_core::tmc::tmc_set_current(run_ma));
     }
 
     /// Configure ABN encoder resolution and compute step width.
@@ -850,15 +771,9 @@ mod app {
     ///   step_width = 65536 * pole_pairs / quadrature_ppr
     #[klipper_command]
     pub fn tmc_set_encoder(context: &mut State, _oid: u8, channel: u8, ppr: u32) {
-        let quad_ppr = ppr * 4;
-        // 50 pole pairs for 200-step 2-phase stepper (MOTOR_TYPE=2).
-        let pole_pairs: u32 = 50;
-        let step_width = (65536u64 * pole_pairs as u64 / quad_ppr as u64) as i32;
-        if (channel as usize) < klipper_mcu::state::NUM_STEPPERS {
-            context.steppers[channel as usize].set_step_width(step_width);
-        }
-        defmt::info!("channel={} step_width={}", channel, step_width);
-        tmc_send(TmcRequest::SetEncoder { ppr });
+        let req = foci_core::tmc::tmc_set_encoder(context, channel, ppr, 50);
+        defmt::info!("channel={} ppr={}", channel, ppr);
+        tmc_send(req);
     }
 
     /// Set ABN encoder count direction. Inverted=1 flips the count
@@ -866,16 +781,14 @@ mod app {
     /// Depends on motor/encoder wiring — not board-specific.
     #[klipper_command]
     pub fn tmc_set_encoder_dir(_context: &mut State, _oid: u8, _channel: u8, invert: u8) {
-        tmc_send(TmcRequest::SetEncoderDir {
-            invert: invert != 0,
-        });
+        tmc_send(foci_core::tmc::tmc_set_encoder_dir(invert != 0));
     }
 
     /// Trigger TMC4671 self-test diagnostic. Results are reported via
     /// defmt RTT logging. Full klipper_output reporting is Phase 2.
     #[klipper_command]
     pub fn tmc_selftest(_context: &mut State, _oid: u8) {
-        tmc_send(TmcRequest::SelfTest);
+        tmc_send(foci_core::tmc::tmc_selftest());
     }
 
     /// Calibrate the TMC4671: ADC offset calibration, encoder alignment,
@@ -884,7 +797,16 @@ mod app {
     /// Must be called before motor enable. Rejected if motor is already enabled.
     #[klipper_command]
     pub fn foci_calibrate(_context: &mut State, oid: u8) {
-        tmc_send(TmcRequest::Calibrate { oid });
+        tmc_send(foci_core::tmc::tmc_calibrate(oid));
+    }
+
+    /// Dump all TMC4671 registers via klipper_output protocol.
+    ///
+    /// The firmware reads registers internally and streams results as
+    /// FOCI:DUMP protocol lines. Replaces Python-side register reads.
+    #[klipper_command]
+    pub fn foci_dump_registers(_context: &mut State, oid: u8) {
+        tmc_send(foci_core::tmc::tmc_dump_registers(oid));
     }
 
     /// SPI transfer stub (returns empty response).
@@ -1093,12 +1015,14 @@ mod app {
     /// SetEnable, Init, and TestSpin are handled inline by the tmc_control main loop.
     async fn handle_tmc_request(req: TmcRequest, tmc: &mut Tmc4671Spi<TmcSpiDevice>) {
         match req {
+            #[cfg(feature = "dev")]
             TmcRequest::Write { addr, value } => {
                 let reg = tmc4671::registers::Register::new(addr);
                 if tmc.write_register(reg, value).await.is_err() {
                     defmt::error!("TMC4671 SPI write failed: addr={:#04x}", addr);
                 }
             }
+            #[cfg(feature = "dev")]
             TmcRequest::Read { oid, addr } => {
                 let reg = tmc4671::registers::Register::new(addr);
                 match tmc.read_register(reg).await {
@@ -1179,6 +1103,29 @@ mod app {
                     }
                 }
                 defmt::info!("TMC4671 self-test: complete (Phase 1 stub)");
+            }
+            TmcRequest::DumpRegisters { oid } => {
+                for &addr in foci_core::dump::DUMP_REGISTERS {
+                    // Yield between SPI reads to let USB task drain TX buffer
+                    Mono::delay(1.millis()).await;
+
+                    let reg = tmc4671::registers::Register::new(addr);
+                    let value = match tmc.read_register(reg).await {
+                        Ok(v) => v,
+                        Err(_) => {
+                            defmt::error!("TMC4671 SPI read failed: addr={:#04x}", addr);
+                            0
+                        }
+                    };
+                    klipper_reply!(
+                        foci_dump_value,
+                        oid: u8 = oid,
+                        addr: u8 = addr,
+                        value: u32 = value
+                    );
+                }
+                Mono::delay(1.millis()).await;
+                klipper_reply!(foci_dump_done, oid: u8 = oid);
             }
             TmcRequest::SetEnable(_) => {
                 defmt::warn!("handle_tmc_request: SetEnable handled by main loop");

@@ -35,6 +35,7 @@ anchor.workspace = true
 tmc4671 = { path = "../tmc4671" }
 klipper-mcu = { path = "../klipper-mcu" }
 klipper-usb = { path = "../klipper-usb" }
+foci-core = { path = "../foci-core", features = ["defmt"] }
 
 # Logging
 defmt.workspace = true
@@ -45,7 +46,7 @@ panic-probe = { version = "1.0", features = ["print-defmt"] }
 heapless.workspace = true
 
 [features]
-dev = []
+dev = ["foci-core/dev"]
 
 [build-dependencies]
 anchor_codegen.workspace = true
