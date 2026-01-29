@@ -77,6 +77,26 @@ mod app {
         }
     }
 
+    /// Bridges selftest stage results to Klipper protocol replies.
+    ///
+    /// Each call to `report_stage` emits a `foci_selftest_result` reply
+    /// back to the host with the stage number, status, and value.
+    struct KlipperSelftestReporter {
+        oid: u8,
+    }
+
+    impl foci_core::selftest::SelftestReporter for KlipperSelftestReporter {
+        fn report_stage(&mut self, stage: u8, status: u8, value: u32) {
+            klipper_reply!(
+                foci_selftest_result,
+                oid: u8 = self.oid,
+                stage: u8 = stage,
+                status: u8 = status,
+                value: u32 = value
+            );
+        }
+    }
+
     /// USB wake signal. The OTG_FS ISR signals this to wake usb_task.
     static USB_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
@@ -784,11 +804,11 @@ mod app {
         tmc_send(foci_core::tmc::tmc_set_encoder_dir(invert != 0));
     }
 
-    /// Trigger TMC4671 self-test diagnostic. Results are reported via
-    /// defmt RTT logging. Full klipper_output reporting is Phase 2.
+    /// Trigger TMC4671 self-test diagnostic. Results stream via
+    /// `foci_selftest_result` replies, completed with `foci_selftest_done`.
     #[klipper_command]
-    pub fn tmc_selftest(_context: &mut State, _oid: u8) {
-        tmc_send(foci_core::tmc::tmc_selftest());
+    pub fn foci_selftest(_context: &mut State, oid: u8) {
+        tmc_send(foci_core::tmc::tmc_selftest(oid));
     }
 
     /// Calibrate the TMC4671: ADC offset calibration, encoder alignment,
@@ -1087,31 +1107,8 @@ mod app {
                     if invert { "reversed" } else { "default" }
                 );
             }
-            TmcRequest::SelfTest => {
-                defmt::info!("TMC4671 self-test: starting");
-                match tmc
-                    .read_sub_register(tmc4671::registers::CHIPINFO_SI_TYPE)
-                    .await
-                {
-                    Ok(chip_id) => {
-                        defmt::info!(
-                            "TMC4671 self-test: chip_id={:#010x} (expected 0x34363731)",
-                            chip_id
-                        );
-                    }
-                    Err(_) => {
-                        defmt::error!("TMC4671 self-test: chip ID read failed");
-                    }
-                }
-                match tmc.read_register(tmc4671::registers::STATUS_FLAGS).await {
-                    Ok(status) => {
-                        defmt::info!("TMC4671 self-test: status_flags={:#010x}", status);
-                    }
-                    Err(_) => {
-                        defmt::error!("TMC4671 self-test: STATUS_FLAGS read failed");
-                    }
-                }
-                defmt::info!("TMC4671 self-test: complete (Phase 1 stub)");
+            TmcRequest::SelfTest { .. } => {
+                defmt::warn!("handle_tmc_request: SelfTest handled by main loop");
             }
             TmcRequest::DumpRegisters { oid } => {
                 for &addr in foci_core::dump::DUMP_REGISTERS {
@@ -1377,6 +1374,35 @@ mod app {
                     #[cfg(feature = "dev")]
                     TmcRequest::TestSpin { revolutions } => {
                         do_test_spin(tmc, revolutions).await;
+                    }
+                    TmcRequest::SelfTest { oid } => {
+                        if motor_enabled {
+                            defmt::warn!("foci_selftest rejected: motor enabled");
+                            klipper_reply!(
+                                foci_selftest_done,
+                                oid: u8 = oid,
+                                status: u8 = foci_core::selftest::SELFTEST_DONE_ABORTED
+                            );
+                        } else {
+                            defmt::info!("foci_selftest: starting");
+                            let current_limit =
+                                CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
+                            let mut reporter = KlipperSelftestReporter { oid };
+                            let status = foci_core::selftest::run_selftest(
+                                tmc,
+                                enable_pin,
+                                &mut Mono,
+                                current_limit,
+                                &mut reporter,
+                            )
+                            .await;
+                            defmt::info!("foci_selftest: done, status={}", status);
+                            klipper_reply!(
+                                foci_selftest_done,
+                                oid: u8 = oid,
+                                status: u8 = status
+                            );
+                        }
                     }
                     other => {
                         handle_tmc_request(other, tmc).await;
