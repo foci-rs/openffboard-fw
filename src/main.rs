@@ -1041,7 +1041,12 @@ mod app {
             }
             TmcRequest::SetCurrent { run_ma } => {
                 use tmc4671::registers::*;
-                let counts = (run_ma as f32 / CURRENT_SCALE_MA_PER_LSB) as u32;
+                // User configures RMS current (Klipper convention). The TMC4671
+                // PID limits operate on peak amplitude in the d-q frame
+                // (datasheet eq. 19/21: I_phase = I_D * sin(phi_e)).
+                // Convert: peak = RMS * sqrt(2).
+                let peak_ma = run_ma as f32 * core::f32::consts::SQRT_2;
+                let counts = (peak_ma / CURRENT_SCALE_MA_PER_LSB) as u32;
                 let limit = (counts << 16) | counts;
                 CURRENT_LIMIT_REG.store(limit, core::sync::atomic::Ordering::Relaxed);
                 if tmc
@@ -1051,7 +1056,11 @@ mod app {
                 {
                     defmt::error!("TMC4671 SPI write failed: PID_TORQUE_FLUX_LIMITS");
                 }
-                defmt::info!("TMC4671 current: {}mA -> {} counts", run_ma, counts);
+                defmt::info!(
+                    "TMC4671 current: {}mA RMS -> {} counts (peak)",
+                    run_ma,
+                    counts
+                );
             }
             TmcRequest::SetEncoder { ppr } => {
                 use tmc4671::registers::*;
