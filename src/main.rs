@@ -66,6 +66,10 @@ mod app {
         EncoderFault,
         /// PID loop not tracking target (torque or position diverging).
         PidFault,
+        /// Motor already enabled (calibration not needed).
+        AlreadyEnabled,
+        /// Internal firmware error (queue full, channel not initialized, etc.).
+        InternalError,
     }
 
     impl CalibrationError {
@@ -76,6 +80,8 @@ mod app {
                 Self::AdcFault => 2,
                 Self::EncoderFault => 3,
                 Self::PidFault => 4,
+                Self::AlreadyEnabled => 5,
+                Self::InternalError => 6,
             }
         }
     }
@@ -482,7 +488,7 @@ mod app {
     pub fn queue_digital_out(context: &mut State, oid: u8, clock: u32, on_ticks: u32) {
         let _ = clock;
         match klipper_mcu::commands::digital_out::queue_digital_out(context, oid, on_ticks) {
-            Ok(enabled) => tmc_send(TmcRequest::SetEnable(enabled)),
+            Ok(enabled) => { tmc_send(TmcRequest::SetEnable(enabled)); }
             Err(e) => {
                 defmt::error!("queue_digital_out: {}", e);
                 if enter_shutdown(context) {
@@ -496,7 +502,7 @@ mod app {
     #[klipper_command]
     pub fn update_digital_out(context: &mut State, oid: u8, value: u8) {
         match klipper_mcu::commands::digital_out::update_digital_out(context, oid, value) {
-            Ok(enabled) => tmc_send(TmcRequest::SetEnable(enabled)),
+            Ok(enabled) => { tmc_send(TmcRequest::SetEnable(enabled)); }
             Err(e) => {
                 defmt::error!("update_digital_out: {}", e);
                 if enter_shutdown(context) {
@@ -780,14 +786,21 @@ mod app {
     // ---- TMC4671 register access commands ----
 
     /// Send a request to the tmc_control task.
-    fn tmc_send(req: TmcRequest) {
+    ///
+    /// Returns `true` if the request was enqueued, `false` if the channel
+    /// was full or not yet initialized. Callers with async reply contracts
+    /// must send a failure reply to the host when this returns `false`.
+    fn tmc_send(req: TmcRequest) -> bool {
         critical_section::with(|cs| {
             if let Some(sender) = TMC_REQUEST_SENDER.borrow(cs).borrow_mut().as_mut() {
                 if sender.try_send(req).is_err() {
                     defmt::warn!("TMC request channel full, command dropped");
+                    return false;
                 }
+                return true;
             }
-        });
+            false
+        })
     }
 
     /// Trigger TMC4671 initialization sequence.
@@ -817,7 +830,14 @@ mod app {
     #[cfg(feature = "dev")]
     #[klipper_command]
     pub fn tmc_read_register(_context: &mut State, oid: u8, addr: u8) {
-        tmc_send(foci_core::tmc::tmc_read_register(oid, addr));
+        if !tmc_send(foci_core::tmc::tmc_read_register(oid, addr)) {
+            klipper_reply!(
+                tmc_register_value,
+                oid: u8 = oid,
+                addr: u8 = addr,
+                value: u32 = 0
+            );
+        }
     }
 
     /// Set motor run current. The firmware converts milliamps to
@@ -874,7 +894,14 @@ mod app {
             );
             return;
         }
-        tmc_send(foci_core::tmc::tmc_selftest(oid));
+        if !tmc_send(foci_core::tmc::tmc_selftest(oid)) {
+            SELFTEST_IN_FLIGHT.store(false, Relaxed);
+            klipper_reply!(
+                foci_selftest_done,
+                oid: u8 = oid,
+                status: u8 = foci_core::selftest::SELFTEST_DONE_ABORTED
+            );
+        }
     }
 
     /// Calibrate the TMC4671: ADC offset calibration, encoder alignment,
@@ -883,7 +910,16 @@ mod app {
     /// Must be called before motor enable. Rejected if motor is already enabled.
     #[klipper_command]
     pub fn foci_calibrate(_context: &mut State, oid: u8) {
-        tmc_send(foci_core::tmc::tmc_calibrate(oid));
+        if !tmc_send(foci_core::tmc::tmc_calibrate(oid)) {
+            klipper_reply!(
+                foci_calibrate_response,
+                oid: u8 = oid,
+                status: u8 = CalibrationError::InternalError.status_code(),
+                adc_i0: u16 = 0,
+                adc_i1: u16 = 0,
+                encoder_count: u32 = 0
+            );
+        }
     }
 
     /// Dump all TMC4671 registers via klipper_output protocol.
@@ -892,7 +928,9 @@ mod app {
     /// FOCI:DUMP protocol lines. Replaces Python-side register reads.
     #[klipper_command]
     pub fn foci_dump_registers(_context: &mut State, oid: u8) {
-        tmc_send(foci_core::tmc::tmc_dump_registers(oid));
+        if !tmc_send(foci_core::tmc::tmc_dump_registers(oid)) {
+            klipper_reply!(foci_dump_done, oid: u8 = oid);
+        }
     }
 
     /// SPI transfer stub (returns empty response).
@@ -1360,16 +1398,14 @@ mod app {
                         }
                     }
                     TmcRequest::Calibrate { oid } => {
-                        // Status codes for foci_calibrate_response
                         const STATUS_OK: u8 = 0;
-                        const STATUS_ALREADY_ENABLED: u8 = 5;
 
                         if motor_enabled {
                             defmt::warn!("foci_calibrate rejected: motor already enabled");
                             klipper_reply!(
                                 foci_calibrate_response,
                                 oid: u8 = oid,
-                                status: u8 = STATUS_ALREADY_ENABLED,
+                                status: u8 = CalibrationError::AlreadyEnabled.status_code(),
                                 adc_i0: u16 = 0,
                                 adc_i1: u16 = 0,
                                 encoder_count: u32 = 0
