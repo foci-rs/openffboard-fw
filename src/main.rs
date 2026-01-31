@@ -405,14 +405,24 @@ mod app {
     /// forward/backward accordingly.
     #[klipper_command]
     pub fn set_next_step_dir(context: &mut State, oid: u8, dir: u8) {
-        klipper_mcu::commands::stepper::set_next_step_dir(context, oid, dir);
+        if let Err(e) = klipper_mcu::commands::stepper::set_next_step_dir(context, oid, dir) {
+            defmt::error!("set_next_step_dir: {}", e);
+            if enter_shutdown(context) {
+                klipper_shutdown!("set_next_step_dir failed", DWT::cycle_count());
+            }
+        }
     }
 
     /// Reset the step clock reference for a stepper.
     #[klipper_command]
     pub fn reset_step_clock(context: &mut State, oid: u8, clock: u32) {
         defmt::info!("reset_step_clock: oid={} clock={}", oid, clock);
-        klipper_mcu::commands::stepper::reset_step_clock(context, oid, clock);
+        if let Err(e) = klipper_mcu::commands::stepper::reset_step_clock(context, oid, clock) {
+            defmt::error!("reset_step_clock: {}", e);
+            if enter_shutdown(context) {
+                klipper_shutdown!("reset_step_clock failed", DWT::cycle_count());
+            }
+        }
     }
 
     /// Report the current position of a stepper.
@@ -647,13 +657,18 @@ mod app {
         report_ticks: u32,
         expire_reason: u8,
     ) {
-        klipper_mcu::commands::trsync::trsync_start(
+        if let Err(e) = klipper_mcu::commands::trsync::trsync_start(
             context,
             oid,
             report_clock,
             report_ticks,
             expire_reason,
-        );
+        ) {
+            defmt::error!("trsync_start: {}", e);
+            if enter_shutdown(context) {
+                klipper_shutdown!("trsync_start failed", DWT::cycle_count());
+            }
+        }
     }
 
     /// Update the expiry deadline for a TrSync.
@@ -662,7 +677,12 @@ mod app {
     /// the clock reaches this value before a manual trigger.
     #[klipper_command]
     pub fn trsync_set_timeout(context: &mut State, oid: u8, clock: u32) {
-        klipper_mcu::commands::trsync::trsync_set_timeout(context, oid, clock);
+        if let Err(e) = klipper_mcu::commands::trsync::trsync_set_timeout(context, oid, clock) {
+            defmt::error!("trsync_set_timeout: {}", e);
+            if enter_shutdown(context) {
+                klipper_shutdown!("trsync_set_timeout failed", DWT::cycle_count());
+            }
+        }
     }
 
     /// Manually trigger a TrSync with the given reason code.
@@ -671,7 +691,12 @@ mod app {
     /// linked to this TrSync OID via stepper_stop_on_trigger.
     #[klipper_command]
     pub fn trsync_trigger(context: &mut State, oid: u8, reason: u8) {
-        klipper_mcu::commands::trsync::trsync_trigger(context, oid, reason);
+        if let Err(e) = klipper_mcu::commands::trsync::trsync_trigger(context, oid, reason) {
+            defmt::error!("trsync_trigger: {}", e);
+            if enter_shutdown(context) {
+                klipper_shutdown!("trsync_trigger failed", DWT::cycle_count());
+            }
+        }
     }
 
     /// Register an endstop object.
@@ -729,7 +754,7 @@ mod app {
         trsync_oid: u8,
         trigger_reason: u8,
     ) {
-        klipper_mcu::commands::endstop::endstop_home(
+        if let Err(e) = klipper_mcu::commands::endstop::endstop_home(
             context,
             oid,
             clock,
@@ -739,7 +764,12 @@ mod app {
             pin_value != 0,
             trsync_oid,
             trigger_reason,
-        );
+        ) {
+            defmt::error!("endstop_home: {}", e);
+            if enter_shutdown(context) {
+                klipper_shutdown!("endstop_home failed", DWT::cycle_count());
+            }
+        }
     }
 
     /// Query the current state of an endstop.
