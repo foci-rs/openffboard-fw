@@ -364,6 +364,9 @@ mod app {
     ) {
         if let Err(e) = klipper_mcu::commands::stepper::config_stepper(context, oid) {
             defmt::error!("config_stepper: {}", e);
+            if enter_shutdown(context) {
+                klipper_shutdown!("config_stepper failed", DWT::cycle_count());
+            }
             return;
         }
         defmt::info!("config_stepper: oid={} (pins ignored, TMC4671 mode)", oid);
@@ -376,6 +379,9 @@ mod app {
             klipper_mcu::commands::stepper::queue_step(context, oid, interval, count, add)
         {
             defmt::error!("queue_step: oid={} {}", oid, e);
+            if enter_shutdown(context) {
+                klipper_shutdown!("queue_step failed", DWT::cycle_count());
+            }
         }
     }
 
@@ -428,6 +434,9 @@ mod app {
                 trsync_oid,
                 e
             );
+            if enter_shutdown(context) {
+                klipper_shutdown!("stepper_stop_on_trigger failed", DWT::cycle_count());
+            }
         }
     }
 
@@ -448,6 +457,9 @@ mod app {
     ) {
         if let Err(e) = klipper_mcu::commands::digital_out::config_digital_out(context, oid) {
             defmt::error!("config_digital_out: {}", e);
+            if enter_shutdown(context) {
+                klipper_shutdown!("config_digital_out failed", DWT::cycle_count());
+            }
             return;
         }
         defmt::info!(
@@ -464,7 +476,12 @@ mod app {
         let _ = clock;
         match klipper_mcu::commands::digital_out::queue_digital_out(context, oid, on_ticks) {
             Ok(enabled) => tmc_send(TmcRequest::SetEnable(enabled)),
-            Err(e) => defmt::error!("queue_digital_out: {}", e),
+            Err(e) => {
+                defmt::error!("queue_digital_out: {}", e);
+                if enter_shutdown(context) {
+                    klipper_shutdown!("queue_digital_out failed", DWT::cycle_count());
+                }
+            }
         }
     }
 
@@ -473,7 +490,12 @@ mod app {
     pub fn update_digital_out(context: &mut State, oid: u8, value: u8) {
         match klipper_mcu::commands::digital_out::update_digital_out(context, oid, value) {
             Ok(enabled) => tmc_send(TmcRequest::SetEnable(enabled)),
-            Err(e) => defmt::error!("update_digital_out: {}", e),
+            Err(e) => {
+                defmt::error!("update_digital_out: {}", e);
+                if enter_shutdown(context) {
+                    klipper_shutdown!("update_digital_out failed", DWT::cycle_count());
+                }
+            }
         }
     }
 
@@ -574,6 +596,9 @@ mod app {
     pub fn config_trsync(context: &mut State, oid: u8) {
         if let Err(e) = klipper_mcu::commands::trsync::config_trsync(context, oid) {
             defmt::error!("config_trsync: {}", e);
+            if enter_shutdown(context) {
+                klipper_shutdown!("config_trsync failed", DWT::cycle_count());
+            }
             return;
         }
         defmt::info!("config_trsync: oid={}", oid);
@@ -628,6 +653,9 @@ mod app {
         let idx = context.endstop_by_oid.len();
         if let Err(e) = klipper_mcu::commands::endstop::config_endstop(context, oid) {
             defmt::error!("config_endstop: {}", e);
+            if enter_shutdown(context) {
+                klipper_shutdown!("config_endstop failed", DWT::cycle_count());
+            }
             return;
         }
 
