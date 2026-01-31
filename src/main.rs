@@ -1778,6 +1778,17 @@ mod app {
                                             }
                                         }
                                     }
+                                } else {
+                                    defmt::error!(
+                                        "endstop trigger: unknown trsync_oid={}",
+                                        trsync_oid
+                                    );
+                                    if enter_shutdown(state) {
+                                        klipper_shutdown!(
+                                            "Endstop trigger: unknown trsync OID",
+                                            DWT::cycle_count()
+                                        );
+                                    }
                                 }
                                 defmt::info!(
                                     "endstop oid={} triggered: reason={} trsync_oid={}",
