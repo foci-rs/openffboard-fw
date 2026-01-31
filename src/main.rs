@@ -488,7 +488,16 @@ mod app {
     pub fn queue_digital_out(context: &mut State, oid: u8, clock: u32, on_ticks: u32) {
         let _ = clock;
         match klipper_mcu::commands::digital_out::queue_digital_out(context, oid, on_ticks) {
-            Ok(enabled) => { tmc_send(TmcRequest::SetEnable(enabled)); }
+            Ok(enabled) => {
+                if !tmc_send(TmcRequest::SetEnable(enabled)) {
+                    if enter_shutdown(context) {
+                        klipper_shutdown!(
+                            "Motor enable/disable lost (queue full)",
+                            DWT::cycle_count()
+                        );
+                    }
+                }
+            }
             Err(e) => {
                 defmt::error!("queue_digital_out: {}", e);
                 if enter_shutdown(context) {
@@ -502,7 +511,16 @@ mod app {
     #[klipper_command]
     pub fn update_digital_out(context: &mut State, oid: u8, value: u8) {
         match klipper_mcu::commands::digital_out::update_digital_out(context, oid, value) {
-            Ok(enabled) => { tmc_send(TmcRequest::SetEnable(enabled)); }
+            Ok(enabled) => {
+                if !tmc_send(TmcRequest::SetEnable(enabled)) {
+                    if enter_shutdown(context) {
+                        klipper_shutdown!(
+                            "Motor enable/disable lost (queue full)",
+                            DWT::cycle_count()
+                        );
+                    }
+                }
+            }
             Err(e) => {
                 defmt::error!("update_digital_out: {}", e);
                 if enter_shutdown(context) {
