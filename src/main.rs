@@ -261,6 +261,13 @@ mod app {
         for pin_id in &ENDSTOP_PIN_IDS {
             pin_id.store(0xFF, core::sync::atomic::Ordering::Relaxed);
         }
+        // Reset board-local control and protocol state
+        CURRENT_LIMIT_REG.store(0, core::sync::atomic::Ordering::Relaxed);
+        ENCODER_REVERSED.store(false, core::sync::atomic::Ordering::Relaxed);
+        STEPPER_POSITION_TARGET.store(0, core::sync::atomic::Ordering::Relaxed);
+        SELFTEST_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+        STATS_SEND_TIME.store(0, core::sync::atomic::Ordering::Relaxed);
+        STATS_SEND_TIME_HIGH.store(0, core::sync::atomic::Ordering::Relaxed);
     }
 
     #[klipper_command]
