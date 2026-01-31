@@ -48,6 +48,9 @@ mod app {
 
     const TMC_CHANNEL_SIZE: usize = 8;
 
+    /// Number of TMC4671 motor channels on OpenFFBoard (single-motor board).
+    const TMC_MOTOR_COUNT: u8 = 1;
+
     /// Current scaling for OpenFFBoard: milliamps per ADC least significant bit.
     /// Derived from sense resistor value and ADC configuration.
     const CURRENT_SCALE_MA_PER_LSB: f32 = 1.155;
@@ -798,6 +801,10 @@ mod app {
     ///   step_width = 65536 * pole_pairs / quadrature_ppr
     #[klipper_command]
     pub fn tmc_set_encoder(context: &mut State, _oid: u8, channel: u8, ppr: u32) {
+        if channel >= TMC_MOTOR_COUNT {
+            klipper_shutdown!("Invalid TMC channel", DWT::cycle_count());
+            return;
+        }
         let req = foci_core::tmc::tmc_set_encoder(context, channel, ppr, 50);
         defmt::info!("channel={} ppr={}", channel, ppr);
         tmc_send(req);
@@ -807,7 +814,11 @@ mod app {
     /// direction so the position PID has correct (negative) feedback.
     /// Depends on motor/encoder wiring — not board-specific.
     #[klipper_command]
-    pub fn tmc_set_encoder_dir(_context: &mut State, _oid: u8, _channel: u8, invert: u8) {
+    pub fn tmc_set_encoder_dir(_context: &mut State, _oid: u8, channel: u8, invert: u8) {
+        if channel >= TMC_MOTOR_COUNT {
+            klipper_shutdown!("Invalid TMC channel", DWT::cycle_count());
+            return;
+        }
         tmc_send(foci_core::tmc::tmc_set_encoder_dir(invert != 0));
     }
 
