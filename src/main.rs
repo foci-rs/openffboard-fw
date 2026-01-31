@@ -849,12 +849,8 @@ mod app {
     #[klipper_command]
     pub fn tmc_read_register(_context: &mut State, oid: u8, addr: u8) {
         if !tmc_send(foci_core::tmc::tmc_read_register(oid, addr)) {
-            klipper_reply!(
-                tmc_register_value,
-                oid: u8 = oid,
-                addr: u8 = addr,
-                value: u32 = 0
-            );
+            defmt::warn!("tmc_read_register dropped: addr={:#04x}", addr);
+            // No reply — let the Python query_command timeout naturally.
         }
     }
 
@@ -947,6 +943,7 @@ mod app {
     #[klipper_command]
     pub fn foci_dump_registers(_context: &mut State, oid: u8) {
         if !tmc_send(foci_core::tmc::tmc_dump_registers(oid)) {
+            defmt::warn!("foci_dump_registers dropped");
             klipper_reply!(foci_dump_done, oid: u8 = oid);
         }
     }
