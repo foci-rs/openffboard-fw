@@ -1084,6 +1084,10 @@ mod app {
             }
             TmcRequest::SetEncoder { ppr } => {
                 use tmc4671::registers::*;
+                if ppr == 0 {
+                    klipper_shutdown!("Invalid encoder PPR: 0", DWT::cycle_count());
+                    return;
+                }
                 let quadrature_ppr = ppr * 4;
                 if tmc
                     .write_register(ABN_DECODER_PPR, quadrature_ppr)
