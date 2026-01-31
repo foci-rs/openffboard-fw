@@ -745,7 +745,9 @@ mod app {
     fn tmc_send(req: TmcRequest) {
         critical_section::with(|cs| {
             if let Some(sender) = TMC_REQUEST_SENDER.borrow(cs).borrow_mut().as_mut() {
-                let _ = sender.try_send(req);
+                if sender.try_send(req).is_err() {
+                    defmt::warn!("TMC request channel full, command dropped");
+                }
             }
         });
     }
