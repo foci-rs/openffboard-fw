@@ -2373,9 +2373,9 @@ mod app {
         loop {
             USB_WAKE.wait().await;
 
-            // Process ALL pending USB events. Keep polling until
-            // no more data is available — klipper-usb internal wake
-            // flags don't signal USB_WAKE.
+            // Process pending USB events. Poll reads new bulk OUT data
+            // and drains bulk IN. Loop while making progress — break if
+            // the protocol can't consume any bytes (incomplete frame).
             while klipper_usb::poll() {
                 let data = klipper_usb::rx_data();
                 if data.is_empty() {
@@ -2393,7 +2393,9 @@ mod app {
                 });
                 let consumed = len - input.available();
                 klipper_usb::rx_consume(consumed);
-                // poll() at top of loop sends acks before reading more
+                if consumed == 0 {
+                    break; // No progress — wait for more USB data
+                }
             }
             // Final poll to flush any remaining TX
             klipper_usb::poll();
