@@ -888,8 +888,12 @@ mod app {
     /// PID_TORQUE_FLUX_LIMITS register counts using the board-specific
     /// current scaling factor.
     #[klipper_command]
-    pub fn tmc_set_current(_context: &mut State, _oid: u8, run_ma: u32) {
-        tmc_send(foci_core::tmc::tmc_set_current(run_ma));
+    pub fn tmc_set_current(context: &mut State, _oid: u8, run_ma: u32) {
+        if !tmc_send(foci_core::tmc::tmc_set_current(run_ma)) {
+            if enter_shutdown(context) {
+                klipper_shutdown!("tmc_set_current lost (queue full)", DWT::cycle_count());
+            }
+        }
     }
 
     /// Configure ABN encoder resolution and compute step width.
@@ -906,19 +910,27 @@ mod app {
         }
         let req = foci_core::tmc::tmc_set_encoder(context, channel, ppr, 50);
         defmt::info!("channel={} ppr={}", channel, ppr);
-        tmc_send(req);
+        if !tmc_send(req) {
+            if enter_shutdown(context) {
+                klipper_shutdown!("tmc_set_encoder lost (queue full)", DWT::cycle_count());
+            }
+        }
     }
 
     /// Set ABN encoder count direction. Inverted=1 flips the count
     /// direction so the position PID has correct (negative) feedback.
     /// Depends on motor/encoder wiring — not board-specific.
     #[klipper_command]
-    pub fn tmc_set_encoder_dir(_context: &mut State, _oid: u8, channel: u8, invert: u8) {
+    pub fn tmc_set_encoder_dir(context: &mut State, _oid: u8, channel: u8, invert: u8) {
         if channel >= TMC_MOTOR_COUNT {
             klipper_shutdown!("Invalid TMC channel", DWT::cycle_count());
             return;
         }
-        tmc_send(foci_core::tmc::tmc_set_encoder_dir(invert != 0));
+        if !tmc_send(foci_core::tmc::tmc_set_encoder_dir(invert != 0)) {
+            if enter_shutdown(context) {
+                klipper_shutdown!("tmc_set_encoder_dir lost (queue full)", DWT::cycle_count());
+            }
+        }
     }
 
     /// Trigger TMC4671 self-test diagnostic. Results stream via
