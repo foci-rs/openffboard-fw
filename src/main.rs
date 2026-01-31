@@ -144,6 +144,11 @@ mod app {
     static SELFTEST_IN_FLIGHT: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
 
+    /// Signal tmc_control to drain all pending requests. Set by config_reset
+    /// (P2), cleared by tmc_control (P1) after draining.
+    static TMC_QUEUE_FLUSH: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
     static TMC_REQUEST_SENDER: Mutex<
         RefCell<Option<Sender<'static, TmcRequest, TMC_CHANNEL_SIZE>>>,
     > = Mutex::new(RefCell::new(None));
@@ -274,6 +279,8 @@ mod app {
         SELFTEST_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
         STATS_SEND_TIME.store(0, core::sync::atomic::Ordering::Relaxed);
         STATS_SEND_TIME_HIGH.store(0, core::sync::atomic::Ordering::Relaxed);
+        // Signal tmc_control to drain stale requests from the pre-reset epoch
+        TMC_QUEUE_FLUSH.store(true, core::sync::atomic::Ordering::Relaxed);
     }
 
     #[klipper_command]
@@ -1409,6 +1416,14 @@ mod app {
         // by usb_receive at P2) — no shared resource lock needed.
         loop {
             use embassy_futures::select::{select, Either};
+
+            // Drain stale requests after config_reset
+            if TMC_QUEUE_FLUSH.swap(false, core::sync::atomic::Ordering::Relaxed) {
+                while rx.try_recv().is_ok() {}
+                motor_enabled = false;
+                calibrated = false;
+                defmt::info!("TMC request queue flushed after config_reset");
+            }
 
             match select(rx.recv(), Mono::delay(1.millis())).await {
                 // Channel message received
