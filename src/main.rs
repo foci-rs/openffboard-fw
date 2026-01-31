@@ -130,6 +130,11 @@ mod app {
     static ENCODER_REVERSED: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
 
+    /// Guard for single-in-flight selftest. Set at command ingress (P2),
+    /// cleared after foci_selftest_done is emitted (P1).
+    static SELFTEST_IN_FLIGHT: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
     static TMC_REQUEST_SENDER: Mutex<
         RefCell<Option<Sender<'static, TmcRequest, TMC_CHANNEL_SIZE>>>,
     > = Mutex::new(RefCell::new(None));
@@ -806,8 +811,21 @@ mod app {
 
     /// Trigger TMC4671 self-test diagnostic. Results stream via
     /// `foci_selftest_result` replies, completed with `foci_selftest_done`.
+    ///
+    /// Only one selftest may be in flight at a time. Concurrent requests
+    /// are rejected with `SELFTEST_DONE_ABORTED`.
     #[klipper_command]
     pub fn foci_selftest(_context: &mut State, oid: u8) {
+        use core::sync::atomic::Ordering::Relaxed;
+        if SELFTEST_IN_FLIGHT.swap(true, Relaxed) {
+            defmt::warn!("foci_selftest rejected: already in flight");
+            klipper_reply!(
+                foci_selftest_done,
+                oid: u8 = oid,
+                status: u8 = foci_core::selftest::SELFTEST_DONE_ABORTED
+            );
+            return;
+        }
         tmc_send(foci_core::tmc::tmc_selftest(oid));
     }
 
@@ -1380,19 +1398,15 @@ mod app {
                         do_test_spin(tmc, revolutions).await;
                     }
                     TmcRequest::SelfTest { oid } => {
-                        if motor_enabled {
+                        let status = if motor_enabled {
                             defmt::warn!("foci_selftest rejected: motor enabled");
-                            klipper_reply!(
-                                foci_selftest_done,
-                                oid: u8 = oid,
-                                status: u8 = foci_core::selftest::SELFTEST_DONE_ABORTED
-                            );
+                            foci_core::selftest::SELFTEST_DONE_ABORTED
                         } else {
                             defmt::info!("foci_selftest: starting");
                             let current_limit =
                                 CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
                             let mut reporter = KlipperSelftestReporter { oid };
-                            let status = foci_core::selftest::run_selftest(
+                            let s = foci_core::selftest::run_selftest(
                                 tmc,
                                 enable_pin,
                                 &mut Mono,
@@ -1400,13 +1414,16 @@ mod app {
                                 &mut reporter,
                             )
                             .await;
-                            defmt::info!("foci_selftest: done, status={}", status);
-                            klipper_reply!(
-                                foci_selftest_done,
-                                oid: u8 = oid,
-                                status: u8 = status
-                            );
-                        }
+                            defmt::info!("foci_selftest: done, status={}", s);
+                            s
+                        };
+                        klipper_reply!(
+                            foci_selftest_done,
+                            oid: u8 = oid,
+                            status: u8 = status
+                        );
+                        SELFTEST_IN_FLIGHT
+                            .store(false, core::sync::atomic::Ordering::Relaxed);
                     }
                     other => {
                         handle_tmc_request(other, tmc).await;
