@@ -944,7 +944,8 @@ mod app {
     pub fn foci_dump_registers(_context: &mut State, oid: u8) {
         if !tmc_send(foci_core::tmc::tmc_dump_registers(oid)) {
             defmt::warn!("foci_dump_registers dropped");
-            klipper_reply!(foci_dump_done, oid: u8 = oid);
+            // No reply — let the Python wait loop timeout with an
+            // explicit "register dump timed out" error.
         }
     }
 
