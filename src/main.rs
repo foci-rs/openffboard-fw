@@ -1257,7 +1257,7 @@ mod app {
                     klipper_shutdown!("Invalid encoder PPR: 0", DWT::cycle_count());
                     return;
                 }
-                let quadrature_ppr = ppr * 4;
+                let quadrature_ppr = ppr.saturating_mul(4);
                 if tmc
                     .write_register(ABN_DECODER_PPR, quadrature_ppr)
                     .await
