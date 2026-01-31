@@ -1324,7 +1324,7 @@ mod app {
         // NOTE: auto-init disabled - motor current regulation not yet safe
         // tmc_init_open_loop(tmc, enable_pin).await;
 
-        // Verify TMC4671 chip identity
+        // Verify TMC4671 chip identity — shutdown if SPI fails or wrong chip
         match tmc
             .read_sub_register(tmc4671::registers::CHIPINFO_SI_TYPE)
             .await
@@ -1337,10 +1337,22 @@ mod app {
                         "TMC4671 chip ID mismatch: expected 0x34363731, got {:#010x}",
                         chip_id
                     );
+                    ctx.shared.app_state.lock(|state| {
+                        if enter_shutdown(state) {
+                            klipper_shutdown!("TMC4671 chip ID mismatch", DWT::cycle_count());
+                        }
+                    });
+                    return;
                 }
             }
             Err(_) => {
                 defmt::error!("TMC4671 SPI communication failed");
+                ctx.shared.app_state.lock(|state| {
+                    if enter_shutdown(state) {
+                        klipper_shutdown!("TMC4671 SPI failed at boot", DWT::cycle_count());
+                    }
+                });
+                return;
             }
         }
 
