@@ -1915,12 +1915,12 @@ mod app {
         // resets PID_TORQUE_FLUX_LIMITS during mode changes, clearing the
         // torque limit field. Without this, the motor has zero torque
         // capacity in position mode.
-        let _ = tmc
-            .write_register(
-                tmc4671::registers::PID_TORQUE_FLUX_LIMITS,
-                current_limit_reg,
-            )
-            .await;
+        tmc.write_register(
+            tmc4671::registers::PID_TORQUE_FLUX_LIMITS,
+            current_limit_reg,
+        )
+        .await
+        .map_err(|_| CalibrationError::SpiError)?;
 
         Ok((adc_i0, adc_i1, encoder_count))
     }
