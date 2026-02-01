@@ -912,7 +912,9 @@ mod app {
     #[klipper_command]
     pub fn tmc_set_encoder(context: &mut State, _oid: u8, channel: u8, ppr: u32) {
         if channel >= TMC_MOTOR_COUNT {
-            klipper_shutdown!("Invalid TMC channel", DWT::cycle_count());
+            if enter_shutdown(context) {
+                klipper_shutdown!("Invalid TMC channel", DWT::cycle_count());
+            }
             return;
         }
         let req = foci_core::tmc::tmc_set_encoder(context, channel, ppr, 50);
@@ -930,7 +932,9 @@ mod app {
     #[klipper_command]
     pub fn tmc_set_encoder_dir(context: &mut State, _oid: u8, channel: u8, invert: u8) {
         if channel >= TMC_MOTOR_COUNT {
-            klipper_shutdown!("Invalid TMC channel", DWT::cycle_count());
+            if enter_shutdown(context) {
+                klipper_shutdown!("Invalid TMC channel", DWT::cycle_count());
+            }
             return;
         }
         if !tmc_send(foci_core::tmc::tmc_set_encoder_dir(invert != 0)) {
@@ -1202,7 +1206,11 @@ mod app {
     /// Handle a TMC request that does not require main-loop state (motor_enabled, enable_pin).
     ///
     /// SetEnable, Init, and TestSpin are handled inline by the tmc_control main loop.
-    async fn handle_tmc_request(req: TmcRequest, tmc: &mut Tmc4671Spi<TmcSpiDevice>) {
+    /// Returns `Ok(())` on success, `Err(())` if the caller should enter shutdown.
+    async fn handle_tmc_request(
+        req: TmcRequest,
+        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
+    ) -> Result<(), ()> {
         match req {
             #[cfg(feature = "dev")]
             TmcRequest::Write { addr, value } => {
@@ -1254,8 +1262,8 @@ mod app {
             TmcRequest::SetEncoder { ppr } => {
                 use tmc4671::registers::*;
                 if ppr == 0 {
-                    klipper_shutdown!("Invalid encoder PPR: 0", DWT::cycle_count());
-                    return;
+                    defmt::error!("Invalid encoder PPR: 0");
+                    return Err(());
                 }
                 let quadrature_ppr = ppr.saturating_mul(4);
                 if tmc
@@ -1321,6 +1329,7 @@ mod app {
                 defmt::warn!("handle_tmc_request: TestSpin handled by main loop");
             }
         }
+        Ok(())
     }
 
     /// TMC4671 control task. Runs at priority 1 (preempted by protocol tasks).
@@ -1595,7 +1604,16 @@ mod app {
                             .store(false, core::sync::atomic::Ordering::Relaxed);
                     }
                     other => {
-                        handle_tmc_request(other, tmc).await;
+                        if handle_tmc_request(other, tmc).await.is_err() {
+                            ctx.shared.app_state.lock(|state| {
+                                if enter_shutdown(state) {
+                                    klipper_shutdown!(
+                                        "TMC request validation failed",
+                                        DWT::cycle_count()
+                                    );
+                                }
+                            });
+                        }
                     }
                 },
                 Either::First(Err(_)) => {}
