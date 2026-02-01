@@ -785,7 +785,16 @@ mod app {
     #[klipper_command]
     pub fn endstop_query_state(context: &mut State, oid: u8) {
         let (homing, next_clock) =
-            klipper_mcu::commands::endstop::endstop_query_state(context, oid);
+            match klipper_mcu::commands::endstop::endstop_query_state(context, oid) {
+                Ok(result) => result,
+                Err(e) => {
+                    defmt::error!("endstop_query_state: {}", e);
+                    if enter_shutdown(context) {
+                        klipper_shutdown!("endstop_query_state failed", DWT::cycle_count());
+                    }
+                    return;
+                }
+            };
         // Read the live GPIO pin state for the endstop
         let pin_state = context
             .endstop_by_oid
