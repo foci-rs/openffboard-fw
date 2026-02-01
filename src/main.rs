@@ -1254,14 +1254,15 @@ mod app {
                 let peak_ma = run_ma as f32 * core::f32::consts::SQRT_2;
                 let counts = (peak_ma / CURRENT_SCALE_MA_PER_LSB) as u32;
                 let limit = (counts << 16) | counts;
-                CURRENT_LIMIT_REG.store(limit, core::sync::atomic::Ordering::Relaxed);
                 if tmc
                     .write_register(PID_TORQUE_FLUX_LIMITS, limit)
                     .await
                     .is_err()
                 {
                     defmt::error!("TMC4671 SPI write failed: PID_TORQUE_FLUX_LIMITS");
+                    return Err(());
                 }
+                CURRENT_LIMIT_REG.store(limit, core::sync::atomic::Ordering::Relaxed);
                 defmt::info!(
                     "TMC4671 current: {}mA RMS -> {} counts (peak)",
                     run_ma,
@@ -1281,6 +1282,7 @@ mod app {
                     .is_err()
                 {
                     defmt::error!("TMC4671 SPI write failed: ABN_DECODER_PPR");
+                    return Err(());
                 }
                 let step_width = 65536u64 * 50 / quadrature_ppr as u64;
                 defmt::info!("TMC4671 encoder: {} PPR, step_width={}", ppr, step_width);
@@ -1290,6 +1292,7 @@ mod app {
                 let mode = if invert { 1u32 << 12 } else { 0 };
                 if tmc.write_register(ABN_DECODER_MODE, mode).await.is_err() {
                     defmt::error!("TMC4671 SPI write failed: ABN_DECODER_MODE");
+                    return Err(());
                 }
                 ENCODER_REVERSED.store(invert, core::sync::atomic::Ordering::Relaxed);
                 defmt::info!(
