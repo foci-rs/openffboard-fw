@@ -1420,6 +1420,66 @@ mod app {
             defmt::info!("TMC4671 STATUS_MASK: {:#010x}, EXTI8 enabled", mask);
         }
 
+        // Configure brake chopper thresholds from measured bus voltage.
+        //
+        // Sample ADC_VM_RAW at boot to measure supply voltage, then set
+        // activation/deactivation thresholds as percentages of measured peak:
+        //   HIGH = +15% above measured (activation)
+        //   LOW  = +10% above measured (deactivation, 5% hysteresis)
+        //
+        // Margins follow industry servo drive practice (5-20% activation,
+        // 1-5% hysteresis). References: ABB ACS880 (+15-19%), Rockwell
+        // PF755 (+16%, 4% hysteresis), KEB F5 (+16%).
+        //
+        // Configured at boot (not during motor calibration) so protection
+        // is active before Klipper connects. VM divider readings are
+        // unaffected by PWM_CHOP state — no motor interaction needed.
+        //
+        // TMC4671 datasheet rev 2.08, section 4.7.12: BRAKE pin activates
+        // per-PWM-cycle when ADC_VM > ADC_VM_LIMIT_HIGH, deactivates when
+        // ADC_VM < ADC_VM_LIMIT_LOW.
+        {
+            use tmc4671::registers::*;
+
+            // Ensure PWM_CHOP=0 before sampling (power-on default, but
+            // explicit per project safety rules).
+            let _ = tmc.write_register(PWM_SV_CHOP, 0).await;
+
+            let mut vm_max: u16 = 0;
+            for _ in 0..100_u32 {
+                if let Ok(raw) = tmc.read_sub_register(ADC_AGPI_A_RAW_ADC_VM_RAW).await {
+                    let vm = (raw & 0xFFFF) as u16;
+                    if vm > vm_max {
+                        vm_max = vm;
+                    }
+                }
+                Mono::delay(1_u32.millis()).await;
+            }
+
+            if vm_max > 0 {
+                let high = vm_max as u32 * 115 / 100;
+                let low = vm_max as u32 * 110 / 100;
+
+                // Clamp to u16::MAX if overflow — fail-safe (max protection),
+                // not fail-open (no protection).
+                let high = high.min(u16::MAX as u32);
+                let low = low.min(u16::MAX as u32);
+
+                // Datasheet page 124: LOW = bits[15:0], HIGH = bits[31:16]
+                let limits = (high << 16) | low;
+                let _ = tmc.write_register(ADC_VM_LIMITS, limits).await;
+                defmt::info!(
+                    "Brake chopper: VM peak={}, LOW={} (+10%), HIGH={} (+15%)",
+                    vm_max,
+                    low,
+                    high,
+                );
+            } else {
+                let _ = tmc.write_register(ADC_VM_LIMITS, 0).await;
+                defmt::warn!("Brake chopper disabled: no VM reading");
+            }
+        }
+
         // Track whether the motor is enabled. Only set to true after the full
         // enable sequence (ADC cal, encoder alignment, closed-loop entry) completes.
         let mut motor_enabled = false;
