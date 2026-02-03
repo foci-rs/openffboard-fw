@@ -1448,15 +1448,18 @@ mod app {
             let mut vm_max: u16 = 0;
             for _ in 0..100_u32 {
                 if let Ok(raw) = tmc.read_sub_register(ADC_AGPI_A_RAW_ADC_VM_RAW).await {
+                    // ADC_VM_RAW is in bits[15:0] (datasheet section 7.2)
                     let vm = (raw & 0xFFFF) as u16;
                     if vm > vm_max {
                         vm_max = vm;
                     }
                 }
-                Mono::delay(1_u32.millis()).await;
+                Mono::delay(1.millis()).await;
             }
 
-            if vm_max > 0 {
+            // Require a plausible reading to filter ADC noise floor.
+            // Any real supply voltage produces counts well above 100.
+            if vm_max > 100 {
                 let high = vm_max as u32 * 115 / 100;
                 let low = vm_max as u32 * 110 / 100;
 
@@ -1465,9 +1468,11 @@ mod app {
                 let high = high.min(u16::MAX as u32);
                 let low = low.min(u16::MAX as u32);
 
-                // Datasheet page 124: LOW = bits[15:0], HIGH = bits[31:16]
+                // Datasheet section 7.2, page 103: LOW = bits[15:0], HIGH = bits[31:16]
                 let limits = (high << 16) | low;
-                let _ = tmc.write_register(ADC_VM_LIMITS, limits).await;
+                if tmc.write_register(ADC_VM_LIMITS, limits).await.is_err() {
+                    defmt::warn!("Brake chopper: ADC_VM_LIMITS write failed");
+                }
                 defmt::info!(
                     "Brake chopper: VM peak={}, LOW={} (+10%), HIGH={} (+15%)",
                     vm_max,
@@ -1475,7 +1480,9 @@ mod app {
                     high,
                 );
             } else {
-                let _ = tmc.write_register(ADC_VM_LIMITS, 0).await;
+                if tmc.write_register(ADC_VM_LIMITS, 0).await.is_err() {
+                    defmt::warn!("Brake chopper: ADC_VM_LIMITS write failed");
+                }
                 defmt::warn!("Brake chopper disabled: no VM reading");
             }
         }
