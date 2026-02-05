@@ -1663,7 +1663,7 @@ mod app {
                             let current_limit =
                                 CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
                             let mut reporter = KlipperSelftestReporter { oid };
-                            let s = foci_core::selftest::run_selftest(
+                            let result = foci_core::selftest::run_selftest(
                                 tmc,
                                 enable_pin,
                                 &mut Mono,
@@ -1671,16 +1671,15 @@ mod app {
                                 &mut reporter,
                             )
                             .await;
-                            defmt::info!("foci_selftest: done, status={}", s);
-                            s
+                            defmt::info!("foci_selftest: done, status={}", result.status);
+                            result.status
                         };
                         klipper_reply!(
                             foci_selftest_done,
                             oid: u8 = oid,
                             status: u8 = status
                         );
-                        SELFTEST_IN_FLIGHT
-                            .store(false, core::sync::atomic::Ordering::Relaxed);
+                        SELFTEST_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
                     }
                     other => {
                         if handle_tmc_request(other, tmc).await.is_err() {
