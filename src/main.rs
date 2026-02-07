@@ -1030,24 +1030,6 @@ mod app {
         }
     }
 
-    /// Set motor R/L from host (saved values from prior FOCI_AUTOTUNE).
-    #[klipper_command]
-    pub fn tmc_set_motor_params(
-        context: &mut State,
-        _oid: u8,
-        resistance_mohm: u32,
-        inductance_uh: u32,
-    ) {
-        if !tmc_send(foci_core::tmc::tmc_set_motor_params(
-            resistance_mohm,
-            inductance_uh,
-        )) {
-            if enter_shutdown(context) {
-                klipper_shutdown!("tmc_set_motor_params lost (queue full)", DWT::cycle_count());
-            }
-        }
-    }
-
     /// Trigger R/L measurement and PI gain computation.
     #[klipper_command]
     pub fn foci_autotune(_context: &mut State, oid: u8) {
@@ -1383,9 +1365,6 @@ mod app {
             }
             TmcRequest::SetPidGains { .. } => {
                 defmt::warn!("handle_tmc_request: SetPidGains handled by main loop");
-            }
-            TmcRequest::SetMotorParams { .. } => {
-                defmt::warn!("handle_tmc_request: SetMotorParams handled by main loop");
             }
             TmcRequest::Autotune { .. } => {
                 defmt::warn!("handle_tmc_request: Autotune handled by main loop");
@@ -1748,27 +1727,6 @@ mod app {
                             flux_i,
                             torque_p,
                             torque_i,
-                        );
-                    }
-                    TmcRequest::SetMotorParams {
-                        resistance_mohm,
-                        inductance_uh,
-                    } => {
-                        let params = foci_core::pid::MotorParams {
-                            resistance_mohm,
-                            inductance_uh,
-                        };
-                        let gains = foci_core::pid::compute_inner_gains(
-                            &params,
-                            foci_core::pid::DEFAULT_PWM_FREQ_HZ,
-                        );
-                        stored_gains = Some(gains);
-                        defmt::info!(
-                            "Motor params: R={}mOhm L={}uH -> P={} I={}",
-                            resistance_mohm,
-                            inductance_uh,
-                            gains.flux_p,
-                            gains.flux_i,
                         );
                     }
                     TmcRequest::Autotune { oid } => {
