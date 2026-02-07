@@ -1011,6 +1011,61 @@ mod app {
         }
     }
 
+    /// Set inner loop PI gains from host (explicit override or saved values).
+    #[klipper_command]
+    pub fn tmc_set_pid_gains(
+        context: &mut State,
+        _oid: u8,
+        flux_p: u16,
+        flux_i: u16,
+        torque_p: u16,
+        torque_i: u16,
+    ) {
+        if !tmc_send(foci_core::tmc::tmc_set_pid_gains(
+            flux_p, flux_i, torque_p, torque_i,
+        )) {
+            if enter_shutdown(context) {
+                klipper_shutdown!("tmc_set_pid_gains lost (queue full)", DWT::cycle_count());
+            }
+        }
+    }
+
+    /// Set motor R/L from host (saved values from prior FOCI_AUTOTUNE).
+    #[klipper_command]
+    pub fn tmc_set_motor_params(
+        context: &mut State,
+        _oid: u8,
+        resistance_mohm: u32,
+        inductance_uh: u32,
+    ) {
+        if !tmc_send(foci_core::tmc::tmc_set_motor_params(
+            resistance_mohm,
+            inductance_uh,
+        )) {
+            if enter_shutdown(context) {
+                klipper_shutdown!("tmc_set_motor_params lost (queue full)", DWT::cycle_count());
+            }
+        }
+    }
+
+    /// Trigger R/L measurement and PI gain computation.
+    #[klipper_command]
+    pub fn foci_autotune(_context: &mut State, oid: u8) {
+        if !tmc_send(foci_core::tmc::tmc_autotune(oid)) {
+            klipper_reply!(
+                foci_autotune_result,
+                oid: u8 = oid,
+                status: u8 = 1,
+                resistance_mohm: u32 = 0,
+                inductance_uh: u32 = 0,
+                flux_p: u16 = 0,
+                flux_i: u16 = 0,
+                torque_p: u16 = 0,
+                torque_i: u16 = 0
+            );
+        }
+    }
+
     /// SPI transfer stub (returns empty response).
     #[klipper_command]
     pub fn spi_transfer(_oid: u8, _data: &[u8]) {
@@ -1326,6 +1381,15 @@ mod app {
                 Mono::delay(1.millis()).await;
                 klipper_reply!(foci_dump_done, oid: u8 = oid);
             }
+            TmcRequest::SetPidGains { .. } => {
+                defmt::warn!("handle_tmc_request: SetPidGains handled by main loop");
+            }
+            TmcRequest::SetMotorParams { .. } => {
+                defmt::warn!("handle_tmc_request: SetMotorParams handled by main loop");
+            }
+            TmcRequest::Autotune { .. } => {
+                defmt::warn!("handle_tmc_request: Autotune handled by main loop");
+            }
             TmcRequest::SetEnable(_) => {
                 defmt::warn!("handle_tmc_request: SetEnable handled by main loop");
             }
@@ -1498,6 +1562,10 @@ mod app {
         // Counter for 1s STATUS_FLAGS poll (1000 * 1ms ticks).
         let mut status_poll_counter: u16 = 0;
 
+        // Stored PID gains from host (explicit or R/L-derived).
+        // None = use defaults during calibration.
+        let mut stored_gains: Option<foci_core::pid::InnerLoopGains> = None;
+
         // Main loop: wait for channel message or 1ms timeout.
         // On message: handle request. On timeout: write position target.
         // Position is read from STEPPER_POSITION_TARGET atomic (updated
@@ -1530,7 +1598,14 @@ mod app {
                                     continue;
                                 }
                                 defmt::info!("Auto-calibrating on enable");
-                                match tmc_run_calibration(tmc, enable_pin, current_limit).await {
+                                match tmc_run_calibration(
+                                    tmc,
+                                    enable_pin,
+                                    current_limit,
+                                    stored_gains,
+                                )
+                                .await
+                                {
                                     Ok(_) => {
                                         calibrated = true;
                                     }
@@ -1609,6 +1684,7 @@ mod app {
                             tmc,
                             enable_pin,
                             CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed),
+                            stored_gains,
                         )
                         .await;
 
@@ -1653,6 +1729,282 @@ mod app {
                     #[cfg(feature = "dev")]
                     TmcRequest::TestSpin { revolutions } => {
                         do_test_spin(tmc, revolutions).await;
+                    }
+                    TmcRequest::SetPidGains {
+                        flux_p,
+                        flux_i,
+                        torque_p,
+                        torque_i,
+                    } => {
+                        stored_gains = Some(foci_core::pid::InnerLoopGains {
+                            flux_p,
+                            flux_i,
+                            torque_p,
+                            torque_i,
+                        });
+                        defmt::info!(
+                            "PID gains received: flux P={} I={}, torque P={} I={}",
+                            flux_p,
+                            flux_i,
+                            torque_p,
+                            torque_i,
+                        );
+                    }
+                    TmcRequest::SetMotorParams {
+                        resistance_mohm,
+                        inductance_uh,
+                    } => {
+                        let params = foci_core::pid::MotorParams {
+                            resistance_mohm,
+                            inductance_uh,
+                        };
+                        let gains = foci_core::pid::compute_inner_gains(
+                            &params,
+                            foci_core::pid::DEFAULT_PWM_FREQ_HZ,
+                        );
+                        stored_gains = Some(gains);
+                        defmt::info!(
+                            "Motor params: R={}mOhm L={}uH -> P={} I={}",
+                            resistance_mohm,
+                            inductance_uh,
+                            gains.flux_p,
+                            gains.flux_i,
+                        );
+                    }
+                    TmcRequest::Autotune { oid } => {
+                        if motor_enabled {
+                            klipper_reply!(
+                                foci_autotune_result,
+                                oid: u8 = oid,
+                                status: u8 = 2,
+                                resistance_mohm: u32 = 0,
+                                inductance_uh: u32 = 0,
+                                flux_p: u16 = 0,
+                                flux_i: u16 = 0,
+                                torque_p: u16 = 0,
+                                torque_i: u16 = 0
+                            );
+                            continue;
+                        }
+
+                        let current_limit =
+                            CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
+                        if current_limit == 0 {
+                            klipper_reply!(
+                                foci_autotune_result,
+                                oid: u8 = oid,
+                                status: u8 = 3,
+                                resistance_mohm: u32 = 0,
+                                inductance_uh: u32 = 0,
+                                flux_p: u16 = 0,
+                                flux_i: u16 = 0,
+                                torque_p: u16 = 0,
+                                torque_i: u16 = 0
+                            );
+                            continue;
+                        }
+
+                        // Autotune drives the motor — invalidate calibration
+                        // state so the next enable re-runs the full sequence.
+                        calibrated = false;
+
+                        // Helper: check for hardware fault between measurement
+                        // steps. The STATUS EXTI ISR queues TMC_DISABLE_SIGNAL
+                        // but the main loop only polls it after the match arm
+                        // returns. Check explicitly so faults during the
+                        // multi-second measurement are caught promptly.
+                        //
+                        // try_take() consumes the signal, so re-signal after
+                        // detection. The re-fired signal persists in the Signal
+                        // until the main loop's emergency handler (bottom of the
+                        // loop, after the select+match block) calls try_take()
+                        // on the next iteration and runs shutdown reporting.
+                        let fault_pending = || -> bool {
+                            if TMC_DISABLE_SIGNAL.try_take().is_some() {
+                                TMC_DISABLE_SIGNAL.signal(());
+                                true
+                            } else {
+                                false
+                            }
+                        };
+
+                        // Macro for autotune abort: safe state + reply + continue
+                        macro_rules! autotune_abort {
+                            ($status:expr, $r:expr, $l:expr) => {{
+                                foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                                klipper_reply!(
+                                    foci_autotune_result,
+                                    oid: u8 = oid,
+                                    status: u8 = $status,
+                                    resistance_mohm: u32 = $r,
+                                    inductance_uh: u32 = $l,
+                                    flux_p: u16 = 0,
+                                    flux_i: u16 = 0,
+                                    torque_p: u16 = 0,
+                                    torque_i: u16 = 0
+                                );
+                                continue;
+                            }};
+                        }
+
+                        // ADC calibration must run before R/L measurement.
+                        // Without it, current readings are uncalibrated.
+                        if let Err(e) = tmc_adc_calibrate(tmc, enable_pin).await {
+                            defmt::error!("Autotune ADC calibration failed: {}", e);
+                            autotune_abort!(4, 0, 0);
+                        }
+
+                        // Check for fault after ADC calibration
+                        if fault_pending() {
+                            defmt::error!("Autotune aborted: hardware fault during ADC cal");
+                            autotune_abort!(4, 0, 0);
+                        }
+
+                        // Derive safe excitation from current limit (1/4, clamped)
+                        let excitation = ((current_limit & 0xFFFF) / 4).max(64).min(1024);
+
+                        // Measure R
+                        let r = match foci_core::selftest::selftest_measure_resistance(
+                            tmc, enable_pin, &mut Mono, excitation,
+                        )
+                        .await
+                        {
+                            Some(r) => r,
+                            None => {
+                                autotune_abort!(4, 0, 0);
+                            }
+                        };
+
+                        // Check for fault after R measurement
+                        if fault_pending() {
+                            defmt::error!("Autotune aborted: hardware fault during R measurement");
+                            autotune_abort!(4, 0, 0);
+                        }
+
+                        // Measure L
+                        let l = match foci_core::selftest::selftest_measure_inductance(
+                            tmc, enable_pin, &mut Mono, excitation, r.mohm,
+                        )
+                        .await
+                        {
+                            Some(l) => l,
+                            None => {
+                                let r_avg = (r.mohm.0 as u32 + r.mohm.1 as u32) / 2;
+                                autotune_abort!(4, r_avg, 0);
+                            }
+                        };
+
+                        foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+
+                        // Check for fault after L measurement
+                        if fault_pending() {
+                            defmt::error!("Autotune aborted: hardware fault during L measurement");
+                            // Already in safe state, include measured values for diagnostics
+                            let r_avg = (r.mohm.0 as u32 + r.mohm.1 as u32) / 2;
+                            let l_avg = (l.uh.0 as u32 + l.uh.1 as u32) / 2;
+                            klipper_reply!(
+                                foci_autotune_result,
+                                oid: u8 = oid,
+                                status: u8 = 4,
+                                resistance_mohm: u32 = r_avg,
+                                inductance_uh: u32 = l_avg,
+                                flux_p: u16 = 0,
+                                flux_i: u16 = 0,
+                                torque_p: u16 = 0,
+                                torque_i: u16 = 0
+                            );
+                            continue;
+                        }
+
+                        // Validate per-coil measurements. Asymmetry errors are
+                        // non-fatal — the step-response tau measurement at 1ms
+                        // sample rate is inherently noisy, so per-coil inductance
+                        // can differ significantly even on healthy motors.
+                        // Averaging still produces usable approximate gains.
+                        // Zero/out-of-range errors remain hard failures.
+                        use foci_core::pid::MotorParamError;
+                        let params = match foci_core::pid::validate_motor_params(
+                            r.mohm.0, r.mohm.1, l.uh.0, l.uh.1,
+                        ) {
+                            Ok(p) => p,
+                            Err(
+                                MotorParamError::ResistanceAsymmetry
+                                | MotorParamError::InductanceAsymmetry,
+                            ) => {
+                                defmt::warn!(
+                                    "Autotune: asymmetry (R={},{} L={},{}), using averages",
+                                    r.mohm.0,
+                                    r.mohm.1,
+                                    l.uh.0,
+                                    l.uh.1,
+                                );
+                                foci_core::pid::MotorParams {
+                                    resistance_mohm: (r.mohm.0 as u32 + r.mohm.1 as u32) / 2,
+                                    inductance_uh: (l.uh.0 as u32 + l.uh.1 as u32) / 2,
+                                }
+                            }
+                            Err(e) => {
+                                defmt::error!(
+                                    "Autotune validation failed: {} (R={},{} L={},{})",
+                                    e,
+                                    r.mohm.0,
+                                    r.mohm.1,
+                                    l.uh.0,
+                                    l.uh.1,
+                                );
+                                let r_avg = (r.mohm.0 as u32 + r.mohm.1 as u32) / 2;
+                                let l_avg = (l.uh.0 as u32 + l.uh.1 as u32) / 2;
+                                klipper_reply!(
+                                    foci_autotune_result,
+                                    oid: u8 = oid,
+                                    status: u8 = 5,
+                                    resistance_mohm: u32 = r_avg,
+                                    inductance_uh: u32 = l_avg,
+                                    flux_p: u16 = 0,
+                                    flux_i: u16 = 0,
+                                    torque_p: u16 = 0,
+                                    torque_i: u16 = 0
+                                );
+                                continue;
+                            }
+                        };
+
+                        // Compute gains
+                        let gains = foci_core::pid::compute_inner_gains(
+                            &params,
+                            foci_core::pid::DEFAULT_PWM_FREQ_HZ,
+                        );
+
+                        // Write to TMC4671
+                        let (flux_reg, torque_reg) = gains.to_registers();
+                        let _ = tmc
+                            .write_register(tmc4671::registers::PID_FLUX_P_FLUX_I, flux_reg)
+                            .await;
+                        let _ = tmc
+                            .write_register(tmc4671::registers::PID_TORQUE_P_TORQUE_I, torque_reg)
+                            .await;
+
+                        stored_gains = Some(gains);
+
+                        defmt::info!(
+                            "Autotune: R={}mOhm L={}uH -> P={} I={}",
+                            params.resistance_mohm,
+                            params.inductance_uh,
+                            gains.flux_p,
+                            gains.flux_i,
+                        );
+
+                        klipper_reply!(
+                            foci_autotune_result,
+                            oid: u8 = oid,
+                            status: u8 = 0,
+                            resistance_mohm: u32 = params.resistance_mohm,
+                            inductance_uh: u32 = params.inductance_uh,
+                            flux_p: u16 = gains.flux_p,
+                            flux_i: u16 = gains.flux_i,
+                            torque_p: u16 = gains.torque_p,
+                            torque_i: u16 = gains.torque_i
+                        );
                     }
                     TmcRequest::SelfTest { oid } => {
                         let status = if motor_enabled {
@@ -1972,10 +2324,11 @@ mod app {
         tmc: &mut Tmc4671Spi<TmcSpiDevice>,
         enable_pin: &mut Output<'static>,
         current_limit_reg: u32,
+        stored_gains: Option<foci_core::pid::InnerLoopGains>,
     ) -> Result<(u16, u16, u32), CalibrationError> {
         let (adc_i0, adc_i1) = tmc_adc_calibrate(tmc, enable_pin).await?;
         let encoder_count = tmc_align_encoder(tmc, current_limit_reg).await?;
-        tmc_enter_closedloop(tmc).await?;
+        tmc_enter_closedloop(tmc, stored_gains).await?;
 
         // Re-apply current limit AFTER closed-loop entry. The TMC4671
         // resets PID_TORQUE_FLUX_LIMITS during mode changes, clearing the
@@ -2239,11 +2592,11 @@ mod app {
     ///
     /// Steps:
     /// 1. Set PHI_E_SELECTION=1 (external) and PHI_E_EXT=0
-    /// 2. Configure flux/torque PID gains
-    /// 3. Enter torque mode with zero flux target
-    /// 4. Ramp PID_FLUX_TARGET from 0 to 50% of current limit over 500ms
-    /// 5. Hold at full target for 200ms settling
-    /// 6. Validate encoder (non-zero, stable count)
+    /// 2. Capture ABN_DECODER_COUNT before alignment
+    /// 3. Configure flux/torque PID gains
+    /// 4. Set flux target to 50% of current limit
+    /// 5. Enter torque mode, hold for settling
+    /// 6. Validate encoder (movement detected or stable non-zero count)
     /// 7. Read ABN_DECODER_COUNT, zero it, zero offset
     /// 8. Stop drive (targets=0, MODE=0)
     ///
@@ -2270,13 +2623,21 @@ mod app {
         let _ = tmc.write_register(PHI_E_SELECTION, 1).await;
         let _ = tmc.write_register(PHI_E_EXT, 0).await;
 
-        // 2. PID gains for flux/torque current control
+        // 2. Capture encoder count before alignment to detect movement later.
+        // ABN_DECODER_COUNT is 0 after chip power-up, so a simple non-zero
+        // check fails when the rotor is already near a D-axis alignment point.
+        let count_before = tmc
+            .read_register(ABN_DECODER_COUNT)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+
+        // 3. PID gains for flux/torque current control
         // P=404 (1.577 in Q8.8), I=26 (0.1 in Q8.8)
         let pid_pi: u32 = (404 << 16) | 26;
         let _ = tmc.write_register(PID_FLUX_P_FLUX_I, pid_pi).await;
         let _ = tmc.write_register(PID_TORQUE_P_TORQUE_I, pid_pi).await;
 
-        // 3. Set flux target: half of current limit on the D-axis.
+        // 4. Set flux target: half of current limit on the D-axis.
         // CRITICAL: PID_FLUX_TARGET is bits[15:0] (D-axis current).
         // PID_TORQUE_TARGET bits[31:16] must be 0 (no Q-axis torque).
         // Using bits[31:16] instead aligns to Q-axis (90deg off).
@@ -2287,13 +2648,13 @@ mod app {
             .into();
         let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, target_reg).await;
 
-        // 4. Enter torque mode (MODE_PID_TYPE=1, MODE_MOTION=1)
+        // 5. Enter torque mode (MODE_PID_TYPE=1, MODE_MOTION=1)
         let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0001).await;
 
-        // 5. Hold for settling (rotor aligns to nearest D-axis pole)
+        // 6. Hold for settling (rotor aligns to nearest D-axis pole)
         Mono::delay(500_u32.millis()).await;
 
-        // 6. Validate encoder: stable count (two reads 10ms apart must match)
+        // 7. Validate encoder: stable count, detect movement or prior counts.
         let count1 = tmc
             .read_register(ABN_DECODER_COUNT)
             .await
@@ -2304,13 +2665,25 @@ mod app {
             .await
             .map_err(|_| CalibrationError::SpiError)?;
 
-        if count1 == 0 && count2 == 0 {
-            defmt::error!("encoder align: no encoder pulses (disconnected?)");
+        // Check encoder presence: compare against pre-alignment count.
+        // The old check (count == 0) false-triggered when the rotor was
+        // already near a D-axis point and ABN_DECODER_COUNT started at 0.
+        // Instead, verify the alignment produced encoder movement OR that
+        // the count is stable and non-zero (prior motion accumulated).
+        let moved = count1 != count_before || count2 != count_before;
+        let stable = count1 == count2;
+        if !moved && count1 == 0 {
+            defmt::error!(
+                "encoder align: no movement (before={}, after={},{})",
+                count_before,
+                count1,
+                count2
+            );
             let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
             let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
             return Err(CalibrationError::EncoderFault);
         }
-        if count1 != count2 {
+        if !stable {
             defmt::error!(
                 "encoder align: encoder unstable: count1={}, count2={}",
                 count1,
@@ -2332,12 +2705,12 @@ mod app {
             torque_actual
         );
 
-        // 7. Zero encoder count and offset at the D-axis position
+        // 8. Zero encoder count and offset at the D-axis position
         let old_count = count1;
         let _ = tmc.write_register(ABN_DECODER_COUNT, 0).await;
         let _ = tmc.write_register(ABN_DECODER_PHI_E_PHI_M_OFFSET, 0).await;
 
-        // 8. Stop drive: zero targets first, then stop mode
+        // 9. Stop drive: zero targets first, then stop mode
         let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
         let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x0000_0000).await;
 
@@ -2361,15 +2734,15 @@ mod app {
     /// Assumes tmc_adc_calibrate and tmc_align_encoder have already been called.
     async fn tmc_enter_closedloop(
         tmc: &mut Tmc4671Spi<TmcSpiDevice>,
+        stored_gains: Option<foci_core::pid::InnerLoopGains>,
     ) -> Result<(), CalibrationError> {
         use tmc4671::registers::*;
 
-        // 1. Flux and torque PID: P=404 (1.577*256), I=26 (0.1*256)
-        let flux_torque_pi: u32 = (404 << 16) | 26;
-        let _ = tmc.write_register(PID_FLUX_P_FLUX_I, flux_torque_pi).await;
-        let _ = tmc
-            .write_register(PID_TORQUE_P_TORQUE_I, flux_torque_pi)
-            .await;
+        // 1. Flux and torque PID: use stored gains or conservative defaults
+        let gains = stored_gains.unwrap_or(foci_core::pid::DEFAULT_INNER_GAINS);
+        let (flux_reg, torque_reg) = gains.to_registers();
+        let _ = tmc.write_register(PID_FLUX_P_FLUX_I, flux_reg).await;
+        let _ = tmc.write_register(PID_TORQUE_P_TORQUE_I, torque_reg).await;
 
         // 2. Velocity PID: P=4.5 (Q8.8 = 1152), I=0
         // Q8.8 format per datasheet 4.7.8: value = real * 256.
