@@ -1860,11 +1860,10 @@ mod app {
                             autotune_abort!(4, 0, 0);
                         }
 
-                        // Derive safe excitation from current limit (1/4, clamped)
-                        let excitation = ((current_limit & 0xFFFF) / 4).max(64).min(1024);
+                        let excitation: u32 = 512;
 
-                        // Measure R
-                        let r = match foci_core::selftest::selftest_measure_resistance(
+                        // Measure R with PWM-rate averaging (1000 samples per coil)
+                        let r_currents = match foci_core::selftest::autotune_measure_resistance(
                             tmc, enable_pin, &mut Mono, excitation,
                         )
                         .await
@@ -1881,33 +1880,44 @@ mod app {
                             autotune_abort!(4, 0, 0);
                         }
 
-                        // Measure L
-                        let l = match foci_core::selftest::selftest_measure_inductance(
-                            tmc, enable_pin, &mut Mono, excitation, r.mohm,
+                        // Measure L with square-wave di/dt.
+                        // Time the measurement with DWT cycle counter so we
+                        // know the actual dt per cycle (SPI overhead dominates).
+                        const DIDT_CYCLES: u32 = 5000;
+                        let dwt_start = DWT::cycle_count();
+                        let l_result = match foci_core::selftest::autotune_measure_inductance(
+                            tmc,
+                            enable_pin,
+                            &mut Mono,
+                            excitation,
+                            DIDT_CYCLES,
                         )
                         .await
                         {
                             Some(l) => l,
                             None => {
-                                let r_avg = (r.mohm.0 as u32 + r.mohm.1 as u32) / 2;
-                                autotune_abort!(4, r_avg, 0);
+                                autotune_abort!(4, 0, 0);
                             }
                         };
+                        let dwt_end = DWT::cycle_count();
+                        // Total wall-clock cycles for both coils, minus settle/cooldown.
+                        // The measurement function includes 120ms of delays (10ms pre-toggle
+                        // + 50ms cooldown per coil) that would inflate dt_us by ~12%.
+                        let dwt_raw = dwt_end.wrapping_sub(dwt_start);
+                        const SETTLE_CYCLES: u32 = foci_core::selftest::DIDT_SETTLE_MS * 168_000;
+                        let dwt_elapsed = dwt_raw.saturating_sub(SETTLE_CYCLES);
 
                         foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
 
                         // Check for fault after L measurement
                         if fault_pending() {
                             defmt::error!("Autotune aborted: hardware fault during L measurement");
-                            // Already in safe state, include measured values for diagnostics
-                            let r_avg = (r.mohm.0 as u32 + r.mohm.1 as u32) / 2;
-                            let l_avg = (l.uh.0 as u32 + l.uh.1 as u32) / 2;
                             klipper_reply!(
                                 foci_autotune_result,
                                 oid: u8 = oid,
                                 status: u8 = 4,
-                                resistance_mohm: u32 = r_avg,
-                                inductance_uh: u32 = l_avg,
+                                resistance_mohm: u32 = 0,
+                                inductance_uh: u32 = 0,
                                 flux_p: u16 = 0,
                                 flux_i: u16 = 0,
                                 torque_p: u16 = 0,
@@ -1916,90 +1926,121 @@ mod app {
                             continue;
                         }
 
-                        // Validate per-coil measurements. Asymmetry errors are
-                        // non-fatal — the step-response tau measurement at 1ms
-                        // sample rate is inherently noisy, so per-coil inductance
-                        // can differ significantly even on healthy motors.
-                        // Averaging still produces usable approximate gains.
-                        // Zero/out-of-range errors remain hard failures.
-                        use foci_core::pid::MotorParamError;
-                        let params = match foci_core::pid::validate_motor_params(
-                            r.mohm.0, r.mohm.1, l.uh.0, l.uh.1,
-                        ) {
-                            Ok(p) => p,
-                            Err(
-                                MotorParamError::ResistanceAsymmetry
-                                | MotorParamError::InductanceAsymmetry,
-                            ) => {
-                                defmt::warn!(
-                                    "Autotune: asymmetry (R={},{} L={},{}), using averages",
-                                    r.mohm.0,
-                                    r.mohm.1,
-                                    l.uh.0,
-                                    l.uh.1,
-                                );
-                                foci_core::pid::MotorParams {
-                                    resistance_mohm: (r.mohm.0 as u32 + r.mohm.1 as u32) / 2,
-                                    inductance_uh: (l.uh.0 as u32 + l.uh.1 as u32) / 2,
-                                }
-                            }
-                            Err(e) => {
-                                defmt::error!(
-                                    "Autotune validation failed: {} (R={},{} L={},{})",
-                                    e,
-                                    r.mohm.0,
-                                    r.mohm.1,
-                                    l.uh.0,
-                                    l.uh.1,
-                                );
-                                let r_avg = (r.mohm.0 as u32 + r.mohm.1 as u32) / 2;
-                                let l_avg = (l.uh.0 as u32 + l.uh.1 as u32) / 2;
-                                klipper_reply!(
-                                    foci_autotune_result,
-                                    oid: u8 = oid,
-                                    status: u8 = 5,
-                                    resistance_mohm: u32 = r_avg,
-                                    inductance_uh: u32 = l_avg,
-                                    flux_p: u16 = 0,
-                                    flux_i: u16 = 0,
-                                    torque_p: u16 = 0,
-                                    torque_i: u16 = 0
-                                );
-                                continue;
-                            }
+                        // Build internal measurement for gain computation
+                        let current_avg = ((r_currents.0 as u32 + r_currents.1 as u32) / 2) as u16;
+
+                        // Compute average dI using wall-clock timing.
+                        // L_int = V * total_time / sum_delta_I (per coil)
+                        // For the gain formula we need dI per unit time:
+                        //   dI_per_sec = sum_delta / total_time_s
+                        // But it's simpler to pass V, sum_delta, and elapsed
+                        // time separately and let the gain formula handle it.
+                        //
+                        // For now (Phase 1), compute approximate physical L:
+                        //   L = V * dt / dI (per cycle, in internal units)
+                        //   L_physical = L_int * R_physical / R_int (approximate)
+                        //
+                        // Use DWT elapsed to get actual dt per cycle:
+                        //   total_cycles_both_coils = count_a + count_b
+                        //   (includes settle time, but settle is small vs measurement)
+                        let total_count = l_result.count.0 as u64 + l_result.count.1 as u64;
+                        let total_sum_delta = l_result.sum_delta.0 + l_result.sum_delta.1;
+
+                        // Average dI per cycle (using actual timing)
+                        // delta_i_avg = sum_delta / count (per cycle, internal units)
+                        let delta_i_avg = if total_count > 0 {
+                            (total_sum_delta / total_count) as u16
+                        } else {
+                            0u16
                         };
 
-                        // Compute gains
-                        let gains = foci_core::pid::compute_inner_gains(
-                            &params,
+                        // Actual dt per cycle in microseconds:
+                        // dt_us = dwt_elapsed / CPU_MHZ / total_cycles_measured
+                        // But total_cycles_measured includes 2 coils' settle time.
+                        // Better: dt_us = dwt_elapsed / (168 * total_count)
+                        // (each count entry is one SPI write+read cycle)
+                        const CPU_MHZ: u32 = 168;
+                        let dt_us = if total_count > 0 {
+                            dwt_elapsed as u64 / (CPU_MHZ as u64 * total_count)
+                        } else {
+                            0
+                        };
+
+                        // Approximate physical R/L for user display
+                        let r_mohm: u32 = if current_avg > 0 {
+                            excitation * 1000 / current_avg as u32
+                        } else {
+                            0
+                        };
+                        // L_uh = V * dt_us / dI (internal units cancel in ratio)
+                        // Then convert to physical: multiply by R_physical/R_int
+                        // Simplified: L_uh = R_mohm * dt_us / 1000
+                        //   (because V/dI ~ R_int, and R_mohm/R_int gives the
+                        //    physical scaling... but actually:
+                        //    L_int = V * dt / dI, L_phys = L_int * scale
+                        //    Since R_int = V/I and R_phys = R_mohm/1000:
+                        //    scale = R_phys/R_int = R_mohm * I / (V * 1000)
+                        //    L_phys = V * dt / dI * R_mohm * I / (V * 1000)
+                        //           = dt * R_mohm * I / (dI * 1000)
+                        //    L_uh = dt_us * R_mohm * I / (dI * 1000)
+                        let l_uh: u32 = if delta_i_avg > 0 {
+                            (dt_us * r_mohm as u64 * current_avg as u64
+                                / (delta_i_avg as u64 * 1000)) as u32
+                        } else {
+                            0
+                        };
+
+                        defmt::info!(
+                            "Autotune: V={} I={} dI={} dt={}us R~{}mOhm L~{}uH (DWT={})",
+                            excitation,
+                            current_avg,
+                            delta_i_avg,
+                            dt_us,
+                            r_mohm,
+                            l_uh,
+                            dwt_elapsed,
+                        );
+
+                        // Phase 2: compute P-only gains from internal measurements
+                        let internal = foci_core::pid::InternalMeasurement {
+                            voltage: excitation as u16,
+                            current_avg,
+                            delta_i_avg,
+                            dt_us: dt_us as u32,
+                        };
+                        let gains = foci_core::pid::compute_gains_from_internal(
+                            &internal,
                             foci_core::pid::DEFAULT_PWM_FREQ_HZ,
                         );
 
-                        // Write to TMC4671
+                        // Write to TMC4671 — abort if SPI fails
                         let (flux_reg, torque_reg) = gains.to_registers();
-                        let _ = tmc
+                        if tmc
                             .write_register(tmc4671::registers::PID_FLUX_P_FLUX_I, flux_reg)
-                            .await;
-                        let _ = tmc
-                            .write_register(tmc4671::registers::PID_TORQUE_P_TORQUE_I, torque_reg)
-                            .await;
+                            .await
+                            .is_err()
+                            || tmc
+                                .write_register(
+                                    tmc4671::registers::PID_TORQUE_P_TORQUE_I,
+                                    torque_reg,
+                                )
+                                .await
+                                .is_err()
+                        {
+                            defmt::error!("Autotune: SPI write failed for gain registers");
+                            autotune_abort!(5, r_mohm, l_uh);
+                        }
 
                         stored_gains = Some(gains);
 
-                        defmt::info!(
-                            "Autotune: R={}mOhm L={}uH -> P={} I={}",
-                            params.resistance_mohm,
-                            params.inductance_uh,
-                            gains.flux_p,
-                            gains.flux_i,
-                        );
+                        defmt::info!("Autotune gains: P={} I={}", gains.flux_p, gains.flux_i,);
 
                         klipper_reply!(
                             foci_autotune_result,
                             oid: u8 = oid,
                             status: u8 = 0,
-                            resistance_mohm: u32 = params.resistance_mohm,
-                            inductance_uh: u32 = params.inductance_uh,
+                            resistance_mohm: u32 = r_mohm,
+                            inductance_uh: u32 = l_uh,
                             flux_p: u16 = gains.flux_p,
                             flux_i: u16 = gains.flux_i,
                             torque_p: u16 = gains.torque_p,
@@ -2328,7 +2369,21 @@ mod app {
     ) -> Result<(u16, u16, u32), CalibrationError> {
         let (adc_i0, adc_i1) = tmc_adc_calibrate(tmc, enable_pin).await?;
         let encoder_count = tmc_align_encoder(tmc, current_limit_reg).await?;
-        tmc_enter_closedloop(tmc, stored_gains).await?;
+        // Use default gains for closed-loop entry (encoder alignment and
+        // runaway detection need enough torque). Apply autotuned gains
+        // after closed-loop is established.
+        tmc_enter_closedloop(tmc, None).await?;
+
+        // Now apply autotuned gains if available
+        if let Some(gains) = stored_gains {
+            let (flux_reg, torque_reg) = gains.to_registers();
+            tmc.write_register(tmc4671::registers::PID_FLUX_P_FLUX_I, flux_reg)
+                .await
+                .map_err(|_| CalibrationError::SpiError)?;
+            tmc.write_register(tmc4671::registers::PID_TORQUE_P_TORQUE_I, torque_reg)
+                .await
+                .map_err(|_| CalibrationError::SpiError)?;
+        }
 
         // Re-apply current limit AFTER closed-loop entry. The TMC4671
         // resets PID_TORQUE_FLUX_LIMITS during mode changes, clearing the
