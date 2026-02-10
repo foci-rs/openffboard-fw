@@ -2650,9 +2650,46 @@ mod app {
         let _ = tmc.write_register(PHI_E_SELECTION, 1).await;
         let _ = tmc.write_register(PHI_E_EXT, 0).await;
 
-        // 2. Capture encoder count before alignment to detect movement later.
-        // ABN_DECODER_COUNT is 0 after chip power-up, so a simple non-zero
-        // check fails when the rotor is already near a D-axis alignment point.
+        // 2. Ensure encoder has non-zero count before alignment.
+        // On cold boot, ABN_DECODER_COUNT is 0. If the rotor is already
+        // at a D-axis point, the alignment won't move it and the encoder
+        // check fails. A brief open-loop nudge guarantees encoder counts
+        // are accumulated, proving the encoder is connected.
+        let count_pre_nudge = tmc
+            .read_register(ABN_DECODER_COUNT)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+        if count_pre_nudge == 0 {
+            // Brief open-loop voltage pulse to force encoder movement.
+            // Drive D-axis at PHI_E=0, then shift to PHI_E=16384 (90 deg).
+            // This forces the rotor to move, generating encoder pulses.
+            let _ = tmc.write_register(PHI_E_SELECTION, 1).await;
+            let _ = tmc.write_register(PHI_E_EXT, 0).await;
+            let _ = tmc.write_register(UQ_UD_EXT, 512).await;
+            let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 8).await;
+            Mono::delay(50_u32.millis()).await;
+            // Shift angle to force movement
+            let _ = tmc.write_register(PHI_E_EXT, 16384).await;
+            Mono::delay(50_u32.millis()).await;
+            let _ = tmc.write_register(UQ_UD_EXT, 0).await;
+            let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+            Mono::delay(10_u32.millis()).await;
+
+            let count_after_nudge = tmc
+                .read_register(ABN_DECODER_COUNT)
+                .await
+                .map_err(|_| CalibrationError::SpiError)?;
+            if count_after_nudge == 0 {
+                defmt::error!("encoder nudge: no pulses after open-loop jog");
+                return Err(CalibrationError::EncoderFault);
+            }
+            defmt::info!(
+                "encoder nudge: count {} -> {}",
+                count_pre_nudge,
+                count_after_nudge
+            );
+        }
+
         let count_before = tmc
             .read_register(ABN_DECODER_COUNT)
             .await
@@ -2698,7 +2735,10 @@ mod app {
         // Instead, verify the alignment produced encoder movement OR that
         // the count is stable and non-zero (prior motion accumulated).
         let moved = count1 != count_before || count2 != count_before;
-        let stable = count1 == count2;
+        // Allow +/-2 encoder counts of jitter during settling.
+        // Exact match (count1 == count2) false-triggers when the PID
+        // is oscillating by 1 count around the alignment point.
+        let stable = (count1 as i32 - count2 as i32).unsigned_abs() <= 2;
         if !moved && count1 == 0 {
             defmt::error!(
                 "encoder align: no movement (before={}, after={},{})",
