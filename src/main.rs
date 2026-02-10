@@ -1952,6 +1952,9 @@ mod app {
                             0
                         };
 
+                        // Excitation voltage used during R/L measurement (from config)
+                        let excitation = TMC_CONFIG.excitation_voltage as u32;
+
                         // Approximate physical R/L for user display
                         let r_mohm: u32 = if current_avg > 0 {
                             excitation * 1000 / current_avg as u32
@@ -1994,10 +1997,8 @@ mod app {
                             delta_i_avg,
                             dt_us: dt_us as u32,
                         };
-                        let gains = foci_core::pid::compute_gains_from_internal(
-                            &internal,
-                            foci_core::pid::DEFAULT_PWM_FREQ_HZ,
-                        );
+                        let gains =
+                            foci_core::pid::compute_gains_from_internal(&internal, &TMC_CONFIG);
 
                         // Write to TMC4671 — abort if SPI fails
                         let (flux_reg, torque_reg) = gains.to_registers();
@@ -2391,8 +2392,8 @@ mod app {
     ///
     /// Steps:
     /// 1. Safety shutdown: enable_pin low, MODE=0, voltage limit=1024, zero targets
-    /// 2. PWM config: polarities=0, 25 kHz, BBM=10/10, CHOP=0 for calibration
-    /// 3. ADC config: DSADC decimation 331, ADC_I_SELECT for 2-phase routing
+    /// 2. PWM config: polarities=0, PWM frequency and BBM from TMC_CONFIG, CHOP=0 for calibration
+    /// 3. ADC config: DSADC decimation from TMC_CONFIG, ADC_I_SELECT for 2-phase routing
     /// 4. Motor type: 2-phase stepper (type 2), 50 pole pairs
     /// 5. ADC offset calibration: scale=256, enable, wait 250 ms, sample 128x, write offsets
     /// 6. Re-enable PWM chopping: PWM_SV_CHOP=7
@@ -2441,8 +2442,12 @@ mod app {
 
         // 2. PWM configuration (chopping disabled for ADC calibration)
         let _ = tmc.write_register(PWM_POLARITIES, 0).await;
-        let _ = tmc.write_register(PWM_MAXCNT, 3999).await; // 25kHz
-        let _ = tmc.write_register(PWM_BBM_H_BBM_L, (10 << 8) | 10).await;
+        let _ = tmc
+            .write_register(PWM_MAXCNT, TMC_CONFIG.pwm_maxcnt as u32)
+            .await;
+        let _ = tmc
+            .write_register(PWM_BBM_H_BBM_L, TMC_CONFIG.bbm_register())
+            .await;
         // PWM_SV=0 (SVPWM off per DS 4.9.7 - stepper only), CHOP=0 for ADC cal
         tmc.write_register(PWM_SV_CHOP, 0)
             .await
@@ -2467,9 +2472,8 @@ mod app {
 
         // 3. ADC configuration
         // DSADC_MCFG: leave at power-on default (ANALOG mode, internal ADC)
-        let mdec: u32 = 331;
         let _ = tmc
-            .write_register(DSADC_MDEC_B_MDEC_A, (mdec << 16) | mdec)
+            .write_register(DSADC_MDEC_B_MDEC_A, TMC_CONFIG.dsadc_mdec_register())
             .await;
         // bits[29:28] ADC_I_WY_SELECT=1 (WY phase current from ADC_I1)
         // bits[27:26] ADC_I_V_SELECT=0  (V unused for stepper FOC2)
@@ -2680,7 +2684,9 @@ mod app {
             // This forces the rotor to move, generating encoder pulses.
             let _ = tmc.write_register(PHI_E_SELECTION, 1).await;
             let _ = tmc.write_register(PHI_E_EXT, 0).await;
-            let _ = tmc.write_register(UQ_UD_EXT, 512).await;
+            let _ = tmc
+                .write_register(UQ_UD_EXT, TMC_CONFIG.excitation_voltage as u32)
+                .await;
             let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 8).await;
             Mono::delay(50_u32.millis()).await;
             // Shift angle to force movement
@@ -2859,7 +2865,9 @@ mod app {
         // 8. Write velocity biquad filter if configured
         let filter_hz = VELOCITY_FILTER_HZ.load(core::sync::atomic::Ordering::Relaxed);
         if filter_hz > 0 {
-            if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, 3999) {
+            if let Some(coeffs) =
+                foci_core::biquad::butterworth_lowpass(filter_hz, TMC_CONFIG.pwm_maxcnt)
+            {
                 let _ = tmc
                     .write_sub_register(CONFIG_BIQUAD_V_A_1, coeffs.a_1 as u32)
                     .await;
