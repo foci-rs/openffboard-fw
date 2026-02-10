@@ -55,6 +55,21 @@ mod app {
     /// Derived from sense resistor value and ADC configuration.
     const CURRENT_SCALE_MA_PER_LSB: f32 = 1.155;
 
+    /// Board-specific TMC4671 hardware configuration for OpenFFBoard v1.2.x.
+    ///
+    /// PWM at 25 kHz (PWM_MAXCNT=3999, fCLK=25 MHz), 100ns BBM dead-time,
+    /// DSADC MDEC=331, 512 PIDOUT excitation voltage for R/L measurement.
+    const TMC_CONFIG: foci_core::config::TmcConfig = foci_core::config::TmcConfig {
+        pwm_maxcnt: 3999,
+        tmc_clock_hz: 25_000_000,
+        bbm_h: 10,
+        bbm_l: 10,
+        dsadc_mdec: 331,
+        excitation_voltage: 512,
+        didt_cycles: 5000,
+        bandwidth_hz: 50.0,
+    };
+
     /// Errors that can occur during the TMC4671 calibration sequence.
     #[derive(Debug, defmt::Format)]
     enum CalibrationError {
@@ -1832,11 +1847,12 @@ mod app {
                             autotune_abort!(4, 0, 0);
                         }
 
-                        let excitation: u32 = 512;
-
                         // Measure R with PWM-rate averaging (1000 samples per coil)
                         let r_currents = match foci_core::selftest::autotune_measure_resistance(
-                            tmc, enable_pin, &mut Mono, excitation,
+                            tmc,
+                            enable_pin,
+                            &mut Mono,
+                            &TMC_CONFIG,
                         )
                         .await
                         {
@@ -1855,14 +1871,12 @@ mod app {
                         // Measure L with square-wave di/dt.
                         // Time the measurement with DWT cycle counter so we
                         // know the actual dt per cycle (SPI overhead dominates).
-                        const DIDT_CYCLES: u32 = 5000;
                         let dwt_start = DWT::cycle_count();
                         let l_result = match foci_core::selftest::autotune_measure_inductance(
                             tmc,
                             enable_pin,
                             &mut Mono,
-                            excitation,
-                            DIDT_CYCLES,
+                            &TMC_CONFIG,
                         )
                         .await
                         {
@@ -2032,6 +2046,7 @@ mod app {
                                 tmc,
                                 enable_pin,
                                 &mut Mono,
+                                &TMC_CONFIG,
                                 current_limit,
                                 &mut reporter,
                             )
