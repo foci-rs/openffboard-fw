@@ -134,6 +134,11 @@ mod app {
     /// the limit is correct regardless of TMC4671 register state.
     static CURRENT_LIMIT_REG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+    /// Velocity biquad filter cutoff frequency in Hz (set by tmc_set_velocity_filter).
+    /// 0 = disabled, 10..=1000 = enabled. Applied during closed-loop entry.
+    static VELOCITY_FILTER_HZ: core::sync::atomic::AtomicU16 =
+        core::sync::atomic::AtomicU16::new(0);
+
     /// Whether the encoder direction is reversed (set by tmc_set_encoder_dir).
     /// When true, position targets are negated before writing to the TMC4671.
     static ENCODER_REVERSED: core::sync::atomic::AtomicBool =
@@ -274,6 +279,7 @@ mod app {
         }
         // Reset board-local control and protocol state
         CURRENT_LIMIT_REG.store(0, core::sync::atomic::Ordering::Relaxed);
+        VELOCITY_FILTER_HZ.store(0, core::sync::atomic::Ordering::Relaxed);
         ENCODER_REVERSED.store(false, core::sync::atomic::Ordering::Relaxed);
         STEPPER_POSITION_TARGET.store(0, core::sync::atomic::Ordering::Relaxed);
         SELFTEST_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
@@ -1030,6 +1036,13 @@ mod app {
         }
     }
 
+    /// Set velocity biquad filter cutoff frequency from host config.
+    #[klipper_command]
+    pub fn tmc_set_velocity_filter(_context: &mut State, _oid: u8, filter_hz: u16) {
+        VELOCITY_FILTER_HZ.store(filter_hz, core::sync::atomic::Ordering::Relaxed);
+        defmt::info!("Velocity filter: {} Hz", filter_hz);
+    }
+
     /// Trigger R/L measurement and PI gain computation.
     #[klipper_command]
     pub fn foci_autotune(_context: &mut State, oid: u8) {
@@ -1375,6 +1388,7 @@ mod app {
             TmcRequest::Calibrate { .. } => {
                 defmt::warn!("handle_tmc_request: Calibrate handled by main loop");
             }
+            TmcRequest::SetVelocityFilter { .. } => {}
             #[cfg(feature = "dev")]
             TmcRequest::Init => {
                 defmt::warn!("handle_tmc_request: Init handled by main loop");
@@ -2787,7 +2801,34 @@ mod app {
         // avoiding an unwanted position error on mode entry.
         let _ = tmc.write_register(PID_POSITION_ACTUAL, 0).await;
 
-        // 8. Enter position mode: MODE_PID_TYPE=1 (bit 31), MODE_MOTION=3 (position)
+        // 8. Write velocity biquad filter if configured
+        let filter_hz = VELOCITY_FILTER_HZ.load(core::sync::atomic::Ordering::Relaxed);
+        if filter_hz > 0 {
+            if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, 3999) {
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_V_A_1, coeffs.a_1 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_V_A_2, coeffs.a_2 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_V_B_0, coeffs.b_0 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_V_B_1, coeffs.b_1 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_V_B_2, coeffs.b_2 as u32)
+                    .await;
+                let _ = tmc.write_sub_register(CONFIG_BIQUAD_V_ENABLE, 1).await;
+                defmt::info!("Velocity biquad: {}Hz enabled", filter_hz);
+            }
+        } else {
+            // Explicitly disable in case a prior session enabled it
+            let _ = tmc.write_sub_register(CONFIG_BIQUAD_V_ENABLE, 0).await;
+        }
+
+        // 9. Enter position mode: MODE_PID_TYPE=1 (bit 31), MODE_MOTION=3 (position)
         let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0003).await;
 
         // 9. Runaway detection (20ms). If position error exceeds 40 steps
