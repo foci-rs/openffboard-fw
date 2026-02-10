@@ -41,8 +41,22 @@ mod app {
     /// SPI bus type for TMC4671 communication.
     type Spi1Bus = Spi<'static, AsyncMode, embassy_stm32::spi::mode::Master>;
 
+    /// Sub-microsecond busy-wait delay for SPI read pauses.
+    ///
+    /// The TMC4671-LA requires a 500ns pause after the address byte for
+    /// SPI reads above 2 MHz (datasheet Table 2, tSCKpause). At 168 MHz,
+    /// 500ns = 84 CPU cycles — too short for async yield.
+    struct CycleDelay;
+
+    impl embedded_hal_async::delay::DelayNs for CycleDelay {
+        async fn delay_ns(&mut self, ns: u32) {
+            let cycles = (ns as u64 * 168 / 1000) as u32;
+            cortex_m::asm::delay(cycles);
+        }
+    }
+
     /// TMC4671 SPI device with exclusive bus access and software CS.
-    type TmcSpiDevice = ExclusiveDevice<Spi1Bus, Output<'static>, embedded_hal_bus::spi::NoDelay>;
+    type TmcSpiDevice = ExclusiveDevice<Spi1Bus, Output<'static>, CycleDelay>;
 
     use foci_core::tmc::TmcRequest;
 
@@ -1179,13 +1193,13 @@ mod app {
         wdg.unleash();
         defmt::info!("IWDG started: 10s timeout");
 
-        // SPI1: TMC4671 communication at 2 MHz, Mode 3 (CPOL=1, CPHA=1)
+        // SPI1: TMC4671 communication at 8 MHz, Mode 3 (CPOL=1, CPHA=1)
         let mut spi_config = embassy_stm32::spi::Config::default();
         spi_config.mode = embassy_stm32::spi::Mode {
             polarity: embassy_stm32::spi::Polarity::IdleHigh,
             phase: embassy_stm32::spi::Phase::CaptureOnSecondTransition,
         };
-        spi_config.frequency = embassy_stm32::time::Hertz(2_000_000);
+        spi_config.frequency = embassy_stm32::time::Hertz(8_000_000);
 
         let spi1 = Spi::new(
             p.SPI1, p.PA5,      // SCK
@@ -1198,7 +1212,7 @@ mod app {
 
         // PA4: TMC4671 chip select (active low)
         let spi_cs = Output::new(p.PA4, Level::High, Speed::VeryHigh);
-        let spi_dev = ExclusiveDevice::new_no_delay(spi1, spi_cs).unwrap();
+        let spi_dev = ExclusiveDevice::new(spi1, spi_cs, CycleDelay).unwrap();
         let tmc = Tmc4671Spi::new(spi_dev);
 
         // TMC register request channel
@@ -1207,7 +1221,7 @@ mod app {
             TMC_REQUEST_SENDER.borrow(cs).replace(Some(tmc_tx));
         });
 
-        defmt::info!("SPI1 configured: 2 MHz, Mode 3, DMA");
+        defmt::info!("SPI1 configured: 8 MHz, Mode 3, DMA");
 
         // USB OTG FS: configure D+/D- GPIO pins (PA11=D-, PA12=D+)
         // Alternate function 10 for USB OTG FS on STM32F4
