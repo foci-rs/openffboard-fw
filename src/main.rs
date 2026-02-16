@@ -177,6 +177,19 @@ mod app {
     static VELOCITY_FILTER_HZ: core::sync::atomic::AtomicU16 =
         core::sync::atomic::AtomicU16::new(0);
 
+    /// Torque biquad filter cutoff frequency in Hz (set by tmc_set_torque_filter).
+    /// 0 = disabled, 10..=1000 = enabled. Applied during closed-loop entry.
+    static TORQUE_FILTER_HZ: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
+    /// Position target biquad filter cutoff frequency in Hz (set by tmc_set_position_filter).
+    /// 0 = disabled, 10..=1000 = enabled. Applied during closed-loop entry.
+    static POSITION_FILTER_HZ: core::sync::atomic::AtomicU16 =
+        core::sync::atomic::AtomicU16::new(0);
+
+    /// Flux biquad filter cutoff frequency in Hz (set by tmc_set_flux_filter).
+    /// 0 = disabled, 10..=1000 = enabled. Applied during closed-loop entry.
+    static FLUX_FILTER_HZ: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
     /// Whether the encoder direction is reversed (set by tmc_set_encoder_dir).
     /// When true, position targets are negated before writing to the TMC4671.
     static ENCODER_REVERSED: core::sync::atomic::AtomicBool =
@@ -1081,6 +1094,27 @@ mod app {
         defmt::info!("Velocity filter: {} Hz", filter_hz);
     }
 
+    /// Set torque biquad filter cutoff frequency from host config.
+    #[klipper_command]
+    pub fn tmc_set_torque_filter(_context: &mut State, _oid: u8, filter_hz: u16) {
+        TORQUE_FILTER_HZ.store(filter_hz, core::sync::atomic::Ordering::Relaxed);
+        defmt::info!("Torque filter: {} Hz", filter_hz);
+    }
+
+    /// Set position target biquad filter cutoff frequency from host config.
+    #[klipper_command]
+    pub fn tmc_set_position_filter(_context: &mut State, _oid: u8, filter_hz: u16) {
+        POSITION_FILTER_HZ.store(filter_hz, core::sync::atomic::Ordering::Relaxed);
+        defmt::info!("Position filter: {} Hz", filter_hz);
+    }
+
+    /// Set flux biquad filter cutoff frequency from host config.
+    #[klipper_command]
+    pub fn tmc_set_flux_filter(_context: &mut State, _oid: u8, filter_hz: u16) {
+        FLUX_FILTER_HZ.store(filter_hz, core::sync::atomic::Ordering::Relaxed);
+        defmt::info!("Flux filter: {} Hz", filter_hz);
+    }
+
     /// Trigger R/L measurement and PI gain computation.
     #[klipper_command]
     pub fn foci_autotune(_context: &mut State, oid: u8) {
@@ -1427,6 +1461,9 @@ mod app {
                 defmt::warn!("handle_tmc_request: Calibrate handled by main loop");
             }
             TmcRequest::SetVelocityFilter { .. } => {}
+            TmcRequest::SetTorqueFilter { .. } => {}
+            TmcRequest::SetPositionFilter { .. } => {}
+            TmcRequest::SetFluxFilter { .. } => {}
             #[cfg(feature = "dev")]
             TmcRequest::Init => {
                 defmt::warn!("handle_tmc_request: Init handled by main loop");
@@ -2839,8 +2876,12 @@ mod app {
     /// 5. Raise PIDOUT_UQ_UD_LIMITS for operation
     /// 6. Set PHI_E_SELECTION=3 (ABN encoder)
     /// 7. Zero PID_POSITION_ACTUAL (also zeros target)
-    /// 8. Enter position mode: MODE_RAMP_MODE_MOTION = 0x8000_0003
-    /// 9. Validate: position error is not diverging
+    /// 8. Write velocity biquad filter if configured
+    /// 9. Write torque biquad filter if configured
+    /// 10. Write position target biquad filter if configured
+    /// 11. Write flux biquad filter if configured
+    /// 12. Enter position mode: MODE_RAMP_MODE_MOTION = 0x8000_0003
+    /// 13. Validate: position error is not diverging
     ///
     /// Assumes tmc_adc_calibrate and tmc_align_encoder have already been called.
     async fn tmc_enter_closedloop(
@@ -2914,10 +2955,94 @@ mod app {
             let _ = tmc.write_sub_register(CONFIG_BIQUAD_V_ENABLE, 0).await;
         }
 
-        // 9. Enter position mode: MODE_PID_TYPE=1 (bit 31), MODE_MOTION=3 (position)
+        // 9. Write torque biquad filter if configured
+        let filter_hz = TORQUE_FILTER_HZ.load(core::sync::atomic::Ordering::Relaxed);
+        if filter_hz > 0 {
+            if let Some(coeffs) =
+                foci_core::biquad::butterworth_lowpass(filter_hz, TMC_CONFIG.pwm_maxcnt)
+            {
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_T_A_1, coeffs.a_1 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_T_A_2, coeffs.a_2 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_T_B_0, coeffs.b_0 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_T_B_1, coeffs.b_1 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_T_B_2, coeffs.b_2 as u32)
+                    .await;
+                let _ = tmc.write_sub_register(CONFIG_BIQUAD_T_ENABLE, 1).await;
+                defmt::info!("Torque biquad: {}Hz enabled", filter_hz);
+            }
+        } else {
+            let _ = tmc.write_sub_register(CONFIG_BIQUAD_T_ENABLE, 0).await;
+        }
+
+        // 10. Write position target biquad filter if configured
+        let filter_hz = POSITION_FILTER_HZ.load(core::sync::atomic::Ordering::Relaxed);
+        if filter_hz > 0 {
+            if let Some(coeffs) =
+                foci_core::biquad::butterworth_lowpass(filter_hz, TMC_CONFIG.pwm_maxcnt)
+            {
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_X_A_1, coeffs.a_1 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_X_A_2, coeffs.a_2 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_X_B_0, coeffs.b_0 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_X_B_1, coeffs.b_1 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_X_B_2, coeffs.b_2 as u32)
+                    .await;
+                let _ = tmc.write_sub_register(CONFIG_BIQUAD_X_ENABLE, 1).await;
+                defmt::info!("Position biquad: {}Hz enabled", filter_hz);
+            }
+        } else {
+            let _ = tmc.write_sub_register(CONFIG_BIQUAD_X_ENABLE, 0).await;
+        }
+
+        // 11. Write flux biquad filter if configured
+        let filter_hz = FLUX_FILTER_HZ.load(core::sync::atomic::Ordering::Relaxed);
+        if filter_hz > 0 {
+            if let Some(coeffs) =
+                foci_core::biquad::butterworth_lowpass(filter_hz, TMC_CONFIG.pwm_maxcnt)
+            {
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_F_A_1, coeffs.a_1 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_F_A_2, coeffs.a_2 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_F_B_0, coeffs.b_0 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_F_B_1, coeffs.b_1 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_F_B_2, coeffs.b_2 as u32)
+                    .await;
+                let _ = tmc.write_sub_register(CONFIG_BIQUAD_F_ENABLE, 1).await;
+                defmt::info!("Flux biquad: {}Hz enabled", filter_hz);
+            }
+        } else {
+            let _ = tmc.write_sub_register(CONFIG_BIQUAD_F_ENABLE, 0).await;
+        }
+
+        // 12. Enter position mode: MODE_PID_TYPE=1 (bit 31), MODE_MOTION=3 (position)
         let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0003).await;
 
-        // 9. Runaway detection (20ms). If position error exceeds 40 steps
+        // 13. Runaway detection (20ms). If position error exceeds 40 steps
         // and is still growing, the feedback sign is wrong — fail fast.
         // Encoder polarity errors are also caught in Stage 2 torque
         // tracking, but this is a secondary safety net for position mode.
