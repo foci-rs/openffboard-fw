@@ -190,6 +190,18 @@ mod app {
     /// 0 = disabled, 10..=1000 = enabled. Applied during closed-loop entry.
     static FLUX_FILTER_HZ: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 
+    /// Velocity feedforward enable flag (set by tmc_set_velocity_feedforward).
+    /// When true, the 1ms tick loop computes position delta and writes
+    /// PID_VELOCITY_OFFSET. Applied immediately in the tick loop.
+    static VELOCITY_FEEDFORWARD: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    /// Signal the tick loop to reset feedforward state (prev_position_target,
+    /// first_tick_after_enable). Set by handle_tmc_request when encoder
+    /// direction changes, consumed by the tick loop on next iteration.
+    static FEEDFORWARD_RESET: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
     /// Whether the encoder direction is reversed (set by tmc_set_encoder_dir).
     /// When true, position targets are negated before writing to the TMC4671.
     static ENCODER_REVERSED: core::sync::atomic::AtomicBool =
@@ -331,6 +343,11 @@ mod app {
         // Reset board-local control and protocol state
         CURRENT_LIMIT_REG.store(0, core::sync::atomic::Ordering::Relaxed);
         VELOCITY_FILTER_HZ.store(0, core::sync::atomic::Ordering::Relaxed);
+        TORQUE_FILTER_HZ.store(0, core::sync::atomic::Ordering::Relaxed);
+        POSITION_FILTER_HZ.store(0, core::sync::atomic::Ordering::Relaxed);
+        FLUX_FILTER_HZ.store(0, core::sync::atomic::Ordering::Relaxed);
+        VELOCITY_FEEDFORWARD.store(false, core::sync::atomic::Ordering::Relaxed);
+        FEEDFORWARD_RESET.store(false, core::sync::atomic::Ordering::Relaxed);
         ENCODER_REVERSED.store(false, core::sync::atomic::Ordering::Relaxed);
         STEPPER_POSITION_TARGET.store(0, core::sync::atomic::Ordering::Relaxed);
         SELFTEST_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
@@ -1115,6 +1132,35 @@ mod app {
         defmt::info!("Flux filter: {} Hz", filter_hz);
     }
 
+    /// Set position/velocity PI gains from host config.
+    #[klipper_command]
+    pub fn tmc_set_position_gains(
+        context: &mut State,
+        _oid: u8,
+        position_p: u16,
+        position_i: u16,
+        velocity_p: u16,
+        velocity_i: u16,
+    ) {
+        if !tmc_send(foci_core::tmc::tmc_set_position_gains(
+            position_p, position_i, velocity_p, velocity_i,
+        )) {
+            if enter_shutdown(context) {
+                klipper_shutdown!(
+                    "tmc_set_position_gains lost (queue full)",
+                    DWT::cycle_count()
+                );
+            }
+        }
+    }
+
+    /// Enable or disable velocity feedforward from host config.
+    #[klipper_command]
+    pub fn tmc_set_velocity_feedforward(_context: &mut State, _oid: u8, enable: u8) {
+        VELOCITY_FEEDFORWARD.store(enable != 0, core::sync::atomic::Ordering::Relaxed);
+        defmt::info!("Velocity feedforward: {}", enable != 0);
+    }
+
     /// Trigger R/L measurement and PI gain computation.
     #[klipper_command]
     pub fn foci_autotune(_context: &mut State, oid: u8) {
@@ -1417,6 +1463,10 @@ mod app {
                     return Err(());
                 }
                 ENCODER_REVERSED.store(invert, core::sync::atomic::Ordering::Relaxed);
+                // Signal the tick loop to reset feedforward state: prev_position_target
+                // has the wrong sign after a direction flip, which would produce a
+                // one-tick velocity impulse in the feedforward delta computation.
+                FEEDFORWARD_RESET.store(true, core::sync::atomic::Ordering::Relaxed);
                 defmt::info!(
                     "TMC4671 encoder direction: {}",
                     if invert { "reversed" } else { "default" }
@@ -1464,6 +1514,10 @@ mod app {
             TmcRequest::SetTorqueFilter { .. } => {}
             TmcRequest::SetPositionFilter { .. } => {}
             TmcRequest::SetFluxFilter { .. } => {}
+            TmcRequest::SetPositionGains { .. } => {
+                defmt::warn!("handle_tmc_request: SetPositionGains handled by main loop");
+            }
+            TmcRequest::SetVelocityFeedforward { .. } => {}
             #[cfg(feature = "dev")]
             TmcRequest::Init => {
                 defmt::warn!("handle_tmc_request: Init handled by main loop");
@@ -1634,6 +1688,14 @@ mod app {
         // None = use defaults during calibration.
         let mut stored_gains: Option<foci_core::pid::InnerLoopGains> = None;
 
+        // Stored position/velocity PID gains from host.
+        // None = use defaults during calibration.
+        let mut stored_position_gains: Option<(u16, u16, u16, u16)> = None;
+
+        // Velocity feedforward state (P1-local, no sync needed)
+        let mut prev_position_target: i32 = 0;
+        let mut first_tick_after_enable: bool = true;
+
         // Main loop: wait for channel message or 1ms timeout.
         // On message: handle request. On timeout: write position target.
         // Position is read from STEPPER_POSITION_TARGET atomic (updated
@@ -1646,6 +1708,10 @@ mod app {
                 while rx.try_recv().is_ok() {}
                 motor_enabled = false;
                 calibrated = false;
+                stored_gains = None;
+                stored_position_gains = None;
+                prev_position_target = 0;
+                first_tick_after_enable = true;
                 defmt::info!("TMC request queue flushed after config_reset");
             }
 
@@ -1671,11 +1737,14 @@ mod app {
                                     enable_pin,
                                     current_limit,
                                     stored_gains,
+                                    stored_position_gains,
                                 )
                                 .await
                                 {
                                     Ok(_) => {
                                         calibrated = true;
+                                        prev_position_target = 0;
+                                        first_tick_after_enable = true;
                                     }
                                     Err(e) => {
                                         defmt::error!("Auto-calibration failed: {}", e);
@@ -1710,6 +1779,8 @@ mod app {
                             ctx.shared.app_state.lock(|state| {
                                 state.steppers[0].reset_position();
                             });
+                            prev_position_target = 0;
+                            first_tick_after_enable = true;
                             defmt::info!("TMC4671 motor disabled");
                         }
                     }
@@ -1753,12 +1824,15 @@ mod app {
                             enable_pin,
                             CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed),
                             stored_gains,
+                            stored_position_gains,
                         )
                         .await;
 
                         match result {
                             Ok((adc_i0, adc_i1, encoder_count)) => {
                                 calibrated = true;
+                                prev_position_target = 0;
+                                first_tick_after_enable = true;
                                 defmt::info!("foci_calibrate complete: oid={}", oid);
                                 klipper_reply!(
                                     foci_calibrate_response,
@@ -1817,6 +1891,27 @@ mod app {
                             torque_p,
                             torque_i,
                         );
+                    }
+                    TmcRequest::SetPositionGains {
+                        position_p,
+                        position_i,
+                        velocity_p,
+                        velocity_i,
+                    } => {
+                        stored_position_gains =
+                            Some((position_p, position_i, velocity_p, velocity_i));
+                        defmt::info!(
+                            "Position gains received: pos P={} I={}, vel P={} I={}",
+                            position_p,
+                            position_i,
+                            velocity_p,
+                            velocity_i,
+                        );
+                    }
+                    TmcRequest::SetVelocityFeedforward { enable } => {
+                        defmt::info!("Velocity feedforward: {} (via queue)", enable);
+                        // Feedforward flag is already set by the atomic in the
+                        // command handler; this arm exists for exhaustiveness.
                     }
                     TmcRequest::Autotune { oid } => {
                         if motor_enabled {
@@ -2214,6 +2309,37 @@ mod app {
                 } else {
                     target
                 };
+
+                // Check if feedforward state needs resetting (e.g., encoder direction change)
+                if FEEDFORWARD_RESET.swap(false, core::sync::atomic::Ordering::Relaxed) {
+                    prev_position_target = adjusted;
+                    first_tick_after_enable = true;
+                }
+
+                // Velocity feedforward: compute position delta from adjusted targets.
+                // Uses wrapping_sub for encoder rollover safety.
+                let velocity_delta = adjusted.wrapping_sub(prev_position_target);
+                prev_position_target = adjusted;
+
+                if VELOCITY_FEEDFORWARD.load(core::sync::atomic::Ordering::Relaxed) {
+                    if !first_tick_after_enable {
+                        let _ = tmc
+                            .write_register(
+                                tmc4671::registers::PID_VELOCITY_OFFSET,
+                                velocity_delta as u32,
+                            )
+                            .await;
+                    } else {
+                        // Suppress feedforward on first tick (prev is stale)
+                        let _ = tmc
+                            .write_register(tmc4671::registers::PID_VELOCITY_OFFSET, 0)
+                            .await;
+                        first_tick_after_enable = false;
+                    }
+                } else if first_tick_after_enable {
+                    first_tick_after_enable = false;
+                }
+
                 let _ = tmc
                     .write_register(tmc4671::registers::PID_POSITION_TARGET, adjusted as u32)
                     .await;
@@ -2414,13 +2540,14 @@ mod app {
         enable_pin: &mut Output<'static>,
         current_limit_reg: u32,
         stored_gains: Option<foci_core::pid::InnerLoopGains>,
+        stored_position_gains: Option<(u16, u16, u16, u16)>,
     ) -> Result<(u16, u16, u32), CalibrationError> {
         let (adc_i0, adc_i1) = tmc_adc_calibrate(tmc, enable_pin).await?;
         let encoder_count = tmc_align_encoder(tmc, current_limit_reg).await?;
-        // Use default gains for closed-loop entry (encoder alignment and
-        // runaway detection need enough torque). Apply autotuned gains
-        // after closed-loop is established.
-        tmc_enter_closedloop(tmc, None).await?;
+        // Use default inner-loop gains for closed-loop entry (runaway
+        // detection needs known-good torque). Position/velocity gains
+        // are applied directly since they don't affect runaway detection.
+        tmc_enter_closedloop(tmc, None, stored_position_gains).await?;
 
         // Now apply autotuned gains if available
         if let Some(gains) = stored_gains {
@@ -2887,6 +3014,7 @@ mod app {
     async fn tmc_enter_closedloop(
         tmc: &mut Tmc4671Spi<TmcSpiDevice>,
         stored_gains: Option<foci_core::pid::InnerLoopGains>,
+        stored_position_gains: Option<(u16, u16, u16, u16)>,
     ) -> Result<(), CalibrationError> {
         use tmc4671::registers::*;
 
@@ -2896,16 +3024,20 @@ mod app {
         let _ = tmc.write_register(PID_FLUX_P_FLUX_I, flux_reg).await;
         let _ = tmc.write_register(PID_TORQUE_P_TORQUE_I, torque_reg).await;
 
-        // 2. Velocity PID: P=4.5 (Q8.8 = 1152), I=0
-        // Q8.8 format per datasheet 4.7.8: value = real * 256.
-        // Used in advanced PID mode (MODE_PID_TYPE=1, bit 31 set).
-        let velocity_pi: u32 = 1152 << 16;
+        // 2. Velocity PID: use stored gains or defaults (P=4.5, I=0)
+        let (vel_p, vel_i) = stored_position_gains
+            .map(|(_, _, vp, vi)| (vp, vi))
+            .unwrap_or((1152, 0));
+        let velocity_pi: u32 = (vel_p as u32) << 16 | vel_i as u32;
         let _ = tmc
             .write_register(PID_VELOCITY_P_VELOCITY_I, velocity_pi)
             .await;
 
-        // 3. Position PID: P=2.5 (Q8.8 = 640), I=0
-        let position_pi: u32 = 640 << 16;
+        // 3. Position PID: use stored gains or defaults (P=2.5, I=0)
+        let (pos_p, pos_i) = stored_position_gains
+            .map(|(pp, pi, _, _)| (pp, pi))
+            .unwrap_or((640, 0));
+        let position_pi: u32 = (pos_p as u32) << 16 | pos_i as u32;
         let _ = tmc
             .write_register(PID_POSITION_P_POSITION_I, position_pi)
             .await;
@@ -3038,6 +3170,10 @@ mod app {
         } else {
             let _ = tmc.write_sub_register(CONFIG_BIQUAD_F_ENABLE, 0).await;
         }
+
+        // NOTE: PID_VELOCITY_OFFSET is NOT cleared here — writing to 0x67
+        // during closedloop entry caused intermittent encoder alignment failures.
+        // The register is cleared during disable and restore_safe_state instead.
 
         // 12. Enter position mode: MODE_PID_TYPE=1 (bit 31), MODE_MOTION=3 (position)
         let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0003).await;
