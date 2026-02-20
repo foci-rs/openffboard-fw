@@ -202,6 +202,12 @@ mod app {
     static FEEDFORWARD_RESET: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
 
+    /// Configurable PID velocity limit (caps position PID output).
+    /// 0 = unconstrained (0x7FFF_FFFF). Set by tmc_set_velocity_limit.
+    /// Written to PID_VELOCITY_LIMIT (0x60) during closedloop entry.
+    static VELOCITY_LIMIT_CFG: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+
     /// Whether the encoder direction is reversed (set by tmc_set_encoder_dir).
     /// When true, position targets are negated before writing to the TMC4671.
     static ENCODER_REVERSED: core::sync::atomic::AtomicBool =
@@ -347,6 +353,7 @@ mod app {
         POSITION_FILTER_HZ.store(0, core::sync::atomic::Ordering::Relaxed);
         FLUX_FILTER_HZ.store(0, core::sync::atomic::Ordering::Relaxed);
         VELOCITY_FEEDFORWARD.store(false, core::sync::atomic::Ordering::Relaxed);
+        VELOCITY_LIMIT_CFG.store(0, core::sync::atomic::Ordering::Relaxed);
         FEEDFORWARD_RESET.store(false, core::sync::atomic::Ordering::Relaxed);
         ENCODER_REVERSED.store(false, core::sync::atomic::Ordering::Relaxed);
         STEPPER_POSITION_TARGET.store(0, core::sync::atomic::Ordering::Relaxed);
@@ -1159,6 +1166,15 @@ mod app {
     pub fn tmc_set_velocity_feedforward(_context: &mut State, _oid: u8, enable: u8) {
         VELOCITY_FEEDFORWARD.store(enable != 0, core::sync::atomic::Ordering::Relaxed);
         defmt::info!("Velocity feedforward: {}", enable != 0);
+    }
+
+    /// Set PID velocity limit from host config.
+    /// Caps position PID output to prevent integrator-driven runaway.
+    /// limit=0 means unconstrained (0x7FFF_FFFF).
+    #[klipper_command]
+    pub fn tmc_set_velocity_limit(_context: &mut State, _oid: u8, limit: u32) {
+        VELOCITY_LIMIT_CFG.store(limit, core::sync::atomic::Ordering::Relaxed);
+        defmt::info!("Velocity limit: {}", limit);
     }
 
     /// Trigger R/L measurement and PI gain computation.
@@ -3039,8 +3055,11 @@ mod app {
             .write_register(PID_POSITION_P_POSITION_I, position_pi)
             .await;
 
-        // 4. Velocity limit: unconstrained for now
-        let _ = tmc.write_register(PID_VELOCITY_LIMIT, 0x7FFF_FFFF).await;
+        // 4. Velocity limit: host-configured or unconstrained default.
+        // Caps position PID output velocity to prevent integrator windup runaway.
+        let vel_limit = VELOCITY_LIMIT_CFG.load(core::sync::atomic::Ordering::Relaxed);
+        let vel_limit = if vel_limit == 0 { 0x7FFF_FFFF } else { vel_limit };
+        let _ = tmc.write_register(PID_VELOCITY_LIMIT, vel_limit).await;
 
         // 5. Raise voltage limit for actual operation. ADC cal sets it to
         // 1024 as a safety measure, but position PID needs headroom to drive
