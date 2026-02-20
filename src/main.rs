@@ -2997,16 +2997,13 @@ mod app {
     ///
     /// Steps:
     /// 1. Set flux/torque PID: P=404, I=26
-    /// 2. Set velocity PID: P=4.5, I=0
-    /// 3. Set position PID: P=2.5, I=0
-    /// 4. Set PID_VELOCITY_LIMIT = 0x7FFF_FFFF
+    /// 2. Set velocity PID: P=4.5, I=0 (or host-configured)
+    /// 3. Set position PID: P=2.5, I=0 (or host-configured)
+    /// 4. Set PID_VELOCITY_LIMIT (host-configured or unconstrained)
     /// 5. Raise PIDOUT_UQ_UD_LIMITS for operation
     /// 6. Set PHI_E_SELECTION=3 (ABN encoder)
-    /// 7. Zero PID_POSITION_ACTUAL (also zeros target)
-    /// 8. Write velocity biquad filter if configured
-    /// 9. Write torque biquad filter if configured
-    /// 10. Write position target biquad filter if configured
-    /// 11. Write flux biquad filter if configured
+    /// 7. Zero PID_POSITION_ACTUAL (also zeros target and error sum)
+    /// 8-11. Write biquad filters if configured (velocity, torque, position, flux)
     /// 12. Enter position mode: MODE_RAMP_MODE_MOTION = 0x8000_0003
     /// 13. Validate: position error is not diverging
     ///
@@ -3082,9 +3079,6 @@ mod app {
                 let _ = tmc.write_sub_register(CONFIG_BIQUAD_V_ENABLE, 1).await;
                 defmt::info!("Velocity biquad: {}Hz enabled", filter_hz);
             }
-        } else {
-            // Explicitly disable in case a prior session enabled it
-            let _ = tmc.write_sub_register(CONFIG_BIQUAD_V_ENABLE, 0).await;
         }
 
         // 9. Write torque biquad filter if configured
@@ -3111,8 +3105,6 @@ mod app {
                 let _ = tmc.write_sub_register(CONFIG_BIQUAD_T_ENABLE, 1).await;
                 defmt::info!("Torque biquad: {}Hz enabled", filter_hz);
             }
-        } else {
-            let _ = tmc.write_sub_register(CONFIG_BIQUAD_T_ENABLE, 0).await;
         }
 
         // 10. Write position target biquad filter if configured
@@ -3139,8 +3131,6 @@ mod app {
                 let _ = tmc.write_sub_register(CONFIG_BIQUAD_X_ENABLE, 1).await;
                 defmt::info!("Position biquad: {}Hz enabled", filter_hz);
             }
-        } else {
-            let _ = tmc.write_sub_register(CONFIG_BIQUAD_X_ENABLE, 0).await;
         }
 
         // 11. Write flux biquad filter if configured
@@ -3167,8 +3157,6 @@ mod app {
                 let _ = tmc.write_sub_register(CONFIG_BIQUAD_F_ENABLE, 1).await;
                 defmt::info!("Flux biquad: {}Hz enabled", filter_hz);
             }
-        } else {
-            let _ = tmc.write_sub_register(CONFIG_BIQUAD_F_ENABLE, 0).await;
         }
 
         // NOTE: PID_VELOCITY_OFFSET is NOT cleared here — writing to 0x67
