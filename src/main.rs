@@ -203,10 +203,11 @@ mod app {
         core::sync::atomic::AtomicBool::new(false);
 
     /// Configurable PID velocity limit (caps position PID output).
-    /// 0 = unconstrained (0x7FFF_FFFF). Set by tmc_set_velocity_limit.
+    /// Prevents integrator-driven velocity runaway when position I > 0.
+    /// Override via tmc_set_velocity_limit command from host config.
     /// Written to PID_VELOCITY_LIMIT (0x60) during closedloop entry.
     static VELOCITY_LIMIT_CFG: core::sync::atomic::AtomicU32 =
-        core::sync::atomic::AtomicU32::new(0);
+        core::sync::atomic::AtomicU32::new(500_000);
 
     /// Whether the encoder direction is reversed (set by tmc_set_encoder_dir).
     /// When true, position targets are negated before writing to the TMC4671.
@@ -353,7 +354,7 @@ mod app {
         POSITION_FILTER_HZ.store(0, core::sync::atomic::Ordering::Relaxed);
         FLUX_FILTER_HZ.store(0, core::sync::atomic::Ordering::Relaxed);
         VELOCITY_FEEDFORWARD.store(false, core::sync::atomic::Ordering::Relaxed);
-        VELOCITY_LIMIT_CFG.store(0, core::sync::atomic::Ordering::Relaxed);
+        VELOCITY_LIMIT_CFG.store(500_000, core::sync::atomic::Ordering::Relaxed);
         FEEDFORWARD_RESET.store(false, core::sync::atomic::Ordering::Relaxed);
         ENCODER_REVERSED.store(false, core::sync::atomic::Ordering::Relaxed);
         STEPPER_POSITION_TARGET.store(0, core::sync::atomic::Ordering::Relaxed);
@@ -1170,7 +1171,7 @@ mod app {
 
     /// Set PID velocity limit from host config.
     /// Caps position PID output to prevent integrator-driven runaway.
-    /// limit=0 means unconstrained (0x7FFF_FFFF).
+    /// Firmware default: 500,000. Override via printer.cfg pid_velocity_limit.
     #[klipper_command]
     pub fn tmc_set_velocity_limit(_context: &mut State, _oid: u8, limit: u32) {
         VELOCITY_LIMIT_CFG.store(limit, core::sync::atomic::Ordering::Relaxed);
@@ -1712,6 +1713,13 @@ mod app {
         let mut prev_position_target: i32 = 0;
         let mut first_tick_after_enable: bool = true;
 
+        // Move boundary detection for integrator reset.
+        // Tracks whether the motor was actively moving on the previous tick
+        // (position target delta was nonzero). When this transitions from
+        // true to false, the position integrator is zeroed to prevent windup
+        // overshoot at the end of a move.
+        let mut was_moving: bool = false;
+
         // Main loop: wait for channel message or 1ms timeout.
         // On message: handle request. On timeout: write position target.
         // Position is read from STEPPER_POSITION_TARGET atomic (updated
@@ -1728,6 +1736,7 @@ mod app {
                 stored_position_gains = None;
                 prev_position_target = 0;
                 first_tick_after_enable = true;
+                was_moving = false;
                 defmt::info!("TMC request queue flushed after config_reset");
             }
 
@@ -1761,6 +1770,7 @@ mod app {
                                         calibrated = true;
                                         prev_position_target = 0;
                                         first_tick_after_enable = true;
+                                        was_moving = false;
                                     }
                                     Err(e) => {
                                         defmt::error!("Auto-calibration failed: {}", e);
@@ -1797,6 +1807,7 @@ mod app {
                             });
                             prev_position_target = 0;
                             first_tick_after_enable = true;
+                            was_moving = false;
                             defmt::info!("TMC4671 motor disabled");
                         }
                     }
@@ -1849,6 +1860,7 @@ mod app {
                                 calibrated = true;
                                 prev_position_target = 0;
                                 first_tick_after_enable = true;
+                                was_moving = false;
                                 defmt::info!("foci_calibrate complete: oid={}", oid);
                                 klipper_reply!(
                                     foci_calibrate_response,
@@ -2359,6 +2371,19 @@ mod app {
                 let _ = tmc
                     .write_register(tmc4671::registers::PID_POSITION_TARGET, adjusted as u32)
                     .await;
+
+                // Move boundary detection: when position target stops changing,
+                // reset the position integrator to prevent windup overshoot.
+                // Only fires at move-to-stop transitions (~every 50-200ms),
+                // not every tick, so the sub-register SPI cost is acceptable.
+                let now_moving = velocity_delta != 0;
+                if was_moving && !now_moving {
+                    let _ = tmc
+                        .write_sub_register(tmc4671::registers::PID_ERROR_PID_POSITION_ERROR_SUM, 0)
+                        .await;
+                }
+                was_moving = now_moving;
+
                 // Note: PID_TORQUE_FLUX_LIMITS (0x5E) is a single u16 field
                 // per the datasheet. Both torque and flux share one limit.
                 // The value 692 (set by tmc_set_current) is correct.
@@ -3058,7 +3083,6 @@ mod app {
         // 4. Velocity limit: host-configured or unconstrained default.
         // Caps position PID output velocity to prevent integrator windup runaway.
         let vel_limit = VELOCITY_LIMIT_CFG.load(core::sync::atomic::Ordering::Relaxed);
-        let vel_limit = if vel_limit == 0 { 0x7FFF_FFFF } else { vel_limit };
         let _ = tmc.write_register(PID_VELOCITY_LIMIT, vel_limit).await;
 
         // 5. Raise voltage limit for actual operation. ADC cal sets it to
@@ -3073,6 +3097,13 @@ mod app {
         // PID_POSITION_TARGET to the same value (per datasheet 0x6B),
         // avoiding an unwanted position error on mode entry.
         let _ = tmc.write_register(PID_POSITION_ACTUAL, 0).await;
+
+        // Zero position integrator to prevent stale error sum from prior session.
+        // Must come after PID_POSITION_ACTUAL=0 so the integrator doesn't
+        // immediately re-accumulate from a nonzero position error.
+        let _ = tmc
+            .write_sub_register(PID_ERROR_PID_POSITION_ERROR_SUM, 0)
+            .await;
 
         // 8. Write velocity biquad filter if configured
         let filter_hz = VELOCITY_FILTER_HZ.load(core::sync::atomic::Ordering::Relaxed);
