@@ -1512,6 +1512,27 @@ mod app {
                         value: u32 = value
                     );
                 }
+                // Sub-registers (INTERIM, PID_ERROR) use synthetic addrs 0x80+
+                for &(synthetic_addr, sub_reg) in foci_core::dump::DUMP_SUB_REGISTERS {
+                    Mono::delay(1.millis()).await;
+
+                    let value = match tmc.read_sub_register(sub_reg).await {
+                        Ok(v) => v,
+                        Err(_) => {
+                            defmt::error!(
+                                "TMC4671 sub-register read failed: addr={:#04x}",
+                                synthetic_addr
+                            );
+                            0
+                        }
+                    };
+                    klipper_reply!(
+                        foci_dump_value,
+                        oid: u8 = oid,
+                        addr: u8 = synthetic_addr,
+                        value: u32 = value
+                    );
+                }
                 Mono::delay(1.millis()).await;
                 klipper_reply!(foci_dump_done, oid: u8 = oid);
             }
