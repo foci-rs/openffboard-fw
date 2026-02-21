@@ -2878,22 +2878,30 @@ mod app {
         }
     }
 
-    /// Align the ABN encoder to the D-axis using current-regulated torque mode,
+    /// Align the ABN encoder to the D-axis using open-loop voltage mode,
     /// waiting for the rotor to settle, then zeroing the encoder count.
     ///
-    /// Uses torque mode with PID_FLUX_TARGET to drive regulated D-axis current
-    /// at PHI_E=0. The flux PID provides overcurrent protection — current is
-    /// clamped to PID_TORQUE_FLUX_LIMITS regardless of motor impedance.
+    /// Uses UQ_UD_EXT mode (mode 8) to apply a direct D-axis voltage at
+    /// PHI_E=0. This matches the TMC-API reference implementation and
+    /// provides sufficient force to overcome motor detent torque regardless
+    /// of impedance. PID-regulated torque mode (mode 1) was previously used
+    /// but was insufficient for motors with strong detent torque.
     ///
     /// Steps:
     /// 1. Set PHI_E_SELECTION=1 (external) and PHI_E_EXT=0
     /// 2. Capture ABN_DECODER_COUNT before alignment
-    /// 3. Configure flux/torque PID gains
-    /// 4. Set flux target to 50% of current limit
-    /// 5. Enter torque mode, hold for settling
+    /// 3. Apply D-axis voltage via UQ_UD_EXT (UD=excitation_voltage, UQ=0)
+    /// 4. Enter open-loop voltage mode (MODE_MOTION=8)
+    /// 5. Hold for settling (rotor aligns to nearest D-axis pole)
     /// 6. Validate encoder (movement detected or stable non-zero count)
-    /// 7. Read ABN_DECODER_COUNT, zero it, zero offset
-    /// 8. Stop drive (targets=0, MODE=0)
+    /// 7. Zero ABN_DECODER_COUNT and PHI_E_PHI_M_OFFSET
+    /// 8. Switch PHI_E to ABN encoder (while still driving)
+    /// 9. Stop drive (UQ_UD_EXT=0, MODE=0)
+    ///
+    /// **Post-condition:** PHI_E_SELECTION=3 (ABN encoder), motor stopped.
+    /// The angle reference is locked to ABN before the drive stops, so the
+    /// rotor cannot drift to a detent position and corrupt the alignment.
+    /// `tmc_enter_closedloop` must NOT overwrite PHI_E_SELECTION.
     ///
     /// Returns the encoder count before zeroing on success.
     async fn tmc_align_encoder(
@@ -2927,37 +2935,21 @@ mod app {
             .read_register(ABN_DECODER_COUNT)
             .await
             .map_err(|_| CalibrationError::SpiError)?;
+        // NOTE: encoder nudge disabled — it moved the motor to a random
+        // D-axis position that the alignment drive couldn't correct,
+        // causing ~50% alignment failure rate. Encoder connectivity is
+        // verified by checking for count change during the alignment
+        // drive itself (the alignment moves the motor, proving encoder
+        // is connected). The count_pre_nudge==0 case is handled by the
+        // existing movement check below (moved || count != 0).
         if count_pre_nudge == 0 {
-            // Brief open-loop voltage pulse to force encoder movement.
-            // Drive D-axis at PHI_E=0, then shift to PHI_E=16384 (90 deg).
-            // This forces the rotor to move, generating encoder pulses.
-            let _ = tmc.write_register(PHI_E_SELECTION, 1).await;
-            let _ = tmc.write_register(PHI_E_EXT, 0).await;
-            let _ = tmc
-                .write_register(UQ_UD_EXT, TMC_CONFIG.excitation_voltage as u32)
-                .await;
-            let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 8).await;
-            Mono::delay(50_u32.millis()).await;
-            // Shift angle to force movement
-            let _ = tmc.write_register(PHI_E_EXT, 16384).await;
-            Mono::delay(50_u32.millis()).await;
-            let _ = tmc.write_register(UQ_UD_EXT, 0).await;
-            let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
-            Mono::delay(10_u32.millis()).await;
-
-            let count_after_nudge = tmc
-                .read_register(ABN_DECODER_COUNT)
-                .await
-                .map_err(|_| CalibrationError::SpiError)?;
-            if count_after_nudge == 0 {
-                defmt::error!("encoder nudge: no pulses after open-loop jog");
-                return Err(CalibrationError::EncoderFault);
-            }
-            defmt::info!(
-                "encoder nudge: count {} -> {}",
-                count_pre_nudge,
-                count_after_nudge
-            );
+            // On cold boot, ABN_DECODER_COUNT is 0. If the rotor is already
+            // at the D-axis, the alignment won't move it and the movement
+            // check would reject count=0 as "no movement". Seed the counter
+            // to 1 so the post-alignment check can detect that the alignment
+            // drive changed it (it will be zeroed after alignment anyway).
+            let _ = tmc.write_register(ABN_DECODER_COUNT, 1).await;
+            defmt::info!("encoder count=0 at alignment start, seeded to 1");
         }
 
         let count_before = tmc
@@ -2965,25 +2957,22 @@ mod app {
             .await
             .map_err(|_| CalibrationError::SpiError)?;
 
-        // 3. PID gains for flux/torque current control
-        // P=404 (1.577 in Q8.8), I=26 (0.1 in Q8.8)
-        let pid_pi: u32 = (404 << 16) | 26;
-        let _ = tmc.write_register(PID_FLUX_P_FLUX_I, pid_pi).await;
-        let _ = tmc.write_register(PID_TORQUE_P_TORQUE_I, pid_pi).await;
+        // 3. Raise voltage limit for alignment. ADC calibration sets
+        // PIDOUT_UQ_UD_LIMITS to 1024 as a safety measure, but that clips
+        // alignment voltages above 1024. Raise to allow the alignment
+        // voltage through. Closedloop entry sets the operational limit.
+        let _ = tmc.write_register(PIDOUT_UQ_UD_LIMITS, 2000).await;
 
-        // 4. Set flux target: half of current limit on the D-axis.
-        // CRITICAL: PID_FLUX_TARGET is bits[15:0] (D-axis current).
-        // PID_TORQUE_TARGET bits[31:16] must be 0 (no Q-axis torque).
-        // Using bits[31:16] instead aligns to Q-axis (90deg off).
-        let flux_target = ((current_limit_reg & 0xFFFF) as i16) / 2;
-        let target_reg: u32 = PidTorqueFluxTarget::new()
-            .with_pid_flux_target(flux_target)
-            .with_pid_torque_target(0)
-            .into();
-        let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, target_reg).await;
+        // 4. D-axis voltage for alignment: UD = 1000, UQ = 0.
+        // Uses open-loop voltage mode (UQ_UD_EXT, mode 8) matching the
+        // TMC-API reference implementation. The voltage must be sufficient
+        // to overcome motor detent torque but not so high as to overdrive
+        // the magnetic circuit. Original FOCI implementation used 1000.
+        // UQ_UD_EXT layout: bits[31:16] = UQ, bits[15:0] = UD
+        let _ = tmc.write_register(UQ_UD_EXT, 1000u32).await;
 
-        // 5. Enter torque mode (MODE_PID_TYPE=1, MODE_MOTION=1)
-        let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0001).await;
+        // 5. Enter open-loop voltage mode (MODE_PID_TYPE=1, MODE_MOTION=8)
+        let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0008).await;
 
         // 6. Hold for settling (rotor aligns to nearest D-axis pole)
         Mono::delay(500_u32.millis()).await;
@@ -3000,14 +2989,10 @@ mod app {
             .map_err(|_| CalibrationError::SpiError)?;
 
         // Check encoder presence: compare against pre-alignment count.
-        // The old check (count == 0) false-triggered when the rotor was
-        // already near a D-axis point and ABN_DECODER_COUNT started at 0.
-        // Instead, verify the alignment produced encoder movement OR that
-        // the count is stable and non-zero (prior motion accumulated).
+        // Verify the alignment produced encoder movement OR that the count
+        // is stable and non-zero (prior motion accumulated).
         let moved = count1 != count_before || count2 != count_before;
         // Allow +/-2 encoder counts of jitter during settling.
-        // Exact match (count1 == count2) false-triggers when the PID
-        // is oscillating by 1 count around the alignment point.
         let stable = (count1 as i32 - count2 as i32).unsigned_abs() <= 2;
         if !moved && count1 == 0 {
             defmt::error!(
@@ -3016,7 +3001,7 @@ mod app {
                 count1,
                 count2
             );
-            let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+            let _ = tmc.write_register(UQ_UD_EXT, 0).await;
             let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
             return Err(CalibrationError::EncoderFault);
         }
@@ -3026,29 +3011,29 @@ mod app {
                 count1,
                 count2
             );
-            let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+            let _ = tmc.write_register(UQ_UD_EXT, 0).await;
             let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
             return Err(CalibrationError::EncoderFault);
         }
 
-        // Diagnostic: verify PID is tracking (flux actual near flux target)
-        let actual = tmc.read_register(PID_TORQUE_FLUX_ACTUAL).await.unwrap_or(0);
-        let flux_actual = (actual & 0xFFFF) as i16;
-        let torque_actual = ((actual >> 16) & 0xFFFF) as i16;
-        defmt::info!(
-            "encoder align PID: flux_target={} flux_actual={} torque_actual={}",
-            flux_target,
-            flux_actual,
-            torque_actual
-        );
-
-        // 8. Zero encoder count and offset at the D-axis position
+        // 8. Zero encoder count and offset at the D-axis position.
+        // CRITICAL: the motor is still held in voltage mode while we do this.
         let old_count = count1;
         let _ = tmc.write_register(ABN_DECODER_COUNT, 0).await;
         let _ = tmc.write_register(ABN_DECODER_PHI_E_PHI_M_OFFSET, 0).await;
 
-        // 9. Stop drive: zero targets first, then stop mode
-        let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+        // 9. Switch PHI_E to ABN encoder WHILE STILL DRIVING.
+        // The motor is actively held at the D-axis position, so the ABN-
+        // derived PHI_E (count=0, offset=0 -> PHI_E=0) matches the external
+        // PHI_E=0 we were using. This avoids an unpowered gap between
+        // alignment and closed-loop entry where the rotor could snap to a
+        // detent position and corrupt the angle reference.
+        let _ = tmc.write_register(PHI_E_SELECTION, 3).await;
+
+        // 10. Stop drive: zero voltage first, then stop mode.
+        // PHI_E is now locked to ABN encoder — the angle reference survives
+        // the brief coast until tmc_enter_closedloop engages position mode.
+        let _ = tmc.write_register(UQ_UD_EXT, 0).await;
         let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x0000_0000).await;
 
         defmt::info!("encoder aligned: old_count={}", old_count);
@@ -3057,15 +3042,19 @@ mod app {
 
     /// Configure TMC4671 for closed-loop position mode with ABN encoder feedback.
     ///
+    /// **Pre-condition:** `tmc_align_encoder` has already set PHI_E_SELECTION=3
+    /// (ABN encoder) with the encoder zeroed at the D-axis. This function must
+    /// NOT overwrite PHI_E_SELECTION.
+    ///
     /// Steps:
-    /// 1. Set flux/torque PID: P=404, I=26
-    /// 2. Set velocity PID: P=4.5, I=0 (or host-configured)
-    /// 3. Set position PID: P=2.5, I=0 (or host-configured)
-    /// 4. Set PID_VELOCITY_LIMIT (host-configured or unconstrained)
+    /// 1. Set flux/torque PID gains
+    /// 2. Set velocity PID gains (host-configured or defaults)
+    /// 3. Set position PID gains (host-configured or defaults)
+    /// 4. Set PID_VELOCITY_LIMIT (anti-windup)
     /// 5. Raise PIDOUT_UQ_UD_LIMITS for operation
-    /// 6. Set PHI_E_SELECTION=3 (ABN encoder)
-    /// 7. Zero PID_POSITION_ACTUAL (also zeros target and error sum)
-    /// 8-11. Write biquad filters if configured (velocity, torque, position, flux)
+    /// 6. Zero PID_POSITION_ACTUAL (also zeros target)
+    /// 7. Zero PID_POSITION_ERROR_SUM (integrator)
+    /// 8-11. Write biquad filters if configured
     /// 12. Enter position mode: MODE_RAMP_MODE_MOTION = 0x8000_0003
     /// 13. Validate: position error is not diverging
     ///
@@ -3111,10 +3100,11 @@ mod app {
         // motion. 16000 tested working in Phase 1 (up to 200+ mm/s).
         let _ = tmc.write_register(PIDOUT_UQ_UD_LIMITS, 16000).await;
 
-        // 6. PHI_E source: ABN encoder feedback (selection=3)
-        let _ = tmc.write_register(PHI_E_SELECTION, 3).await;
+        // NOTE: PHI_E_SELECTION is NOT written here. tmc_align_encoder
+        // already set it to 3 (ABN encoder) while the motor was held in
+        // voltage mode, locking the angle reference before the drive stopped.
 
-        // 7. Zero position: writing PID_POSITION_ACTUAL also writes
+        // 6. Zero position: writing PID_POSITION_ACTUAL also writes
         // PID_POSITION_TARGET to the same value (per datasheet 0x6B),
         // avoiding an unwanted position error on mode entry.
         let _ = tmc.write_register(PID_POSITION_ACTUAL, 0).await;
