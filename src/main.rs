@@ -2735,6 +2735,13 @@ mod app {
             .write_register(MOTOR_TYPE_N_POLE_PAIRS, (2 << 16) | 50)
             .await;
 
+        // 4b. Velocity meter: PWM-synchronized (selection=1).
+        // Required for advanced PI mode (datasheet section 4.6.11, p.51):
+        // "This option is recommended for usage with the advanced PI controller
+        // structure. Otherwise, the controller structure might tend to be
+        // unstable due to non-matched sampling."
+        let _ = tmc.write_register(VELOCITY_SELECTION, 1).await;
+
         // 5. ADC offset calibration
         // With PWM_CHOP=0, no current flows even with motor connected.
         // This matches the Python driver's _calibrate_adc() method.
