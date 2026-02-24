@@ -2740,7 +2740,14 @@ mod app {
         // "This option is recommended for usage with the advanced PI controller
         // structure. Otherwise, the controller structure might tend to be
         // unstable due to non-matched sampling."
-        let _ = tmc.write_register(VELOCITY_SELECTION, 1).await;
+        // VELOCITY_SELECTION: bits[7:0]=0 (follows PHI_E_SELECTION),
+        // bits[15:8]=1 (PWM-synchronized velocity meter for advanced PI).
+        // Note: phi_m_abn (9) for position/velocity was tested but doesn't
+        // work with SPI-written position targets — phi_m wraps at 65536
+        // (one revolution) while the emulated stepper accumulates without
+        // wrapping, causing position target overflow. The reference driver
+        // avoids this by using hardware step/dir input instead of SPI.
+        let _ = tmc.write_register(VELOCITY_SELECTION, (1 << 8) | 0).await;
 
         // 5. ADC offset calibration
         // With PWM_CHOP=0, no current flows even with motor connected.
