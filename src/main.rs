@@ -16,7 +16,7 @@ mod app {
     use core::cell::RefCell;
 
     use anchor::*;
-    use cortex_m::peripheral::DWT;
+    // CycleDelay uses cortex_m::asm::delay() (CPU busy-wait, no DWT needed)
     use critical_section::Mutex;
     use embassy_stm32::gpio::{Level, Output, Speed};
     use embassy_stm32::mode::Async as AsyncMode;
@@ -247,7 +247,7 @@ mod app {
     // ---- Klipper constants ----
 
     #[klipper_constant]
-    const CLOCK_FREQ: u32 = 168_000_000;
+    const CLOCK_FREQ: u32 = 84_000_000;
 
     #[klipper_constant]
     const MCU: &str = "stm32f407xx";
@@ -285,16 +285,21 @@ mod app {
 
     // ---- Klipper command handlers ----
 
+    /// Read the TIM5 counter (Klipper clock at 84 MHz).
+    fn read_tim5() -> u32 {
+        embassy_stm32::pac::TIM5.cnt().read()
+    }
+
     #[klipper_command(in_shutdown)]
     pub fn get_clock(_context: &mut State) {
-        let clock = DWT::cycle_count();
+        let clock = read_tim5();
         klipper_reply!(clock, clock: u32 = clock);
     }
 
     #[klipper_command(in_shutdown)]
     pub fn get_uptime(_context: &mut State) {
         use core::sync::atomic::Ordering::Relaxed;
-        let cur = DWT::cycle_count();
+        let cur = read_tim5();
         let high =
             STATS_SEND_TIME_HIGH.load(Relaxed) + u32::from(cur < STATS_SEND_TIME.load(Relaxed));
         klipper_reply!(uptime, high: u32 = high, clock: u32 = cur);
@@ -322,7 +327,7 @@ mod app {
         if klipper_mcu::commands::lifecycle::clear_shutdown(context).is_err()
             && enter_shutdown(context)
         {
-            klipper_shutdown!("Shutdown cleared when not shutdown", DWT::cycle_count());
+            klipper_shutdown!("Shutdown cleared when not shutdown", read_tim5());
         }
     }
 
@@ -335,10 +340,7 @@ mod app {
     pub fn config_reset(context: &mut State) {
         if !context.mcu_state.is_shutdown() {
             if enter_shutdown(context) {
-                klipper_shutdown!(
-                    "config_reset only available when shutdown",
-                    DWT::cycle_count()
-                );
+                klipper_shutdown!("config_reset only available when shutdown", read_tim5());
             }
             return;
         }
@@ -379,7 +381,7 @@ mod app {
     #[klipper_command(in_shutdown)]
     pub fn emergency_stop(context: &mut State) {
         if enter_shutdown(context) {
-            klipper_shutdown!("Command request", DWT::cycle_count());
+            klipper_shutdown!("Command request", read_tim5());
         }
     }
 
@@ -467,7 +469,7 @@ mod app {
         if let Err(e) = klipper_mcu::commands::stepper::config_stepper(context, oid) {
             defmt::error!("config_stepper: {}", e);
             if enter_shutdown(context) {
-                klipper_shutdown!("config_stepper failed", DWT::cycle_count());
+                klipper_shutdown!("config_stepper failed", read_tim5());
             }
             return;
         }
@@ -482,7 +484,7 @@ mod app {
         {
             defmt::error!("queue_step: oid={} {}", oid, e);
             if enter_shutdown(context) {
-                klipper_shutdown!("queue_step failed", DWT::cycle_count());
+                klipper_shutdown!("queue_step failed", read_tim5());
             }
         }
     }
@@ -497,7 +499,7 @@ mod app {
         if let Err(e) = klipper_mcu::commands::stepper::set_next_step_dir(context, oid, dir) {
             defmt::error!("set_next_step_dir: {}", e);
             if enter_shutdown(context) {
-                klipper_shutdown!("set_next_step_dir failed", DWT::cycle_count());
+                klipper_shutdown!("set_next_step_dir failed", read_tim5());
             }
         }
     }
@@ -509,7 +511,7 @@ mod app {
         if let Err(e) = klipper_mcu::commands::stepper::reset_step_clock(context, oid, clock) {
             defmt::error!("reset_step_clock: {}", e);
             if enter_shutdown(context) {
-                klipper_shutdown!("reset_step_clock failed", DWT::cycle_count());
+                klipper_shutdown!("reset_step_clock failed", read_tim5());
             }
         }
     }
@@ -547,7 +549,7 @@ mod app {
                 e
             );
             if enter_shutdown(context) {
-                klipper_shutdown!("stepper_stop_on_trigger failed", DWT::cycle_count());
+                klipper_shutdown!("stepper_stop_on_trigger failed", read_tim5());
             }
         }
     }
@@ -570,7 +572,7 @@ mod app {
         if let Err(e) = klipper_mcu::commands::digital_out::config_digital_out(context, oid) {
             defmt::error!("config_digital_out: {}", e);
             if enter_shutdown(context) {
-                klipper_shutdown!("config_digital_out failed", DWT::cycle_count());
+                klipper_shutdown!("config_digital_out failed", read_tim5());
             }
             return;
         }
@@ -590,17 +592,14 @@ mod app {
             Ok(enabled) => {
                 if !tmc_send(TmcRequest::SetEnable(enabled)) {
                     if enter_shutdown(context) {
-                        klipper_shutdown!(
-                            "Motor enable/disable lost (queue full)",
-                            DWT::cycle_count()
-                        );
+                        klipper_shutdown!("Motor enable/disable lost (queue full)", read_tim5());
                     }
                 }
             }
             Err(e) => {
                 defmt::error!("queue_digital_out: {}", e);
                 if enter_shutdown(context) {
-                    klipper_shutdown!("queue_digital_out failed", DWT::cycle_count());
+                    klipper_shutdown!("queue_digital_out failed", read_tim5());
                 }
             }
         }
@@ -613,17 +612,14 @@ mod app {
             Ok(enabled) => {
                 if !tmc_send(TmcRequest::SetEnable(enabled)) {
                     if enter_shutdown(context) {
-                        klipper_shutdown!(
-                            "Motor enable/disable lost (queue full)",
-                            DWT::cycle_count()
-                        );
+                        klipper_shutdown!("Motor enable/disable lost (queue full)", read_tim5());
                     }
                 }
             }
             Err(e) => {
                 defmt::error!("update_digital_out: {}", e);
                 if enter_shutdown(context) {
-                    klipper_shutdown!("update_digital_out failed", DWT::cycle_count());
+                    klipper_shutdown!("update_digital_out failed", read_tim5());
                 }
             }
         }
@@ -727,7 +723,7 @@ mod app {
         if let Err(e) = klipper_mcu::commands::trsync::config_trsync(context, oid) {
             defmt::error!("config_trsync: {}", e);
             if enter_shutdown(context) {
-                klipper_shutdown!("config_trsync failed", DWT::cycle_count());
+                klipper_shutdown!("config_trsync failed", read_tim5());
             }
             return;
         }
@@ -755,7 +751,7 @@ mod app {
         ) {
             defmt::error!("trsync_start: {}", e);
             if enter_shutdown(context) {
-                klipper_shutdown!("trsync_start failed", DWT::cycle_count());
+                klipper_shutdown!("trsync_start failed", read_tim5());
             }
         }
     }
@@ -769,7 +765,7 @@ mod app {
         if let Err(e) = klipper_mcu::commands::trsync::trsync_set_timeout(context, oid, clock) {
             defmt::error!("trsync_set_timeout: {}", e);
             if enter_shutdown(context) {
-                klipper_shutdown!("trsync_set_timeout failed", DWT::cycle_count());
+                klipper_shutdown!("trsync_set_timeout failed", read_tim5());
             }
         }
     }
@@ -783,7 +779,7 @@ mod app {
         if let Err(e) = klipper_mcu::commands::trsync::trsync_trigger(context, oid, reason) {
             defmt::error!("trsync_trigger: {}", e);
             if enter_shutdown(context) {
-                klipper_shutdown!("trsync_trigger failed", DWT::cycle_count());
+                klipper_shutdown!("trsync_trigger failed", read_tim5());
             }
         }
     }
@@ -799,7 +795,7 @@ mod app {
         if let Err(e) = klipper_mcu::commands::endstop::config_endstop(context, oid) {
             defmt::error!("config_endstop: {}", e);
             if enter_shutdown(context) {
-                klipper_shutdown!("config_endstop failed", DWT::cycle_count());
+                klipper_shutdown!("config_endstop failed", read_tim5());
             }
             return;
         }
@@ -856,7 +852,7 @@ mod app {
         ) {
             defmt::error!("endstop_home: {}", e);
             if enter_shutdown(context) {
-                klipper_shutdown!("endstop_home failed", DWT::cycle_count());
+                klipper_shutdown!("endstop_home failed", read_tim5());
             }
         }
     }
@@ -872,7 +868,7 @@ mod app {
                 Err(e) => {
                     defmt::error!("endstop_query_state: {}", e);
                     if enter_shutdown(context) {
-                        klipper_shutdown!("endstop_query_state failed", DWT::cycle_count());
+                        klipper_shutdown!("endstop_query_state failed", read_tim5());
                     }
                     return;
                 }
@@ -989,7 +985,7 @@ mod app {
     pub fn tmc_set_current(context: &mut State, _oid: u8, run_ma: u32) {
         if !tmc_send(foci_core::tmc::tmc_set_current(run_ma)) {
             if enter_shutdown(context) {
-                klipper_shutdown!("tmc_set_current lost (queue full)", DWT::cycle_count());
+                klipper_shutdown!("tmc_set_current lost (queue full)", read_tim5());
             }
         }
     }
@@ -1004,7 +1000,7 @@ mod app {
     pub fn tmc_set_encoder(context: &mut State, _oid: u8, channel: u8, ppr: u32) {
         if channel >= TMC_MOTOR_COUNT {
             if enter_shutdown(context) {
-                klipper_shutdown!("Invalid TMC channel", DWT::cycle_count());
+                klipper_shutdown!("Invalid TMC channel", read_tim5());
             }
             return;
         }
@@ -1012,7 +1008,7 @@ mod app {
         defmt::info!("channel={} ppr={}", channel, ppr);
         if !tmc_send(req) {
             if enter_shutdown(context) {
-                klipper_shutdown!("tmc_set_encoder lost (queue full)", DWT::cycle_count());
+                klipper_shutdown!("tmc_set_encoder lost (queue full)", read_tim5());
             }
         }
     }
@@ -1024,13 +1020,13 @@ mod app {
     pub fn tmc_set_encoder_dir(context: &mut State, _oid: u8, channel: u8, invert: u8) {
         if channel >= TMC_MOTOR_COUNT {
             if enter_shutdown(context) {
-                klipper_shutdown!("Invalid TMC channel", DWT::cycle_count());
+                klipper_shutdown!("Invalid TMC channel", read_tim5());
             }
             return;
         }
         if !tmc_send(foci_core::tmc::tmc_set_encoder_dir(invert != 0)) {
             if enter_shutdown(context) {
-                klipper_shutdown!("tmc_set_encoder_dir lost (queue full)", DWT::cycle_count());
+                klipper_shutdown!("tmc_set_encoder_dir lost (queue full)", read_tim5());
             }
         }
     }
@@ -1107,7 +1103,7 @@ mod app {
             flux_p, flux_i, torque_p, torque_i,
         )) {
             if enter_shutdown(context) {
-                klipper_shutdown!("tmc_set_pid_gains lost (queue full)", DWT::cycle_count());
+                klipper_shutdown!("tmc_set_pid_gains lost (queue full)", read_tim5());
             }
         }
     }
@@ -1154,10 +1150,7 @@ mod app {
             position_p, position_i, velocity_p, velocity_i,
         )) {
             if enter_shutdown(context) {
-                klipper_shutdown!(
-                    "tmc_set_position_gains lost (queue full)",
-                    DWT::cycle_count()
-                );
+                klipper_shutdown!("tmc_set_position_gains lost (queue full)", read_tim5());
             }
         }
     }
@@ -1242,7 +1235,7 @@ mod app {
             rtic_sync::channel::Channel::new(),
         uid_str: [u8; 24] = [0; 24],
     ])]
-    fn init(mut ctx: init::Context) -> (Shared, Local) {
+    fn init(ctx: init::Context) -> (Shared, Local) {
         defmt::info!("FOCI OpenFFBoard starting");
 
         // Configure clock tree: HSE 8 MHz -> PLL -> 168 MHz SYSCLK, 48 MHz USB
@@ -1271,11 +1264,21 @@ mod app {
 
         defmt::info!("SYSCLK: 168 MHz, USB: 48 MHz");
 
-        // Enable DWT cycle counter for Klipper clock reporting
-        ctx.core.DCB.enable_trace();
-        ctx.core.DWT.enable_cycle_counter();
+        // TIM5: free-running 32-bit counter at 84 MHz (APB1 timer clock).
+        // Sole Klipper clock source and step timer base.
+        {
+            let rcc = embassy_stm32::pac::RCC;
+            rcc.apb1enr().modify(|w| w.set_tim5en(true));
+            // Two cycles for clock to stabilize
+            cortex_m::asm::delay(2);
+            let tim5 = embassy_stm32::pac::TIM5;
+            tim5.psc().write_value(0); // No prescaler: 84 MHz
+            tim5.arr().write_value(0xFFFF_FFFF); // Full 32-bit range
+            tim5.egr().write(|w| w.set_ug(true)); // Force update to load PSC/ARR
+            tim5.cr1().modify(|w| w.set_cen(true)); // Start counting
+        }
 
-        defmt::info!("DWT CYCCNT enabled for Klipper clock @ 168 MHz");
+        defmt::info!("TIM5 enabled for Klipper clock @ 84 MHz");
 
         Mono::start(ctx.core.SYST, 168_000_000);
 
@@ -1603,7 +1606,7 @@ mod app {
                     );
                     ctx.shared.app_state.lock(|state| {
                         if enter_shutdown(state) {
-                            klipper_shutdown!("TMC4671 chip ID mismatch", DWT::cycle_count());
+                            klipper_shutdown!("TMC4671 chip ID mismatch", read_tim5());
                         }
                     });
                     return;
@@ -1613,7 +1616,7 @@ mod app {
                 defmt::error!("TMC4671 SPI communication failed");
                 ctx.shared.app_state.lock(|state| {
                     if enter_shutdown(state) {
-                        klipper_shutdown!("TMC4671 SPI failed at boot", DWT::cycle_count());
+                        klipper_shutdown!("TMC4671 SPI failed at boot", read_tim5());
                     }
                 });
                 return;
@@ -1799,7 +1802,7 @@ mod app {
                                             if enter_shutdown(state) {
                                                 klipper_shutdown!(
                                                     "Calibration failed on enable",
-                                                    DWT::cycle_count()
+                                                    read_tim5()
                                                 );
                                             }
                                         });
@@ -2075,7 +2078,7 @@ mod app {
                         // Measure L with square-wave di/dt.
                         // Time the measurement with DWT cycle counter so we
                         // know the actual dt per cycle (SPI overhead dominates).
-                        let dwt_start = DWT::cycle_count();
+                        let dwt_start = read_tim5();
                         let l_result = match foci_core::selftest::autotune_measure_inductance(
                             tmc,
                             enable_pin,
@@ -2089,7 +2092,7 @@ mod app {
                                 autotune_abort!(4, 0, 0);
                             }
                         };
-                        let dwt_end = DWT::cycle_count();
+                        let dwt_end = read_tim5();
                         // Total wall-clock cycles for both coils, minus settle/cooldown.
                         // The measurement function includes 120ms of delays (10ms pre-toggle
                         // + 50ms cooldown per coil) that would inflate dt_us by ~12%.
@@ -2270,10 +2273,7 @@ mod app {
                         if handle_tmc_request(other, tmc).await.is_err() {
                             ctx.shared.app_state.lock(|state| {
                                 if enter_shutdown(state) {
-                                    klipper_shutdown!(
-                                        "TMC request validation failed",
-                                        DWT::cycle_count()
-                                    );
+                                    klipper_shutdown!("TMC request validation failed", read_tim5());
                                 }
                             });
                         }
@@ -2303,20 +2303,17 @@ mod app {
                 ctx.shared.app_state.lock(|state| {
                     if flags & NOT_PLL_LOCKED != 0 {
                         if enter_shutdown(state) {
-                            klipper_shutdown!(
-                                "TMC4671: PLL not locked (clock lost)",
-                                DWT::cycle_count()
-                            );
+                            klipper_shutdown!("TMC4671: PLL not locked (clock lost)", read_tim5());
                         }
                     } else if flags & ADC_I_CLIPPED != 0 {
                         if enter_shutdown(state) {
                             klipper_shutdown!(
                                 "TMC4671: ADC current clipped (overcurrent)",
-                                DWT::cycle_count()
+                                read_tim5()
                             );
                         }
                     } else if enter_shutdown(state) {
-                        klipper_shutdown!("TMC4671 fault", DWT::cycle_count());
+                        klipper_shutdown!("TMC4671 fault", read_tim5());
                     }
                 });
             }
@@ -2328,7 +2325,7 @@ mod app {
             // on the first tick — the TMC4671 position PID handles smooth
             // motion to the target position.
             if motor_enabled {
-                let clock = DWT::cycle_count();
+                let clock = read_tim5();
                 let mut stepped = false;
                 let mut queue_empty = true;
                 ctx.shared.app_state.lock(|state| {
@@ -2421,7 +2418,7 @@ mod app {
             // field access (split borrows on State's distinct fields).
             {
                 use klipper_mcu::trsync::TrSyncState;
-                let now_clock = DWT::cycle_count();
+                let now_clock = read_tim5();
                 ctx.shared.app_state.lock(|state| {
                     // Collect OID-index pairs (max NUM_TRSYNC = 4)
                     let mut pairs: [(u8, usize); klipper_mcu::state::NUM_TRSYNC] =
@@ -2469,7 +2466,7 @@ mod app {
             // the endstop triggers, fire the linked TrSync and stop steppers.
             {
                 use klipper_mcu::endstop::SampleResult;
-                let now_clock = DWT::cycle_count();
+                let now_clock = read_tim5();
                 ctx.shared.app_state.lock(|state| {
                     // Collect OID-index pairs (max NUM_ENDSTOPS = 4)
                     let mut pairs: [(u8, usize); klipper_mcu::state::NUM_ENDSTOPS] =
@@ -2526,7 +2523,7 @@ mod app {
                                     if enter_shutdown(state) {
                                         klipper_shutdown!(
                                             "Endstop trigger: unknown trsync OID",
-                                            DWT::cycle_count()
+                                            read_tim5()
                                         );
                                     }
                                 }
@@ -3345,12 +3342,12 @@ mod app {
         let mut count: u32 = 0;
         let mut sum: u32 = 0;
         let mut sumsq: u32 = 0;
-        let mut last_clock = DWT::cycle_count();
+        let mut last_clock = read_tim5();
 
         loop {
             Mono::delay(5000.millis()).await;
 
-            let now = DWT::cycle_count();
+            let now = read_tim5();
             let elapsed = now.wrapping_sub(last_clock);
             last_clock = now;
 
