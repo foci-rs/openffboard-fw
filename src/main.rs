@@ -224,6 +224,53 @@ mod app {
     static TMC_QUEUE_FLUSH: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
 
+    // --- Hardware step/dir state ---
+
+    /// Step count (incremented by P3 ISR, read by P1/P2 for stepper_get_position).
+    static STEPPER_POSITION: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+    /// Set by stepper_stop(), cleared by reset_step_clock. When true,
+    /// queue_step discards moves. Starts false to match Klipper stepper.c
+    /// (SF_NEED_RESET is NOT set by config_stepper — only by stepper_stop).
+    static STEPPER_NEED_RESET: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    /// Set by P1 after calibration, cleared on disable/fault.
+    /// Gates timer arming and ISR execution.
+    static MOTOR_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    /// Set by fault EXTI, cleared by P1 fault handler after cleanup.
+    static FAULT_ACTIVE: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    /// True when TIM5 CC1 is armed. Used by reset_step_clock to detect
+    /// "called while active" (triggers shutdown).
+    static TIMER_ACTIVE: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    /// STEP_WIDTH value computed by tmc_set_encoder_hw, written to TMC4671
+    /// register 0x78 during closedloop entry.
+    static STEP_WIDTH_VALUE: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
+
+    /// Lock-free move queue for hardware step/dir.
+    /// P2 enqueues, P3 dequeues. When timer is disabled, P1/P2 may drain.
+    ///
+    /// SAFETY: Access protocol enforced by RTIC priorities:
+    /// - Timer active: P2 enqueues only (Producer), P3 dequeues only (Consumer)
+    /// - Timer disabled: P1/P2 may drain (Consumer side safe, P3 quiesced)
+    static mut STEP_QUEUE: heapless::spsc::Queue<klipper_mcu::stepper::StepMove, 1024> =
+        heapless::spsc::Queue::new();
+
+    /// P2-local HardwareStepper state (direction tracking, prepare_move).
+    /// Only accessed from usb_task (P2) command handlers.
+    static mut P2_STEPPER: klipper_mcu::stepper::HardwareStepper =
+        klipper_mcu::stepper::HardwareStepper::new();
+
+    /// P3-local HardwareStepper state (active segment, step execution).
+    /// Only accessed from TIM5 CC1 ISR (P3).
+    static mut ISR_STEPPER: klipper_mcu::stepper::HardwareStepper =
+        klipper_mcu::stepper::HardwareStepper::new();
+
     static TMC_REQUEST_SENDER: Mutex<
         RefCell<Option<Sender<'static, TmcRequest, TMC_CHANNEL_SIZE>>>,
     > = Mutex::new(RefCell::new(None));
@@ -282,6 +329,10 @@ mod app {
 
     #[klipper_constant]
     const RESERVE_PINS_DRV: &str = "PB0,PB1,PC4,PC5";
+
+    /// STEP (PB11) and DIR (PA0) GPIO pins for TMC4671 hardware step/dir.
+    #[klipper_constant]
+    const RESERVE_PINS_STEP: &str = "PA0,PB11";
 
     // ---- Klipper command handlers ----
 
@@ -1278,7 +1329,51 @@ mod app {
             tim5.cr1().modify(|w| w.set_cen(true)); // Start counting
         }
 
-        defmt::info!("TIM5 enabled for Klipper clock @ 84 MHz");
+        // TIM5 CC1: configure for step timer interrupts (not armed yet).
+        // CC1 interrupt is enabled when the first queue_step arms the timer.
+        // NVIC unmask is also deferred to first arm — unmasking here would
+        // fire the ISR from the UIF flag set by EGR.UG above.
+        {
+            let tim5 = embassy_stm32::pac::TIM5;
+            tim5.dier().write_value(Default::default()); // All interrupts off
+            tim5.sr().write_value(Default::default()); // Clear all pending flags
+        }
+
+        // PB11: STEP GPIO (push-pull output, low initial)
+        // PA0: DIR GPIO (push-pull output, low initial)
+        {
+            use embassy_stm32::pac::gpio::vals;
+            // Enable GPIOB and GPIOA clocks
+            let rcc = embassy_stm32::pac::RCC;
+            rcc.ahb1enr().modify(|w| w.set_gpioaen(true));
+            rcc.ahb1enr().modify(|w| w.set_gpioben(true));
+
+            // PB11: push-pull output, very high speed
+            let gpio_b = embassy_stm32::pac::GPIOB;
+            gpio_b
+                .moder()
+                .modify(|w| w.set_moder(11, vals::Moder::OUTPUT));
+            gpio_b
+                .otyper()
+                .modify(|w| w.set_ot(11, vals::Ot::PUSH_PULL));
+            gpio_b
+                .ospeedr()
+                .modify(|w| w.set_ospeedr(11, vals::Ospeedr::VERY_HIGH_SPEED));
+            gpio_b.odr().modify(|w| w.set_odr(11, vals::Odr::LOW));
+
+            // PA0: push-pull output, very high speed
+            let gpio_a = embassy_stm32::pac::GPIOA;
+            gpio_a
+                .moder()
+                .modify(|w| w.set_moder(0, vals::Moder::OUTPUT));
+            gpio_a.otyper().modify(|w| w.set_ot(0, vals::Ot::PUSH_PULL));
+            gpio_a
+                .ospeedr()
+                .modify(|w| w.set_ospeedr(0, vals::Ospeedr::VERY_HIGH_SPEED));
+            gpio_a.odr().modify(|w| w.set_odr(0, vals::Odr::LOW));
+        }
+
+        defmt::info!("TIM5 enabled for Klipper clock @ 84 MHz, STEP/DIR GPIO configured");
 
         Mono::start(ctx.core.SYST, 168_000_000);
 
@@ -1287,6 +1382,15 @@ mod app {
 
         // PE7: TMC4671 ENABLE pin (active high, start disabled)
         let tmc_enable = Output::new(p.PE7, Level::Low, Speed::Low);
+
+        // PE10: Brake chopper control (active-high assumed).
+        // Drive LOW immediately to prevent the brake resistor from firing
+        // while the STM32 is booting. On STM32 reset, GPIO defaults to
+        // analog/high-impedance which the brake FET may interpret as ON.
+        {
+            let _brake_pin = Output::new(p.PE10, Level::Low, Speed::Low);
+            core::mem::forget(_brake_pin); // Keep pin configured, don't drop
+        }
 
         // PE8: TMC4671 STATUS pin (input, active high).
         // Pin mode configured here; EXTI interrupt enabled later in
@@ -1621,6 +1725,14 @@ mod app {
                 });
                 return;
             }
+        }
+
+        // Disable TMC4671 brake chopper until VM is measured. Both limits=0
+        // disables the BRAKE output (datasheet section 4.7.12). Proper limits
+        // are set later after measuring the actual bus voltage.
+        {
+            use tmc4671::registers::*;
+            let _ = tmc.write_register(ADC_VM_LIMITS, 0).await;
         }
 
         // Configure STATUS_MASK: route critical fault flags to the STATUS
@@ -3268,6 +3380,166 @@ mod app {
 
         defmt::info!("TMC4671 closed-loop position mode active");
         Ok(())
+    }
+
+    /// Stop hardware stepper: disable timer, set need_reset, drain queue.
+    ///
+    /// Safe to call from P1 or P2. P3 is quiesced by disabling TIM5 CC1.
+    fn stepper_stop() {
+        use core::sync::atomic::Ordering::Relaxed;
+        let tim5 = embassy_stm32::pac::TIM5;
+        // Disable CC1 interrupt — quiesce P3
+        tim5.dier().modify(|w| w.set_ccie(0, false));
+        // Clear any pending CC1 flag
+        tim5.sr().modify(|w| w.set_ccif(0, false));
+        TIMER_ACTIVE.store(false, Relaxed);
+        STEPPER_NEED_RESET.store(true, Relaxed);
+        // Drain queue (safe: P3 is disabled by the CC1IE clear above)
+        // SAFETY: P3 (timer ISR) is quiesced — we are the sole accessor.
+        unsafe { while (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue().is_some() {} }
+    }
+
+    /// Arm the TIM5 CC1 step timer for a compare at `clock`.
+    ///
+    /// Ensures NVIC is unmasked, sets compare value, enables CC1 interrupt.
+    fn arm_step_timer(clock: u32) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let tim5 = embassy_stm32::pac::TIM5;
+        // Ensure NVIC is unmasked (idempotent after first call)
+        unsafe { cortex_m::peripheral::NVIC::unmask(embassy_stm32::pac::Interrupt::TIM5) };
+        tim5.ccr(0).write_value(clock);
+        tim5.sr().modify(|w| w.set_ccif(0, false)); // Clear pending CC1
+        tim5.dier().modify(|w| w.set_ccie(0, true)); // Enable CC1 interrupt
+        TIMER_ACTIVE.store(true, Relaxed);
+    }
+
+    /// TIM5 CC1 step timer interrupt.
+    ///
+    /// Dequeues moves from SPSC consumer, toggles STEP GPIO, schedules
+    /// next compare. Same priority as USB OTG and fault EXTI (P3).
+    #[task(binds = TIM5, priority = 3)]
+    fn step_timer_irq(_ctx: step_timer_irq::Context) {
+        use core::sync::atomic::Ordering::Relaxed;
+        use klipper_mcu::stepper::StepEventResult;
+
+        let tim5 = embassy_stm32::pac::TIM5;
+        // Clear CC1 interrupt flag
+        tim5.sr().modify(|w| w.set_ccif(0, false));
+
+        // Check gates
+        if FAULT_ACTIVE.load(Relaxed) {
+            return;
+        }
+        if !MOTOR_ARMED.load(Relaxed) {
+            return;
+        }
+
+        // SAFETY: ISR_STEPPER is only accessed from this P3 ISR.
+        // P3 tasks cannot preempt each other on Cortex-M.
+        let stepper = unsafe { &mut *core::ptr::addr_of_mut!(ISR_STEPPER) };
+
+        let gpio_b = embassy_stm32::pac::GPIOB;
+        let gpio_a = embassy_stm32::pac::GPIOA;
+
+        loop {
+            if !stepper.has_active_segment() {
+                // Need a new move from the queue
+                // SAFETY: P3 is the sole consumer of the queue.
+                // P3 ISRs cannot preempt each other on Cortex-M.
+                match unsafe { (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue() } {
+                    Some(m) => {
+                        let dir_changed = stepper.load_move(m);
+                        if dir_changed {
+                            // Set DIR GPIO (PA0) before first step pulse
+                            let dir_val = if stepper.dir_state() {
+                                embassy_stm32::pac::gpio::vals::Odr::HIGH
+                            } else {
+                                embassy_stm32::pac::gpio::vals::Odr::LOW
+                            };
+                            gpio_a.odr().modify(|w| w.set_odr(0, dir_val));
+                        }
+                    }
+                    None => {
+                        // Queue empty: disarm timer, go idle
+                        tim5.dier().modify(|w| w.set_ccie(0, false));
+                        TIMER_ACTIVE.store(false, Relaxed);
+                        return;
+                    }
+                }
+
+                // Check deadline for the first step of this segment
+                let now = tim5.cnt().read();
+                match stepper.check_deadline(
+                    stepper.next_step_clock(),
+                    now,
+                    CLOCK_FREQ,
+                ) {
+                    Ok(compare) => {
+                        tim5.ccr(0).write_value(compare);
+                        if compare != now.wrapping_add(2) {
+                            // Step is in the future — schedule and return
+                            return;
+                        }
+                        // Step is now or immediately — fall through to execute
+                    }
+                    Err(()) => {
+                        // >1ms past: shutdown
+                        tim5.dier().modify(|w| w.set_ccie(0, false));
+                        TIMER_ACTIVE.store(false, Relaxed);
+                        // Signal shutdown via TMC_DISABLE_SIGNAL
+                        TMC_DISABLE_SIGNAL.signal(());
+                        defmt::error!("Stepper too far in past");
+                        return;
+                    }
+                }
+            } else {
+                // Active segment: execute one step
+                // Toggle STEP GPIO (PB11) via BSRR (atomic set/reset)
+                {
+                    use embassy_stm32::pac::gpio::vals::Idr;
+                    let is_high = gpio_b.idr().read().idr(11) == Idr::HIGH;
+                    gpio_b.bsrr().write(|w| {
+                        if is_high {
+                            w.set_br(11, true); // Reset (low)
+                        } else {
+                            w.set_bs(11, true); // Set (high)
+                        }
+                    });
+                }
+
+                // Increment position
+                let dir = if stepper.dir_state() { 1i32 } else { -1i32 };
+                STEPPER_POSITION.fetch_add(dir, Relaxed);
+
+                // Advance scheduling
+                match stepper.step_event() {
+                    StepEventResult::ScheduleNext { clock } => {
+                        let now = tim5.cnt().read();
+                        match stepper.check_deadline(clock, now, CLOCK_FREQ) {
+                            Ok(compare) => {
+                                tim5.ccr(0).write_value(compare);
+                                if compare != now.wrapping_add(2) {
+                                    return; // Future step: wait for next interrupt
+                                }
+                                // Immediate: loop to execute next step
+                                continue;
+                            }
+                            Err(()) => {
+                                tim5.dier().modify(|w| w.set_ccie(0, false));
+                                TIMER_ACTIVE.store(false, Relaxed);
+                                TMC_DISABLE_SIGNAL.signal(());
+                                defmt::error!("Stepper too far in past");
+                                return;
+                            }
+                        }
+                    }
+                    StepEventResult::NeedMove => {
+                        // Segment exhausted: loop to dequeue next
+                        continue;
+                    }
+                }
+            }
+        }
     }
 
     /// USB OTG FS interrupt handler. Masks interrupt sources and wakes usb_task.
