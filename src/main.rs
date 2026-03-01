@@ -528,59 +528,115 @@ mod app {
     }
 
     /// Enqueue a trapezoidal move segment for a stepper.
+    ///
+    /// Routes through the hardware step/dir SPSC queue. Moves are consumed
+    /// by the TIM5 CC1 ISR (P3) which toggles STEP/DIR GPIO pins.
     #[klipper_command]
     pub fn queue_step(context: &mut State, oid: u8, interval: u32, count: u16, add: i16) {
-        if let Err(e) =
-            klipper_mcu::commands::stepper::queue_step(context, oid, interval, count, add)
-        {
-            defmt::error!("queue_step: oid={} {}", oid, e);
-            if enter_shutdown(context) {
-                klipper_shutdown!("queue_step failed", read_tim5());
+        use core::sync::atomic::Ordering::Relaxed;
+        use klipper_mcu::commands::stepper::{queue_step_hw, QueueStepResult};
+
+        let need_reset = STEPPER_NEED_RESET.load(Relaxed);
+
+        // Check queue state before pushing (need len for first-move detection)
+        // SAFETY: P2 is the sole producer. Queue len read is safe from P2.
+        let queue_was_empty = unsafe { (*core::ptr::addr_of_mut!(STEP_QUEUE)).is_empty() };
+
+        match queue_step_hw(need_reset, count, queue_was_empty) {
+            Ok(QueueStepResult::Discarded) => return,
+            Err(e) => {
+                defmt::error!("queue_step: oid={} {}", oid, e);
+                if enter_shutdown(context) {
+                    klipper_shutdown!("queue_step failed", read_tim5());
+                }
+                return;
+            }
+            Ok(result) => {
+                // Prepare move with direction state
+                // SAFETY: P2_STEPPER is only accessed from P2 command handlers.
+                let m = klipper_mcu::stepper::StepMove::new(interval, count, add);
+                let m = unsafe { (*core::ptr::addr_of_mut!(P2_STEPPER)).prepare_move(m) };
+
+                // Push to SPSC queue
+                // SAFETY: P2 is the sole producer.
+                let ok = unsafe { (*core::ptr::addr_of_mut!(STEP_QUEUE)).enqueue(m).is_ok() };
+                if !ok {
+                    defmt::error!("queue_step: queue full");
+                    if enter_shutdown(context) {
+                        klipper_shutdown!("queue_step: queue full", read_tim5());
+                    }
+                    return;
+                }
+
+                // Arm timer on first move if motor is armed.
+                // Fire immediately — P3 ISR will pop the move and schedule.
+                if matches!(result, QueueStepResult::QueuedFirstMove)
+                    && MOTOR_ARMED.load(Relaxed)
+                    && !TIMER_ACTIVE.load(Relaxed)
+                {
+                    let now = read_tim5();
+                    arm_step_timer(now.wrapping_add(1));
+                }
             }
         }
     }
 
     /// Set the direction for subsequent steps on a stepper.
     ///
-    /// In Klipper's stepcompress, `dir=0` means negative direction
-    /// and `dir=1` means positive direction. Map to our EmulatedStepper's
-    /// forward/backward accordingly.
+    /// Direction is captured per-move in `queue_step` via `prepare_move()`.
     #[klipper_command]
-    pub fn set_next_step_dir(context: &mut State, oid: u8, dir: u8) {
-        if let Err(e) = klipper_mcu::commands::stepper::set_next_step_dir(context, oid, dir) {
-            defmt::error!("set_next_step_dir: {}", e);
-            if enter_shutdown(context) {
-                klipper_shutdown!("set_next_step_dir failed", read_tim5());
-            }
+    pub fn set_next_step_dir(_context: &mut State, _oid: u8, dir: u8) {
+        // SAFETY: P2_STEPPER is only accessed from P2 command handlers.
+        unsafe {
+            (*core::ptr::addr_of_mut!(P2_STEPPER)).set_next_step_dir(dir != 0);
         }
     }
 
     /// Reset the step clock reference for a stepper.
+    ///
+    /// Only valid when the stepper is inactive (timer not armed).
+    /// Triggers shutdown if called while active (matches Klipper stepper.c).
     #[klipper_command]
-    pub fn reset_step_clock(context: &mut State, oid: u8, clock: u32) {
-        defmt::info!("reset_step_clock: oid={} clock={}", oid, clock);
-        if let Err(e) = klipper_mcu::commands::stepper::reset_step_clock(context, oid, clock) {
+    pub fn reset_step_clock(context: &mut State, _oid: u8, clock: u32) {
+        use core::sync::atomic::Ordering::Relaxed;
+
+        if let Err(e) =
+            klipper_mcu::commands::stepper::reset_step_clock_hw(TIMER_ACTIVE.load(Relaxed))
+        {
             defmt::error!("reset_step_clock: {}", e);
             if enter_shutdown(context) {
-                klipper_shutdown!("reset_step_clock failed", read_tim5());
+                klipper_shutdown!("Can't reset time when stepper active", read_tim5());
             }
+            return;
         }
+
+        // Drain any stale items from a previous stop
+        // SAFETY: Timer is not active (checked above), P3 is quiesced.
+        unsafe { while (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue().is_some() {} }
+
+        // Set clock base on P2 stepper state
+        // SAFETY: P2_STEPPER is only accessed from P2 command handlers.
+        unsafe {
+            (*core::ptr::addr_of_mut!(P2_STEPPER)).reset_step_clock(clock);
+        }
+
+        STEPPER_NEED_RESET.store(false, Relaxed);
     }
 
     /// Report the current position of a stepper.
     #[klipper_command]
-    pub fn stepper_get_position(context: &mut State, oid: u8) {
-        let pos = klipper_mcu::commands::stepper::stepper_get_position(context, oid);
+    pub fn stepper_get_position(_context: &mut State, oid: u8) {
+        let pos = STEPPER_POSITION.load(core::sync::atomic::Ordering::Relaxed);
         klipper_reply!(stepper_position, oid: u8 = oid, pos: i32 = pos);
     }
 
     /// Report the commanded (target) position of a stepper.
     ///
-    /// For TMC4671 mode this is equivalent to `stepper_get_position` since
-    /// we track only the logical step count.
+    /// For hardware step/dir this is equivalent to `stepper_get_position`
+    /// since the firmware tracks only the logical step count.
     #[klipper_command]
-    pub fn stepper_get_commanded_position(context: &mut State, oid: u8) {
-        let pos = klipper_mcu::commands::stepper::stepper_get_commanded_position(context, oid);
+    pub fn stepper_get_commanded_position(_context: &mut State, oid: u8) {
+        let pos = STEPPER_POSITION.load(core::sync::atomic::Ordering::Relaxed);
         klipper_reply!(stepper_position, oid: u8 = oid, pos: i32 = pos);
     }
 
