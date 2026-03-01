@@ -3383,14 +3383,29 @@ mod app {
         unsafe { while (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue().is_some() {} }
     }
 
+    /// Minimum lead time when arming TIM5 CC1 from thread context.
+    ///
+    /// If CC1 is programmed too close to the live CNT value, the compare can
+    /// be missed before CC1IE is fully armed. TIM5 is free-running 32-bit at
+    /// 84 MHz, so a missed match would not reoccur until wrap (~51 s later).
+    const STEP_TIMER_ARM_MIN_LEAD_TICKS: u32 = 128;
+
     /// Arm the TIM5 CC1 step timer for a compare at `clock`.
     ///
-    /// Ensures NVIC is unmasked, sets compare value, enables CC1 interrupt.
+    /// Ensures NVIC is unmasked, clamps too-close compares forward, then
+    /// enables CC1 interrupt.
     fn arm_step_timer(clock: u32) {
         use core::sync::atomic::Ordering::Relaxed;
         let tim5 = embassy_stm32::pac::TIM5;
         // Ensure NVIC is unmasked (idempotent after first call)
         unsafe { cortex_m::peripheral::NVIC::unmask(embassy_stm32::pac::Interrupt::TIM5) };
+        let now = tim5.cnt().read();
+        let min_clock = now.wrapping_add(STEP_TIMER_ARM_MIN_LEAD_TICKS);
+        let clock = if (clock as i32).wrapping_sub(min_clock as i32) < 0 {
+            min_clock
+        } else {
+            clock
+        };
         tim5.ccr(0).write_value(clock);
         tim5.sr().modify(|w| w.set_ccif(0, false)); // Clear pending CC1
         tim5.dier().modify(|w| w.set_ccie(0, true)); // Enable CC1 interrupt
@@ -3453,7 +3468,8 @@ mod app {
 
                 // Check deadline for the first step of this segment
                 let now = tim5.cnt().read();
-                match stepper.check_deadline(stepper.next_step_clock(), now, CLOCK_FREQ) {
+                let scheduled = stepper.next_step_clock();
+                match stepper.check_deadline(scheduled, now, CLOCK_FREQ) {
                     Ok(compare) => {
                         tim5.ccr(0).write_value(compare);
                         if compare != now.wrapping_add(2) {
