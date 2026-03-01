@@ -1901,16 +1901,8 @@ mod app {
         // None = use defaults during calibration.
         let mut stored_position_gains: Option<(u16, u16, u16, u16)> = None;
 
-        // Velocity feedforward state (P1-local, no sync needed)
-        let mut prev_position_target: i32 = 0;
-        let mut first_tick_after_enable: bool = true;
-
-        // Move boundary detection for integrator reset.
-        // Tracks whether the motor was actively moving on the previous tick
-        // (position target delta was nonzero). When this transitions from
-        // true to false, the position integrator is zeroed to prevent windup
-        // overshoot at the end of a move.
-        let mut was_moving: bool = false;
+        // (Velocity feedforward and move boundary detection removed —
+        // hardware step/dir eliminates the 1ms SPI position target write.)
 
         // Main loop: wait for channel message or 1ms timeout.
         // On message: handle request. On timeout: write position target.
@@ -1926,9 +1918,11 @@ mod app {
                 calibrated = false;
                 stored_gains = None;
                 stored_position_gains = None;
-                prev_position_target = 0;
-                first_tick_after_enable = true;
-                was_moving = false;
+                // Reset hardware stepper state
+                MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+                stepper_stop();
+                STEPPER_POSITION.store(0, core::sync::atomic::Ordering::Relaxed);
+                FAULT_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
                 defmt::info!("TMC request queue flushed after config_reset");
             }
 
@@ -1960,9 +1954,6 @@ mod app {
                                 {
                                     Ok(_) => {
                                         calibrated = true;
-                                        prev_position_target = 0;
-                                        first_tick_after_enable = true;
-                                        was_moving = false;
                                     }
                                     Err(e) => {
                                         defmt::error!("Auto-calibration failed: {}", e);
@@ -1980,8 +1971,30 @@ mod app {
                             }
                             motor_enabled = true;
                             enable_pin.set_high();
-                            defmt::info!("Motor enabled (calibrated)");
+
+                            // Zero firmware position counter
+                            STEPPER_POSITION.store(0, core::sync::atomic::Ordering::Relaxed);
+
+                            // Arm stepper: allow TIM5 CC1 ISR to fire
+                            MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+
+                            // If queue already has moves (burst-drain scenario),
+                            // arm timer to start processing them
+                            let queue_has_moves =
+                                unsafe { !(*core::ptr::addr_of_mut!(STEP_QUEUE)).is_empty() };
+                            if queue_has_moves
+                                && !TIMER_ACTIVE.load(core::sync::atomic::Ordering::Relaxed)
+                            {
+                                let now = read_tim5();
+                                arm_step_timer(now.wrapping_add(1));
+                            }
+
+                            defmt::info!("Motor enabled (calibrated, step/dir armed)");
                         } else {
+                            // Disable: stop stepping, kill motor
+                            MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+                            stepper_stop();
+
                             motor_enabled = false;
                             calibrated = false;
                             use tmc4671::registers::*;
@@ -1990,16 +2003,10 @@ mod app {
                             let _ = tmc.write_register(UQ_UD_EXT, 0).await;
                             let _ = tmc.write_register(PWM_SV_CHOP, 0).await;
                             enable_pin.set_low();
-                            // Zero stepper accumulator to prevent stale steps
-                            // from causing a violent jump on recalibration.
-                            // Calibration zeros the TMC4671 PID_POSITION_ACTUAL,
-                            // so the firmware-side accumulator must match.
-                            ctx.shared.app_state.lock(|state| {
-                                state.steppers[0].reset_position();
-                            });
-                            prev_position_target = 0;
-                            first_tick_after_enable = true;
-                            was_moving = false;
+
+                            // Zero position counter
+                            STEPPER_POSITION.store(0, core::sync::atomic::Ordering::Relaxed);
+
                             defmt::info!("TMC4671 motor disabled");
                         }
                     }
@@ -2050,9 +2057,6 @@ mod app {
                         match result {
                             Ok((adc_i0, adc_i1, encoder_count)) => {
                                 calibrated = true;
-                                prev_position_target = 0;
-                                first_tick_after_enable = true;
-                                was_moving = false;
                                 defmt::info!("foci_calibrate complete: oid={}", oid);
                                 klipper_reply!(
                                     foci_calibrate_response,
@@ -2456,6 +2460,11 @@ mod app {
             // STATUS interrupt or enter_shutdown. Disables motor and reports
             // the fault to Klipper so the host knows the MCU is down.
             if TMC_DISABLE_SIGNAL.try_take().is_some() {
+                // Stop hardware stepper immediately
+                MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+                stepper_stop();
+                FAULT_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
+
                 motor_enabled = false;
                 calibrated = false;
                 enable_pin.set_low();
@@ -2486,94 +2495,10 @@ mod app {
                 });
             }
 
-            // Advance emulated stepper and write position target (1kHz).
-            //
-            // Processes all queued steps whose scheduled time has passed.
-            // Steps queued during calibration (~1.5s) are consumed instantly
-            // on the first tick — the TMC4671 position PID handles smooth
-            // motion to the target position.
-            if motor_enabled {
-                let clock = read_tim5();
-                let mut stepped = false;
-                let mut queue_empty = true;
-                ctx.shared.app_state.lock(|state| {
-                    queue_empty = state.steppers[0].move_queue_empty();
-                    stepped = state.steppers[0].advance(clock);
-                    let target = state.steppers[0].position_target();
-                    STEPPER_POSITION_TARGET.store(target, core::sync::atomic::Ordering::Relaxed);
-                });
-                let target = STEPPER_POSITION_TARGET.load(core::sync::atomic::Ordering::Relaxed);
-                if stepped {
-                    status_poll_counter = status_poll_counter.wrapping_add(1);
-                    if status_poll_counter % 100 == 1 {
-                        ctx.shared.app_state.lock(|state| {
-                            defmt::info!(
-                                "pos: raw={} target={} step_width={}",
-                                state.steppers[0].position(),
-                                target,
-                                target / core::cmp::max(state.steppers[0].position(), 1)
-                            );
-                        });
-                    }
-                }
-                // Negate when encoder is reversed: the TMC4671 position PID
-                // accumulates opposite to Klipper's step convention.
-                let adjusted = if ENCODER_REVERSED.load(core::sync::atomic::Ordering::Relaxed) {
-                    -target
-                } else {
-                    target
-                };
-
-                // Check if feedforward state needs resetting (e.g., encoder direction change)
-                if FEEDFORWARD_RESET.swap(false, core::sync::atomic::Ordering::Relaxed) {
-                    prev_position_target = adjusted;
-                    first_tick_after_enable = true;
-                }
-
-                // Velocity feedforward: compute position delta from adjusted targets.
-                // Uses wrapping_sub for encoder rollover safety.
-                let velocity_delta = adjusted.wrapping_sub(prev_position_target);
-                prev_position_target = adjusted;
-
-                if VELOCITY_FEEDFORWARD.load(core::sync::atomic::Ordering::Relaxed) {
-                    if !first_tick_after_enable {
-                        let _ = tmc
-                            .write_register(
-                                tmc4671::registers::PID_VELOCITY_OFFSET,
-                                velocity_delta as u32,
-                            )
-                            .await;
-                    } else {
-                        // Suppress feedforward on first tick (prev is stale)
-                        let _ = tmc
-                            .write_register(tmc4671::registers::PID_VELOCITY_OFFSET, 0)
-                            .await;
-                        first_tick_after_enable = false;
-                    }
-                } else if first_tick_after_enable {
-                    first_tick_after_enable = false;
-                }
-
-                let _ = tmc
-                    .write_register(tmc4671::registers::PID_POSITION_TARGET, adjusted as u32)
-                    .await;
-
-                // Move boundary detection: when position target stops changing,
-                // reset the position integrator to prevent windup overshoot.
-                // Only fires at move-to-stop transitions (~every 50-200ms),
-                // not every tick, so the sub-register SPI cost is acceptable.
-                let now_moving = velocity_delta != 0;
-                if was_moving && !now_moving {
-                    let _ = tmc
-                        .write_sub_register(tmc4671::registers::PID_ERROR_PID_POSITION_ERROR_SUM, 0)
-                        .await;
-                }
-                was_moving = now_moving;
-
-                // Note: PID_TORQUE_FLUX_LIMITS (0x5E) is a single u16 field
-                // per the datasheet. Both torque and flux share one limit.
-                // The value 692 (set by tmc_set_current) is correct.
-            }
+            // Hardware step/dir: position target is driven by TIM5 CC1 ISR
+            // toggling STEP GPIO → TMC4671 hardware step counter. No SPI
+            // position target write needed. The 1ms tick loop only handles
+            // STATUS_FLAGS polling, TrSync, endstop, and watchdog.
 
             // TrSync: check timeouts and send periodic status reports.
             //
@@ -3525,11 +3450,7 @@ mod app {
 
                 // Check deadline for the first step of this segment
                 let now = tim5.cnt().read();
-                match stepper.check_deadline(
-                    stepper.next_step_clock(),
-                    now,
-                    CLOCK_FREQ,
-                ) {
+                match stepper.check_deadline(stepper.next_step_clock(), now, CLOCK_FREQ) {
                     Ok(compare) => {
                         tim5.ccr(0).write_value(compare);
                         if compare != now.wrapping_add(2) {
@@ -3617,8 +3538,14 @@ mod app {
     fn tmc_status_irq(_ctx: tmc_status_irq::Context) {
         let exti = embassy_stm32::pac::EXTI;
         exti.pr(0).write(|w| w.set_line(8, true));
+
+        // Immediately quiesce step generation (same P3, atomic)
+        FAULT_ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed);
+        let tim5 = embassy_stm32::pac::TIM5;
+        tim5.dier().modify(|w| w.set_ccie(0, false));
+
         TMC_DISABLE_SIGNAL.signal(());
-        defmt::warn!("TMC4671 STATUS interrupt: fault detected");
+        defmt::warn!("TMC4671 STATUS interrupt: fault detected, step timer disabled");
     }
 
     /// Single USB task replacing usb_pump, usb_receive, usb_send, usb_control.
