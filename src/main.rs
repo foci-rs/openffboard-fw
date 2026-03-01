@@ -1111,8 +1111,10 @@ mod app {
             }
             return;
         }
-        let req = foci_core::tmc::tmc_set_encoder(context, channel, ppr, 50);
-        defmt::info!("channel={} ppr={}", channel, ppr);
+        // Use _hw variant: returns step_width for TMC4671 STEP_WIDTH register
+        let (req, step_width) = foci_core::tmc::tmc_set_encoder_hw(ppr, 50);
+        STEP_WIDTH_VALUE.store(step_width, core::sync::atomic::Ordering::Relaxed);
+        defmt::info!("channel={} ppr={} step_width={}", channel, ppr, step_width);
         if !tmc_send(req) {
             if enter_shutdown(context) {
                 klipper_shutdown!("tmc_set_encoder lost (queue full)", read_tim5());
@@ -3220,7 +3222,24 @@ mod app {
             .write_sub_register(PID_ERROR_PID_POSITION_ERROR_SUM, 0)
             .await;
 
-        // 8. Write velocity biquad filter if configured
+        // 7. Explicit POSITION_SELECTION=0 (phi_e). Don't rely on power-on
+        // default — survives fault/reset/re-calibration because closedloop
+        // entry always runs.
+        let _ = tmc.write_register(POSITION_SELECTION, 0).await;
+
+        // 8. Write STEP_WIDTH for hardware step/dir input. Each STEP pulse
+        // increments the TMC4671's internal position target by this value.
+        let step_width = STEP_WIDTH_VALUE.load(core::sync::atomic::Ordering::Relaxed);
+        if step_width > 0 {
+            let _ = tmc.write_register(STEP_WIDTH, step_width as u32).await;
+            defmt::info!("STEP_WIDTH(0x78) = {} written", step_width);
+        } else {
+            defmt::warn!("STEP_WIDTH = 0, skipping register write!");
+        }
+
+        // 8. Write velocity biquad filter if configured, disable if not.
+        // If the cutoff is nonzero but out of the valid 10-1000 Hz range,
+        // butterworth_lowpass returns None — explicitly disable in that case.
         let filter_hz = VELOCITY_FILTER_HZ.load(core::sync::atomic::Ordering::Relaxed);
         if filter_hz > 0 {
             if let Some(coeffs) =
