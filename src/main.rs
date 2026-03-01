@@ -1099,9 +1099,10 @@ mod app {
 
     /// Configure ABN encoder resolution and compute step width.
     ///
-    /// `channel` maps to the stepper index (STEP0=0, STEP1=1) so the
-    /// correct EmulatedStepper gets the step_width. The TMC4671 position
-    /// PID operates on phi_e, not encoder counts:
+    /// Uses `tmc_set_encoder_hw` to compute the step width from PPR and
+    /// pole pairs, then stores it in the `STEP_WIDTH_VALUE` atomic for
+    /// the TMC4671 STEP_WIDTH register. The TMC4671 position PID operates
+    /// on phi_e, not encoder counts:
     ///   step_width = 65536 * pole_pairs / quadrature_ppr
     #[klipper_command]
     pub fn tmc_set_encoder(context: &mut State, _oid: u8, channel: u8, ppr: u32) {
@@ -2524,15 +2525,9 @@ mod app {
                     }
 
                     for &(oid, idx) in &pairs[..count] {
-                        // Check timeout — if expired, stop linked steppers
+                        // Check timeout — if expired, stop hardware stepper
                         if state.trsync[idx].check_timeout(now_clock) {
-                            for &(stepper_oid, linked_trsync) in state.stepper_trsync_links.iter() {
-                                if linked_trsync == oid {
-                                    if let Some(&s_idx) = state.steppers_by_oid.get(&stepper_oid) {
-                                        state.steppers[s_idx].stop();
-                                    }
-                                }
-                            }
+                            stepper_stop();
                         }
 
                         // Send periodic status report if due
@@ -2598,18 +2593,7 @@ mod app {
                                 // Fire TrSync trigger and stop linked steppers
                                 if let Some(&ts_idx) = state.trsync_by_oid.get(&trsync_oid) {
                                     state.trsync[ts_idx].trigger(reason);
-                                    // Stop linked steppers
-                                    for &(stepper_oid, linked_trsync) in
-                                        state.stepper_trsync_links.iter()
-                                    {
-                                        if linked_trsync == trsync_oid {
-                                            if let Some(&s_idx) =
-                                                state.steppers_by_oid.get(&stepper_oid)
-                                            {
-                                                state.steppers[s_idx].stop();
-                                            }
-                                        }
-                                    }
+                                    stepper_stop();
                                 } else {
                                     defmt::error!(
                                         "endstop trigger: unknown trsync_oid={}",
