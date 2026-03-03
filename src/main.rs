@@ -11,6 +11,8 @@ pub mod pac {
     pub use embassy_stm32::Peripherals;
 }
 
+mod commission;
+
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [UART4, UART5, USART3])]
 mod app {
     use core::cell::RefCell;
@@ -1722,6 +1724,12 @@ mod app {
                 defmt::warn!("handle_tmc_request: SetPositionGains handled by main loop");
             }
             TmcRequest::SetVelocityFeedforward { .. } => {}
+            TmcRequest::CommissionInner { .. } => {
+                defmt::warn!("handle_tmc_request: CommissionInner handled by main loop");
+            }
+            TmcRequest::CommissionOuter { .. } => {
+                defmt::warn!("handle_tmc_request: CommissionOuter handled by main loop");
+            }
             #[cfg(feature = "dev")]
             TmcRequest::Init => {
                 defmt::warn!("handle_tmc_request: Init handled by main loop");
