@@ -146,6 +146,72 @@ mod app {
         }
     }
 
+    /// CommissioningBackend implementation for OpenFFBoard.
+    ///
+    /// Wraps the TMC4671 SPI driver, enable pin, and timer so the
+    /// board-agnostic [`crate::commission::CommissioningEngine`] can
+    /// perform register I/O, pin control, and timing.
+    struct OpenFFBoardBackend<'a> {
+        tmc: &'a mut Tmc4671Spi<TmcSpiDevice>,
+        enable_pin: &'a mut Output<'static>,
+    }
+
+    impl<'a> crate::commission::CommissioningBackend for OpenFFBoardBackend<'a> {
+        type Error = tmc4671::spi::SpiError<
+            embedded_hal_bus::spi::DeviceError<
+                embassy_stm32::spi::Error,
+                core::convert::Infallible,
+            >,
+        >;
+
+        async fn read_register(
+            &mut self,
+            reg: tmc4671::registers::Register,
+        ) -> Result<u32, Self::Error> {
+            self.tmc.read_register(reg).await
+        }
+
+        async fn write_register(
+            &mut self,
+            reg: tmc4671::registers::Register,
+            val: u32,
+        ) -> Result<(), Self::Error> {
+            self.tmc.write_register(reg, val).await
+        }
+
+        fn set_enable_pin(&mut self, state: bool) {
+            if state {
+                self.enable_pin.set_high();
+            } else {
+                self.enable_pin.set_low();
+            }
+        }
+
+        async fn read_encoder_count(&mut self) -> u32 {
+            self.tmc
+                .read_register(tmc4671::registers::ABN_DECODER_COUNT)
+                .await
+                .unwrap_or(0)
+        }
+
+        fn elapsed_us(&self) -> u32 {
+            read_tim5() / 84
+        }
+
+        fn is_shutdown_requested(&self) -> bool {
+            if TMC_DISABLE_SIGNAL.try_take().is_some() {
+                TMC_DISABLE_SIGNAL.signal(());
+                true
+            } else {
+                false
+            }
+        }
+
+        fn current_limit(&self) -> u32 {
+            CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
     /// USB wake signal. The OTG_FS ISR signals this to wake usb_task.
     static USB_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
@@ -219,6 +285,11 @@ mod app {
     /// Guard for single-in-flight selftest. Set at command ingress (P2),
     /// cleared after foci_selftest_done is emitted (P1).
     static SELFTEST_IN_FLIGHT: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
+    /// Guard for single-in-flight commissioning. Set at command ingress (P2),
+    /// cleared after commissioning completes or fails (P1).
+    static COMMISSION_IN_FLIGHT: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
 
     /// Signal tmc_control to drain all pending requests. Set by config_reset
@@ -414,6 +485,7 @@ mod app {
         ENCODER_REVERSED.store(false, core::sync::atomic::Ordering::Relaxed);
         STEPPER_POSITION_TARGET.store(0, core::sync::atomic::Ordering::Relaxed);
         SELFTEST_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
         STATS_SEND_TIME.store(0, core::sync::atomic::Ordering::Relaxed);
         STATS_SEND_TIME_HIGH.store(0, core::sync::atomic::Ordering::Relaxed);
         // Signal tmc_control to drain stale requests from the pre-reset epoch
@@ -1912,6 +1984,10 @@ mod app {
         // None = use defaults during calibration.
         let mut stored_position_gains: Option<(u16, u16, u16, u16)> = None;
 
+        // Active commissioning engine. Set when a CommissionInner/Outer
+        // request arrives, cleared when the engine finishes or fails.
+        let mut commission_engine: Option<crate::commission::CommissioningEngine> = None;
+
         // (Velocity feedforward and move boundary detection removed —
         // hardware step/dir eliminates the 1ms SPI position target write.)
 
@@ -1929,12 +2005,154 @@ mod app {
                 calibrated = false;
                 stored_gains = None;
                 stored_position_gains = None;
+                // Clear any in-flight commissioning engine and restore safe
+                // hardware state (zero targets, disable outputs) so the motor
+                // is not left energized in whatever mode the engine last set.
+                if commission_engine.take().is_some() {
+                    foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                }
+                COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+                // Clear commissioned outer configuration so the next closed-
+                // loop entry uses defaults, not stale commissioned values.
+                use core::sync::atomic::Ordering::Relaxed as R;
+                VELOCITY_LIMIT_CFG.store(500_000, R);
+                VELOCITY_FILTER_HZ.store(0, R);
+                POSITION_FILTER_HZ.store(0, R);
+                FLUX_FILTER_HZ.store(0, R);
+                TORQUE_FILTER_HZ.store(0, R);
                 // Reset hardware stepper state
                 MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
                 stepper_stop();
                 STEPPER_POSITION.store(0, core::sync::atomic::Ordering::Relaxed);
                 FAULT_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
                 defmt::info!("TMC request queue flushed after config_reset");
+            }
+
+            // Tick the commissioning engine if one is active.
+            // Each step() does at most 1ms of work, then returns.
+            if let Some(engine) = commission_engine.as_mut() {
+                let mut backend = OpenFFBoardBackend { tmc, enable_pin };
+                let result = engine.step(&mut backend).await;
+                match result {
+                    crate::commission::StepResult::Continue => {
+                        Mono::delay(1.millis()).await;
+                        continue;
+                    }
+                    crate::commission::StepResult::PhaseChanged(phase_id) => {
+                        let oid = engine.oid();
+                        klipper_reply!(
+                            foci_commission_phase,
+                            oid: u8 = oid,
+                            phase: u8 = phase_id.to_u8(),
+                            status: u8 = 0
+                        );
+                        Mono::delay(1.millis()).await;
+                        continue;
+                    }
+                    crate::commission::StepResult::InnerDone(inner) => {
+                        let oid = engine.oid();
+                        commission_engine = None;
+                        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+                        foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+
+                        // Persist inner gains so closed-loop entry uses them.
+                        stored_gains = Some(foci_core::pid::InnerLoopGains {
+                            flux_p: inner.flux_p,
+                            flux_i: inner.flux_i,
+                            torque_p: inner.torque_p,
+                            torque_i: inner.torque_i,
+                        });
+
+                        let status = match inner.status {
+                            foci_core::autotune::CommissionStatus::Accepted => 0u8,
+                            foci_core::autotune::CommissionStatus::AcceptedWithWarnings => 1,
+                            foci_core::autotune::CommissionStatus::InnerOnly => 2,
+                            foci_core::autotune::CommissionStatus::Failed(e) => e.status_code(),
+                        };
+                        klipper_reply!(
+                            foci_commission_inner_result,
+                            oid: u8 = oid,
+                            status: u8 = status,
+                            r_mohm: u32 = inner.r_mohm,
+                            l_uh: u32 = inner.l_uh,
+                            flux_p: u16 = inner.flux_p,
+                            flux_i: u16 = inner.flux_i,
+                            torque_p: u16 = inner.torque_p,
+                            torque_i: u16 = inner.torque_i
+                        );
+                    }
+                    crate::commission::StepResult::InnerFailed(error) => {
+                        let oid = engine.oid();
+                        commission_engine = None;
+                        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+                        foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                        klipper_reply!(
+                            foci_commission_phase,
+                            oid: u8 = oid,
+                            phase: u8 = 0,
+                            status: u8 = error.status_code()
+                        );
+                    }
+                    crate::commission::StepResult::OuterDone(outer) => {
+                        let oid = engine.oid();
+                        commission_engine = None;
+                        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+                        foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+
+                        // Persist outer gains so closed-loop entry uses them.
+                        stored_position_gains = Some((
+                            outer.position_p,
+                            outer.position_i,
+                            outer.velocity_p,
+                            outer.velocity_i,
+                        ));
+
+                        // Persist velocity limit for closed-loop entry.
+                        VELOCITY_LIMIT_CFG
+                            .store(outer.velocity_limit, core::sync::atomic::Ordering::Relaxed);
+
+                        // Persist filter settings into atomics for closed-loop entry.
+                        use core::sync::atomic::Ordering::Relaxed as R;
+                        VELOCITY_FILTER_HZ.store(outer.velocity_filter_hz, R);
+                        POSITION_FILTER_HZ.store(outer.position_filter_hz, R);
+                        FLUX_FILTER_HZ.store(outer.flux_filter_hz, R);
+                        TORQUE_FILTER_HZ.store(outer.torque_filter_hz, R);
+
+                        let status = match outer.status {
+                            foci_core::autotune::CommissionStatus::Accepted => 0u8,
+                            foci_core::autotune::CommissionStatus::AcceptedWithWarnings => 1,
+                            foci_core::autotune::CommissionStatus::InnerOnly => 2,
+                            foci_core::autotune::CommissionStatus::Failed(e) => e.status_code(),
+                        };
+                        klipper_reply!(
+                            foci_commission_outer_result,
+                            oid: u8 = oid,
+                            status: u8 = status,
+                            velocity_p: u16 = outer.velocity_p,
+                            velocity_i: u16 = outer.velocity_i,
+                            velocity_limit: u32 = outer.velocity_limit,
+                            position_p: u16 = outer.position_p,
+                            position_i: u16 = outer.position_i,
+                            velocity_filter_hz: u16 = outer.velocity_filter_hz,
+                            position_filter_hz: u16 = outer.position_filter_hz,
+                            flux_filter_hz: u16 = outer.flux_filter_hz,
+                            torque_filter_hz: u16 = outer.torque_filter_hz
+                        );
+                    }
+                    crate::commission::StepResult::OuterFailed(error) => {
+                        let oid = engine.oid();
+                        commission_engine = None;
+                        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+                        foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                        klipper_reply!(
+                            foci_commission_phase,
+                            oid: u8 = oid,
+                            phase: u8 = 0,
+                            status: u8 = error.status_code()
+                        );
+                    }
+                }
+                // For Done/Failed cases, fall through to normal processing
             }
 
             match select(rx.recv(), Mono::delay(1.millis())).await {
@@ -2423,6 +2641,79 @@ mod app {
                             torque_p: u16 = gains.torque_p,
                             torque_i: u16 = gains.torque_i
                         );
+                    }
+                    TmcRequest::CommissionInner { oid, profile } => {
+                        if motor_enabled {
+                            COMMISSION_IN_FLIGHT
+                                .store(false, core::sync::atomic::Ordering::Relaxed);
+                            klipper_reply!(
+                                foci_commission_phase,
+                                oid: u8 = oid,
+                                phase: u8 = 0,
+                                status: u8 =
+                                    foci_core::autotune::CommissionError::MotorEnabled
+                                        .status_code()
+                            );
+                            continue;
+                        }
+                        let current_limit =
+                            CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
+                        if current_limit == 0 {
+                            COMMISSION_IN_FLIGHT
+                                .store(false, core::sync::atomic::Ordering::Relaxed);
+                            klipper_reply!(
+                                foci_commission_phase,
+                                oid: u8 = oid,
+                                phase: u8 = 0,
+                                status: u8 =
+                                    foci_core::autotune::CommissionError::NoCurrent
+                                        .status_code()
+                            );
+                            continue;
+                        }
+                        calibrated = false;
+                        commission_engine =
+                            Some(crate::commission::CommissioningEngine::new_inner(
+                                oid,
+                                foci_core::autotune::CommissionProfile::from_u8(profile),
+                            ));
+                    }
+                    TmcRequest::CommissionOuter { oid, profile, mode } => {
+                        if motor_enabled {
+                            COMMISSION_IN_FLIGHT
+                                .store(false, core::sync::atomic::Ordering::Relaxed);
+                            klipper_reply!(
+                                foci_commission_phase,
+                                oid: u8 = oid,
+                                phase: u8 = 0,
+                                status: u8 =
+                                    foci_core::autotune::CommissionError::MotorEnabled
+                                        .status_code()
+                            );
+                            continue;
+                        }
+                        let current_limit =
+                            CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
+                        if current_limit == 0 {
+                            COMMISSION_IN_FLIGHT
+                                .store(false, core::sync::atomic::Ordering::Relaxed);
+                            klipper_reply!(
+                                foci_commission_phase,
+                                oid: u8 = oid,
+                                phase: u8 = 0,
+                                status: u8 =
+                                    foci_core::autotune::CommissionError::NoCurrent
+                                        .status_code()
+                            );
+                            continue;
+                        }
+                        calibrated = false;
+                        commission_engine =
+                            Some(crate::commission::CommissioningEngine::new_outer(
+                                oid,
+                                foci_core::autotune::CommissionProfile::from_u8(profile),
+                                foci_core::autotune::OperatingMode::from_u8(mode),
+                            ));
                     }
                     TmcRequest::SelfTest { oid } => {
                         let status = if motor_enabled {
