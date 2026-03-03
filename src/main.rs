@@ -1373,6 +1373,54 @@ mod app {
         }
     }
 
+    /// Start inner commissioning (diagnostics + electrical ID + current tune).
+    #[klipper_command]
+    pub fn foci_commission_inner(_context: &mut State, oid: u8, profile: u8) {
+        use core::sync::atomic::Ordering::Relaxed;
+        if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
+            klipper_reply!(
+                foci_commission_phase,
+                oid: u8 = oid,
+                phase: u8 = 0,
+                status: u8 = foci_core::autotune::CommissionError::AlreadyRunning.status_code()
+            );
+            return;
+        }
+        if !tmc_send(foci_core::tmc::tmc_commission_inner(oid, profile)) {
+            COMMISSION_IN_FLIGHT.store(false, Relaxed);
+            klipper_reply!(
+                foci_commission_phase,
+                oid: u8 = oid,
+                phase: u8 = 0,
+                status: u8 = foci_core::autotune::CommissionError::QueueFull.status_code()
+            );
+        }
+    }
+
+    /// Start outer commissioning (mechanical ID + velocity/position/filters).
+    #[klipper_command]
+    pub fn foci_commission_outer(_context: &mut State, oid: u8, profile: u8, mode: u8) {
+        use core::sync::atomic::Ordering::Relaxed;
+        if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
+            klipper_reply!(
+                foci_commission_phase,
+                oid: u8 = oid,
+                phase: u8 = 0,
+                status: u8 = foci_core::autotune::CommissionError::AlreadyRunning.status_code()
+            );
+            return;
+        }
+        if !tmc_send(foci_core::tmc::tmc_commission_outer(oid, profile, mode)) {
+            COMMISSION_IN_FLIGHT.store(false, Relaxed);
+            klipper_reply!(
+                foci_commission_phase,
+                oid: u8 = oid,
+                phase: u8 = 0,
+                status: u8 = foci_core::autotune::CommissionError::QueueFull.status_code()
+            );
+        }
+    }
+
     /// SPI transfer stub (returns empty response).
     #[klipper_command]
     pub fn spi_transfer(_oid: u8, _data: &[u8]) {
