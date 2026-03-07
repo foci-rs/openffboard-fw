@@ -11,6 +11,7 @@
 use foci_core::autotune::{
     CommissionError, CommissionProfile, CommissionStatus, CurrentGains, CurrentValidation,
     ElectricalModel, MechanicalModel, OperatingMode, PhaseId, TransientBuffer, ValidationResult,
+    VelocityGains, VelocityValidation,
 };
 use foci_core::config::TmcConfig;
 use tmc4671::registers::Register;
@@ -515,6 +516,32 @@ const MECH_ID_ACCEL_SAMPLES: usize = 8;
 const MECH_ID_VELOCITY_ONSET_THRESHOLD: i32 = 2;
 
 // ---------------------------------------------------------------------------
+// Velocity validation constants (Phase 10)
+// ---------------------------------------------------------------------------
+
+/// Velocity step as a fraction of velocity_limit (15% = 15/100).
+/// Spec says 10-20%.
+const VEL_VALIDATE_STEP_PERCENT: u32 = 15;
+
+/// Sampling interval for velocity capture (microseconds).
+/// 1 kHz = 1000us between samples.
+const VEL_VALIDATE_SAMPLE_PERIOD_US: u32 = 1000;
+
+/// Settling time after removing velocity target (microseconds).
+const VEL_VALIDATE_SETTLE_US: u32 = 200_000;
+
+/// Zero-speed chatter monitoring window (samples at 1 kHz).
+/// Spec: 200ms = 200 samples.
+const VEL_VALIDATE_CHATTER_WINDOW: u16 = 200;
+
+/// Chatter threshold (encoder counts/tick). Spec: > 3.
+const VEL_VALIDATE_CHATTER_THRESHOLD: u32 = 3;
+
+/// Lambda multiplier for retry (150% = lambda * 3 / 2).
+const VEL_RETRY_LAMBDA_MUL_NUM: u32 = 3;
+const VEL_RETRY_LAMBDA_MUL_DEN: u32 = 2;
+
+// ---------------------------------------------------------------------------
 // Mechanical identification sub-states
 // ---------------------------------------------------------------------------
 
@@ -574,6 +601,65 @@ impl MechanicalIdData {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Velocity validation sub-states
+// ---------------------------------------------------------------------------
+
+/// Velocity-loop validation sub-state machine (Phase 10).
+#[derive(Debug, defmt::Format)]
+enum VelocityValidateState {
+    /// Write velocity gains to TMC4671 registers.
+    WriteGains,
+    /// Switch to velocity mode and apply forward velocity step.
+    ForwardStep,
+    /// Capture forward step response at 1 kHz.
+    ForwardCapture { next_sample_us: u32 },
+    /// Return to zero velocity and wait for settling.
+    ForwardSettle { deadline_us: u32 },
+    /// Apply reverse velocity step.
+    ReverseStep,
+    /// Capture reverse step response.
+    ReverseCapture { next_sample_us: u32 },
+    /// Return to zero velocity and wait for settling.
+    ReverseSettle { deadline_us: u32 },
+    /// Monitor zero-speed chatter for 200ms.
+    ChatterCheck { next_sample_us: u32, remaining: u16 },
+    /// Extract metrics and classify response.
+    Classify,
+    /// Restore safe state before finalize or retry.
+    SafeState { deadline_us: u32 },
+    /// Emit result or transition.
+    Finalize,
+}
+
+/// Accumulated data for velocity-loop validation.
+#[derive(Debug, defmt::Format)]
+struct VelocityValidateData {
+    /// Synthesized velocity gains for the current attempt.
+    gains: VelocityGains,
+    /// The mechanical model from Phase 8 (needed for retry re-synthesis).
+    model: MechanicalModel,
+    /// Current attempt (0 = first, 1 = retry).
+    attempt: u8,
+    /// Velocity step amplitude (encoder counts/ms or velocity target units).
+    step_target: u32,
+    /// Forward capture metrics.
+    forward_metrics: Option<VelocityValidation>,
+    /// Reverse capture metrics.
+    reverse_metrics: Option<VelocityValidation>,
+    /// Maximum chatter value observed during zero-speed check.
+    max_chatter: u32,
+    /// Peak velocity from mechanical ID (for velocity limit derivation).
+    peak_velocity: u32,
+    /// Previous encoder count for velocity derivation (position delta per tick).
+    prev_encoder_for_velocity: u32,
+    /// Saturation counter: samples where the velocity PID's torque output
+    /// is near the current limit (indicating the controller is effort-limited).
+    saturation_count: u16,
+    /// Current limit for saturation detection (from `backend.current_limit()`).
+    torque_limit: u32,
+}
+
 /// Outer safety limits, computed once at the start of outer commissioning.
 #[derive(Debug, Clone, Copy, defmt::Format)]
 struct OuterSafetyLimits {
@@ -614,11 +700,14 @@ enum OuterPhase {
     /// Phase 9: Velocity-loop SIMC gain synthesis.
     VelocityTune {
         model: MechanicalModel,
+        /// Peak velocity from mechanical ID (for velocity limit derivation).
+        peak_velocity: u32,
         safety: OuterSafetyLimits,
     },
     /// Phase 10: Velocity-loop step-response validation.
     VelocityValidate {
-        attempt: u8,
+        state: VelocityValidateState,
+        data: VelocityValidateData,
         safety: OuterSafetyLimits,
     },
     /// Phase 11: Position-loop P ramp-up.
@@ -644,6 +733,14 @@ enum EngineMode {
         phase: OuterPhase,
         profile: CommissionProfile,
         mode: OperatingMode,
+        /// Inner-loop closed-loop lambda in microseconds.
+        inner_lambda_us: u32,
+        /// Electrical transport delay in microseconds.
+        theta_e_us: u32,
+        /// Whether current-loop ringing was detected during inner validation.
+        current_ringing: bool,
+        /// Current-loop effective bandwidth Hz from inner commissioning.
+        current_bandwidth_hz: u32,
     },
 }
 
@@ -672,7 +769,15 @@ impl CommissioningEngine {
     }
 
     /// Create an engine for outer (mechanical) commissioning.
-    pub fn new_outer(oid: u8, profile: CommissionProfile, mode: OperatingMode) -> Self {
+    pub fn new_outer(
+        oid: u8,
+        profile: CommissionProfile,
+        mode: OperatingMode,
+        inner_lambda_us: u32,
+        theta_e_us: u32,
+        current_ringing: bool,
+        current_bandwidth_hz: u32,
+    ) -> Self {
         // Safety limits and data are initialized with placeholder values.
         // The MechanicalIdState::Setup sub-state reads the actual encoder
         // position and current limit from the backend on the first step().
@@ -688,6 +793,10 @@ impl CommissioningEngine {
                 },
                 profile,
                 mode,
+                inner_lambda_us,
+                theta_e_us,
+                current_ringing,
+                current_bandwidth_hz,
             },
             buf: TransientBuffer::new(),
         }
@@ -720,7 +829,24 @@ impl CommissioningEngine {
                 ref mut phase,
                 profile,
                 mode,
-            } => Self::step_outer(phase, &mut self.buf, *profile, *mode, backend).await,
+                inner_lambda_us,
+                theta_e_us,
+                current_ringing,
+                current_bandwidth_hz,
+            } => {
+                Self::step_outer(
+                    phase,
+                    &mut self.buf,
+                    *profile,
+                    *mode,
+                    *inner_lambda_us,
+                    *theta_e_us,
+                    *current_ringing,
+                    *current_bandwidth_hz,
+                    backend,
+                )
+                .await
+            }
         }
     }
 
@@ -2120,8 +2246,12 @@ impl CommissioningEngine {
     async fn step_outer<B: CommissioningBackend>(
         phase: &mut OuterPhase,
         buf: &mut TransientBuffer,
-        _profile: CommissionProfile,
-        _mode: OperatingMode,
+        profile: CommissionProfile,
+        mode: OperatingMode,
+        inner_lambda_us: u32,
+        theta_e_us: u32,
+        current_ringing: bool,
+        current_bandwidth_hz: u32,
         backend: &mut B,
     ) -> StepResult {
         // Run per-tick safety envelope for all active phases.
@@ -2141,12 +2271,28 @@ impl CommissioningEngine {
 
         match phase {
             OuterPhase::MechanicalId { .. } => Self::step_mechanical_id(phase, buf, backend).await,
-            OuterPhase::VelocityTune { .. }
-            | OuterPhase::VelocityValidate { .. }
-            | OuterPhase::PositionTune { .. }
+            OuterPhase::VelocityTune { .. } => {
+                Self::step_velocity_tune(phase, profile, mode, inner_lambda_us, theta_e_us, backend)
+                    .await
+            }
+            OuterPhase::VelocityValidate { .. } => {
+                Self::step_velocity_validate(
+                    phase,
+                    buf,
+                    profile,
+                    mode,
+                    inner_lambda_us,
+                    theta_e_us,
+                    current_ringing,
+                    current_bandwidth_hz,
+                    backend,
+                )
+                .await
+            }
+            OuterPhase::PositionTune { .. }
             | OuterPhase::FilterTune { .. }
             | OuterPhase::Commit => {
-                // Placeholder for later phases — not in scope for this plan.
+                // Placeholder for later phases.
                 StepResult::Continue
             }
             OuterPhase::Done(result) => StepResult::OuterDone(result.clone()),
@@ -2572,6 +2718,7 @@ impl CommissioningEngine {
 
                 *phase = OuterPhase::VelocityTune {
                     model,
+                    peak_velocity: peak_avg,
                     safety: carried_safety,
                 };
                 StepResult::PhaseChanged(PhaseId::VelocityTune)
@@ -2677,5 +2824,526 @@ impl CommissioningEngine {
         }
 
         (initial_accel, peak_velocity, delay_samples)
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 9: Velocity-Loop SIMC Synthesis
+    // -------------------------------------------------------------------
+
+    /// Advance velocity-tune phase.
+    ///
+    /// This is a thin pass-through: call the pure synthesis helper,
+    /// then immediately transition to VelocityValidate with the
+    /// computed gains.
+    async fn step_velocity_tune<B: CommissioningBackend>(
+        phase: &mut OuterPhase,
+        profile: CommissionProfile,
+        mode: OperatingMode,
+        inner_lambda_us: u32,
+        theta_e_us: u32,
+        backend: &mut B,
+    ) -> StepResult {
+        let (model, peak_velocity, safety) = match phase {
+            OuterPhase::VelocityTune {
+                model,
+                peak_velocity,
+                safety,
+            } => (*model, *peak_velocity, *safety),
+            _ => return StepResult::Continue,
+        };
+
+        let config = backend.tmc_config();
+        let gains = match foci_core::autotune::simc_velocity_gains(
+            &model,
+            profile,
+            mode,
+            inner_lambda_us,
+            theta_e_us,
+            peak_velocity,
+            config,
+        ) {
+            Some(gains) => gains,
+            None => {
+                defmt::warn!("velocity tune: synthesis returned None");
+                return Self::fail_outer(phase, CommissionError::MechanicalIdFailed);
+            }
+        };
+
+        defmt::info!(
+            "velocity tune: P={}, I={}, limit={}, bw={}Hz, lambda={}ms",
+            gains.velocity_p,
+            gains.velocity_i,
+            gains.velocity_limit,
+            gains.effective_bandwidth_hz,
+            gains.lambda_vel_ms
+        );
+
+        // Compute velocity step target: 15% of velocity_limit.
+        let step_target = if gains.velocity_limit > 0 {
+            (gains.velocity_limit * VEL_VALIDATE_STEP_PERCENT / 100).max(1)
+        } else {
+            return Self::fail_outer(phase, CommissionError::VelocityValidationFailed);
+        };
+
+        let data = VelocityValidateData {
+            gains,
+            model,
+            attempt: 0,
+            step_target,
+            forward_metrics: None,
+            reverse_metrics: None,
+            max_chatter: 0,
+            peak_velocity,
+            prev_encoder_for_velocity: 0,
+            saturation_count: 0,
+            torque_limit: backend.current_limit() & 0xFFFF,
+        };
+
+        *phase = OuterPhase::VelocityValidate {
+            state: VelocityValidateState::WriteGains,
+            data,
+            safety,
+        };
+        StepResult::PhaseChanged(PhaseId::VelocityValidate)
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 10: Velocity-Loop Validation
+    // -------------------------------------------------------------------
+
+    /// Advance velocity-validate sub-state machine.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    async fn step_velocity_validate<B: CommissioningBackend>(
+        phase: &mut OuterPhase,
+        buf: &mut TransientBuffer,
+        profile: CommissionProfile,
+        mode: OperatingMode,
+        inner_lambda_us: u32,
+        theta_e_us: u32,
+        current_ringing: bool,
+        current_bandwidth_hz: u32,
+        backend: &mut B,
+    ) -> StepResult {
+        use tmc4671::registers::*;
+
+        let (state, data, safety) = match phase {
+            OuterPhase::VelocityValidate {
+                state,
+                data,
+                safety,
+            } => (state, data, safety),
+            _ => return StepResult::Continue,
+        };
+
+        match state {
+            VelocityValidateState::WriteGains => {
+                // Write velocity PI gains to TMC4671.
+                let vel_reg =
+                    ((data.gains.velocity_p as u32) << 16) | (data.gains.velocity_i as u32);
+                if backend
+                    .write_register(PID_VELOCITY_P_VELOCITY_I, vel_reg)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_outer(phase, CommissionError::Spi);
+                }
+
+                // Write velocity limit.
+                if backend
+                    .write_register(PID_VELOCITY_LIMIT, data.gains.velocity_limit)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_outer(phase, CommissionError::Spi);
+                }
+
+                // Switch to velocity mode (MODE=2).
+                if backend
+                    .write_register(MODE_RAMP_MODE_MOTION, 2)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_outer(phase, CommissionError::Spi);
+                }
+
+                // Zero velocity target.
+                let _ = backend.write_register(PID_VELOCITY_TARGET, 0).await;
+
+                // Prepare buffer for forward capture.
+                buf.reset(VEL_VALIDATE_SAMPLE_PERIOD_US as u16);
+                data.forward_metrics = None;
+                data.reverse_metrics = None;
+                data.max_chatter = 0;
+                data.saturation_count = 0;
+
+                *state = VelocityValidateState::ForwardStep;
+                StepResult::Continue
+            }
+
+            VelocityValidateState::ForwardStep => {
+                // Apply positive velocity step.
+                if backend
+                    .write_register(PID_VELOCITY_TARGET, data.step_target)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_outer(phase, CommissionError::Spi);
+                }
+
+                // Record initial encoder position for velocity derivation.
+                data.prev_encoder_for_velocity = backend.read_encoder_count().await;
+
+                let next_sample_us = backend
+                    .elapsed_us()
+                    .wrapping_add(VEL_VALIDATE_SAMPLE_PERIOD_US);
+                *state = VelocityValidateState::ForwardCapture { next_sample_us };
+                StepResult::Continue
+            }
+
+            VelocityValidateState::ForwardCapture { next_sample_us } => {
+                let now = backend.elapsed_us();
+                if now.wrapping_sub(*next_sample_us) >= 0x8000_0000 {
+                    return StepResult::Continue;
+                }
+
+                // Derive velocity from encoder position delta (counts/tick).
+                let encoder_raw = backend.read_encoder_count().await;
+                let velocity = (encoder_raw as i32)
+                    .wrapping_sub(data.prev_encoder_for_velocity as i32)
+                    .unsigned_abs();
+                data.prev_encoder_for_velocity = encoder_raw;
+                buf.push(velocity);
+
+                // Detect velocity-controller saturation: read the velocity
+                // PID's torque output (INTERIM_PIDOUT_TARGET_TORQUE) and
+                // count when it's at or near the configured torque limit.
+                if data.torque_limit > 0 {
+                    let sub = tmc4671::registers::INTERIM_PIDOUT_TARGET_TORQUE;
+                    let _ = backend.write_register(sub.addr, sub.sub_addr as u32).await;
+                    if let Ok(pidout) = backend.read_register(sub.data).await {
+                        let commanded_torque = (pidout & 0xFFFF) as i16;
+                        let abs_commanded = commanded_torque.unsigned_abs() as u32;
+                        if abs_commanded >= data.torque_limit * 9 / 10 {
+                            data.saturation_count += 1;
+                        }
+                    }
+                }
+
+                if buf.is_full() {
+                    // Forward capture complete — zero velocity target.
+                    let _ = backend.write_register(PID_VELOCITY_TARGET, 0).await;
+
+                    // Extract forward metrics.
+                    let metrics = foci_core::autotune::extract_velocity_metrics(
+                        buf,
+                        data.step_target,
+                        0, // Saturation counted from velocity PID output, not velocity samples.
+                        VEL_VALIDATE_CHATTER_THRESHOLD,
+                        VEL_VALIDATE_CHATTER_WINDOW,
+                    );
+                    data.forward_metrics = Some(metrics);
+
+                    defmt::info!(
+                        "vel fwd: rise={}ms, overshoot={}, settle={}ms",
+                        metrics.rise_time_ms,
+                        metrics.overshoot_pct,
+                        metrics.settling_time_ms
+                    );
+
+                    let deadline = backend.elapsed_us().wrapping_add(VEL_VALIDATE_SETTLE_US);
+                    *state = VelocityValidateState::ForwardSettle {
+                        deadline_us: deadline,
+                    };
+                } else {
+                    *next_sample_us = now.wrapping_add(VEL_VALIDATE_SAMPLE_PERIOD_US);
+                }
+                StepResult::Continue
+            }
+
+            VelocityValidateState::ForwardSettle { deadline_us } => {
+                if backend.elapsed_us().wrapping_sub(*deadline_us) < 0x8000_0000 {
+                    buf.reset(VEL_VALIDATE_SAMPLE_PERIOD_US as u16);
+                    *state = VelocityValidateState::ReverseStep;
+                }
+                StepResult::Continue
+            }
+
+            VelocityValidateState::ReverseStep => {
+                // Apply negative velocity step.
+                // PID_VELOCITY_TARGET is signed i32.
+                let neg_target = -(data.step_target as i32);
+                if backend
+                    .write_register(PID_VELOCITY_TARGET, neg_target as u32)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_outer(phase, CommissionError::Spi);
+                }
+
+                // Record initial encoder position for velocity derivation.
+                data.prev_encoder_for_velocity = backend.read_encoder_count().await;
+
+                let next_sample_us = backend
+                    .elapsed_us()
+                    .wrapping_add(VEL_VALIDATE_SAMPLE_PERIOD_US);
+                *state = VelocityValidateState::ReverseCapture { next_sample_us };
+                StepResult::Continue
+            }
+
+            VelocityValidateState::ReverseCapture { next_sample_us } => {
+                let now = backend.elapsed_us();
+                if now.wrapping_sub(*next_sample_us) >= 0x8000_0000 {
+                    return StepResult::Continue;
+                }
+
+                // Derive velocity from encoder position delta (counts/tick).
+                let encoder_raw = backend.read_encoder_count().await;
+                let velocity = (encoder_raw as i32)
+                    .wrapping_sub(data.prev_encoder_for_velocity as i32)
+                    .unsigned_abs();
+                data.prev_encoder_for_velocity = encoder_raw;
+                buf.push(velocity);
+
+                // Detect velocity-controller saturation from PID output.
+                if data.torque_limit > 0 {
+                    let sub = tmc4671::registers::INTERIM_PIDOUT_TARGET_TORQUE;
+                    let _ = backend.write_register(sub.addr, sub.sub_addr as u32).await;
+                    if let Ok(pidout) = backend.read_register(sub.data).await {
+                        let commanded_torque = (pidout & 0xFFFF) as i16;
+                        let abs_commanded = commanded_torque.unsigned_abs() as u32;
+                        if abs_commanded >= data.torque_limit * 9 / 10 {
+                            data.saturation_count += 1;
+                        }
+                    }
+                }
+
+                if buf.is_full() {
+                    let _ = backend.write_register(PID_VELOCITY_TARGET, 0).await;
+
+                    let metrics = foci_core::autotune::extract_velocity_metrics(
+                        buf,
+                        data.step_target,
+                        0, // Saturation counted from velocity PID output, not velocity samples.
+                        VEL_VALIDATE_CHATTER_THRESHOLD,
+                        VEL_VALIDATE_CHATTER_WINDOW,
+                    );
+                    data.reverse_metrics = Some(metrics);
+
+                    defmt::info!(
+                        "vel rev: rise={}ms, overshoot={}, settle={}ms",
+                        metrics.rise_time_ms,
+                        metrics.overshoot_pct,
+                        metrics.settling_time_ms
+                    );
+
+                    let deadline = backend.elapsed_us().wrapping_add(VEL_VALIDATE_SETTLE_US);
+                    *state = VelocityValidateState::ReverseSettle {
+                        deadline_us: deadline,
+                    };
+                } else {
+                    *next_sample_us = now.wrapping_add(VEL_VALIDATE_SAMPLE_PERIOD_US);
+                }
+                StepResult::Continue
+            }
+
+            VelocityValidateState::ReverseSettle { deadline_us } => {
+                if backend.elapsed_us().wrapping_sub(*deadline_us) < 0x8000_0000 {
+                    // Seed chatter encoder tracker independently of safety.
+                    data.prev_encoder_for_velocity = backend.read_encoder_count().await;
+                    buf.reset(VEL_VALIDATE_SAMPLE_PERIOD_US as u16);
+                    let next_sample_us = backend
+                        .elapsed_us()
+                        .wrapping_add(VEL_VALIDATE_SAMPLE_PERIOD_US);
+                    *state = VelocityValidateState::ChatterCheck {
+                        next_sample_us,
+                        remaining: VEL_VALIDATE_CHATTER_WINDOW,
+                    };
+                }
+                StepResult::Continue
+            }
+
+            VelocityValidateState::ChatterCheck {
+                next_sample_us,
+                remaining,
+            } => {
+                let now = backend.elapsed_us();
+                if now.wrapping_sub(*next_sample_us) >= 0x8000_0000 {
+                    return StepResult::Continue;
+                }
+
+                // Derive velocity from own encoder tracker, independent of
+                // the safety check which updates prev_encoder_count earlier.
+                let count = backend.read_encoder_count().await;
+                let velocity = (count as i32).wrapping_sub(data.prev_encoder_for_velocity as i32);
+                data.prev_encoder_for_velocity = count;
+                let abs_velocity = if velocity < 0 {
+                    (-velocity) as u32
+                } else {
+                    velocity as u32
+                };
+                if abs_velocity > data.max_chatter {
+                    data.max_chatter = abs_velocity;
+                }
+
+                *remaining -= 1;
+                if *remaining == 0 {
+                    *state = VelocityValidateState::Classify;
+                } else {
+                    *next_sample_us = now.wrapping_add(VEL_VALIDATE_SAMPLE_PERIOD_US);
+                }
+                StepResult::Continue
+            }
+
+            VelocityValidateState::Classify => {
+                // Compute symmetry from forward/reverse rise times.
+                let fwd = data.forward_metrics.unwrap_or(VelocityValidation {
+                    rise_time_ms: 0,
+                    overshoot_pct: 0,
+                    settling_time_ms: 0,
+                    zero_speed_chatter: false,
+                    saturation_samples: 0,
+                    symmetry_pct: 0,
+                });
+                let rev = data.reverse_metrics.unwrap_or(VelocityValidation {
+                    rise_time_ms: 0,
+                    overshoot_pct: 0,
+                    settling_time_ms: 0,
+                    zero_speed_chatter: false,
+                    saturation_samples: 0,
+                    symmetry_pct: 0,
+                });
+
+                let symmetry =
+                    foci_core::autotune::compute_symmetry_pct(fwd.rise_time_ms, rev.rise_time_ms);
+
+                // Merge: take the worst of forward/reverse for each metric.
+                let merged = VelocityValidation {
+                    rise_time_ms: fwd.rise_time_ms.max(rev.rise_time_ms),
+                    overshoot_pct: fwd.overshoot_pct.max(rev.overshoot_pct),
+                    settling_time_ms: fwd.settling_time_ms.max(rev.settling_time_ms),
+                    zero_speed_chatter: data.max_chatter > VEL_VALIDATE_CHATTER_THRESHOLD,
+                    saturation_samples: data.saturation_count,
+                    symmetry_pct: symmetry,
+                };
+
+                let result = foci_core::autotune::classify_velocity_validation(
+                    &merged,
+                    data.model.tau_mech_ms,
+                    foci_core::autotune::TRANSIENT_LEN as u16 * 2, // Total samples across both captures.
+                );
+
+                defmt::info!(
+                    "vel classify: result={}, chatter={}, symmetry={}",
+                    match result {
+                        ValidationResult::Pass => "pass",
+                        ValidationResult::Marginal => "marginal",
+                        ValidationResult::Fail => "fail",
+                    },
+                    data.max_chatter,
+                    symmetry
+                );
+
+                match result {
+                    ValidationResult::Pass => {
+                        // Success — restore safe state then transition.
+                        let _ = backend.write_register(PID_VELOCITY_TARGET, 0).await;
+                        let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+                        let deadline = backend.elapsed_us().wrapping_add(VEL_VALIDATE_SETTLE_US);
+                        *state = VelocityValidateState::SafeState {
+                            deadline_us: deadline,
+                        };
+                    }
+                    ValidationResult::Marginal if data.attempt == 0 => {
+                        // Retry: increase lambda_vel by 50% and recompute gains.
+                        defmt::info!("vel validate: marginal on attempt 0, retrying");
+                        data.attempt = 1;
+
+                        let config = backend.tmc_config();
+                        // Compute new gains with increased lambda.
+                        // We modify the model's theta_mech to force a larger lambda,
+                        // matching the SIMC retry pattern from current validation.
+                        let mut retry_model = data.model;
+                        let new_theta = data.model.theta_mech_us * VEL_RETRY_LAMBDA_MUL_NUM
+                            / VEL_RETRY_LAMBDA_MUL_DEN;
+                        retry_model.theta_mech_us = new_theta;
+
+                        match foci_core::autotune::simc_velocity_gains(
+                            &retry_model,
+                            profile,
+                            mode,
+                            inner_lambda_us,
+                            theta_e_us,
+                            data.peak_velocity,
+                            config,
+                        ) {
+                            Some(new_gains) => {
+                                defmt::info!(
+                                    "vel retry: P={}, I={}, lambda={}ms",
+                                    new_gains.velocity_p,
+                                    new_gains.velocity_i,
+                                    new_gains.lambda_vel_ms
+                                );
+                                data.gains = new_gains;
+                                data.step_target =
+                                    (new_gains.velocity_limit * VEL_VALIDATE_STEP_PERCENT / 100)
+                                        .max(1);
+                                *state = VelocityValidateState::WriteGains;
+                            }
+                            None => {
+                                return Self::fail_outer(
+                                    phase,
+                                    CommissionError::VelocityValidationFailed,
+                                );
+                            }
+                        }
+                    }
+                    ValidationResult::Marginal | ValidationResult::Fail => {
+                        // Already retried or hard fail — abort.
+                        defmt::warn!(
+                            "vel validate: {} on attempt {}",
+                            match result {
+                                ValidationResult::Fail => "fail",
+                                _ => "marginal",
+                            },
+                            data.attempt
+                        );
+                        let _ = backend.write_register(PID_VELOCITY_TARGET, 0).await;
+                        let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+                        return Self::fail_outer(phase, CommissionError::VelocityValidationFailed);
+                    }
+                }
+                StepResult::Continue
+            }
+
+            VelocityValidateState::SafeState { deadline_us } => {
+                if backend.elapsed_us().wrapping_sub(*deadline_us) < 0x8000_0000 {
+                    *state = VelocityValidateState::Finalize;
+                }
+                StepResult::Continue
+            }
+
+            VelocityValidateState::Finalize => {
+                // Ensure motor is stopped.
+                let _ = backend.write_register(PID_VELOCITY_TARGET, 0).await;
+                let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+
+                // Carry velocity gains and safety forward to PositionTune.
+                let carried_safety = *safety;
+                let _accepted_gains = data.gains;
+
+                defmt::info!(
+                    "vel validate: accepted P={}, I={}, limit={}",
+                    data.gains.velocity_p,
+                    data.gains.velocity_i,
+                    data.gains.velocity_limit
+                );
+
+                *phase = OuterPhase::PositionTune {
+                    safety: carried_safety,
+                };
+                StepResult::PhaseChanged(PhaseId::PositionTune)
+            }
+        }
     }
 }

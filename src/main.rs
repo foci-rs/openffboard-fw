@@ -1423,7 +1423,16 @@ mod app {
 
     /// Start outer commissioning (mechanical ID + velocity/position/filters).
     #[klipper_command]
-    pub fn foci_commission_outer(_context: &mut State, oid: u8, profile: u8, mode: u8) {
+    pub fn foci_commission_outer(
+        _context: &mut State,
+        oid: u8,
+        profile: u8,
+        mode: u8,
+        inner_lambda: u32,
+        theta_e: u32,
+        current_ringing: u8,
+        current_bw: u32,
+    ) {
         use core::sync::atomic::Ordering::Relaxed;
         if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
             klipper_reply!(
@@ -1434,7 +1443,15 @@ mod app {
             );
             return;
         }
-        if !tmc_send(foci_core::tmc::tmc_commission_outer(oid, profile, mode)) {
+        if !tmc_send(foci_core::tmc::tmc_commission_outer(
+            oid,
+            profile,
+            mode,
+            inner_lambda,
+            theta_e,
+            current_ringing,
+            current_bw,
+        )) {
             COMMISSION_IN_FLIGHT.store(false, Relaxed);
             klipper_reply!(
                 foci_commission_phase,
@@ -2750,7 +2767,15 @@ mod app {
                                 foci_core::autotune::CommissionProfile::from_u8(profile),
                             ));
                     }
-                    TmcRequest::CommissionOuter { oid, profile, mode } => {
+                    TmcRequest::CommissionOuter {
+                        oid,
+                        profile,
+                        mode,
+                        inner_lambda_us,
+                        theta_e_us,
+                        current_ringing_count,
+                        current_bandwidth_hz,
+                    } => {
                         if motor_enabled {
                             COMMISSION_IN_FLIGHT
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
@@ -2785,6 +2810,10 @@ mod app {
                                 oid,
                                 foci_core::autotune::CommissionProfile::from_u8(profile),
                                 foci_core::autotune::OperatingMode::from_u8(mode),
+                                inner_lambda_us,
+                                theta_e_us,
+                                current_ringing_count > 1,
+                                current_bandwidth_hz,
                             ));
                     }
                     TmcRequest::SelfTest { oid } => {
