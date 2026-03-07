@@ -226,6 +226,14 @@ mod app {
         fn excitation_voltage(&self) -> u16 {
             TMC_CONFIG.excitation_voltage
         }
+
+        fn tmc_config(&self) -> &foci_core::config::TmcConfig {
+            &TMC_CONFIG
+        }
+
+        fn step_width(&self) -> u32 {
+            STEP_WIDTH_VALUE.load(core::sync::atomic::Ordering::Relaxed) as u32
+        }
     }
 
     /// USB wake signal. The OTG_FS ISR signals this to wake usb_task.

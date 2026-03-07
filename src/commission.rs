@@ -9,9 +9,10 @@
 //! electrical-ID and current-tune plans.
 
 use foci_core::autotune::{
-    CommissionError, CommissionProfile, CommissionStatus, ElectricalModel, OperatingMode, PhaseId,
-    TransientBuffer,
+    CommissionError, CommissionProfile, CommissionStatus, CurrentGains, CurrentValidation,
+    ElectricalModel, OperatingMode, PhaseId, TransientBuffer, ValidationResult,
 };
+use foci_core::config::TmcConfig;
 use tmc4671::registers::Register;
 
 /// Hardware abstraction for commissioning measurements.
@@ -68,6 +69,17 @@ pub trait CommissioningBackend {
 
     /// Test excitation voltage magnitude (PIDOUT units, bits [15:0]).
     fn excitation_voltage(&self) -> u16;
+
+    /// Board-specific TMC4671 configuration.
+    ///
+    /// Needed by SIMC gain synthesis for PWM frequency.
+    fn tmc_config(&self) -> &TmcConfig;
+
+    /// TMC4671 STEP_WIDTH value (phi_e increment per step pulse).
+    ///
+    /// Used by position-loop tuning as the position step size.
+    /// Returns 0 if the encoder has not been configured.
+    fn step_width(&self) -> u32;
 }
 
 /// Result of a `step()` call.
@@ -200,6 +212,77 @@ const DELAY_ONSET_THRESHOLD: u16 = 20;
 /// Fraction of steady-state current for 63% rise detection (fixed-point).
 /// 0.632 * 1024 ≈ 647 (Q10 format for integer math).
 const RISE_63_PCT_Q10: u32 = 647;
+
+// ---------------------------------------------------------------------------
+// Current validation constants (Phase 7)
+// ---------------------------------------------------------------------------
+
+/// Step amplitude as a fraction of run_current (15% = 15/100).
+const VALIDATION_STEP_PERCENT: u32 = 15;
+
+/// Settling time after applying or removing current step (microseconds).
+const VALIDATION_SETTLE_US: u32 = 50_000;
+
+/// Lambda multiplier for retry (150% = increase lambda by 50%).
+/// Applied as lambda_us = lambda_us * 3 / 2.
+const RETRY_LAMBDA_MULTIPLIER_NUM: u32 = 3;
+const RETRY_LAMBDA_MULTIPLIER_DEN: u32 = 2;
+
+/// Capture direction for bidirectional validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+enum CaptureDirection {
+    Forward,
+    Reverse,
+}
+
+/// Current-loop validation sub-state machine (Phase 7).
+#[derive(Debug, defmt::Format)]
+enum CurrentValidateState {
+    /// Write PI gains to TMC4671 registers.
+    WriteGains,
+    /// Switch to torque mode and apply current step.
+    StepSetup { direction: CaptureDirection },
+    /// Wait for transient to develop before capturing.
+    StepSettle {
+        direction: CaptureDirection,
+        deadline_us: u32,
+    },
+    /// Capture step response into TransientBuffer at 160us intervals.
+    StepCapture {
+        direction: CaptureDirection,
+        next_sample_us: u32,
+    },
+    /// Extract metrics and classify response.
+    Classify,
+    /// Restore safe state before finalizing.
+    SafeState { deadline_us: u32 },
+    /// Emit final InnerResult.
+    Finalize,
+}
+
+/// Accumulated data for current-loop validation.
+#[derive(Debug, Clone, defmt::Format)]
+struct CurrentValidateData {
+    /// The electrical model from Phase 5.
+    model: ElectricalModel,
+    /// Currently applied gains.
+    gains: CurrentGains,
+    /// Validation attempt (0 = first, 1 = retry).
+    attempt: u8,
+    /// Current step amplitude (absolute, PIDOUT units).
+    step_amplitude: u16,
+    /// Forward capture metrics (filled after forward capture).
+    forward_metrics: Option<CurrentValidation>,
+    /// Reverse capture metrics (filled after reverse capture).
+    reverse_metrics: Option<CurrentValidation>,
+    /// Final commissioning status to report.
+    final_status: CommissionStatus,
+    /// PID-output saturation counter: samples where the current PID's
+    /// voltage output is at or near `PIDOUT_UQ_UD_LIMITS`.
+    saturation_count: u16,
+    /// Configured PIDOUT voltage limit for saturation detection.
+    pidout_limit: u32,
+}
 
 // ---------------------------------------------------------------------------
 // Diagnostic sub-states
@@ -379,9 +462,12 @@ enum InnerPhase {
         data: ElectricalIdData,
     },
     /// Phase 6: Current-loop SIMC gain synthesis.
-    CurrentTune,
+    CurrentTune { model: ElectricalModel },
     /// Phase 7: Current-loop step-response validation.
-    CurrentValidate { attempt: u8 },
+    CurrentValidate {
+        state: CurrentValidateState,
+        data: CurrentValidateData,
+    },
     /// All inner phases completed successfully.
     Done(InnerResult),
     /// A phase failed.
@@ -473,8 +559,8 @@ impl CommissioningEngine {
         match &mut self.engine_mode {
             EngineMode::Inner {
                 ref mut phase,
-                profile: _,
-            } => Self::step_inner(phase, &mut self.buf, backend).await,
+                profile,
+            } => Self::step_inner(phase, &mut self.buf, *profile, backend).await,
             EngineMode::Outer {
                 ref mut phase,
                 profile: _,
@@ -500,6 +586,7 @@ impl CommissioningEngine {
     async fn step_inner<B: CommissioningBackend>(
         phase: &mut InnerPhase,
         buf: &mut TransientBuffer,
+        profile: CommissionProfile,
         backend: &mut B,
     ) -> StepResult {
         match phase {
@@ -517,13 +604,11 @@ impl CommissioningEngine {
             }
             InnerPhase::EncoderCheck { .. } => Self::step_encoder_check(phase, backend).await,
             InnerPhase::ElectricalId { .. } => Self::step_elec_id(phase, buf, backend).await,
-            InnerPhase::CurrentTune => {
-                // Placeholder — filled by current-tune plan.
-                StepResult::Continue
+            InnerPhase::CurrentTune { .. } => {
+                Self::step_current_tune(phase, profile, backend).await
             }
             InnerPhase::CurrentValidate { .. } => {
-                // Placeholder — filled by current-validation plan.
-                StepResult::Continue
+                Self::step_current_validate(phase, buf, profile, backend).await
             }
             InnerPhase::Done(result) => StepResult::InnerDone(result.clone()),
             InnerPhase::Failed(err) => StepResult::InnerFailed(*err),
@@ -1472,8 +1557,7 @@ impl CommissioningEngine {
                 }
 
                 // --- Assemble ElectricalModel ---
-                // Assembled model — consumed by Phase 6 (CurrentTune) plan.
-                let _model = ElectricalModel {
+                let model = ElectricalModel {
                     r_int,
                     l_int,
                     tau_e_us,
@@ -1483,12 +1567,378 @@ impl CommissioningEngine {
                     tau_e_crosscheck_us: tau_crosscheck_us,
                 };
 
-                // Transition to CurrentTune with the model.
-                // The model is consumed by Phase 6; for now we just store
-                // it by transitioning. Phase 6 will access it through
-                // the engine mode.
-                *phase = InnerPhase::CurrentTune;
+                // Transition to CurrentTune carrying the model.
+                *phase = InnerPhase::CurrentTune { model };
                 StepResult::PhaseChanged(PhaseId::CurrentTune)
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 6: Current-Loop SIMC Synthesis
+    // -------------------------------------------------------------------
+
+    /// Thin phase: read the electrical model, compute SIMC gains, and
+    /// transition immediately to validation.
+    async fn step_current_tune<B: CommissioningBackend>(
+        phase: &mut InnerPhase,
+        profile: CommissionProfile,
+        backend: &mut B,
+    ) -> StepResult {
+        let model = match phase {
+            InnerPhase::CurrentTune { model } => *model,
+            _ => return StepResult::Continue,
+        };
+
+        let config = backend.tmc_config();
+        let gains = foci_core::autotune::simc_current_gains(&model, profile, config);
+
+        // Compute step amplitude: 15% of run_current.
+        let current_limit = backend.current_limit() & 0xFFFF;
+        let step_amplitude = if current_limit > 0 {
+            (current_limit * VALIDATION_STEP_PERCENT / 100).max(1) as u16
+        } else {
+            // No current limit configured — cannot validate.
+            return Self::fail_inner(phase, CommissionError::CurrentValidationFailed);
+        };
+
+        *phase = InnerPhase::CurrentValidate {
+            state: CurrentValidateState::WriteGains,
+            data: CurrentValidateData {
+                model,
+                gains,
+                attempt: 0,
+                step_amplitude,
+                forward_metrics: None,
+                reverse_metrics: None,
+                final_status: CommissionStatus::Accepted,
+                saturation_count: 0,
+                pidout_limit: {
+                    // Read PIDOUT_UQ_UD_LIMITS for saturation detection.
+                    backend
+                        .read_register(tmc4671::registers::PIDOUT_UQ_UD_LIMITS)
+                        .await
+                        .unwrap_or(0)
+                        & 0xFFFF
+                },
+            },
+        };
+        StepResult::PhaseChanged(PhaseId::CurrentValidate)
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 7: Current-Loop Validation
+    // -------------------------------------------------------------------
+
+    /// Advance current-loop validation sub-state.
+    ///
+    /// Writes SIMC gains, runs bidirectional step-response captures,
+    /// classifies the response, retries once if marginal, and falls
+    /// back to conservative defaults on failure.
+    async fn step_current_validate<B: CommissioningBackend>(
+        phase: &mut InnerPhase,
+        buf: &mut TransientBuffer,
+        profile: CommissionProfile,
+        backend: &mut B,
+    ) -> StepResult {
+        use tmc4671::registers::*;
+
+        let (validate_state, data) = match phase {
+            InnerPhase::CurrentValidate { state, data } => (state, data),
+            _ => return StepResult::Continue,
+        };
+
+        match validate_state {
+            CurrentValidateState::WriteGains => {
+                // Write gains to TMC4671 PI registers.
+                // PID_FLUX_P_FLUX_I: P in [31:16], I in [15:0]
+                let flux_reg = ((data.gains.flux_p as u32) << 16) | data.gains.flux_i as u32;
+                let torque_reg = ((data.gains.torque_p as u32) << 16) | data.gains.torque_i as u32;
+
+                if backend
+                    .write_register(PID_FLUX_P_FLUX_I, flux_reg)
+                    .await
+                    .is_err()
+                    || backend
+                        .write_register(PID_TORQUE_P_TORQUE_I, torque_reg)
+                        .await
+                        .is_err()
+                {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+
+                // Clear any previous metrics for this attempt.
+                data.forward_metrics = None;
+                data.reverse_metrics = None;
+                data.saturation_count = 0;
+
+                *validate_state = CurrentValidateState::StepSetup {
+                    direction: CaptureDirection::Forward,
+                };
+                StepResult::Continue
+            }
+
+            CurrentValidateState::StepSetup { direction } => {
+                let dir = *direction;
+                // Switch to torque mode (MODE=1).
+                if backend
+                    .write_register(MODE_RAMP_MODE_MOTION, 1)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+                backend.set_enable_pin(true);
+
+                // Apply current step via PID_TORQUE_FLUX_TARGET.
+                // Torque target in [31:16], flux target in [15:0].
+                let torque_val = match dir {
+                    CaptureDirection::Forward => data.step_amplitude as u32,
+                    CaptureDirection::Reverse => (-(data.step_amplitude as i16) as u16) as u32,
+                };
+                let target = torque_val << 16;
+                if backend
+                    .write_register(PID_TORQUE_FLUX_TARGET, target)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+
+                // Reset buffer for this capture.
+                buf.reset(ELEC_SAMPLE_PERIOD_US as u16);
+
+                let next = backend.elapsed_us().wrapping_add(ELEC_SAMPLE_PERIOD_US);
+                *validate_state = CurrentValidateState::StepCapture {
+                    direction: dir,
+                    next_sample_us: next,
+                };
+                StepResult::Continue
+            }
+
+            CurrentValidateState::StepSettle {
+                direction,
+                deadline_us,
+            } => {
+                if backend.elapsed_us().wrapping_sub(*deadline_us) >= 0x8000_0000 {
+                    return StepResult::Continue;
+                }
+                // Settling done. Continue based on direction.
+                let dir = *direction;
+                match dir {
+                    CaptureDirection::Forward => {
+                        // Move to reverse capture.
+                        *validate_state = CurrentValidateState::StepSetup {
+                            direction: CaptureDirection::Reverse,
+                        };
+                    }
+                    CaptureDirection::Reverse => {
+                        // Both captures done. Classify.
+                        *validate_state = CurrentValidateState::Classify;
+                    }
+                }
+                StepResult::Continue
+            }
+
+            CurrentValidateState::StepCapture {
+                direction,
+                next_sample_us,
+            } => {
+                let dir = *direction;
+                // Capture samples at 160us intervals.
+                loop {
+                    if buf.is_full() || buf.len() >= DELAY_SAMPLE_COUNT {
+                        // Capture complete. Extract metrics.
+                        // Saturation is counted from the PID output (voltage),
+                        // not from measured current, so disable the helper's
+                        // sample-level saturation check.
+                        let target = data.step_amplitude as u32;
+                        let metrics = foci_core::autotune::extract_step_metrics(buf, target, 0);
+
+                        match dir {
+                            CaptureDirection::Forward => {
+                                data.forward_metrics = Some(metrics);
+                            }
+                            CaptureDirection::Reverse => {
+                                data.reverse_metrics = Some(metrics);
+                            }
+                        }
+
+                        // Return to zero target.
+                        let _ = backend.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+                        let deadline = backend.elapsed_us().wrapping_add(VALIDATION_SETTLE_US);
+                        *validate_state = CurrentValidateState::StepSettle {
+                            direction: dir,
+                            deadline_us: deadline,
+                        };
+                        return StepResult::Continue;
+                    }
+                    if backend.elapsed_us().wrapping_sub(*next_sample_us) >= 0x8000_0000 {
+                        break; // Not yet time, yield.
+                    }
+                    match backend.read_register(PID_TORQUE_FLUX_ACTUAL).await {
+                        Ok(actual) => {
+                            // PID_TORQUE_ACTUAL is in [31:16], PID_FLUX_ACTUAL in [15:0].
+                            // We stepped the torque axis, so read the upper half.
+                            let torque_actual = ((actual >> 16) & 0xFFFF) as i16;
+                            buf.push(torque_actual.unsigned_abs() as u32);
+                        }
+                        Err(_) => {
+                            return Self::fail_inner(phase, CommissionError::Spi);
+                        }
+                    }
+                    // Detect current-PID output saturation: read the limited
+                    // FOC voltage output (FOC_UQ_UD_LIMITED) and count when
+                    // it's near the PIDOUT_UQ_UD_LIMITS voltage ceiling.
+                    if data.pidout_limit > 0 {
+                        let sub = tmc4671::registers::INTERIM_FOC_UQ_UD_LIMITED;
+                        let _ = backend.write_register(sub.addr, sub.sub_addr as u32).await;
+                        if let Ok(foc_limited) = backend.read_register(sub.data).await {
+                            // FOC_UQ_UD_LIMITED packs UQ in [31:16], UD in [15:0].
+                            // Check the torque-axis voltage (UQ) since we stepped torque.
+                            let uq = ((foc_limited >> 16) & 0xFFFF) as i16;
+                            let abs_uq = uq.unsigned_abs() as u32;
+                            if abs_uq >= data.pidout_limit * 9 / 10 {
+                                data.saturation_count += 1;
+                            }
+                        }
+                    }
+                    *next_sample_us = next_sample_us.wrapping_add(ELEC_SAMPLE_PERIOD_US);
+                }
+                StepResult::Continue
+            }
+
+            CurrentValidateState::Classify => {
+                let forward = match data.forward_metrics {
+                    Some(m) => m,
+                    None => {
+                        return Self::fail_inner(phase, CommissionError::CurrentValidationFailed);
+                    }
+                };
+                let reverse = match data.reverse_metrics {
+                    Some(m) => m,
+                    None => {
+                        return Self::fail_inner(phase, CommissionError::CurrentValidationFailed);
+                    }
+                };
+
+                // Compute symmetry from forward and reverse rise times.
+                let symmetry = foci_core::autotune::compute_symmetry_pct(
+                    forward.rise_time_us,
+                    reverse.rise_time_us,
+                );
+
+                // Use the forward metrics with symmetry filled in for classification.
+                let combined = CurrentValidation {
+                    symmetry_pct: symmetry,
+                    // Use worst-case of forward and reverse for other metrics.
+                    overshoot_pct: forward.overshoot_pct.max(reverse.overshoot_pct),
+                    ringing_count: forward.ringing_count.max(reverse.ringing_count),
+                    settling_time_us: forward.settling_time_us.max(reverse.settling_time_us),
+                    // Use firmware-counted PID-output saturation, not the
+                    // helper's current-level saturation.
+                    saturation_samples: data.saturation_count,
+                    rise_time_us: forward.rise_time_us,
+                };
+
+                let total_samples = foci_core::autotune::TRANSIENT_LEN as u16 * 2;
+                let result = foci_core::autotune::classify_current_validation(
+                    &combined,
+                    data.model.tau_e_us,
+                    total_samples,
+                );
+
+                match result {
+                    ValidationResult::Pass => {
+                        // Gains accepted.
+                        data.final_status = if data.attempt > 0 {
+                            CommissionStatus::AcceptedWithWarnings
+                        } else {
+                            CommissionStatus::Accepted
+                        };
+                    }
+                    ValidationResult::Marginal if data.attempt == 0 => {
+                        // Retry: increase lambda by 50%, recompute gains.
+                        data.attempt = 1;
+                        let new_lambda = data.gains.lambda_us * RETRY_LAMBDA_MULTIPLIER_NUM
+                            / RETRY_LAMBDA_MULTIPLIER_DEN;
+
+                        // Adjust theta_e_us so the SIMC formula for the
+                        // original profile yields the desired larger lambda.
+                        //   Conservative: lambda = 4*theta → theta = lambda/4
+                        //   Balanced:     lambda = 2*theta → theta = lambda/2
+                        //   Stiff:        lambda = max(theta, tau/4) → theta = lambda
+                        let mut retry_model = data.model;
+                        retry_model.theta_e_us = match profile {
+                            CommissionProfile::Conservative => new_lambda / 4,
+                            CommissionProfile::Balanced => new_lambda / 2,
+                            CommissionProfile::Stiff => new_lambda,
+                        };
+
+                        let config = backend.tmc_config();
+                        let retry_gains =
+                            foci_core::autotune::simc_current_gains(&retry_model, profile, config);
+                        data.gains = retry_gains;
+                        *validate_state = CurrentValidateState::WriteGains;
+                        return StepResult::Continue;
+                    }
+                    ValidationResult::Marginal | ValidationResult::Fail => {
+                        // Fall back to conservative defaults.
+                        data.gains = CurrentGains {
+                            flux_p: foci_core::pid::DEFAULT_INNER_GAINS.flux_p,
+                            flux_i: foci_core::pid::DEFAULT_INNER_GAINS.flux_i,
+                            torque_p: foci_core::pid::DEFAULT_INNER_GAINS.torque_p,
+                            torque_i: foci_core::pid::DEFAULT_INNER_GAINS.torque_i,
+                            effective_bandwidth_hz: 0,
+                            lambda_us: 0,
+                        };
+                        data.final_status = CommissionStatus::AcceptedWithWarnings;
+
+                        // Write the default gains to TMC4671 so outer
+                        // commissioning uses the reported conservative gains.
+                        let flux_reg =
+                            ((data.gains.flux_p as u32) << 16) | data.gains.flux_i as u32;
+                        let torque_reg =
+                            ((data.gains.torque_p as u32) << 16) | data.gains.torque_i as u32;
+                        let _ = backend.write_register(PID_FLUX_P_FLUX_I, flux_reg).await;
+                        let _ = backend
+                            .write_register(PID_TORQUE_P_TORQUE_I, torque_reg)
+                            .await;
+                    }
+                }
+
+                // Restore safe state.
+                let _ = backend.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+                let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+                backend.set_enable_pin(false);
+
+                let deadline = backend.elapsed_us().wrapping_add(VALIDATION_SETTLE_US);
+                *validate_state = CurrentValidateState::SafeState {
+                    deadline_us: deadline,
+                };
+                StepResult::Continue
+            }
+
+            CurrentValidateState::SafeState { deadline_us } => {
+                if backend.elapsed_us().wrapping_sub(*deadline_us) >= 0x8000_0000 {
+                    return StepResult::Continue;
+                }
+                *validate_state = CurrentValidateState::Finalize;
+                StepResult::Continue
+            }
+
+            CurrentValidateState::Finalize => {
+                let result = InnerResult {
+                    status: data.final_status,
+                    r_mohm: data.model.r_mohm,
+                    l_uh: data.model.l_uh,
+                    flux_p: data.gains.flux_p,
+                    flux_i: data.gains.flux_i,
+                    torque_p: data.gains.torque_p,
+                    torque_i: data.gains.torque_i,
+                };
+                *phase = InnerPhase::Done(result.clone());
+                StepResult::InnerDone(result)
             }
         }
     }
