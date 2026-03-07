@@ -3646,10 +3646,15 @@ mod app {
                     .await;
                 let _ = tmc.write_sub_register(CONFIG_BIQUAD_V_ENABLE, 1).await;
                 defmt::info!("Velocity biquad: {}Hz enabled", filter_hz);
+            } else {
+                let _ = tmc.write_sub_register(CONFIG_BIQUAD_V_ENABLE, 0).await;
+                defmt::warn!("Velocity biquad: {}Hz out of range, disabled", filter_hz);
             }
+        } else {
+            let _ = tmc.write_sub_register(CONFIG_BIQUAD_V_ENABLE, 0).await;
         }
 
-        // 9. Write torque biquad filter if configured
+        // 9. Write torque biquad filter if configured, disable if not.
         let filter_hz = TORQUE_FILTER_HZ.load(core::sync::atomic::Ordering::Relaxed);
         if filter_hz > 0 {
             if let Some(coeffs) =
@@ -3672,10 +3677,15 @@ mod app {
                     .await;
                 let _ = tmc.write_sub_register(CONFIG_BIQUAD_T_ENABLE, 1).await;
                 defmt::info!("Torque biquad: {}Hz enabled", filter_hz);
+            } else {
+                let _ = tmc.write_sub_register(CONFIG_BIQUAD_T_ENABLE, 0).await;
+                defmt::warn!("Torque biquad: {}Hz out of range, disabled", filter_hz);
             }
+        } else {
+            let _ = tmc.write_sub_register(CONFIG_BIQUAD_T_ENABLE, 0).await;
         }
 
-        // 10. Write position target biquad filter if configured
+        // 10. Write position target biquad filter if configured, disable if not.
         let filter_hz = POSITION_FILTER_HZ.load(core::sync::atomic::Ordering::Relaxed);
         if filter_hz > 0 {
             if let Some(coeffs) =
@@ -3698,10 +3708,15 @@ mod app {
                     .await;
                 let _ = tmc.write_sub_register(CONFIG_BIQUAD_X_ENABLE, 1).await;
                 defmt::info!("Position biquad: {}Hz enabled", filter_hz);
+            } else {
+                let _ = tmc.write_sub_register(CONFIG_BIQUAD_X_ENABLE, 0).await;
+                defmt::warn!("Position biquad: {}Hz out of range, disabled", filter_hz);
             }
+        } else {
+            let _ = tmc.write_sub_register(CONFIG_BIQUAD_X_ENABLE, 0).await;
         }
 
-        // 11. Write flux biquad filter if configured
+        // 11. Write flux biquad filter if configured, disable if not.
         let filter_hz = FLUX_FILTER_HZ.load(core::sync::atomic::Ordering::Relaxed);
         if filter_hz > 0 {
             if let Some(coeffs) =
@@ -3724,7 +3739,12 @@ mod app {
                     .await;
                 let _ = tmc.write_sub_register(CONFIG_BIQUAD_F_ENABLE, 1).await;
                 defmt::info!("Flux biquad: {}Hz enabled", filter_hz);
+            } else {
+                let _ = tmc.write_sub_register(CONFIG_BIQUAD_F_ENABLE, 0).await;
+                defmt::warn!("Flux biquad: {}Hz out of range, disabled", filter_hz);
             }
+        } else {
+            let _ = tmc.write_sub_register(CONFIG_BIQUAD_F_ENABLE, 0).await;
         }
 
         // NOTE: PID_VELOCITY_OFFSET is NOT cleared here — writing to 0x67

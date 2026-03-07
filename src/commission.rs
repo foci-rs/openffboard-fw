@@ -542,6 +542,31 @@ const VEL_RETRY_LAMBDA_MUL_NUM: u32 = 3;
 const VEL_RETRY_LAMBDA_MUL_DEN: u32 = 2;
 
 // ---------------------------------------------------------------------------
+// Position-loop tuning constants (Phase 11)
+// ---------------------------------------------------------------------------
+
+/// Starting position P gain: 128 = 0.5 in Q8.8 (conservative).
+const POS_TUNE_INITIAL_P: u16 = 128;
+
+/// P gain increase per iteration: 150% = P * 3 / 2.
+const POS_TUNE_P_MUL_NUM: u32 = 3;
+const POS_TUNE_P_MUL_DEN: u32 = 2;
+
+/// Maximum position P gain: cap derived from velocity bandwidth.
+/// Capped at 16384 = 64.0 in Q8.8 as a hard upper limit.
+const POS_TUNE_MAX_P: u16 = 16384;
+
+/// Position I gain as fraction of P for Nominal/HighInertia modes.
+/// 5% of P = P * 5 / 100.
+const POS_TUNE_I_PERCENT: u32 = 5;
+
+/// Sampling interval for position capture (microseconds). 1 kHz.
+const POS_TUNE_SAMPLE_PERIOD_US: u32 = 1000;
+
+/// Settling time after position step (microseconds).
+const POS_TUNE_SETTLE_US: u32 = 200_000;
+
+// ---------------------------------------------------------------------------
 // Mechanical identification sub-states
 // ---------------------------------------------------------------------------
 
@@ -660,6 +685,48 @@ struct VelocityValidateData {
     torque_limit: u32,
 }
 
+// ---------------------------------------------------------------------------
+// Position-loop tuning sub-states (Phase 11)
+// ---------------------------------------------------------------------------
+
+/// Position-loop tuning sub-state machine (Phase 11).
+#[derive(Debug, defmt::Format)]
+enum PositionTuneState {
+    /// Switch to position mode and write initial P gain.
+    Setup,
+    /// Command a position step and capture response.
+    StepCapture { next_sample_us: u32 },
+    /// Wait for settling after capture.
+    Settle { deadline_us: u32 },
+    /// Analyze capture: oscillation check and decide to increase P or stop.
+    Analyze,
+    /// Restore safe state and finalize.
+    Finalize,
+}
+
+/// Accumulated data for position-loop tuning.
+#[derive(Debug, defmt::Format)]
+struct PositionTuneData {
+    /// Current candidate P gain.
+    current_p: u16,
+    /// Last known stable P gain (no oscillation).
+    stable_p: u16,
+    /// Position step target (encoder counts) — one step_width.
+    step_target: u32,
+    /// Starting position for step.
+    step_start: i32,
+    /// Whether oscillation was detected early (at the first P value).
+    oscillation_at_minimum: bool,
+    /// Accepted velocity gains from Phase 10.
+    velocity_gains: VelocityGains,
+    /// Whether zero-speed chatter was detected during velocity validation.
+    velocity_chatter: bool,
+    /// Whether current ringing was detected (from inner validation).
+    current_ringing: bool,
+    /// Current-loop effective bandwidth Hz (for filter recommendation).
+    current_bandwidth_hz: u32,
+}
+
 /// Outer safety limits, computed once at the start of outer commissioning.
 #[derive(Debug, Clone, Copy, defmt::Format)]
 struct OuterSafetyLimits {
@@ -711,11 +778,33 @@ enum OuterPhase {
         safety: OuterSafetyLimits,
     },
     /// Phase 11: Position-loop P ramp-up.
-    PositionTune { safety: OuterSafetyLimits },
+    PositionTune {
+        state: PositionTuneState,
+        data: PositionTuneData,
+        safety: OuterSafetyLimits,
+    },
     /// Phase 12: Filter selection.
-    FilterTune { safety: OuterSafetyLimits },
+    FilterTune {
+        /// Accepted velocity gains.
+        velocity_gains: VelocityGains,
+        /// Accepted position gains.
+        position_gains: foci_core::autotune::PositionGains,
+        /// Whether position oscillation was detected early (at minimum P).
+        position_oscillation_early: bool,
+        /// Whether velocity chatter was detected.
+        velocity_chatter: bool,
+        /// Whether current ringing was detected.
+        current_ringing: bool,
+        /// Current-loop bandwidth Hz.
+        current_bandwidth_hz: u32,
+        safety: OuterSafetyLimits,
+    },
     /// Phase 13: Assemble and transmit results.
-    Commit,
+    Commit {
+        velocity_gains: VelocityGains,
+        position_gains: foci_core::autotune::PositionGains,
+        filter_config: foci_core::autotune::FilterConfig,
+    },
     /// All outer phases completed.
     Done(OuterResult),
     /// A phase failed.
@@ -2289,12 +2378,11 @@ impl CommissioningEngine {
                 )
                 .await
             }
-            OuterPhase::PositionTune { .. }
-            | OuterPhase::FilterTune { .. }
-            | OuterPhase::Commit => {
-                // Placeholder for later phases.
-                StepResult::Continue
+            OuterPhase::PositionTune { .. } => {
+                Self::step_position_tune(phase, buf, mode, backend).await
             }
+            OuterPhase::FilterTune { .. } => Self::step_filter_tune(phase, backend).await,
+            OuterPhase::Commit { .. } => Self::step_commit(phase),
             OuterPhase::Done(result) => StepResult::OuterDone(result.clone()),
             OuterPhase::Failed(err) => StepResult::OuterFailed(*err),
         }
@@ -2311,7 +2399,7 @@ impl CommissioningEngine {
             | OuterPhase::VelocityValidate { safety, .. }
             | OuterPhase::PositionTune { safety, .. }
             | OuterPhase::FilterTune { safety, .. } => Some(safety),
-            OuterPhase::Commit | OuterPhase::Done(_) | OuterPhase::Failed(_) => None,
+            OuterPhase::Commit { .. } | OuterPhase::Done(_) | OuterPhase::Failed(_) => None,
         }
     }
 
@@ -3328,22 +3416,482 @@ impl CommissioningEngine {
                 let _ = backend.write_register(PID_VELOCITY_TARGET, 0).await;
                 let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
 
-                // Carry velocity gains and safety forward to PositionTune.
                 let carried_safety = *safety;
-                let _accepted_gains = data.gains;
+                let accepted_gains = data.gains;
+                let velocity_chatter = data.max_chatter > VEL_VALIDATE_CHATTER_THRESHOLD;
 
                 defmt::info!(
                     "vel validate: accepted P={}, I={}, limit={}",
-                    data.gains.velocity_p,
-                    data.gains.velocity_i,
-                    data.gains.velocity_limit
+                    accepted_gains.velocity_p,
+                    accepted_gains.velocity_i,
+                    accepted_gains.velocity_limit
                 );
 
+                // Use the configured step_width as the position step size.
+                // Falls back to 256 counts if the encoder is not configured.
+                let step_target: u32 = {
+                    let sw = backend.step_width();
+                    if sw > 0 {
+                        sw
+                    } else {
+                        256
+                    }
+                };
+
+                let pos_data = PositionTuneData {
+                    current_p: POS_TUNE_INITIAL_P,
+                    stable_p: 0,
+                    step_target,
+                    step_start: 0,
+                    oscillation_at_minimum: false,
+                    velocity_gains: accepted_gains,
+                    velocity_chatter,
+                    current_ringing,
+                    current_bandwidth_hz,
+                };
+
                 *phase = OuterPhase::PositionTune {
+                    state: PositionTuneState::Setup,
+                    data: pos_data,
                     safety: carried_safety,
                 };
                 StepResult::PhaseChanged(PhaseId::PositionTune)
             }
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 11: Position-Loop P Ramp-Up
+    // -------------------------------------------------------------------
+
+    /// Advance position-tune sub-state machine.
+    ///
+    /// Ramps position P from conservative starting value until oscillation
+    /// is detected or a cap is reached. Final P = last non-oscillating value.
+    async fn step_position_tune<B: CommissioningBackend>(
+        phase: &mut OuterPhase,
+        buf: &mut TransientBuffer,
+        mode: OperatingMode,
+        backend: &mut B,
+    ) -> StepResult {
+        use tmc4671::registers::*;
+
+        let (state, data, safety) = match phase {
+            OuterPhase::PositionTune {
+                state,
+                data,
+                safety,
+            } => (state, data, safety),
+            _ => return StepResult::Continue,
+        };
+
+        match state {
+            PositionTuneState::Setup => {
+                // Switch to position mode (MODE=3).
+                if backend
+                    .write_register(MODE_RAMP_MODE_MOTION, 3)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_outer(phase, CommissionError::Spi);
+                }
+
+                // Write initial position P gain, I=0.
+                let pos_reg = (data.current_p as u32) << 16;
+                if backend
+                    .write_register(PID_POSITION_P_POSITION_I, pos_reg)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_outer(phase, CommissionError::Spi);
+                }
+
+                // Record current position as step start.
+                let encoder_raw = backend.read_encoder_count().await;
+                data.step_start = encoder_raw as i32;
+
+                // Command a position step.
+                let target = (encoder_raw as i32).wrapping_add(data.step_target as i32);
+                if backend
+                    .write_register(PID_POSITION_TARGET, target as u32)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_outer(phase, CommissionError::Spi);
+                }
+
+                // Prepare capture buffer.
+                buf.reset(POS_TUNE_SAMPLE_PERIOD_US as u16);
+
+                let next_sample_us = backend.elapsed_us().wrapping_add(POS_TUNE_SAMPLE_PERIOD_US);
+                *state = PositionTuneState::StepCapture { next_sample_us };
+                StepResult::Continue
+            }
+
+            PositionTuneState::StepCapture { next_sample_us } => {
+                let now = backend.elapsed_us();
+                if now.wrapping_sub(*next_sample_us) >= 0x8000_0000 {
+                    return StepResult::Continue;
+                }
+
+                let encoder_raw = backend.read_encoder_count().await;
+                // Store position relative to step start so the oscillation
+                // detector compares against the step amplitude, not absolute
+                // encoder counts.
+                let relative = (encoder_raw as i32)
+                    .wrapping_sub(data.step_start)
+                    .unsigned_abs();
+                buf.push(relative);
+
+                if buf.is_full() {
+                    // Return to start position.
+                    let _ = backend
+                        .write_register(PID_POSITION_TARGET, data.step_start as u32)
+                        .await;
+
+                    let deadline = backend.elapsed_us().wrapping_add(POS_TUNE_SETTLE_US);
+                    *state = PositionTuneState::Settle {
+                        deadline_us: deadline,
+                    };
+                } else {
+                    *next_sample_us = now.wrapping_add(POS_TUNE_SAMPLE_PERIOD_US);
+                }
+                StepResult::Continue
+            }
+
+            PositionTuneState::Settle { deadline_us } => {
+                if backend.elapsed_us().wrapping_sub(*deadline_us) < 0x8000_0000 {
+                    *state = PositionTuneState::Analyze;
+                }
+                StepResult::Continue
+            }
+
+            PositionTuneState::Analyze => {
+                // Check for oscillation in the captured response.
+                let target_abs = data.step_target;
+                let oscillation = foci_core::autotune::detect_position_oscillation(buf, target_abs);
+
+                defmt::info!(
+                    "pos tune: P={}, oscillation={}",
+                    data.current_p,
+                    oscillation
+                );
+
+                if oscillation {
+                    if data.stable_p == 0 {
+                        // Minimum P already oscillates — position tune failed.
+                        data.oscillation_at_minimum = true;
+                        defmt::warn!("pos tune: minimum P={} oscillates", data.current_p);
+                    }
+                    // Stop ramp-up. Use last stable P (or fail if none).
+                    *state = PositionTuneState::Finalize;
+                } else {
+                    // Clean response — record this as stable and increase P.
+                    data.stable_p = data.current_p;
+
+                    let new_p =
+                        (data.current_p as u32 * POS_TUNE_P_MUL_NUM / POS_TUNE_P_MUL_DEN) as u16;
+                    if new_p >= POS_TUNE_MAX_P || new_p <= data.current_p {
+                        // Hit cap — finalize with current stable P.
+                        defmt::info!("pos tune: P cap reached at {}", data.stable_p);
+                        *state = PositionTuneState::Finalize;
+                    } else {
+                        // Try higher P.
+                        data.current_p = new_p;
+
+                        // Write new P to registers.
+                        let pos_reg = (data.current_p as u32) << 16;
+                        let _ = backend
+                            .write_register(PID_POSITION_P_POSITION_I, pos_reg)
+                            .await;
+
+                        // Record new step start and command step.
+                        let encoder_raw = backend.read_encoder_count().await;
+                        data.step_start = encoder_raw as i32;
+                        let target = (encoder_raw as i32).wrapping_add(data.step_target as i32);
+                        let _ = backend
+                            .write_register(PID_POSITION_TARGET, target as u32)
+                            .await;
+
+                        buf.reset(POS_TUNE_SAMPLE_PERIOD_US as u16);
+                        let next_sample_us =
+                            backend.elapsed_us().wrapping_add(POS_TUNE_SAMPLE_PERIOD_US);
+                        *state = PositionTuneState::StepCapture { next_sample_us };
+                    }
+                }
+                StepResult::Continue
+            }
+
+            PositionTuneState::Finalize => {
+                // Ensure motor is stopped.
+                let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+
+                if data.oscillation_at_minimum {
+                    // Position tune failed — keep velocity gains.
+                    return Self::fail_outer(phase, CommissionError::PositionTuneFailed);
+                }
+
+                let final_p = data.stable_p;
+
+                // Add small position I for Nominal/HighInertia modes.
+                let final_i = match mode {
+                    OperatingMode::Nominal | OperatingMode::HighInertia => {
+                        (final_p as u32 * POS_TUNE_I_PERCENT / 100).max(1) as u16
+                    }
+                    OperatingMode::Unloaded => 0,
+                };
+
+                defmt::info!("pos tune: final P={}, I={}", final_p, final_i);
+
+                let carried_safety = *safety;
+                let position_gains = foci_core::autotune::PositionGains {
+                    position_p: final_p,
+                    position_i: final_i,
+                };
+                let velocity_gains = data.velocity_gains;
+                let velocity_chatter = data.velocity_chatter;
+                let current_ringing = data.current_ringing;
+                let current_bandwidth_hz = data.current_bandwidth_hz;
+                // Position oscillation is "early" if the first stable P was
+                // reached only at the minimum value (suggesting the system
+                // is marginal for position control).
+                let position_oscillation_early =
+                    final_p == POS_TUNE_INITIAL_P && data.current_p > POS_TUNE_INITIAL_P;
+
+                *phase = OuterPhase::FilterTune {
+                    velocity_gains,
+                    position_gains,
+                    position_oscillation_early,
+                    velocity_chatter,
+                    current_ringing,
+                    current_bandwidth_hz,
+                    safety: carried_safety,
+                };
+                StepResult::PhaseChanged(PhaseId::FilterTune)
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 12: Filter Selection
+    // -------------------------------------------------------------------
+
+    /// Implement filter selection from prior validation metrics.
+    ///
+    /// Calls the pure recommendation helper, computes biquad coefficients,
+    /// and writes them to the TMC4671 sub-registers.
+    async fn step_filter_tune<B: CommissioningBackend>(
+        phase: &mut OuterPhase,
+        backend: &mut B,
+    ) -> StepResult {
+        let (
+            velocity_gains,
+            position_gains,
+            position_oscillation_early,
+            velocity_chatter,
+            current_ringing,
+            current_bandwidth_hz,
+        ) = match phase {
+            OuterPhase::FilterTune {
+                velocity_gains,
+                position_gains,
+                position_oscillation_early,
+                velocity_chatter,
+                current_ringing,
+                current_bandwidth_hz,
+                ..
+            } => (
+                *velocity_gains,
+                *position_gains,
+                *position_oscillation_early,
+                *velocity_chatter,
+                *current_ringing,
+                *current_bandwidth_hz,
+            ),
+            _ => return StepResult::Continue,
+        };
+
+        // Estimate position bandwidth as velocity_bw / 4.
+        let position_bandwidth_hz = velocity_gains.effective_bandwidth_hz / 4;
+
+        let filter_config = foci_core::autotune::recommend_filters(
+            velocity_chatter,
+            velocity_gains.effective_bandwidth_hz,
+            position_oscillation_early,
+            position_bandwidth_hz,
+            current_ringing,
+            current_bandwidth_hz,
+        );
+
+        let pwm_maxcnt = backend.pwm_maxcnt();
+
+        // Enable or explicitly disable each filter to avoid stale biquad
+        // state leaking from prior commissioning runs or host configuration.
+        if let Some(cutoff_hz) = filter_config.velocity_filter_hz {
+            Self::write_biquad_velocity(backend, cutoff_hz as u16, pwm_maxcnt).await;
+        } else {
+            Self::write_sub_register(backend, tmc4671::registers::CONFIG_BIQUAD_V_ENABLE, 0).await;
+        }
+
+        if let Some(cutoff_hz) = filter_config.position_filter_hz {
+            Self::write_biquad_position(backend, cutoff_hz as u16, pwm_maxcnt).await;
+        } else {
+            Self::write_sub_register(backend, tmc4671::registers::CONFIG_BIQUAD_X_ENABLE, 0).await;
+        }
+
+        if let Some(cutoff_hz) = filter_config.flux_filter_hz {
+            Self::write_biquad_flux(backend, cutoff_hz as u16, pwm_maxcnt).await;
+        } else {
+            Self::write_sub_register(backend, tmc4671::registers::CONFIG_BIQUAD_F_ENABLE, 0).await;
+        }
+
+        if let Some(cutoff_hz) = filter_config.torque_filter_hz {
+            Self::write_biquad_torque(backend, cutoff_hz as u16, pwm_maxcnt).await;
+        } else {
+            Self::write_sub_register(backend, tmc4671::registers::CONFIG_BIQUAD_T_ENABLE, 0).await;
+        }
+
+        defmt::info!(
+            "filter tune: vel={}, pos={}, flux={}, torque={}",
+            filter_config.velocity_filter_hz.unwrap_or(0),
+            filter_config.position_filter_hz.unwrap_or(0),
+            filter_config.flux_filter_hz.unwrap_or(0),
+            filter_config.torque_filter_hz.unwrap_or(0)
+        );
+
+        *phase = OuterPhase::Commit {
+            velocity_gains,
+            position_gains,
+            filter_config,
+        };
+        StepResult::PhaseChanged(PhaseId::Commit)
+    }
+
+    // -------------------------------------------------------------------
+    // Biquad filter write helpers
+    // -------------------------------------------------------------------
+
+    /// Write a sub-register via the backend's regular register writes.
+    ///
+    /// TMC4671 sub-registers use address register 0x4D and data register 0x4E.
+    async fn write_sub_register<B: CommissioningBackend>(
+        backend: &mut B,
+        sub: tmc4671::registers::SubRegister,
+        value: u32,
+    ) {
+        let _ = backend.write_register(sub.addr, sub.sub_addr as u32).await;
+        let _ = backend.write_register(sub.data, value).await;
+    }
+
+    /// Write velocity biquad filter coefficients.
+    async fn write_biquad_velocity<B: CommissioningBackend>(
+        backend: &mut B,
+        cutoff_hz: u16,
+        pwm_maxcnt: u16,
+    ) {
+        use tmc4671::registers::*;
+        if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(cutoff_hz, pwm_maxcnt) {
+            Self::write_sub_register(backend, CONFIG_BIQUAD_V_A_1, coeffs.a_1 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_V_A_2, coeffs.a_2 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_V_B_0, coeffs.b_0 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_V_B_1, coeffs.b_1 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_V_B_2, coeffs.b_2 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_V_ENABLE, 1).await;
+            defmt::info!("biquad velocity: {}Hz enabled", cutoff_hz);
+        }
+    }
+
+    /// Write position biquad filter coefficients.
+    async fn write_biquad_position<B: CommissioningBackend>(
+        backend: &mut B,
+        cutoff_hz: u16,
+        pwm_maxcnt: u16,
+    ) {
+        use tmc4671::registers::*;
+        if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(cutoff_hz, pwm_maxcnt) {
+            Self::write_sub_register(backend, CONFIG_BIQUAD_X_A_1, coeffs.a_1 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_X_A_2, coeffs.a_2 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_X_B_0, coeffs.b_0 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_X_B_1, coeffs.b_1 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_X_B_2, coeffs.b_2 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_X_ENABLE, 1).await;
+            defmt::info!("biquad position: {}Hz enabled", cutoff_hz);
+        }
+    }
+
+    /// Write flux biquad filter coefficients.
+    async fn write_biquad_flux<B: CommissioningBackend>(
+        backend: &mut B,
+        cutoff_hz: u16,
+        pwm_maxcnt: u16,
+    ) {
+        use tmc4671::registers::*;
+        if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(cutoff_hz, pwm_maxcnt) {
+            Self::write_sub_register(backend, CONFIG_BIQUAD_F_A_1, coeffs.a_1 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_F_A_2, coeffs.a_2 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_F_B_0, coeffs.b_0 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_F_B_1, coeffs.b_1 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_F_B_2, coeffs.b_2 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_F_ENABLE, 1).await;
+            defmt::info!("biquad flux: {}Hz enabled", cutoff_hz);
+        }
+    }
+
+    /// Write torque biquad filter coefficients.
+    async fn write_biquad_torque<B: CommissioningBackend>(
+        backend: &mut B,
+        cutoff_hz: u16,
+        pwm_maxcnt: u16,
+    ) {
+        use tmc4671::registers::*;
+        if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(cutoff_hz, pwm_maxcnt) {
+            Self::write_sub_register(backend, CONFIG_BIQUAD_T_A_1, coeffs.a_1 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_T_A_2, coeffs.a_2 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_T_B_0, coeffs.b_0 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_T_B_1, coeffs.b_1 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_T_B_2, coeffs.b_2 as u32).await;
+            Self::write_sub_register(backend, CONFIG_BIQUAD_T_ENABLE, 1).await;
+            defmt::info!("biquad torque: {}Hz enabled", cutoff_hz);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 13: Commit
+    // -------------------------------------------------------------------
+
+    /// Assemble and emit the final outer commissioning result.
+    fn step_commit(phase: &mut OuterPhase) -> StepResult {
+        let (velocity_gains, position_gains, filter_config) = match phase {
+            OuterPhase::Commit {
+                velocity_gains,
+                position_gains,
+                filter_config,
+            } => (*velocity_gains, *position_gains, *filter_config),
+            _ => return StepResult::Continue,
+        };
+
+        let result = OuterResult {
+            status: CommissionStatus::Accepted,
+            velocity_p: velocity_gains.velocity_p,
+            velocity_i: velocity_gains.velocity_i,
+            velocity_limit: velocity_gains.velocity_limit,
+            position_p: position_gains.position_p,
+            position_i: position_gains.position_i,
+            velocity_filter_hz: filter_config.velocity_filter_hz.unwrap_or(0) as u16,
+            position_filter_hz: filter_config.position_filter_hz.unwrap_or(0) as u16,
+            flux_filter_hz: filter_config.flux_filter_hz.unwrap_or(0) as u16,
+            torque_filter_hz: filter_config.torque_filter_hz.unwrap_or(0) as u16,
+        };
+
+        defmt::info!(
+            "outer commit: vel_p={}, vel_i={}, pos_p={}, pos_i={}",
+            result.velocity_p,
+            result.velocity_i,
+            result.position_p,
+            result.position_i
+        );
+
+        *phase = OuterPhase::Done(result.clone());
+        StepResult::OuterDone(result)
     }
 }
