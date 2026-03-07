@@ -210,6 +210,22 @@ mod app {
         fn current_limit(&self) -> u32 {
             CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed)
         }
+
+        fn pwm_maxcnt(&self) -> u16 {
+            TMC_CONFIG.pwm_maxcnt
+        }
+
+        fn bbm_register(&self) -> u32 {
+            TMC_CONFIG.bbm_register()
+        }
+
+        fn dsadc_mdec_register(&self) -> u32 {
+            TMC_CONFIG.dsadc_mdec_register()
+        }
+
+        fn excitation_voltage(&self) -> u16 {
+            TMC_CONFIG.excitation_voltage
+        }
     }
 
     /// USB wake signal. The OTG_FS ISR signals this to wake usb_task.
