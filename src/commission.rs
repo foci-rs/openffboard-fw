@@ -117,6 +117,14 @@ pub struct InnerResult {
     pub torque_p: u16,
     /// Computed torque I gain (Q8.8).
     pub torque_i: u16,
+    /// Inner-loop closed-loop lambda in microseconds.
+    pub lambda_us: u32,
+    /// Electrical transport delay in microseconds.
+    pub theta_e_us: u32,
+    /// Max ringing count from forward/reverse current validation.
+    pub ringing_count: u8,
+    /// Effective current-loop bandwidth in Hz.
+    pub bandwidth_hz: u32,
 }
 
 /// Result of outer (mechanical) commissioning.
@@ -142,6 +150,10 @@ pub struct OuterResult {
     pub flux_filter_hz: u16,
     /// Torque filter cutoff Hz (0 = disabled).
     pub torque_filter_hz: u16,
+    /// Identified effective inertia from mechanical ID (internal units).
+    pub j_eff: u32,
+    /// Identified effective damping from mechanical ID (internal units).
+    pub b_eff: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -725,6 +737,10 @@ struct PositionTuneData {
     current_ringing: bool,
     /// Current-loop effective bandwidth Hz (for filter recommendation).
     current_bandwidth_hz: u32,
+    /// Identified effective inertia from mechanical ID (internal units).
+    j_eff: u32,
+    /// Identified effective damping from mechanical ID (internal units).
+    b_eff: u32,
 }
 
 /// Outer safety limits, computed once at the start of outer commissioning.
@@ -797,6 +813,10 @@ enum OuterPhase {
         current_ringing: bool,
         /// Current-loop bandwidth Hz.
         current_bandwidth_hz: u32,
+        /// Identified effective inertia from mechanical ID (internal units).
+        j_eff: u32,
+        /// Identified effective damping from mechanical ID (internal units).
+        b_eff: u32,
         safety: OuterSafetyLimits,
     },
     /// Phase 13: Assemble and transmit results.
@@ -804,6 +824,10 @@ enum OuterPhase {
         velocity_gains: VelocityGains,
         position_gains: foci_core::autotune::PositionGains,
         filter_config: foci_core::autotune::FilterConfig,
+        /// Identified effective inertia from mechanical ID (internal units).
+        j_eff: u32,
+        /// Identified effective damping from mechanical ID (internal units).
+        b_eff: u32,
     },
     /// All outer phases completed.
     Done(OuterResult),
@@ -2298,6 +2322,14 @@ impl CommissioningEngine {
             }
 
             CurrentValidateState::Finalize => {
+                // Compute max ringing count from forward/reverse metrics.
+                let ringing_count = match (data.forward_metrics, data.reverse_metrics) {
+                    (Some(fwd), Some(rev)) => fwd.ringing_count.max(rev.ringing_count),
+                    (Some(fwd), None) => fwd.ringing_count,
+                    (None, Some(rev)) => rev.ringing_count,
+                    (None, None) => 0,
+                };
+
                 let result = InnerResult {
                     status: data.final_status,
                     r_mohm: data.model.r_mohm,
@@ -2306,6 +2338,10 @@ impl CommissioningEngine {
                     flux_i: data.gains.flux_i,
                     torque_p: data.gains.torque_p,
                     torque_i: data.gains.torque_i,
+                    lambda_us: data.gains.lambda_us,
+                    theta_e_us: data.model.theta_e_us,
+                    ringing_count,
+                    bandwidth_hz: data.gains.effective_bandwidth_hz,
                 };
                 *phase = InnerPhase::Done(result.clone());
                 StepResult::InnerDone(result)
@@ -3438,6 +3474,9 @@ impl CommissioningEngine {
                     }
                 };
 
+                let j_eff = data.model.j_eff;
+                let b_eff = data.model.b_eff;
+
                 let pos_data = PositionTuneData {
                     current_p: POS_TUNE_INITIAL_P,
                     stable_p: 0,
@@ -3448,6 +3487,8 @@ impl CommissioningEngine {
                     velocity_chatter,
                     current_ringing,
                     current_bandwidth_hz,
+                    j_eff,
+                    b_eff,
                 };
 
                 *phase = OuterPhase::PositionTune {
@@ -3652,6 +3693,8 @@ impl CommissioningEngine {
                 let velocity_chatter = data.velocity_chatter;
                 let current_ringing = data.current_ringing;
                 let current_bandwidth_hz = data.current_bandwidth_hz;
+                let j_eff = data.j_eff;
+                let b_eff = data.b_eff;
                 // Position oscillation is "early" if the first stable P was
                 // reached only at the minimum value (suggesting the system
                 // is marginal for position control).
@@ -3665,6 +3708,8 @@ impl CommissioningEngine {
                     velocity_chatter,
                     current_ringing,
                     current_bandwidth_hz,
+                    j_eff,
+                    b_eff,
                     safety: carried_safety,
                 };
                 StepResult::PhaseChanged(PhaseId::FilterTune)
@@ -3691,6 +3736,8 @@ impl CommissioningEngine {
             velocity_chatter,
             current_ringing,
             current_bandwidth_hz,
+            j_eff,
+            b_eff,
         ) = match phase {
             OuterPhase::FilterTune {
                 velocity_gains,
@@ -3699,6 +3746,8 @@ impl CommissioningEngine {
                 velocity_chatter,
                 current_ringing,
                 current_bandwidth_hz,
+                j_eff,
+                b_eff,
                 ..
             } => (
                 *velocity_gains,
@@ -3707,6 +3756,8 @@ impl CommissioningEngine {
                 *velocity_chatter,
                 *current_ringing,
                 *current_bandwidth_hz,
+                *j_eff,
+                *b_eff,
             ),
             _ => return StepResult::Continue,
         };
@@ -3763,6 +3814,8 @@ impl CommissioningEngine {
             velocity_gains,
             position_gains,
             filter_config,
+            j_eff,
+            b_eff,
         };
         StepResult::PhaseChanged(PhaseId::Commit)
     }
@@ -3861,12 +3914,20 @@ impl CommissioningEngine {
 
     /// Assemble and emit the final outer commissioning result.
     fn step_commit(phase: &mut OuterPhase) -> StepResult {
-        let (velocity_gains, position_gains, filter_config) = match phase {
+        let (velocity_gains, position_gains, filter_config, j_eff, b_eff) = match phase {
             OuterPhase::Commit {
                 velocity_gains,
                 position_gains,
                 filter_config,
-            } => (*velocity_gains, *position_gains, *filter_config),
+                j_eff,
+                b_eff,
+            } => (
+                *velocity_gains,
+                *position_gains,
+                *filter_config,
+                *j_eff,
+                *b_eff,
+            ),
             _ => return StepResult::Continue,
         };
 
@@ -3881,6 +3942,8 @@ impl CommissioningEngine {
             position_filter_hz: filter_config.position_filter_hz.unwrap_or(0) as u16,
             flux_filter_hz: filter_config.flux_filter_hz.unwrap_or(0) as u16,
             torque_filter_hz: filter_config.torque_filter_hz.unwrap_or(0) as u16,
+            j_eff,
+            b_eff,
         };
 
         defmt::info!(

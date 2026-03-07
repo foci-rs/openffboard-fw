@@ -2167,7 +2167,11 @@ mod app {
                             flux_p: u16 = inner.flux_p,
                             flux_i: u16 = inner.flux_i,
                             torque_p: u16 = inner.torque_p,
-                            torque_i: u16 = inner.torque_i
+                            torque_i: u16 = inner.torque_i,
+                            lambda_us: u32 = inner.lambda_us,
+                            theta_e_us: u32 = inner.theta_e_us,
+                            ringing_count: u8 = inner.ringing_count,
+                            bandwidth_hz: u32 = inner.bandwidth_hz
                         );
                     }
                     crate::commission::StepResult::InnerFailed(error) => {
@@ -2225,7 +2229,9 @@ mod app {
                             velocity_filter_hz: u16 = outer.velocity_filter_hz,
                             position_filter_hz: u16 = outer.position_filter_hz,
                             flux_filter_hz: u16 = outer.flux_filter_hz,
-                            torque_filter_hz: u16 = outer.torque_filter_hz
+                            torque_filter_hz: u16 = outer.torque_filter_hz,
+                            j_eff: u32 = outer.j_eff,
+                            b_eff: u32 = outer.b_eff
                         );
                     }
                     crate::commission::StepResult::OuterFailed(error) => {
