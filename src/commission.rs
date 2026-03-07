@@ -10,7 +10,7 @@
 
 use foci_core::autotune::{
     CommissionError, CommissionProfile, CommissionStatus, CurrentGains, CurrentValidation,
-    ElectricalModel, OperatingMode, PhaseId, TransientBuffer, ValidationResult,
+    ElectricalModel, MechanicalModel, OperatingMode, PhaseId, TransientBuffer, ValidationResult,
 };
 use foci_core::config::TmcConfig;
 use tmc4671::registers::Register;
@@ -474,16 +474,162 @@ enum InnerPhase {
     Failed(CommissionError),
 }
 
+// ---------------------------------------------------------------------------
+// Outer safety-envelope constants
+// ---------------------------------------------------------------------------
+
+/// Default velocity cap in encoder counts per millisecond.
+/// 2 rev/s at 4096 counts/rev = 8192 counts/s = ~8 counts/ms.
+const VELOCITY_CAP_COUNTS_PER_MS: i32 = 8;
+
+/// Default position window: +/- encoder counts from start position.
+/// 2 revolutions at 4096 counts/rev = 8192 counts.
+const POSITION_WINDOW_COUNTS: i32 = 8192;
+
+// ---------------------------------------------------------------------------
+// Mechanical identification constants (Phase 8)
+// ---------------------------------------------------------------------------
+
+/// Torque step as a fraction of run_current (25% = 25/100).
+/// Spec says 20-30%; 25% is a safe midpoint.
+const MECH_ID_TORQUE_STEP_PERCENT: u32 = 25;
+
+/// Sampling interval for encoder capture (microseconds).
+/// 1 kHz = 1000us between samples.
+const MECH_ID_SAMPLE_PERIOD_US: u32 = 1000;
+
+/// Settling time after removing torque (microseconds).
+/// Allow the motor to decelerate and stop before reverse capture.
+const MECH_ID_SETTLE_US: u32 = 500_000;
+
+/// Forward/reverse agreement threshold (30% = 30/100).
+/// If |J_fwd - J_rev| / avg > 30%, mechanical ID fails.
+const MECH_ID_SYMMETRY_THRESHOLD_PCT: u32 = 30;
+
+/// Minimum number of acceleration samples used for inertia estimate.
+/// First few samples before friction/damping dominates.
+const MECH_ID_ACCEL_SAMPLES: usize = 8;
+
+/// Minimum velocity delta to consider the motor has started moving.
+/// In encoder counts per sample period.
+const MECH_ID_VELOCITY_ONSET_THRESHOLD: i32 = 2;
+
+// ---------------------------------------------------------------------------
+// Mechanical identification sub-states
+// ---------------------------------------------------------------------------
+
+/// Mechanical identification sub-state machine (Phase 8).
+#[derive(Debug, defmt::Format)]
+enum MechanicalIdState {
+    /// Record starting position, configure torque mode.
+    Setup,
+    /// Apply torque step and begin forward capture.
+    ForwardStart,
+    /// Sample encoder position into transient buffer at 1 kHz.
+    ForwardCapture { next_sample_us: u32 },
+    /// Return to zero torque and wait for settling.
+    ForwardSettle { deadline_us: u32 },
+    /// Apply reverse torque step and begin reverse capture.
+    ReverseStart,
+    /// Sample encoder position for reverse direction.
+    ReverseCapture { next_sample_us: u32 },
+    /// Return to zero torque and wait for settling.
+    ReverseSettle { deadline_us: u32 },
+    /// Estimate mechanical parameters from captured data.
+    Estimate,
+    /// Validate gates and finalize.
+    Finalize,
+}
+
+/// Accumulated data for mechanical identification.
+#[derive(Debug, defmt::Format)]
+struct MechanicalIdData {
+    /// Starting encoder position recorded at setup.
+    start_position: i32,
+    /// Torque step amplitude (PIDOUT units).
+    torque_step: u16,
+    /// Forward capture: per-sample velocity (encoder counts/ms).
+    /// Stored as [initial_acceleration, peak_velocity] pairs.
+    forward_initial_accel: i32,
+    forward_peak_velocity: i32,
+    forward_delay_samples: u16,
+    /// Reverse capture: same metrics.
+    reverse_initial_accel: i32,
+    reverse_peak_velocity: i32,
+    reverse_delay_samples: u16,
+}
+
+impl MechanicalIdData {
+    fn new(start_position: i32, torque_step: u16) -> Self {
+        Self {
+            start_position,
+            torque_step,
+            forward_initial_accel: 0,
+            forward_peak_velocity: 0,
+            forward_delay_samples: 0,
+            reverse_initial_accel: 0,
+            reverse_peak_velocity: 0,
+            reverse_delay_samples: 0,
+        }
+    }
+}
+
+/// Outer safety limits, computed once at the start of outer commissioning.
+#[derive(Debug, Clone, Copy, defmt::Format)]
+struct OuterSafetyLimits {
+    /// Maximum absolute velocity in encoder counts per millisecond.
+    velocity_cap: i32,
+    /// Maximum distance from start position in encoder counts.
+    position_window: i32,
+    /// Starting encoder position for window enforcement.
+    start_position: i32,
+    /// Torque cap: the configured run_current limit.
+    torque_cap: u16,
+    /// Previous encoder count for velocity estimation.
+    prev_encoder_count: i32,
+}
+
+impl OuterSafetyLimits {
+    fn new(start_position: i32, torque_cap: u16) -> Self {
+        Self {
+            velocity_cap: VELOCITY_CAP_COUNTS_PER_MS,
+            position_window: POSITION_WINDOW_COUNTS,
+            start_position,
+            torque_cap,
+            prev_encoder_count: start_position,
+        }
+    }
+}
+
 /// Outer commissioning phase state machine.
 #[derive(Debug, defmt::Format)]
+#[allow(dead_code)] // Later phases (9-13) are placeholders for future plans.
 enum OuterPhase {
-    MechanicalId,
-    VelocityTune,
-    VelocityValidate { attempt: u8 },
-    PositionTune,
-    FilterTune,
+    /// Phase 8: Mechanical identification.
+    MechanicalId {
+        state: MechanicalIdState,
+        data: MechanicalIdData,
+        safety: OuterSafetyLimits,
+    },
+    /// Phase 9: Velocity-loop SIMC gain synthesis.
+    VelocityTune {
+        model: MechanicalModel,
+        safety: OuterSafetyLimits,
+    },
+    /// Phase 10: Velocity-loop step-response validation.
+    VelocityValidate {
+        attempt: u8,
+        safety: OuterSafetyLimits,
+    },
+    /// Phase 11: Position-loop P ramp-up.
+    PositionTune { safety: OuterSafetyLimits },
+    /// Phase 12: Filter selection.
+    FilterTune { safety: OuterSafetyLimits },
+    /// Phase 13: Assemble and transmit results.
     Commit,
+    /// All outer phases completed.
     Done(OuterResult),
+    /// A phase failed.
     Failed(CommissionError),
 }
 
@@ -527,10 +673,19 @@ impl CommissioningEngine {
 
     /// Create an engine for outer (mechanical) commissioning.
     pub fn new_outer(oid: u8, profile: CommissionProfile, mode: OperatingMode) -> Self {
+        // Safety limits and data are initialized with placeholder values.
+        // The MechanicalIdState::Setup sub-state reads the actual encoder
+        // position and current limit from the backend on the first step().
+        let safety = OuterSafetyLimits::new(0, 0);
+        let data = MechanicalIdData::new(0, 0);
         Self {
             oid,
             engine_mode: EngineMode::Outer {
-                phase: OuterPhase::MechanicalId,
+                phase: OuterPhase::MechanicalId {
+                    state: MechanicalIdState::Setup,
+                    data,
+                    safety,
+                },
                 profile,
                 mode,
             },
@@ -563,9 +718,9 @@ impl CommissioningEngine {
             } => Self::step_inner(phase, &mut self.buf, *profile, backend).await,
             EngineMode::Outer {
                 ref mut phase,
-                profile: _,
-                mode: _,
-            } => Self::step_outer(phase, &mut self.buf, backend).await,
+                profile,
+                mode,
+            } => Self::step_outer(phase, &mut self.buf, *profile, *mode, backend).await,
         }
     }
 
@@ -1953,26 +2108,574 @@ impl CommissioningEngine {
         StepResult::InnerFailed(err)
     }
 
+    // -------------------------------------------------------------------
+    // Outer phase dispatch and safety
+    // -------------------------------------------------------------------
+
     /// Step outer phase state machine.
     ///
-    /// Phase logic bodies are placeholder stubs.
+    /// Dispatches to per-phase handlers. Every tick runs the safety
+    /// envelope check before the phase-specific logic.
+    #[allow(clippy::too_many_arguments)]
     async fn step_outer<B: CommissioningBackend>(
-        _phase: &mut OuterPhase,
-        _buf: &mut TransientBuffer,
-        _backend: &mut B,
+        phase: &mut OuterPhase,
+        buf: &mut TransientBuffer,
+        _profile: CommissionProfile,
+        _mode: OperatingMode,
+        backend: &mut B,
     ) -> StepResult {
-        // TODO: dispatch on phase variant, implement phase logic
-        StepResult::OuterDone(OuterResult {
-            status: CommissionStatus::Accepted,
-            velocity_p: 0,
-            velocity_i: 0,
-            velocity_limit: 0,
-            position_p: 0,
-            position_i: 0,
-            velocity_filter_hz: 0,
-            position_filter_hz: 0,
-            flux_filter_hz: 0,
-            torque_filter_hz: 0,
-        })
+        // Run per-tick safety envelope for all active phases.
+        if let Some(safety) = Self::outer_safety_mut(phase) {
+            if Self::check_outer_safety(safety, backend).await {
+                // Zero excitation immediately on any safety violation.
+                let _ = backend
+                    .write_register(tmc4671::registers::PID_TORQUE_FLUX_TARGET, 0)
+                    .await;
+                let _ = backend
+                    .write_register(tmc4671::registers::MODE_RAMP_MODE_MOTION, 0)
+                    .await;
+                let err = Self::safety_error_for_phase(phase);
+                return Self::fail_outer(phase, err);
+            }
+        }
+
+        match phase {
+            OuterPhase::MechanicalId { .. } => Self::step_mechanical_id(phase, buf, backend).await,
+            OuterPhase::VelocityTune { .. }
+            | OuterPhase::VelocityValidate { .. }
+            | OuterPhase::PositionTune { .. }
+            | OuterPhase::FilterTune { .. }
+            | OuterPhase::Commit => {
+                // Placeholder for later phases — not in scope for this plan.
+                StepResult::Continue
+            }
+            OuterPhase::Done(result) => StepResult::OuterDone(result.clone()),
+            OuterPhase::Failed(err) => StepResult::OuterFailed(*err),
+        }
+    }
+
+    /// Get a mutable reference to the safety limits for the current phase.
+    ///
+    /// Returns `None` for terminal phases (Done/Failed/Commit) that don't
+    /// need per-tick safety checks.
+    fn outer_safety_mut(phase: &mut OuterPhase) -> Option<&mut OuterSafetyLimits> {
+        match phase {
+            OuterPhase::MechanicalId { safety, .. }
+            | OuterPhase::VelocityTune { safety, .. }
+            | OuterPhase::VelocityValidate { safety, .. }
+            | OuterPhase::PositionTune { safety, .. }
+            | OuterPhase::FilterTune { safety, .. } => Some(safety),
+            OuterPhase::Commit | OuterPhase::Done(_) | OuterPhase::Failed(_) => None,
+        }
+    }
+
+    /// Per-tick safety envelope check for all outer phases.
+    ///
+    /// Reads the current encoder position, estimates velocity from the
+    /// delta since the last tick, and checks:
+    /// - Velocity within cap
+    /// - Position within window from start
+    ///
+    /// Returns `true` if a safety limit is violated.
+    async fn check_outer_safety<B: CommissioningBackend>(
+        safety: &mut OuterSafetyLimits,
+        backend: &mut B,
+    ) -> bool {
+        let encoder_raw = backend.read_encoder_count().await;
+        let encoder_count = encoder_raw as i32;
+
+        // Velocity estimate: delta encoder counts per 1ms tick.
+        let velocity = encoder_count.wrapping_sub(safety.prev_encoder_count);
+        safety.prev_encoder_count = encoder_count;
+
+        // Check velocity cap (absolute value).
+        let abs_velocity = if velocity < 0 { -velocity } else { velocity };
+        if abs_velocity > safety.velocity_cap {
+            defmt::warn!(
+                "outer safety: velocity {} exceeds cap {}",
+                abs_velocity,
+                safety.velocity_cap
+            );
+            return true;
+        }
+
+        // Check position window.
+        let position_delta = encoder_count.wrapping_sub(safety.start_position);
+        let abs_position = if position_delta < 0 {
+            -position_delta
+        } else {
+            position_delta
+        };
+        if abs_position > safety.position_window {
+            defmt::warn!(
+                "outer safety: position {} exceeds window {}",
+                abs_position,
+                safety.position_window
+            );
+            return true;
+        }
+
+        false
+    }
+
+    /// Map a safety violation to the appropriate phase-specific error.
+    fn safety_error_for_phase(phase: &OuterPhase) -> CommissionError {
+        match phase {
+            OuterPhase::MechanicalId { .. } => CommissionError::MechanicalIdFailed,
+            OuterPhase::VelocityTune { .. } | OuterPhase::VelocityValidate { .. } => {
+                CommissionError::VelocityValidationFailed
+            }
+            OuterPhase::PositionTune { .. } | OuterPhase::FilterTune { .. } => {
+                CommissionError::PositionTuneFailed
+            }
+            OuterPhase::Commit { .. } | OuterPhase::Done(_) | OuterPhase::Failed(_) => {
+                CommissionError::Shutdown // Terminal phases; safety shouldn't fire here.
+            }
+        }
+    }
+
+    /// Transition outer phase to Failed.
+    fn fail_outer(phase: &mut OuterPhase, err: CommissionError) -> StepResult {
+        *phase = OuterPhase::Failed(err);
+        StepResult::OuterFailed(err)
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 8: Mechanical Identification
+    // -------------------------------------------------------------------
+
+    /// Advance mechanical identification sub-state.
+    ///
+    /// Implements the spec's acceleration test procedure:
+    /// 1. Switch to torque mode with tuned current-loop gains active
+    /// 2. Record starting position
+    /// 3. Apply torque step, sample encoder at 1 kHz
+    /// 4. Return to zero torque, wait for settling
+    /// 5. Repeat in opposite direction
+    /// 6. Estimate J_eff, B_eff, tau_mech, theta_mech
+    /// 7. Validate gates and transition
+    async fn step_mechanical_id<B: CommissioningBackend>(
+        phase: &mut OuterPhase,
+        buf: &mut TransientBuffer,
+        backend: &mut B,
+    ) -> StepResult {
+        use tmc4671::registers::*;
+
+        let (state, data, safety) = match phase {
+            OuterPhase::MechanicalId {
+                state,
+                data,
+                safety,
+            } => (state, data, safety),
+            _ => return StepResult::Continue,
+        };
+
+        match state {
+            MechanicalIdState::Setup => {
+                // Read current encoder position as the reference point.
+                let encoder_raw = backend.read_encoder_count().await;
+                let start_position = encoder_raw as i32;
+
+                // Compute torque step from configured run_current.
+                let current_limit = backend.current_limit() & 0xFFFF;
+                let torque_step = if current_limit > 0 {
+                    (current_limit * MECH_ID_TORQUE_STEP_PERCENT / 100).max(1) as u16
+                } else {
+                    return Self::fail_outer(phase, CommissionError::NoCurrent);
+                };
+
+                // Initialize safety limits with real values.
+                safety.start_position = start_position;
+                safety.prev_encoder_count = start_position;
+                safety.torque_cap = current_limit as u16;
+
+                // Initialize data with real values.
+                data.start_position = start_position;
+                data.torque_step = torque_step;
+
+                // Ensure we are in torque mode (MODE=1) with current-loop
+                // gains already written by inner commissioning.
+                if backend
+                    .write_register(MODE_RAMP_MODE_MOTION, 1)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_outer(phase, CommissionError::Spi);
+                }
+
+                // Zero torque target before starting capture.
+                let _ = backend.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+
+                // Prepare transient buffer for forward capture.
+                buf.reset(MECH_ID_SAMPLE_PERIOD_US as u16);
+
+                defmt::info!(
+                    "mech-id: start pos={}, torque_step={}, current_limit={}",
+                    start_position,
+                    torque_step,
+                    current_limit
+                );
+
+                *state = MechanicalIdState::ForwardStart;
+                StepResult::PhaseChanged(PhaseId::MechanicalId)
+            }
+
+            MechanicalIdState::ForwardStart => {
+                // Apply positive torque step.
+                let torque = data.torque_step as u32;
+                // PID_TORQUE_FLUX_TARGET: torque in [31:16], flux=0 in [15:0].
+                let target = torque << 16;
+                if backend
+                    .write_register(PID_TORQUE_FLUX_TARGET, target)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_outer(phase, CommissionError::Spi);
+                }
+
+                let next_sample_us = backend.elapsed_us().wrapping_add(MECH_ID_SAMPLE_PERIOD_US);
+                *state = MechanicalIdState::ForwardCapture { next_sample_us };
+                StepResult::Continue
+            }
+
+            MechanicalIdState::ForwardCapture { next_sample_us } => {
+                // Check if it's time for the next sample.
+                let now = backend.elapsed_us();
+                if now.wrapping_sub(*next_sample_us) >= 0x8000_0000 {
+                    // Not yet time for next sample.
+                    return StepResult::Continue;
+                }
+
+                // Sample encoder position.
+                let encoder_raw = backend.read_encoder_count().await;
+                buf.push(encoder_raw);
+
+                if buf.is_full() {
+                    // Forward capture complete — zero torque.
+                    let _ = backend.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+
+                    // Extract forward metrics from buffer before reset.
+                    let (initial_accel, peak_velocity, delay_samples) =
+                        Self::extract_mech_metrics(buf, data.start_position);
+                    data.forward_initial_accel = initial_accel;
+                    data.forward_peak_velocity = peak_velocity;
+                    data.forward_delay_samples = delay_samples;
+
+                    defmt::info!(
+                        "mech-id fwd: accel={}, peak_vel={}, delay={}",
+                        initial_accel,
+                        peak_velocity,
+                        delay_samples
+                    );
+
+                    let deadline = backend.elapsed_us().wrapping_add(MECH_ID_SETTLE_US);
+                    *state = MechanicalIdState::ForwardSettle {
+                        deadline_us: deadline,
+                    };
+                } else {
+                    *next_sample_us = now.wrapping_add(MECH_ID_SAMPLE_PERIOD_US);
+                }
+                StepResult::Continue
+            }
+
+            MechanicalIdState::ForwardSettle { deadline_us } => {
+                if backend.elapsed_us().wrapping_sub(*deadline_us) < 0x8000_0000 {
+                    // Settled — prepare for reverse capture.
+                    buf.reset(MECH_ID_SAMPLE_PERIOD_US as u16);
+                    *state = MechanicalIdState::ReverseStart;
+                }
+                StepResult::Continue
+            }
+
+            MechanicalIdState::ReverseStart => {
+                // Apply negative torque step.
+                // Torque is signed i16 in upper 16 bits.
+                let neg_torque = (-(data.torque_step as i16)) as u16;
+                let target = (neg_torque as u32) << 16;
+                if backend
+                    .write_register(PID_TORQUE_FLUX_TARGET, target)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_outer(phase, CommissionError::Spi);
+                }
+
+                let next_sample_us = backend.elapsed_us().wrapping_add(MECH_ID_SAMPLE_PERIOD_US);
+                *state = MechanicalIdState::ReverseCapture { next_sample_us };
+                StepResult::Continue
+            }
+
+            MechanicalIdState::ReverseCapture { next_sample_us } => {
+                let now = backend.elapsed_us();
+                if now.wrapping_sub(*next_sample_us) >= 0x8000_0000 {
+                    return StepResult::Continue;
+                }
+
+                let encoder_raw = backend.read_encoder_count().await;
+                buf.push(encoder_raw);
+
+                if buf.is_full() {
+                    // Reverse capture complete — zero torque.
+                    let _ = backend.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+
+                    // For reverse capture, use the position at capture start
+                    // (first sample) as the reference, not the original start.
+                    let reverse_start = if buf.len() > 0 {
+                        buf.samples()[0] as i32
+                    } else {
+                        data.start_position
+                    };
+                    let (initial_accel, peak_velocity, delay_samples) =
+                        Self::extract_mech_metrics(buf, reverse_start);
+                    // Store as absolute values for symmetry comparison.
+                    data.reverse_initial_accel = if initial_accel < 0 {
+                        -initial_accel
+                    } else {
+                        initial_accel
+                    };
+                    data.reverse_peak_velocity = if peak_velocity < 0 {
+                        -peak_velocity
+                    } else {
+                        peak_velocity
+                    };
+                    data.reverse_delay_samples = delay_samples;
+
+                    defmt::info!(
+                        "mech-id rev: accel={}, peak_vel={}, delay={}",
+                        data.reverse_initial_accel,
+                        data.reverse_peak_velocity,
+                        delay_samples
+                    );
+
+                    let deadline = backend.elapsed_us().wrapping_add(MECH_ID_SETTLE_US);
+                    *state = MechanicalIdState::ReverseSettle {
+                        deadline_us: deadline,
+                    };
+                } else {
+                    *next_sample_us = now.wrapping_add(MECH_ID_SAMPLE_PERIOD_US);
+                }
+                StepResult::Continue
+            }
+
+            MechanicalIdState::ReverseSettle { deadline_us } => {
+                if backend.elapsed_us().wrapping_sub(*deadline_us) < 0x8000_0000 {
+                    *state = MechanicalIdState::Estimate;
+                }
+                StepResult::Continue
+            }
+
+            MechanicalIdState::Estimate => {
+                // Ensure motor is stopped.
+                let _ = backend.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+                let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+
+                *state = MechanicalIdState::Finalize;
+                StepResult::Continue
+            }
+
+            MechanicalIdState::Finalize => {
+                // Assemble and validate mechanical model.
+                let torque = data.torque_step as u32;
+
+                // Forward metrics (already absolute for accel).
+                let fwd_accel = if data.forward_initial_accel < 0 {
+                    (-data.forward_initial_accel) as u32
+                } else {
+                    data.forward_initial_accel as u32
+                };
+                let rev_accel = data.reverse_initial_accel as u32;
+
+                // Gate: both accelerations must be positive and non-zero.
+                if fwd_accel == 0 || rev_accel == 0 {
+                    defmt::warn!("mech-id: zero acceleration detected");
+                    return Self::fail_outer(phase, CommissionError::MechanicalIdFailed);
+                }
+
+                // J_eff = torque / initial_acceleration.
+                // Scale: torque is in DAC units, accel is in counts/ms^2.
+                // We multiply torque by 1000 to get better fixed-point resolution.
+                let j_eff_fwd = (torque * 1000) / fwd_accel;
+                let j_eff_rev = (torque * 1000) / rev_accel;
+
+                // Symmetry gate: |J_fwd - J_rev| / avg <= 30%.
+                let j_avg = (j_eff_fwd + j_eff_rev) / 2;
+                if j_avg == 0 {
+                    defmt::warn!("mech-id: zero average inertia");
+                    return Self::fail_outer(phase, CommissionError::MechanicalIdFailed);
+                }
+                let j_diff = if j_eff_fwd > j_eff_rev {
+                    j_eff_fwd - j_eff_rev
+                } else {
+                    j_eff_rev - j_eff_fwd
+                };
+                let asymmetry_pct = (j_diff * 100) / j_avg;
+                if asymmetry_pct > MECH_ID_SYMMETRY_THRESHOLD_PCT {
+                    defmt::warn!(
+                        "mech-id: asymmetry {}% exceeds {}%",
+                        asymmetry_pct,
+                        MECH_ID_SYMMETRY_THRESHOLD_PCT
+                    );
+                    return Self::fail_outer(phase, CommissionError::MechanicalIdFailed);
+                }
+
+                let j_eff = j_avg;
+
+                // B_eff from peak velocity (steady-state approximation).
+                let fwd_peak = if data.forward_peak_velocity < 0 {
+                    (-data.forward_peak_velocity) as u32
+                } else {
+                    data.forward_peak_velocity as u32
+                };
+                let rev_peak = data.reverse_peak_velocity as u32;
+                let peak_avg = (fwd_peak + rev_peak) / 2;
+
+                // B_eff = torque / steady_state_velocity.
+                // Scale to match J_eff units.
+                let b_eff = if peak_avg > 0 {
+                    (torque * 1000) / peak_avg
+                } else {
+                    // No steady-state velocity reached — pure inertial load.
+                    // Use a small minimum to avoid division by zero in tau.
+                    1
+                };
+
+                // tau_mech = J_eff / B_eff in milliseconds.
+                let tau_mech_ms = if b_eff > 0 { j_eff / b_eff } else { 1000 };
+
+                // theta_mech from delay samples (time from torque step to
+                // first measurable velocity change).
+                let avg_delay_samples =
+                    (data.forward_delay_samples + data.reverse_delay_samples) / 2;
+                let theta_mech_us = avg_delay_samples as u32 * MECH_ID_SAMPLE_PERIOD_US;
+
+                let model = MechanicalModel {
+                    j_eff,
+                    b_eff,
+                    tau_mech_ms,
+                    theta_mech_us,
+                    t_f: 0, // Static friction not measured in this phase.
+                };
+
+                defmt::info!(
+                    "mech-id: J={}, B={}, tau={}ms, theta={}us",
+                    model.j_eff,
+                    model.b_eff,
+                    model.tau_mech_ms,
+                    model.theta_mech_us
+                );
+
+                // Carry safety limits forward to VelocityTune.
+                let carried_safety = match phase {
+                    OuterPhase::MechanicalId { safety, .. } => *safety,
+                    _ => unreachable!(),
+                };
+
+                *phase = OuterPhase::VelocityTune {
+                    model,
+                    safety: carried_safety,
+                };
+                StepResult::PhaseChanged(PhaseId::VelocityTune)
+            }
+        }
+    }
+
+    /// Extract mechanical metrics from a position transient buffer.
+    ///
+    /// Computes velocity as first-order differences of position samples,
+    /// then derives:
+    /// - Initial acceleration (from first `MECH_ID_ACCEL_SAMPLES` velocities)
+    /// - Peak velocity (maximum absolute velocity in the capture)
+    /// - Delay samples (number of samples before first velocity onset)
+    ///
+    /// # Parameters
+    /// - `buf`: Transient buffer filled with encoder position samples
+    /// - `reference_position`: Starting position for velocity computation
+    fn extract_mech_metrics(buf: &TransientBuffer, reference_position: i32) -> (i32, i32, u16) {
+        let samples = buf.samples();
+        if samples.len() < 2 {
+            return (0, 0, 0);
+        }
+
+        // Compute velocity as position differences (counts per sample period).
+        // First velocity is relative to the reference position.
+        let first_velocity = (samples[0] as i32).wrapping_sub(reference_position);
+
+        let mut peak_velocity: i32 = first_velocity;
+        let mut delay_samples: u16 = 0;
+        let mut found_onset = false;
+
+        // Track velocity onset.
+        let abs_first = if first_velocity < 0 {
+            -first_velocity
+        } else {
+            first_velocity
+        };
+        if abs_first >= MECH_ID_VELOCITY_ONSET_THRESHOLD {
+            found_onset = true;
+        }
+
+        // Accumulate acceleration from early samples.
+        let accel_limit = MECH_ID_ACCEL_SAMPLES.min(samples.len());
+        let mut accel_sum: i32 = 0;
+        let mut accel_count: u32 = 0;
+
+        // First acceleration point.
+        if accel_limit >= 2 {
+            let vel0 = first_velocity;
+            let vel1 = (samples[1] as i32).wrapping_sub(samples[0] as i32);
+            accel_sum += vel1 - vel0;
+            accel_count += 1;
+        }
+
+        let mut prev_velocity = first_velocity;
+
+        for i in 1..samples.len() {
+            let velocity = (samples[i] as i32).wrapping_sub(samples[i - 1] as i32);
+
+            // Track velocity onset.
+            if !found_onset {
+                let abs_vel = if velocity < 0 { -velocity } else { velocity };
+                if abs_vel >= MECH_ID_VELOCITY_ONSET_THRESHOLD {
+                    found_onset = true;
+                    delay_samples = i as u16;
+                } else {
+                    delay_samples = i as u16;
+                }
+            }
+
+            // Peak velocity (signed, tracking the direction of motion).
+            let abs_cur = if velocity < 0 { -velocity } else { velocity };
+            let abs_peak = if peak_velocity < 0 {
+                -peak_velocity
+            } else {
+                peak_velocity
+            };
+            if abs_cur > abs_peak {
+                peak_velocity = velocity;
+            }
+
+            // Acceleration from early samples.
+            if i < accel_limit && i >= 2 {
+                let accel = velocity - prev_velocity;
+                accel_sum += accel;
+                accel_count += 1;
+            }
+
+            prev_velocity = velocity;
+        }
+
+        // Average initial acceleration.
+        let initial_accel = if accel_count > 0 {
+            accel_sum / accel_count as i32
+        } else {
+            first_velocity // Fallback: use first velocity as proxy.
+        };
+
+        // If onset was never found, the motor didn't move.
+        if !found_onset {
+            delay_samples = samples.len() as u16;
+        }
+
+        (initial_accel, peak_velocity, delay_samples)
     }
 }
