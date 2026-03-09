@@ -1239,40 +1239,58 @@ mod app {
         }
     }
 
-    /// Trigger TMC4671 self-test diagnostic. Results stream via
-    /// `foci_selftest_result` replies, completed with `foci_selftest_done`.
+    /// Trigger TMC4671 self-test diagnostic via the commissioning engine.
     ///
-    /// Only one selftest may be in flight at a time. Concurrent requests
-    /// are rejected with `SELFTEST_DONE_ABORTED`.
+    /// Only one commissioning operation may be in flight at a time.
+    /// Concurrent requests are rejected.
     #[klipper_command]
     pub fn foci_selftest(_context: &mut State, oid: u8) {
         use core::sync::atomic::Ordering::Relaxed;
-        if SELFTEST_IN_FLIGHT.swap(true, Relaxed) {
-            defmt::warn!("foci_selftest rejected: already in flight");
+        if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
+            defmt::warn!("foci_selftest rejected: commission in flight");
             klipper_reply!(
-                foci_selftest_done,
+                foci_commission_phase,
                 oid: u8 = oid,
-                status: u8 = foci_core::selftest::SELFTEST_DONE_ABORTED
+                phase: u8 = 0,
+                status: u8 =
+                    foci_core::autotune::CommissionError::AlreadyRunning.status_code()
             );
             return;
         }
         if !tmc_send(foci_core::tmc::tmc_selftest(oid)) {
-            SELFTEST_IN_FLIGHT.store(false, Relaxed);
+            COMMISSION_IN_FLIGHT.store(false, Relaxed);
             klipper_reply!(
-                foci_selftest_done,
+                foci_commission_phase,
                 oid: u8 = oid,
-                status: u8 = foci_core::selftest::SELFTEST_DONE_ABORTED
+                phase: u8 = 0,
+                status: u8 =
+                    foci_core::autotune::CommissionError::QueueFull.status_code()
             );
         }
     }
 
     /// Calibrate the TMC4671: ADC offset calibration, encoder alignment,
-    /// and closed-loop entry. Sends `foci_calibrate_response` when complete.
+    /// and closed-loop entry via the commissioning engine.
     ///
-    /// Must be called before motor enable. Rejected if motor is already enabled.
+    /// Must be called before motor enable. Rejected if motor is already
+    /// enabled or another commissioning operation is in flight.
     #[klipper_command]
     pub fn foci_calibrate(_context: &mut State, oid: u8) {
+        use core::sync::atomic::Ordering::Relaxed;
+        if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
+            defmt::warn!("foci_calibrate rejected: commission in flight");
+            klipper_reply!(
+                foci_calibrate_response,
+                oid: u8 = oid,
+                status: u8 = CalibrationError::InternalError.status_code(),
+                adc_i0: u16 = 0,
+                adc_i1: u16 = 0,
+                encoder_count: u32 = 0
+            );
+            return;
+        }
         if !tmc_send(foci_core::tmc::tmc_calibrate(oid)) {
+            COMMISSION_IN_FLIGHT.store(false, Relaxed);
             klipper_reply!(
                 foci_calibrate_response,
                 oid: u8 = oid,
@@ -2246,15 +2264,109 @@ mod app {
                             status: u8 = error.status_code()
                         );
                     }
-                    crate::commission::StepResult::CalibrateDone(_cal_result) => {
-                        // TODO(task-3): report ADC calibration result to host.
+                    crate::commission::StepResult::CalibrateDone(cal_result) => {
+                        let oid = engine.oid();
                         commission_engine = None;
-                        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+                        // Keep COMMISSION_IN_FLIGHT set until the full
+                        // calibration sequence (ADC + align + closedloop)
+                        // completes, to prevent overlapping requests.
+                        // Do NOT call restore_safe_state: hardware must remain
+                        // active for encoder alignment and closed-loop entry.
+
+                        let current_limit =
+                            CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
+
+                        // Encoder alignment + closed-loop entry (same sequence
+                        // as tmc_run_calibration, minus the ADC cal step).
+                        match tmc_align_encoder(tmc, current_limit).await {
+                            Ok(encoder_count) => {
+                                match tmc_enter_closedloop(tmc, None, stored_position_gains).await {
+                                    Ok(()) => {
+                                        // Apply autotuned gains if available
+                                        if let Some(gains) = stored_gains {
+                                            let (flux_reg, torque_reg) = gains.to_registers();
+                                            let _ = tmc
+                                                .write_register(
+                                                    tmc4671::registers::PID_FLUX_P_FLUX_I,
+                                                    flux_reg,
+                                                )
+                                                .await;
+                                            let _ = tmc
+                                                .write_register(
+                                                    tmc4671::registers::PID_TORQUE_P_TORQUE_I,
+                                                    torque_reg,
+                                                )
+                                                .await;
+                                        }
+                                        // Re-apply current limit after closed-loop
+                                        // entry (TMC4671 resets it on mode change).
+                                        let _ = tmc
+                                            .write_register(
+                                                tmc4671::registers::PID_TORQUE_FLUX_LIMITS,
+                                                current_limit,
+                                            )
+                                            .await;
+
+                                        calibrated = true;
+                                        motor_enabled = true;
+                                        MOTOR_ARMED
+                                            .store(true, core::sync::atomic::Ordering::Relaxed);
+                                        defmt::info!("foci_calibrate complete: oid={}", oid);
+                                        COMMISSION_IN_FLIGHT
+                                            .store(false, core::sync::atomic::Ordering::Relaxed);
+                                        klipper_reply!(
+                                            foci_calibrate_response,
+                                            oid: u8 = oid,
+                                            status: u8 = 0,
+                                            adc_i0: u16 = cal_result.adc_i0,
+                                            adc_i1: u16 = cal_result.adc_i1,
+                                            encoder_count: u32 = encoder_count
+                                        );
+                                    }
+                                    Err(e) => {
+                                        defmt::error!("CalibrateDone: closed-loop failed: {}", e);
+                                        foci_core::selftest::restore_safe_state(tmc, enable_pin)
+                                            .await;
+                                        COMMISSION_IN_FLIGHT
+                                            .store(false, core::sync::atomic::Ordering::Relaxed);
+                                        klipper_reply!(
+                                            foci_calibrate_response,
+                                            oid: u8 = oid,
+                                            status: u8 = e.status_code(),
+                                            adc_i0: u16 = 0,
+                                            adc_i1: u16 = 0,
+                                            encoder_count: u32 = 0
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                defmt::error!("CalibrateDone: encoder align failed: {}", e);
+                                foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                                COMMISSION_IN_FLIGHT
+                                    .store(false, core::sync::atomic::Ordering::Relaxed);
+                                klipper_reply!(
+                                    foci_calibrate_response,
+                                    oid: u8 = oid,
+                                    status: u8 = e.status_code(),
+                                    adc_i0: u16 = 0,
+                                    adc_i1: u16 = 0,
+                                    encoder_count: u32 = 0
+                                );
+                            }
+                        }
                     }
                     crate::commission::StepResult::SelftestDone => {
-                        // TODO(task-3): report selftest completion to host.
+                        let oid = engine.oid();
                         commission_engine = None;
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+                        // Engine already restored safe state internally.
+                        klipper_reply!(
+                            foci_commission_phase,
+                            oid: u8 = oid,
+                            phase: u8 = 0,
+                            status: u8 = 0
+                        );
                     }
                 }
                 // For Done/Failed cases, fall through to normal processing
@@ -2268,40 +2380,25 @@ mod app {
                             if !calibrated {
                                 // Auto-calibrate: Klipper may send enable before
                                 // the Python module's foci_calibrate arrives due
-                                // to queue_digital_out timing. Run calibration
-                                // in-place instead of shutting down.
-                                let current_limit =
-                                    CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
-                                if current_limit == 0 {
-                                    defmt::error!("Motor enable rejected: current limit not set");
+                                // to queue_digital_out timing. Launch the
+                                // commissioning engine to run ADC calibration
+                                // asynchronously; the CalibrateDone handler will
+                                // complete encoder alignment and closed-loop entry.
+                                if COMMISSION_IN_FLIGHT
+                                    .swap(true, core::sync::atomic::Ordering::Relaxed)
+                                {
+                                    defmt::warn!("Auto-calibrate skipped: commission in flight");
                                     continue;
                                 }
+                                // TODO: hardcoded OID 0 — correct for single-motor
+                                // OpenFFBoard but needs OID routing for multi-motor boards.
                                 defmt::info!("Auto-calibrating on enable");
-                                match tmc_run_calibration(
-                                    tmc,
-                                    enable_pin,
-                                    current_limit,
-                                    stored_gains,
-                                    stored_position_gains,
-                                )
-                                .await
-                                {
-                                    Ok(_) => {
-                                        calibrated = true;
-                                    }
-                                    Err(e) => {
-                                        defmt::error!("Auto-calibration failed: {}", e);
-                                        ctx.shared.app_state.lock(|state| {
-                                            if enter_shutdown(state) {
-                                                klipper_shutdown!(
-                                                    "Calibration failed on enable",
-                                                    read_tim5()
-                                                );
-                                            }
-                                        });
-                                        continue;
-                                    }
-                                }
+                                commission_engine =
+                                    Some(crate::commission::CommissioningEngine::new_calibrate(0));
+                                // Don't set motor_enabled/MOTOR_ARMED yet --
+                                // the CalibrateDone handler does that after
+                                // encoder alignment + closed-loop entry.
+                                continue;
                             }
                             motor_enabled = true;
                             enable_pin.set_high();
@@ -2345,10 +2442,10 @@ mod app {
                         }
                     }
                     TmcRequest::Calibrate { oid } => {
-                        const STATUS_OK: u8 = 0;
-
                         if motor_enabled {
                             defmt::warn!("foci_calibrate rejected: motor already enabled");
+                            COMMISSION_IN_FLIGHT
+                                .store(false, core::sync::atomic::Ordering::Relaxed);
                             klipper_reply!(
                                 foci_calibrate_response,
                                 oid: u8 = oid,
@@ -2359,67 +2456,11 @@ mod app {
                             );
                             continue;
                         }
-
-                        // Pre-flight: verify TMC4671 is alive before calibration
-                        let chip_id = tmc
-                            .read_sub_register(tmc4671::registers::CHIPINFO_SI_TYPE)
-                            .await
-                            .unwrap_or(0);
-                        if chip_id != tmc4671::CHIP_ID {
-                            defmt::error!("foci_calibrate: chip ID mismatch: {:#010x}", chip_id);
-                            klipper_reply!(
-                                foci_calibrate_response,
-                                oid: u8 = oid,
-                                status: u8 = CalibrationError::SpiError.status_code(),
-                                adc_i0: u16 = 0,
-                                adc_i1: u16 = 0,
-                                encoder_count: u32 = 0
-                            );
-                            continue;
-                        }
-
-                        // Run the three-stage calibration sequence
-                        let result = tmc_run_calibration(
-                            tmc,
-                            enable_pin,
-                            CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed),
-                            stored_gains,
-                            stored_position_gains,
-                        )
-                        .await;
-
-                        match result {
-                            Ok((adc_i0, adc_i1, encoder_count)) => {
-                                calibrated = true;
-                                defmt::info!("foci_calibrate complete: oid={}", oid);
-                                klipper_reply!(
-                                    foci_calibrate_response,
-                                    oid: u8 = oid,
-                                    status: u8 = STATUS_OK,
-                                    adc_i0: u16 = adc_i0,
-                                    adc_i1: u16 = adc_i1,
-                                    encoder_count: u32 = encoder_count
-                                );
-                            }
-                            Err(e) => {
-                                // Safety shutdown on calibration failure
-                                calibrated = false;
-                                use tmc4671::registers::*;
-                                let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
-                                let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
-                                let _ = tmc.write_register(PWM_SV_CHOP, 0).await;
-                                enable_pin.set_low();
-                                defmt::error!("foci_calibrate failed: oid={} error={}", oid, e);
-                                klipper_reply!(
-                                    foci_calibrate_response,
-                                    oid: u8 = oid,
-                                    status: u8 = e.status_code(),
-                                    adc_i0: u16 = 0,
-                                    adc_i1: u16 = 0,
-                                    encoder_count: u32 = 0
-                                );
-                            }
-                        }
+                        // Engine tick will drive ADC cal; CalibrateDone handler
+                        // performs encoder alignment and closed-loop entry.
+                        calibrated = false;
+                        commission_engine =
+                            Some(crate::commission::CommissioningEngine::new_calibrate(oid));
                     }
                     #[cfg(feature = "dev")]
                     TmcRequest::Init => {
@@ -2833,32 +2874,24 @@ mod app {
                             ));
                     }
                     TmcRequest::SelfTest { oid } => {
-                        let status = if motor_enabled {
+                        if motor_enabled {
                             defmt::warn!("foci_selftest rejected: motor enabled");
-                            foci_core::selftest::SELFTEST_DONE_ABORTED
-                        } else {
-                            defmt::info!("foci_selftest: starting");
-                            let current_limit =
-                                CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
-                            let mut reporter = KlipperSelftestReporter { oid };
-                            let result = foci_core::selftest::run_selftest(
-                                tmc,
-                                enable_pin,
-                                &mut Mono,
-                                &TMC_CONFIG,
-                                current_limit,
-                                &mut reporter,
-                            )
-                            .await;
-                            defmt::info!("foci_selftest: done, status={}", result.status);
-                            result.status
-                        };
-                        klipper_reply!(
-                            foci_selftest_done,
-                            oid: u8 = oid,
-                            status: u8 = status
-                        );
-                        SELFTEST_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+                            COMMISSION_IN_FLIGHT
+                                .store(false, core::sync::atomic::Ordering::Relaxed);
+                            klipper_reply!(
+                                foci_commission_phase,
+                                oid: u8 = oid,
+                                phase: u8 = 0,
+                                status: u8 =
+                                    foci_core::autotune::CommissionError::MotorEnabled
+                                        .status_code()
+                            );
+                            continue;
+                        }
+                        // Engine tick drives selftest phases; SelftestDone
+                        // handler sends the completion signal.
+                        commission_engine =
+                            Some(crate::commission::CommissioningEngine::new_selftest(oid));
                     }
                     other => {
                         if handle_tmc_request(other, tmc).await.is_err() {
