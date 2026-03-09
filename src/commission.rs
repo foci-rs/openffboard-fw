@@ -98,6 +98,11 @@ pub enum StepResult {
     OuterDone(OuterResult),
     /// Outer commissioning failed.
     OuterFailed(CommissionError),
+    /// ADC calibration completed. Hardware remains active for encoder
+    /// alignment.
+    CalibrateDone(AdcCalResult),
+    /// Selftest phases completed. Hardware restored to safe state.
+    SelftestDone,
 }
 
 /// Result of inner (electrical) commissioning.
@@ -154,6 +159,21 @@ pub struct OuterResult {
     pub j_eff: u32,
     /// Identified effective damping from mechanical ID (internal units).
     pub b_eff: u32,
+}
+
+/// Result of ADC-only calibration.
+///
+/// Returned by `CalibrateDone` -- hardware remains in post-ADC state
+/// (enable pin high, outputs active) so the caller can proceed with
+/// encoder alignment.
+#[derive(Debug, Clone, defmt::Format)]
+pub struct AdcCalResult {
+    /// ADC I0 offset.
+    pub adc_i0: u16,
+    /// ADC I1 offset.
+    pub adc_i1: u16,
+    /// Encoder count captured at end of ADC calibration.
+    pub encoder_baseline: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -841,6 +861,7 @@ enum EngineMode {
     Inner {
         phase: InnerPhase,
         profile: CommissionProfile,
+        stop_after: PhaseId,
     },
     Outer {
         phase: OuterPhase,
@@ -869,6 +890,40 @@ pub struct CommissioningEngine {
 }
 
 impl CommissioningEngine {
+    /// Create an engine for ADC calibration only.
+    ///
+    /// The engine stops after ADC offset calibration, returning
+    /// `StepResult::CalibrateDone` with the measured offsets.
+    /// Hardware remains active for encoder alignment.
+    pub fn new_calibrate(oid: u8) -> Self {
+        Self {
+            oid,
+            engine_mode: EngineMode::Inner {
+                phase: InnerPhase::AdcCalibrate(AdcCalState::Setup),
+                profile: CommissionProfile::Balanced,
+                stop_after: PhaseId::AdcCalibrate,
+            },
+            buf: TransientBuffer::new(),
+        }
+    }
+
+    /// Create an engine for selftest (diagnostics + electrical ID).
+    ///
+    /// Runs ADC calibration, coil check, phase wiring, encoder check,
+    /// and electrical identification, then stops with
+    /// `StepResult::SelftestDone` after restoring safe state.
+    pub fn new_selftest(oid: u8) -> Self {
+        Self {
+            oid,
+            engine_mode: EngineMode::Inner {
+                phase: InnerPhase::AdcCalibrate(AdcCalState::Setup),
+                profile: CommissionProfile::Balanced,
+                stop_after: PhaseId::ElectricalId,
+            },
+            buf: TransientBuffer::new(),
+        }
+    }
+
     /// Create an engine for inner (electrical) commissioning.
     pub fn new_inner(oid: u8, profile: CommissionProfile) -> Self {
         Self {
@@ -876,6 +931,7 @@ impl CommissioningEngine {
             engine_mode: EngineMode::Inner {
                 phase: InnerPhase::AdcCalibrate(AdcCalState::Setup),
                 profile,
+                stop_after: PhaseId::CurrentValidate,
             },
             buf: TransientBuffer::new(),
         }
@@ -937,7 +993,8 @@ impl CommissioningEngine {
             EngineMode::Inner {
                 ref mut phase,
                 profile,
-            } => Self::step_inner(phase, &mut self.buf, *profile, backend).await,
+                stop_after,
+            } => Self::step_inner(phase, &mut self.buf, *profile, *stop_after, backend).await,
             EngineMode::Outer {
                 ref mut phase,
                 profile,
@@ -981,10 +1038,13 @@ impl CommissioningEngine {
         phase: &mut InnerPhase,
         buf: &mut TransientBuffer,
         profile: CommissionProfile,
+        stop_after: PhaseId,
         backend: &mut B,
     ) -> StepResult {
         match phase {
-            InnerPhase::AdcCalibrate(_) => Self::step_adc_calibrate(phase, backend).await,
+            InnerPhase::AdcCalibrate(_) => {
+                Self::step_adc_calibrate(phase, stop_after, backend).await
+            }
             InnerPhase::CoilCheck { .. } => Self::step_coil_check(phase, backend).await,
             InnerPhase::PhaseWiringCheck {
                 coil_a,
@@ -996,8 +1056,12 @@ impl CommissioningEngine {
                 let baseline = *encoder_baseline;
                 Self::step_phase_wiring(phase, a, b, baseline)
             }
-            InnerPhase::EncoderCheck { .. } => Self::step_encoder_check(phase, backend).await,
-            InnerPhase::ElectricalId { .. } => Self::step_elec_id(phase, buf, backend).await,
+            InnerPhase::EncoderCheck { .. } => {
+                Self::step_encoder_check(phase, stop_after, backend).await
+            }
+            InnerPhase::ElectricalId { .. } => {
+                Self::step_elec_id(phase, buf, stop_after, backend).await
+            }
             InnerPhase::CurrentTune { .. } => {
                 Self::step_current_tune(phase, profile, backend).await
             }
@@ -1020,6 +1084,7 @@ impl CommissioningEngine {
     /// one per step() call, validates offsets, programs them back.
     async fn step_adc_calibrate<B: CommissioningBackend>(
         phase: &mut InnerPhase,
+        stop_after: PhaseId,
         backend: &mut B,
     ) -> StepResult {
         use tmc4671::registers::*;
@@ -1168,6 +1233,18 @@ impl CommissioningEngine {
 
                 // Capture encoder baseline for later presence check.
                 let encoder_baseline = backend.read_encoder_count().await;
+
+                // Check if we should stop after ADC calibration.
+                // CalibrateDone does NOT restore safe state -- hardware
+                // must remain active for encoder alignment.
+                if stop_after == PhaseId::AdcCalibrate {
+                    let result = AdcCalResult {
+                        adc_i0: offset_i0,
+                        adc_i1: offset_i1,
+                        encoder_baseline,
+                    };
+                    return StepResult::CalibrateDone(result);
+                }
 
                 // Transition to CoilCheck.
                 *phase = InnerPhase::CoilCheck {
@@ -1376,6 +1453,7 @@ impl CommissioningEngine {
     /// decreased.
     async fn step_encoder_check<B: CommissioningBackend>(
         phase: &mut InnerPhase,
+        stop_after: PhaseId,
         backend: &mut B,
     ) -> StepResult {
         use tmc4671::registers::*;
@@ -1469,6 +1547,17 @@ impl CommissioningEngine {
                     return Self::fail_inner(phase, CommissionError::EncoderFault);
                 }
 
+                // Check if we should stop after encoder check.
+                if stop_after == PhaseId::EncoderCheck {
+                    // Full safe-state restore matching restore_safe_state().
+                    let _ = backend.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+                    let _ = backend.write_register(PWM_SV_CHOP, 0).await;
+                    let _ = backend
+                        .write_register(tmc4671::registers::PID_VELOCITY_OFFSET, 0)
+                        .await;
+                    return StepResult::SelftestDone;
+                }
+
                 // Direction detected. Transition to ElectricalId.
                 // Direction value (0=forward, 1=reversed) is carried as
                 // commissioning-local data; persistence is outside this plan.
@@ -1495,6 +1584,7 @@ impl CommissioningEngine {
     async fn step_elec_id<B: CommissioningBackend>(
         phase: &mut InnerPhase,
         buf: &mut TransientBuffer,
+        stop_after: PhaseId,
         backend: &mut B,
     ) -> StepResult {
         use tmc4671::registers::*;
@@ -1960,6 +2050,20 @@ impl CommissioningEngine {
                     l_uh: l_uh as u32,
                     tau_e_crosscheck_us: tau_crosscheck_us,
                 };
+
+                // Check if we should stop after electrical ID.
+                if stop_after == PhaseId::ElectricalId {
+                    // Full safe-state restore matching restore_safe_state().
+                    backend.set_enable_pin(false);
+                    let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+                    let _ = backend.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+                    let _ = backend.write_register(UQ_UD_EXT, 0).await;
+                    let _ = backend.write_register(PWM_SV_CHOP, 0).await;
+                    let _ = backend
+                        .write_register(tmc4671::registers::PID_VELOCITY_OFFSET, 0)
+                        .await;
+                    return StepResult::SelftestDone;
+                }
 
                 // Transition to CurrentTune carrying the model.
                 *phase = InnerPhase::CurrentTune { model };

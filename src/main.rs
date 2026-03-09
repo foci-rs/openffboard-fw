@@ -2246,6 +2246,16 @@ mod app {
                             status: u8 = error.status_code()
                         );
                     }
+                    crate::commission::StepResult::CalibrateDone(_cal_result) => {
+                        // TODO(task-3): report ADC calibration result to host.
+                        commission_engine = None;
+                        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    crate::commission::StepResult::SelftestDone => {
+                        // TODO(task-3): report selftest completion to host.
+                        commission_engine = None;
+                        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 // For Done/Failed cases, fall through to normal processing
             }
