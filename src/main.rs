@@ -126,26 +126,6 @@ mod app {
         }
     }
 
-    /// Bridges selftest stage results to Klipper protocol replies.
-    ///
-    /// Each call to `report_stage` emits a `foci_selftest_result` reply
-    /// back to the host with the stage number, status, and value.
-    struct KlipperSelftestReporter {
-        oid: u8,
-    }
-
-    impl foci_core::selftest::SelftestReporter for KlipperSelftestReporter {
-        fn report_stage(&mut self, stage: u8, status: u8, value: u32) {
-            klipper_reply!(
-                foci_selftest_result,
-                oid: u8 = self.oid,
-                stage: u8 = stage,
-                status: u8 = status,
-                value: u32 = value
-            );
-        }
-    }
-
     /// CommissioningBackend implementation for OpenFFBoard.
     ///
     /// Wraps the TMC4671 SPI driver, enable pin, and timer so the
@@ -304,11 +284,6 @@ mod app {
     /// Whether the encoder direction is reversed (set by tmc_set_encoder_dir).
     /// When true, position targets are negated before writing to the TMC4671.
     static ENCODER_REVERSED: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-
-    /// Guard for single-in-flight selftest. Set at command ingress (P2),
-    /// cleared after foci_selftest_done is emitted (P1).
-    static SELFTEST_IN_FLIGHT: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
 
     /// Guard for single-in-flight commissioning. Set at command ingress (P2),
@@ -528,7 +503,6 @@ mod app {
         FEEDFORWARD_RESET.store(false, core::sync::atomic::Ordering::Relaxed);
         ENCODER_REVERSED.store(false, core::sync::atomic::Ordering::Relaxed);
         STEPPER_POSITION_TARGET.store(0, core::sync::atomic::Ordering::Relaxed);
-        SELFTEST_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
         STATS_SEND_TIME.store(0, core::sync::atomic::Ordering::Relaxed);
         STATS_SEND_TIME_HIGH.store(0, core::sync::atomic::Ordering::Relaxed);
@@ -2335,8 +2309,8 @@ mod app {
                         let current_limit =
                             CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
 
-                        // Encoder alignment + closed-loop entry (same sequence
-                        // as tmc_run_calibration, minus the ADC cal step).
+                        // Encoder alignment + closed-loop entry. ADC cal was
+                        // already performed by the commissioning engine.
                         match tmc_align_encoder(tmc, current_limit).await {
                             Ok(encoder_count) => {
                                 match tmc_enter_closedloop(tmc, None, stored_position_gains).await {
@@ -3231,50 +3205,6 @@ mod app {
         defmt::info!("Spin complete");
     }
 
-    /// Run the full three-stage calibration sequence: ADC calibration,
-    /// encoder alignment, and closed-loop entry.
-    ///
-    /// Returns `(adc_i0, adc_i1, encoder_count)` on success, or
-    /// `CalibrationError` on any stage failure.
-    async fn tmc_run_calibration(
-        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
-        enable_pin: &mut Output<'static>,
-        current_limit_reg: u32,
-        stored_gains: Option<foci_core::pid::InnerLoopGains>,
-        stored_position_gains: Option<(u16, u16, u16, u16)>,
-    ) -> Result<(u16, u16, u32), CalibrationError> {
-        let (adc_i0, adc_i1) = tmc_adc_calibrate(tmc, enable_pin).await?;
-        let encoder_count = tmc_align_encoder(tmc, current_limit_reg).await?;
-        // Use default inner-loop gains for closed-loop entry (runaway
-        // detection needs known-good torque). Position/velocity gains
-        // are applied directly since they don't affect runaway detection.
-        tmc_enter_closedloop(tmc, None, stored_position_gains).await?;
-
-        // Now apply autotuned gains if available
-        if let Some(gains) = stored_gains {
-            let (flux_reg, torque_reg) = gains.to_registers();
-            tmc.write_register(tmc4671::registers::PID_FLUX_P_FLUX_I, flux_reg)
-                .await
-                .map_err(|_| CalibrationError::SpiError)?;
-            tmc.write_register(tmc4671::registers::PID_TORQUE_P_TORQUE_I, torque_reg)
-                .await
-                .map_err(|_| CalibrationError::SpiError)?;
-        }
-
-        // Re-apply current limit AFTER closed-loop entry. The TMC4671
-        // resets PID_TORQUE_FLUX_LIMITS during mode changes, clearing the
-        // torque limit field. Without this, the motor has zero torque
-        // capacity in position mode.
-        tmc.write_register(
-            tmc4671::registers::PID_TORQUE_FLUX_LIMITS,
-            current_limit_reg,
-        )
-        .await
-        .map_err(|_| CalibrationError::SpiError)?;
-
-        Ok((adc_i0, adc_i1, encoder_count))
-    }
-
     /// Perform TMC4671 hardware safety shutdown, PWM/ADC configuration, and ADC
     /// offset calibration.
     ///
@@ -3711,7 +3641,7 @@ mod app {
     /// 12. Enter position mode: MODE_RAMP_MODE_MOTION = 0x8000_0003
     /// 13. Validate: position error is not diverging
     ///
-    /// Assumes tmc_adc_calibrate and tmc_align_encoder have already been called.
+    /// Assumes ADC calibration and encoder alignment have already been performed.
     async fn tmc_enter_closedloop(
         tmc: &mut Tmc4671Spi<TmcSpiDevice>,
         stored_gains: Option<foci_core::pid::InnerLoopGains>,
