@@ -354,6 +354,20 @@ mod app {
     /// register 0x78 during closedloop entry.
     static STEP_WIDTH_VALUE: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 
+    /// Homing I-suppression state machine.
+    /// 0=Idle, 1=SuppressPending, 2=Suppressing, 3=RestorePending
+    static HOMING_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    /// TrSync OID that triggered the current homing operation.
+    static HOMING_TRSYNC_OID: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+    /// Position P gain for cross-priority access (Q8.8).
+    static POSITION_P_VALUE: core::sync::atomic::AtomicU16 =
+        core::sync::atomic::AtomicU16::new(640);
+
+    /// Position I gain for cross-priority access (Q8.8).
+    static POSITION_I_VALUE: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
     /// Lock-free move queue for hardware step/dir.
     /// P2 enqueues, P3 dequeues. When timer is disabled, P1/P2 may drain.
     ///
@@ -762,6 +776,17 @@ mod app {
             );
             if enter_shutdown(context) {
                 klipper_shutdown!("stepper_stop_on_trigger failed", read_tim5());
+            }
+        } else {
+            // Begin homing I-suppression: only update the TrSync OID if
+            // we successfully transition Idle -> SuppressPending. This
+            // prevents overwriting the OID of an active suppression cycle.
+            use core::sync::atomic::Ordering::Relaxed;
+            if HOMING_STATE
+                .compare_exchange(0, 1, Relaxed, Relaxed)
+                .is_ok()
+            {
+                HOMING_TRSYNC_OID.store(trsync_oid, Relaxed);
             }
         }
     }
@@ -2247,6 +2272,10 @@ mod app {
                             outer.velocity_p,
                             outer.velocity_i,
                         ));
+                        POSITION_P_VALUE
+                            .store(outer.position_p, core::sync::atomic::Ordering::Relaxed);
+                        POSITION_I_VALUE
+                            .store(outer.position_i, core::sync::atomic::Ordering::Relaxed);
 
                         // Persist velocity limit for closed-loop entry.
                         VELOCITY_LIMIT_CFG
@@ -2524,6 +2553,8 @@ mod app {
                     } => {
                         stored_position_gains =
                             Some((position_p, position_i, velocity_p, velocity_i));
+                        POSITION_P_VALUE.store(position_p, core::sync::atomic::Ordering::Relaxed);
+                        POSITION_I_VALUE.store(position_i, core::sync::atomic::Ordering::Relaxed);
                         defmt::info!(
                             "Position gains received: pos P={} I={}, vel P={} I={}",
                             position_p,
@@ -3093,6 +3124,64 @@ mod app {
                 });
             }
 
+            // Homing I-suppression state machine.
+            //
+            // During homing the motor hits a physical constraint (endstop or
+            // bed). The position I integrator accumulates error, causing
+            // overshoot when the motor releases. Fix: zero position I gain
+            // while homing, restore + clear integrator when TrSync resolves.
+            {
+                use core::sync::atomic::Ordering::Relaxed;
+                let homing = HOMING_STATE.load(Relaxed);
+                match homing {
+                    1 => {
+                        // SuppressPending: write position P with I=0
+                        let pos_p = POSITION_P_VALUE.load(Relaxed);
+                        let reg = (pos_p as u32) << 16; // P in upper half, I=0
+                        let _ = tmc
+                            .write_register(tmc4671::registers::PID_POSITION_P_POSITION_I, reg)
+                            .await;
+                        HOMING_STATE.store(2, Relaxed);
+                        defmt::info!("homing: position I suppressed");
+                    }
+                    2 => {
+                        // Suppressing: check if the linked TrSync has resolved
+                        let trsync_oid = HOMING_TRSYNC_OID.load(Relaxed);
+                        let resolved = ctx.shared.app_state.lock(|state| {
+                            if let Some(&ts_idx) = state.trsync_by_oid.get(&trsync_oid) {
+                                state.trsync[ts_idx].state()
+                                    != klipper_mcu::trsync::TrSyncState::Armed
+                            } else {
+                                // TrSync OID invalid, abort suppression
+                                true
+                            }
+                        });
+                        if resolved {
+                            HOMING_STATE.store(3, Relaxed);
+                        }
+                    }
+                    3 => {
+                        // RestorePending: restore position I and clear integrator
+                        let pos_p = POSITION_P_VALUE.load(Relaxed);
+                        let pos_i = POSITION_I_VALUE.load(Relaxed);
+                        let reg = ((pos_p as u32) << 16) | pos_i as u32;
+                        let _ = tmc
+                            .write_register(tmc4671::registers::PID_POSITION_P_POSITION_I, reg)
+                            .await;
+                        // Clear position error integrator
+                        let _ = tmc
+                            .write_sub_register(
+                                tmc4671::registers::PID_ERROR_PID_POSITION_ERROR_SUM,
+                                0,
+                            )
+                            .await;
+                        HOMING_STATE.store(0, Relaxed);
+                        defmt::info!("homing: position I restored, integrator cleared");
+                    }
+                    _ => {} // Idle, nothing to do
+                }
+            }
+
             // Poll STATUS_FLAGS every ~1 second for warning-level flags.
             // Critical faults (PLL lost, ADC clipped) are handled by EXTI.
             status_poll_counter += 1;
@@ -3653,6 +3742,8 @@ mod app {
         let _ = tmc
             .write_register(PID_POSITION_P_POSITION_I, position_pi)
             .await;
+        POSITION_P_VALUE.store(pos_p, core::sync::atomic::Ordering::Relaxed);
+        POSITION_I_VALUE.store(pos_i, core::sync::atomic::Ordering::Relaxed);
 
         // 4. Velocity limit: host-configured or unconstrained default.
         // Caps position PID output velocity to prevent integrator windup runaway.
