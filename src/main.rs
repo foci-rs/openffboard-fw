@@ -316,6 +316,11 @@ mod app {
     static COMMISSION_IN_FLIGHT: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
 
+    /// Shutdown active flag. Set by enter_shutdown(), cleared by clear_shutdown().
+    /// Checked by tmc_control to perform one-shot motor safe-state on first tick.
+    static SHUTDOWN_ACTIVE: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
     /// Signal tmc_control to drain all pending requests. Set by config_reset
     /// (P2), cleared by tmc_control (P1) after draining.
     static TMC_QUEUE_FLUSH: core::sync::atomic::AtomicBool =
@@ -477,6 +482,7 @@ mod app {
         {
             klipper_shutdown!("Shutdown cleared when not shutdown", read_tim5());
         }
+        SHUTDOWN_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// Full config reset: clear all OIDs, steppers, and shutdown state.
@@ -544,6 +550,7 @@ mod app {
         let entered = klipper_mcu::commands::lifecycle::enter_shutdown(context);
         if entered {
             TMC_DISABLE_SIGNAL.signal(());
+            SHUTDOWN_ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed);
         }
         entered
     }
@@ -2095,6 +2102,10 @@ mod app {
         // request arrives, cleared when the engine finishes or fails.
         let mut commission_engine: Option<crate::commission::CommissioningEngine> = None;
 
+        // Whether the shutdown safe-state has already been applied this
+        // shutdown cycle. Reset when shutdown clears.
+        let mut shutdown_handled = false;
+
         // (Velocity feedforward and move boundary detection removed —
         // hardware step/dir eliminates the 1ms SPI position target write.)
 
@@ -2104,6 +2115,25 @@ mod app {
         // by usb_receive at P2) — no shared resource lock needed.
         loop {
             use embassy_futures::select::{select, Either};
+
+            // On shutdown, perform one-shot motor safe-state then idle until
+            // shutdown clears. This catches USB disconnect / host crash where
+            // no further commands arrive but the TMC4671 remains energized.
+            if SHUTDOWN_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+                if !shutdown_handled {
+                    if let Some(_) = commission_engine.take() {}
+                    foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                    motor_enabled = false;
+                    calibrated = false;
+                    COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+                    stepper_stop();
+                    MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+                    shutdown_handled = true;
+                }
+                Mono::delay(1.millis()).await;
+                continue;
+            }
+            shutdown_handled = false;
 
             // Drain stale requests after config_reset
             if TMC_QUEUE_FLUSH.swap(false, core::sync::atomic::Ordering::Relaxed) {
@@ -2428,12 +2458,7 @@ mod app {
 
                             motor_enabled = false;
                             calibrated = false;
-                            use tmc4671::registers::*;
-                            let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
-                            let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
-                            let _ = tmc.write_register(UQ_UD_EXT, 0).await;
-                            let _ = tmc.write_register(PWM_SV_CHOP, 0).await;
-                            enable_pin.set_low();
+                            foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
 
                             // Zero position counter
                             STEPPER_POSITION.store(0, core::sync::atomic::Ordering::Relaxed);
