@@ -1996,7 +1996,7 @@ mod app {
         //
         // Both limits=0 disables the BRAKE output (datasheet section 4.7.12).
         // The prior auto-configuration (sample VM at boot, set HIGH at +15%)
-        // had two fundamental problems that together created a fire hazard:
+        // had two fundamental issues:
         //
         //   1. Threshold too tight: 15% above nominal bus voltage leaves
         //      insufficient margin for regen transients and PSU ripple. At
