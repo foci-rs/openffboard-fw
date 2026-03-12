@@ -329,6 +329,18 @@ mod app {
     /// register 0x78 during closedloop entry.
     static STEP_WIDTH_VALUE: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 
+    /// Current step interval in TIM5 clock ticks, written by P3 after
+    /// every step event. Written to 0 when the step queue drains (both
+    /// the ISR empty-queue branch and stepper_stop). Read by tmc_control
+    /// at 1 kHz for velocity feedforward computation.
+    static STEP_INTERVAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    /// Current step direction, written by P3 when direction changes.
+    /// true = forward, false = reverse. Read by tmc_control for
+    /// feedforward sign.
+    static STEP_DIRECTION: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(true);
+
     /// Homing I-suppression state machine.
     /// 0=Idle, 1=SuppressPending, 2=Suppressing, 3=RestorePending
     static HOMING_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
