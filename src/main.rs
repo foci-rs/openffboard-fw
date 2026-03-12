@@ -2117,8 +2117,9 @@ mod app {
         // shutdown cycle. Reset when shutdown clears.
         let mut shutdown_handled = false;
 
-        // (Velocity feedforward and move boundary detection removed —
-        // hardware step/dir eliminates the 1ms SPI position target write.)
+        // Velocity feedforward scale factor, computed when encoder PPR arrives.
+        // velocity_tmc = velocity_scale / step_interval
+        let mut velocity_scale: u32 = 0;
 
         // Main loop: wait for channel message or 1ms timeout.
         // On message: handle request. On timeout: write position target.
@@ -2935,6 +2936,23 @@ mod app {
                         commission_engine =
                             Some(crate::commission::CommissioningEngine::new_selftest(oid));
                     }
+                    req @ TmcRequest::SetEncoder { .. } => {
+                        if handle_tmc_request(req, tmc).await.is_err() {
+                            ctx.shared.app_state.lock(|state| {
+                                if enter_shutdown(state) {
+                                    klipper_shutdown!("TMC request validation failed", read_tim5());
+                                }
+                            });
+                        }
+                        // Compute feedforward scale factor from step_width and PWM config
+                        velocity_scale = foci_core::tmc::compute_velocity_scale_factor(
+                            STEP_WIDTH_VALUE
+                                .load(core::sync::atomic::Ordering::Relaxed)
+                                .unsigned_abs(),
+                            CLOCK_FREQ,
+                            TMC_CONFIG.pwm_freq_hz(),
+                        );
+                    }
                     other => {
                         if handle_tmc_request(other, tmc).await.is_err() {
                             ctx.shared.app_state.lock(|state| {
@@ -2993,6 +3011,34 @@ mod app {
             // toggling STEP GPIO → TMC4671 hardware step counter. No SPI
             // position target write needed. The 1ms tick loop only handles
             // STATUS_FLAGS polling, TrSync, endstop, and watchdog.
+
+            // Velocity feedforward: compute offset from live step interval
+            // and write to PID_VELOCITY_OFFSET. Gated on:
+            // - motor_enabled (closedloop active, safe to write 0x67)
+            // - velocity_scale != 0 (encoder configured)
+            // - VELOCITY_FEEDFORWARD enabled (host config)
+            // - commission_engine is None (not commissioning)
+            // - homing not active
+            if motor_enabled
+                && velocity_scale != 0
+                && VELOCITY_FEEDFORWARD.load(core::sync::atomic::Ordering::Relaxed)
+                && commission_engine.is_none()
+            {
+                let homing_active = HOMING_STATE.load(core::sync::atomic::Ordering::Relaxed) != 0;
+                let reset = FEEDFORWARD_RESET.swap(false, core::sync::atomic::Ordering::Relaxed);
+
+                let offset = if homing_active || reset {
+                    0i32
+                } else {
+                    let interval = STEP_INTERVAL.load(core::sync::atomic::Ordering::Relaxed);
+                    let forward = STEP_DIRECTION.load(core::sync::atomic::Ordering::Relaxed);
+                    foci_core::tmc::compute_velocity_offset(velocity_scale, interval, forward)
+                };
+
+                let _ = tmc
+                    .write_register(tmc4671::registers::PID_VELOCITY_OFFSET, offset as u32)
+                    .await;
+            }
 
             // TrSync: check timeouts and send periodic status reports.
             //
