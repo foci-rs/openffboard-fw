@@ -263,14 +263,15 @@ mod app {
     static FLUX_FILTER_HZ: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 
     /// Velocity feedforward enable flag (set by tmc_set_velocity_feedforward).
-    /// When true, the 1ms tick loop computes position delta and writes
-    /// PID_VELOCITY_OFFSET. Applied immediately in the tick loop.
+    /// When true, the 1ms tick loop computes velocity from the step
+    /// interval and writes PID_VELOCITY_OFFSET.
     static VELOCITY_FEEDFORWARD: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
 
-    /// Signal the tick loop to reset feedforward state (prev_position_target,
-    /// first_tick_after_enable). Set by handle_tmc_request when encoder
-    /// direction changes, consumed by the tick loop on next iteration.
+    /// Signal the tick loop to zero feedforward for one tick after a
+    /// direction change. Avoids a sign-flip transient in
+    /// PID_VELOCITY_OFFSET. Set by handle_tmc_request when encoder
+    /// direction changes, consumed by tmc_control on next iteration.
     static FEEDFORWARD_RESET: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
 
