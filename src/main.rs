@@ -1994,7 +1994,21 @@ mod app {
 
         // Disable TMC4671 brake chopper unconditionally.
         //
-        // Both limits=0 disables the BRAKE output (datasheet section 4.7.12).
+        // Write both ADC_VM_LIMIT_HIGH and ADC_VM_LIMIT_LOW to u16::MAX
+        // (0xFFFFFFFF). Since ADC_VM_RAW is a 16-bit value that can
+        // never exceed 0xFFFF, the comparison `ADC_VM > LIMIT_HIGH` is
+        // never true and the BRAKE pin never activates.
+        //
+        // WARNING: Do NOT write 0/0 to disable the brake, despite the
+        // TMC4671 rev 2.08 datasheet section 4.7.12 claim that "BRAKE can
+        // be deactivated by setting both registers to Zero". Bench testing
+        // on 2026-04-09 proved that writing 0/0 causes the brake to fire
+        // continuously — consistent with the comparison `ADC_VM > 0` being
+        // always true for any positive bus voltage. The "deactivation"
+        // language in the datasheet is either wrong or refers to stopping
+        // an already-firing brake (not the default state). The safe
+        // "disabled" pattern is 0xFFFFFFFF, not 0.
+        //
         // The prior auto-configuration (sample VM at boot, set HIGH at +15%)
         // had two fundamental issues:
         //
@@ -2017,7 +2031,7 @@ mod app {
         // held LOW at boot (line ~1650) to keep the Layer 2 brake FET off.
         {
             use tmc4671::registers::*;
-            let _ = tmc.write_register(ADC_VM_LIMITS, 0).await;
+            let _ = tmc.write_register(ADC_VM_LIMITS, 0xFFFF_FFFF).await;
         }
 
         // Configure STATUS_MASK: route critical fault flags to the STATUS
