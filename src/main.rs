@@ -4033,6 +4033,7 @@ mod app {
                             };
                             gpio_a.odr().modify(|w| w.set_odr(0, dir_val));
                             STEP_DIRECTION.store(stepper.dir_state(), Relaxed);
+                            FEEDFORWARD_RESET.store(true, Relaxed);
                         }
                     }
                     None => {
