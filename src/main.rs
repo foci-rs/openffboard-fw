@@ -2122,6 +2122,10 @@ mod app {
         // velocity_tmc = velocity_scale / step_interval
         let mut velocity_scale: u32 = 0;
 
+        // Track whether feedforward was active on the previous tick, so we
+        // can zero PID_VELOCITY_OFFSET on the deactivation edge.
+        let mut feedforward_was_active = false;
+
         // Main loop: wait for channel message or 1ms timeout.
         // On message: handle request. On timeout: write position target.
         // Position is read from STEPPER_POSITION_TARGET atomic (updated
@@ -3020,11 +3024,12 @@ mod app {
             // - VELOCITY_FEEDFORWARD enabled (host config)
             // - commission_engine is None (not commissioning)
             // - homing not active
-            if motor_enabled
+            let ff_active = motor_enabled
                 && velocity_scale != 0
                 && VELOCITY_FEEDFORWARD.load(core::sync::atomic::Ordering::Relaxed)
-                && commission_engine.is_none()
-            {
+                && commission_engine.is_none();
+
+            if ff_active {
                 let homing_active = HOMING_STATE.load(core::sync::atomic::Ordering::Relaxed) != 0;
                 let reset = FEEDFORWARD_RESET.swap(false, core::sync::atomic::Ordering::Relaxed);
 
@@ -3039,7 +3044,13 @@ mod app {
                 let _ = tmc
                     .write_register(tmc4671::registers::PID_VELOCITY_OFFSET, offset as u32)
                     .await;
+            } else if feedforward_was_active {
+                // Feedforward just deactivated — clear stale offset
+                let _ = tmc
+                    .write_register(tmc4671::registers::PID_VELOCITY_OFFSET, 0)
+                    .await;
             }
+            feedforward_was_active = ff_active;
 
             // TrSync: check timeouts and send periodic status reports.
             //
