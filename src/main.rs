@@ -3905,6 +3905,7 @@ mod app {
         tim5.sr().modify(|w| w.set_ccif(0, false));
         TIMER_ACTIVE.store(false, Relaxed);
         STEPPER_NEED_RESET.store(true, Relaxed);
+        STEP_INTERVAL.store(0, Relaxed);
         // Drain queue (safe: P3 is disabled by the CC1IE clear above)
         // SAFETY: P3 (timer ISR) is quiesced — we are the sole accessor.
         unsafe { while (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue().is_some() {} }
@@ -3975,6 +3976,7 @@ mod app {
                 match unsafe { (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue() } {
                     Some(m) => {
                         let dir_changed = stepper.load_move(m);
+                        STEP_INTERVAL.store(stepper.current_interval(), Relaxed);
                         if dir_changed {
                             // Set DIR GPIO (PA0) before first step pulse
                             let dir_val = if stepper.dir_state() {
@@ -3983,12 +3985,14 @@ mod app {
                                 embassy_stm32::pac::gpio::vals::Odr::LOW
                             };
                             gpio_a.odr().modify(|w| w.set_odr(0, dir_val));
+                            STEP_DIRECTION.store(stepper.dir_state(), Relaxed);
                         }
                     }
                     None => {
                         // Queue empty: disarm timer, go idle
                         tim5.dier().modify(|w| w.set_ccie(0, false));
                         TIMER_ACTIVE.store(false, Relaxed);
+                        STEP_INTERVAL.store(0, Relaxed);
                         return;
                     }
                 }
@@ -4037,6 +4041,8 @@ mod app {
                 // Advance scheduling
                 match stepper.step_event() {
                     StepEventResult::ScheduleNext { clock } => {
+                        // Update feedforward interval (read by tmc_control at 1 kHz)
+                        STEP_INTERVAL.store(stepper.current_interval(), Relaxed);
                         let now = tim5.cnt().read();
                         match stepper.check_deadline(clock, now, CLOCK_FREQ) {
                             Ok(compare) => {
