@@ -1992,9 +1992,29 @@ mod app {
             }
         }
 
-        // Disable TMC4671 brake chopper until VM is measured. Both limits=0
-        // disables the BRAKE output (datasheet section 4.7.12). Proper limits
-        // are set later after measuring the actual bus voltage.
+        // Disable TMC4671 brake chopper unconditionally.
+        //
+        // Both limits=0 disables the BRAKE output (datasheet section 4.7.12).
+        // The prior auto-configuration (sample VM at boot, set HIGH at +15%)
+        // had two fundamental problems that together created a fire hazard:
+        //
+        //   1. Threshold too tight: 15% above nominal bus voltage leaves
+        //      insufficient margin for regen transients and PSU ripple. At
+        //      24V nominal, HIGH was ~26.65V — easily crossed during any
+        //      brief motor spin, causing continuous brake firing.
+        //   2. Voltage divider saturates at ~43V: the OpenFFBoard v1.2.4
+        //      voltage sense can only measure up to ~43V, so boards running
+        //      at 36V/48V/65V bus have no usable ADC_VM reading and can't
+        //      be protected by this mechanism at all.
+        //
+        // Proper overvoltage protection requires the Layer 2 brake (STM32
+        // ADC monitoring + PE10 GPIO control) with its own voltage sense
+        // path that spans the full 12-65V operating range. That is tracked
+        // in docs/specs/2026-03-29-foci-design.md (Future Ideas).
+        //
+        // For now, rely on the PSU's own overvoltage protection and the
+        // bulk capacitors to absorb typical regen events. PE10 remains
+        // held LOW at boot (line ~1650) to keep the Layer 2 brake FET off.
         {
             use tmc4671::registers::*;
             let _ = tmc.write_register(ADC_VM_LIMITS, 0).await;
@@ -2022,73 +2042,6 @@ mod app {
             exti.pr(0).write(|w| w.set_line(8, true)); // Clear pending
             exti.imr(0).modify(|w| w.set_line(8, true)); // Unmask
             defmt::info!("TMC4671 STATUS_MASK: {:#010x}, EXTI8 enabled", mask);
-        }
-
-        // Configure brake chopper thresholds from measured bus voltage.
-        //
-        // Sample ADC_VM_RAW at boot to measure supply voltage, then set
-        // activation/deactivation thresholds as percentages of measured peak:
-        //   HIGH = +15% above measured (activation)
-        //   LOW  = +10% above measured (deactivation, 5% hysteresis)
-        //
-        // Margins follow industry servo drive practice (5-20% activation,
-        // 1-5% hysteresis). References: ABB ACS880 (+15-19%), Rockwell
-        // PF755 (+16%, 4% hysteresis), KEB F5 (+16%).
-        //
-        // Configured at boot (not during motor calibration) so protection
-        // is active before Klipper connects. VM divider readings are
-        // unaffected by PWM_CHOP state — no motor interaction needed.
-        //
-        // TMC4671 datasheet rev 2.08, section 4.7.12: BRAKE pin activates
-        // per-PWM-cycle when ADC_VM > ADC_VM_LIMIT_HIGH, deactivates when
-        // ADC_VM < ADC_VM_LIMIT_LOW.
-        {
-            use tmc4671::registers::*;
-
-            // Ensure PWM_CHOP=0 before sampling (power-on default, but
-            // explicit per project safety rules).
-            let _ = tmc.write_register(PWM_SV_CHOP, 0).await;
-
-            let mut vm_max: u16 = 0;
-            for _ in 0..100_u32 {
-                if let Ok(raw) = tmc.read_sub_register(ADC_AGPI_A_RAW_ADC_VM_RAW).await {
-                    // ADC_VM_RAW is in bits[15:0] (datasheet section 7.2)
-                    let vm = (raw & 0xFFFF) as u16;
-                    if vm > vm_max {
-                        vm_max = vm;
-                    }
-                }
-                Mono::delay(1.millis()).await;
-            }
-
-            // Require a plausible reading to filter ADC noise floor.
-            // Any real supply voltage produces counts well above 100.
-            if vm_max > 100 {
-                let high = vm_max as u32 * 115 / 100;
-                let low = vm_max as u32 * 110 / 100;
-
-                // Clamp to u16::MAX if overflow — fail-safe (max protection),
-                // not fail-open (no protection).
-                let high = high.min(u16::MAX as u32);
-                let low = low.min(u16::MAX as u32);
-
-                // Datasheet section 7.2, page 103: LOW = bits[15:0], HIGH = bits[31:16]
-                let limits = (high << 16) | low;
-                if tmc.write_register(ADC_VM_LIMITS, limits).await.is_err() {
-                    defmt::warn!("Brake chopper: ADC_VM_LIMITS write failed");
-                }
-                defmt::info!(
-                    "Brake chopper: VM peak={}, LOW={} (+10%), HIGH={} (+15%)",
-                    vm_max,
-                    low,
-                    high,
-                );
-            } else {
-                if tmc.write_register(ADC_VM_LIMITS, 0).await.is_err() {
-                    defmt::warn!("Brake chopper: ADC_VM_LIMITS write failed");
-                }
-                defmt::warn!("Brake chopper disabled: no VM reading");
-            }
         }
 
         // Track whether the motor is enabled. Only set to true after the full
