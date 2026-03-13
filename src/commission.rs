@@ -42,11 +42,23 @@ pub trait CommissioningBackend {
     /// Read the current ABN encoder count.
     async fn read_encoder_count(&mut self) -> u32;
 
-    /// Microseconds elapsed since an arbitrary reference point.
+    /// Microseconds elapsed since an arbitrary monotonic reference point.
     ///
     /// Used for deadline-driven sub-state timing within `step()`.
-    /// Must be monotonic within a commissioning session.
-    fn elapsed_us(&self) -> u32;
+    /// Must be strictly monotonic (never decreases or wraps) across
+    /// a commissioning session.
+    ///
+    /// Returning `u64` avoids any realistic wraparound: u64 us covers
+    /// ~584,942 years. The previous `u32` return type combined with
+    /// a `read_tim5() / 84` implementation wrapped every ~51 seconds
+    /// on a non-u32-clean boundary, which broke deadline arithmetic
+    /// and caused the commissioning engine to hang.
+    ///
+    /// Board implementations should use a hardware-backed monotonic
+    /// (e.g. a TIM2 `stm32_tim2_monotonic!` from rtic-monotonics) to
+    /// preserve microsecond precision for sub-ms sampling loops in
+    /// Phase 5 electrical identification.
+    fn elapsed_us(&self) -> u64;
 
     /// Whether a shutdown has been requested (M112 / e-stop).
     ///
@@ -184,7 +196,7 @@ pub struct AdcCalResult {
 const ADC_CAL_SAMPLES: u16 = 128;
 
 /// Settling time after enabling ADC outputs (microseconds).
-const ADC_CAL_SETTLE_US: u32 = 250_000;
+const ADC_CAL_SETTLE_US: u64 = 250_000;
 
 /// Valid ADC offset range (centered around ~33000).
 const ADC_OFFSET_MIN: u16 = 30_000;
@@ -194,16 +206,16 @@ const ADC_OFFSET_MAX: u16 = 36_000;
 const MOTOR_CURRENT_THRESHOLD: u16 = 200;
 
 /// Settling time after applying coil test voltage (microseconds).
-const COIL_SETTLE_US: u32 = 100_000;
+const COIL_SETTLE_US: u64 = 100_000;
 
 /// Settling time after disabling coil test (microseconds).
-const COIL_COOLDOWN_US: u32 = 50_000;
+const COIL_COOLDOWN_US: u64 = 50_000;
 
 /// Number of PHI_E steps for encoder direction sweep.
 const ENCODER_DIR_STEPS: u16 = 50;
 
 /// Per-step dwell time for encoder direction sweep (microseconds).
-const ENCODER_DIR_STEP_US: u32 = 10_000;
+const ENCODER_DIR_STEP_US: u64 = 10_000;
 
 // ---------------------------------------------------------------------------
 // Electrical identification constants (Phase 5)
@@ -214,16 +226,16 @@ const RES_SAMPLE_COUNT: u16 = 1000;
 
 /// Sampling interval for resistance and transient captures (microseconds).
 /// Matches PWM rate (~160us at 25 kHz) for Nyquist-rate current sampling.
-const ELEC_SAMPLE_PERIOD_US: u32 = 160;
+const ELEC_SAMPLE_PERIOD_US: u64 = 160;
 
 /// Settling time after applying excitation voltage (microseconds).
-const RES_SETTLE_US: u32 = 100_000;
+const RES_SETTLE_US: u64 = 100_000;
 
 /// Cooldown time after disabling a per-coil measurement (microseconds).
-const ELEC_COOLDOWN_US: u32 = 50_000;
+const ELEC_COOLDOWN_US: u64 = 50_000;
 
 /// Brief settle before starting di/dt toggling (microseconds).
-const DIDT_PRE_SETTLE_US: u32 = 10_000;
+const DIDT_PRE_SETTLE_US: u64 = 10_000;
 
 /// Maximum di/dt toggle cycles per step() call.
 /// Each cycle is ~2 SPI transfers (~22us at 8 MHz SPI).
@@ -254,7 +266,7 @@ const RISE_63_PCT_Q10: u32 = 647;
 const VALIDATION_STEP_PERCENT: u32 = 15;
 
 /// Settling time after applying or removing current step (microseconds).
-const VALIDATION_SETTLE_US: u32 = 50_000;
+const VALIDATION_SETTLE_US: u64 = 50_000;
 
 /// Lambda multiplier for retry (150% = increase lambda by 50%).
 /// Applied as lambda_us = lambda_us * 3 / 2.
@@ -278,17 +290,17 @@ enum CurrentValidateState {
     /// Wait for transient to develop before capturing.
     StepSettle {
         direction: CaptureDirection,
-        deadline_us: u32,
+        deadline_us: u64,
     },
     /// Capture step response into TransientBuffer at 160us intervals.
     StepCapture {
         direction: CaptureDirection,
-        next_sample_us: u32,
+        next_sample_us: u64,
     },
     /// Extract metrics and classify response.
     Classify,
     /// Restore safe state before finalizing.
-    SafeState { deadline_us: u32 },
+    SafeState { deadline_us: u64 },
     /// Emit final InnerResult.
     Finalize,
 }
@@ -327,7 +339,7 @@ enum AdcCalState {
     /// Configure registers and enable outputs.
     Setup,
     /// Wait for ADC outputs to settle.
-    Settle { deadline_us: u32 },
+    Settle { deadline_us: u64 },
     /// Collect ADC samples one per step() call.
     Sample {
         sum_i0: i32,
@@ -344,11 +356,11 @@ enum CoilTestState {
     /// Configure open-loop voltage mode for this phase.
     Setup { phase: u8 },
     /// Wait for current to settle.
-    Settle { phase: u8, deadline_us: u32 },
+    Settle { phase: u8, deadline_us: u64 },
     /// Read ADC and record result.
     Read { phase: u8 },
     /// Disable and cool down before next test.
-    Cooldown { phase: u8, deadline_us: u32 },
+    Cooldown { phase: u8, deadline_us: u64 },
 }
 
 /// Coil check phase state (wraps both coil tests).
@@ -379,7 +391,7 @@ enum EncoderCheckState {
     /// Sweep PHI_E_EXT in steps, one per tick.
     DirSweep {
         step: u16,
-        deadline_us: u32,
+        deadline_us: u64,
         count_start: i32,
     },
     /// Read final count and determine direction.
@@ -423,38 +435,38 @@ enum ElectricalIdState {
     /// Configure open-loop voltage mode for resistance measurement.
     ResSetup { coil: u8 },
     /// Wait for steady-state current.
-    ResSettle { coil: u8, deadline_us: u32 },
+    ResSettle { coil: u8, deadline_us: u64 },
     /// Sample PID_TORQUE_FLUX_ACTUAL at 160us intervals (multiple per step).
-    ResSample { coil: u8, next_sample_us: u32 },
+    ResSample { coil: u8, next_sample_us: u64 },
     /// Disable motor and cool down before next measurement.
-    ResDisable { coil: u8, deadline_us: u32 },
+    ResDisable { coil: u8, deadline_us: u64 },
 
     // --- Inductance measurement (per coil, square-wave di/dt) ---
     /// Configure for di/dt toggling.
     IndSetup { coil: u8 },
     /// Brief settle before toggling.
-    IndSettle { coil: u8, deadline_us: u32 },
+    IndSettle { coil: u8, deadline_us: u64 },
     /// Toggle voltage and accumulate |delta_I| (chunked per step).
     IndToggle {
         coil: u8,
         remaining_cycles: u32,
         prev_current: i16,
-        start_us: u32,
+        start_us: u64,
     },
     /// Disable motor and cool down.
-    IndDisable { coil: u8, deadline_us: u32 },
+    IndDisable { coil: u8, deadline_us: u64 },
 
     // --- Delay identification ---
     /// Configure for delay step response capture.
     DelaySetup,
     /// Brief settle at zero voltage before step.
-    DelaySettle { deadline_us: u32 },
+    DelaySettle { deadline_us: u64 },
     /// Apply voltage step and start capturing.
     DelayStep,
     /// Capture 256 samples into TransientBuffer at 160us intervals.
-    DelaySample { baseline: i16, next_sample_us: u32 },
+    DelaySample { baseline: i16, next_sample_us: u64 },
     /// Disable and restore safe state.
-    DelayDisable { deadline_us: u32 },
+    DelayDisable { deadline_us: u64 },
 
     // --- Final ---
     /// Assemble ElectricalModel and validate.
@@ -529,11 +541,11 @@ const MECH_ID_TORQUE_STEP_PERCENT: u32 = 25;
 
 /// Sampling interval for encoder capture (microseconds).
 /// 1 kHz = 1000us between samples.
-const MECH_ID_SAMPLE_PERIOD_US: u32 = 1000;
+const MECH_ID_SAMPLE_PERIOD_US: u64 = 1000;
 
 /// Settling time after removing torque (microseconds).
 /// Allow the motor to decelerate and stop before reverse capture.
-const MECH_ID_SETTLE_US: u32 = 500_000;
+const MECH_ID_SETTLE_US: u64 = 500_000;
 
 /// Forward/reverse agreement threshold (30% = 30/100).
 /// If |J_fwd - J_rev| / avg > 30%, mechanical ID fails.
@@ -557,10 +569,10 @@ const VEL_VALIDATE_STEP_PERCENT: u32 = 15;
 
 /// Sampling interval for velocity capture (microseconds).
 /// 1 kHz = 1000us between samples.
-const VEL_VALIDATE_SAMPLE_PERIOD_US: u32 = 1000;
+const VEL_VALIDATE_SAMPLE_PERIOD_US: u64 = 1000;
 
 /// Settling time after removing velocity target (microseconds).
-const VEL_VALIDATE_SETTLE_US: u32 = 200_000;
+const VEL_VALIDATE_SETTLE_US: u64 = 200_000;
 
 /// Zero-speed chatter monitoring window (samples at 1 kHz).
 /// Spec: 200ms = 200 samples.
@@ -593,10 +605,10 @@ const POS_TUNE_MAX_P: u16 = 16384;
 const POS_TUNE_I_PERCENT: u32 = 5;
 
 /// Sampling interval for position capture (microseconds). 1 kHz.
-const POS_TUNE_SAMPLE_PERIOD_US: u32 = 1000;
+const POS_TUNE_SAMPLE_PERIOD_US: u64 = 1000;
 
 /// Settling time after position step (microseconds).
-const POS_TUNE_SETTLE_US: u32 = 200_000;
+const POS_TUNE_SETTLE_US: u64 = 200_000;
 
 // ---------------------------------------------------------------------------
 // Mechanical identification sub-states
@@ -610,15 +622,15 @@ enum MechanicalIdState {
     /// Apply torque step and begin forward capture.
     ForwardStart,
     /// Sample encoder position into transient buffer at 1 kHz.
-    ForwardCapture { next_sample_us: u32 },
+    ForwardCapture { next_sample_us: u64 },
     /// Return to zero torque and wait for settling.
-    ForwardSettle { deadline_us: u32 },
+    ForwardSettle { deadline_us: u64 },
     /// Apply reverse torque step and begin reverse capture.
     ReverseStart,
     /// Sample encoder position for reverse direction.
-    ReverseCapture { next_sample_us: u32 },
+    ReverseCapture { next_sample_us: u64 },
     /// Return to zero torque and wait for settling.
-    ReverseSettle { deadline_us: u32 },
+    ReverseSettle { deadline_us: u64 },
     /// Estimate mechanical parameters from captured data.
     Estimate,
     /// Validate gates and finalize.
@@ -670,21 +682,21 @@ enum VelocityValidateState {
     /// Switch to velocity mode and apply forward velocity step.
     ForwardStep,
     /// Capture forward step response at 1 kHz.
-    ForwardCapture { next_sample_us: u32 },
+    ForwardCapture { next_sample_us: u64 },
     /// Return to zero velocity and wait for settling.
-    ForwardSettle { deadline_us: u32 },
+    ForwardSettle { deadline_us: u64 },
     /// Apply reverse velocity step.
     ReverseStep,
     /// Capture reverse step response.
-    ReverseCapture { next_sample_us: u32 },
+    ReverseCapture { next_sample_us: u64 },
     /// Return to zero velocity and wait for settling.
-    ReverseSettle { deadline_us: u32 },
+    ReverseSettle { deadline_us: u64 },
     /// Monitor zero-speed chatter for 200ms.
-    ChatterCheck { next_sample_us: u32, remaining: u16 },
+    ChatterCheck { next_sample_us: u64, remaining: u16 },
     /// Extract metrics and classify response.
     Classify,
     /// Restore safe state before finalize or retry.
-    SafeState { deadline_us: u32 },
+    SafeState { deadline_us: u64 },
     /// Emit result or transition.
     Finalize,
 }
@@ -727,9 +739,9 @@ enum PositionTuneState {
     /// Switch to position mode and write initial P gain.
     Setup,
     /// Command a position step and capture response.
-    StepCapture { next_sample_us: u32 },
+    StepCapture { next_sample_us: u64 },
     /// Wait for settling after capture.
-    Settle { deadline_us: u32 },
+    Settle { deadline_us: u64 },
     /// Analyze capture: oscillation check and decide to increase P or stop.
     Analyze,
     /// Restore safe state and finalize.
@@ -1782,8 +1794,10 @@ impl CommissioningEngine {
 
                 if *remaining_cycles == 0 {
                     // All cycles done. Record elapsed time.
+                    // Duration is bounded by DIDT_CYCLES * cycle time
+                    // (~200ms max), well within u32 us range.
                     let end = backend.elapsed_us();
-                    data.ind_elapsed_us[coil_idx] = end.wrapping_sub(*start_us);
+                    data.ind_elapsed_us[coil_idx] = (end - *start_us) as u32;
 
                     // Disable motor.
                     let _ = backend.write_register(UQ_UD_EXT, 0).await;
@@ -2016,11 +2030,13 @@ impl CommissioningEngine {
                 };
 
                 // Onset: first sample above noise threshold.
+                // Result values are bounded by samples.len() * sample period
+                // (< 256 * 160us = 41ms), well within u32 us range.
                 let onset_threshold = DELAY_ONSET_THRESHOLD as u32;
                 let mut theta_e_us = 0u32;
                 for (i, &sample) in samples.iter().enumerate() {
                     if sample > onset_threshold {
-                        theta_e_us = i as u32 * ELEC_SAMPLE_PERIOD_US;
+                        theta_e_us = (i as u64 * ELEC_SAMPLE_PERIOD_US) as u32;
                         break;
                     }
                 }
@@ -2030,14 +2046,14 @@ impl CommissioningEngine {
                 let mut tau_crosscheck_us = 0u32;
                 for (i, &sample) in samples.iter().enumerate() {
                     if sample >= rise_threshold {
-                        tau_crosscheck_us = i as u32 * ELEC_SAMPLE_PERIOD_US;
+                        tau_crosscheck_us = (i as u64 * ELEC_SAMPLE_PERIOD_US) as u32;
                         break;
                     }
                 }
 
                 // Default theta_e to at least one sample period if zero.
                 if theta_e_us == 0 {
-                    theta_e_us = ELEC_SAMPLE_PERIOD_US;
+                    theta_e_us = ELEC_SAMPLE_PERIOD_US as u32;
                 }
 
                 // --- Assemble ElectricalModel ---
@@ -2920,7 +2936,7 @@ impl CommissioningEngine {
                 // first measurable velocity change).
                 let avg_delay_samples =
                     (data.forward_delay_samples + data.reverse_delay_samples) / 2;
-                let theta_mech_us = avg_delay_samples as u32 * MECH_ID_SAMPLE_PERIOD_US;
+                let theta_mech_us = (avg_delay_samples as u64 * MECH_ID_SAMPLE_PERIOD_US) as u32;
 
                 let model = MechanicalModel {
                     j_eff,

@@ -29,7 +29,7 @@ mod app {
     use embassy_sync::signal::Signal;
     use embedded_hal_bus::spi::ExclusiveDevice;
     use klipper_mcu::state::State;
-    use rtic_monotonics::systick::prelude::*;
+    use rtic_monotonics::stm32::prelude::*;
     use rtic_sync::channel::{Receiver, Sender};
     use tmc4671::spi::Tmc4671Spi;
 
@@ -38,7 +38,17 @@ mod app {
         DMA2_STREAM3 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH3>;
     });
 
-    systick_monotonic!(Mono, 1_000);
+    // TIM2-backed monotonic at 1 MHz (1 us resolution).
+    //
+    // Previously used SysTick at 1 kHz, but the commissioning engine's
+    // tight sample loops in Phase 5 (R/L measurement) rely on sub-ms
+    // deadlines. Using a TIM2-backed monotonic gives true u64 us
+    // precision without the 51-second wraparound bug that affected
+    // the old read_tim5()/84 path.
+    //
+    // The rtic-monotonics crate handles the hardware timer overflow
+    // automatically via an extended u64 counter in a TimerQueueBackend.
+    stm32_tim2_monotonic!(Mono, 1_000_000);
 
     /// SPI bus type for TMC4671 communication.
     type Spi1Bus = Spi<'static, AsyncMode, embassy_stm32::spi::mode::Master>;
@@ -174,8 +184,15 @@ mod app {
                 .unwrap_or(0)
         }
 
-        fn elapsed_us(&self) -> u32 {
-            read_tim5() / 84
+        fn elapsed_us(&self) -> u64 {
+            // Microseconds since Mono start. Returned as u64 so deadline
+            // comparisons in commission.rs never wrap across the 51-second
+            // TIM5 boundary that previously broke the engine.
+            //
+            // Source: TIM2 monotonic at 1 MHz (1 us resolution) via
+            // rtic-monotonics. See systick_monotonic! replacement at the
+            // top of this module.
+            Mono::now().duration_since_epoch().to_micros()
         }
 
         fn is_shutdown_requested(&self) -> bool {
@@ -1634,7 +1651,11 @@ mod app {
 
         defmt::info!("TIM5 enabled for Klipper clock @ 84 MHz, STEP/DIR GPIO configured");
 
-        Mono::start(ctx.core.SYST, 168_000_000);
+        // TIM2 clock: 84 MHz (APB1 timer clock, same bus as TIM5). At the
+        // 1 MHz target monotonic rate, the prescaler is 84 (integer divisor).
+        // rtic-monotonics enables and configures TIM2 internally; no PAC
+        // setup is required beyond passing the timer clock frequency.
+        Mono::start(84_000_000);
 
         // PD7: system status LED on OpenFFBoard
         let led = Output::new(p.PD7, Level::Low, Speed::Low);
@@ -3363,7 +3384,7 @@ mod app {
 
         // Enable to power the ADC, but CHOP=0 means no PWM switching
         enable_pin.set_high();
-        Mono::delay(250_u32.millis()).await;
+        Mono::delay(250_u64.millis()).await;
 
         // Sample ADC values 128 times and average for offset
         let mut sum_i0: i32 = 0;
@@ -3376,7 +3397,7 @@ mod app {
                 sum_i0 += i_ux;
                 sum_i1 += i_wy;
             }
-            Mono::delay(1_u32.millis()).await;
+            Mono::delay(1_u64.millis()).await;
         }
         // Cast via i16 to u16: negative values wrap correctly for the
         // TMC4671's unsigned offset subtraction register.
@@ -3595,14 +3616,14 @@ mod app {
         let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0008).await;
 
         // 6. Hold for settling (rotor aligns to nearest D-axis pole)
-        Mono::delay(500_u32.millis()).await;
+        Mono::delay(500_u64.millis()).await;
 
         // 7. Validate encoder: stable count, detect movement or prior counts.
         let count1 = tmc
             .read_register(ABN_DECODER_COUNT)
             .await
             .map_err(|_| CalibrationError::SpiError)?;
-        Mono::delay(10_u32.millis()).await;
+        Mono::delay(10_u64.millis()).await;
         let count2 = tmc
             .read_register(ABN_DECODER_COUNT)
             .await
