@@ -120,6 +120,12 @@ mod app {
         AlreadyEnabled,
         /// Internal firmware error (queue full, channel not initialized, etc.).
         InternalError,
+        /// Required configuration (e.g., `tmc_set_encoder`) has not been
+        /// issued by the host before calibration. Most commonly this means
+        /// STEP_WIDTH has not been computed, so the TMC4671 hardware step
+        /// input would not advance the position target — the motor would
+        /// calibrate successfully but silently not respond to step pulses.
+        ConfigFault,
     }
 
     impl CalibrationError {
@@ -132,6 +138,7 @@ mod app {
                 Self::PidFault => 4,
                 Self::AlreadyEnabled => 5,
                 Self::InternalError => 6,
+                Self::ConfigFault => 7,
             }
         }
     }
@@ -1313,6 +1320,25 @@ mod app {
     #[klipper_command]
     pub fn foci_calibrate(_context: &mut State, oid: u8) {
         use core::sync::atomic::Ordering::Relaxed;
+        // Pre-flight: STEP_WIDTH_VALUE must have been populated by a prior
+        // tmc_set_encoder command. If it hasn't, fail before touching hardware
+        // — otherwise calibration would succeed but the motor would silently
+        // refuse to respond to step pulses. See also the hard check inside
+        // tmc_enter_closedloop.
+        if STEP_WIDTH_VALUE.load(Relaxed) <= 0 {
+            defmt::error!(
+                "foci_calibrate rejected: STEP_WIDTH not configured (host must call tmc_set_encoder first)"
+            );
+            klipper_reply!(
+                foci_calibrate_response,
+                oid: u8 = oid,
+                status: u8 = CalibrationError::ConfigFault.status_code(),
+                adc_i0: u16 = 0,
+                adc_i1: u16 = 0,
+                encoder_count: u32 = 0
+            );
+            return;
+        }
         if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
             defmt::warn!("foci_calibrate rejected: commission in flight");
             klipper_reply!(
@@ -3744,13 +3770,23 @@ mod app {
 
         // 8. Write STEP_WIDTH for hardware step/dir input. Each STEP pulse
         // increments the TMC4671's internal position target by this value.
+        // A zero value means tmc_set_encoder was never called (or failed)
+        // to populate STEP_WIDTH_VALUE. Continuing would produce a motor
+        // that calibrates and enables successfully but silently refuses
+        // to move under step pulses — the exact invisible-failure class
+        // this guard is designed to prevent. Fail loudly instead.
         let step_width = STEP_WIDTH_VALUE.load(core::sync::atomic::Ordering::Relaxed);
-        if step_width > 0 {
-            let _ = tmc.write_register(STEP_WIDTH, step_width as u32).await;
-            defmt::info!("STEP_WIDTH(0x78) = {} written", step_width);
-        } else {
-            defmt::warn!("STEP_WIDTH = 0, skipping register write!");
+        if step_width <= 0 {
+            defmt::error!(
+                "STEP_WIDTH = {}, aborting closedloop entry — host must call tmc_set_encoder first",
+                step_width
+            );
+            return Err(CalibrationError::ConfigFault);
         }
+        tmc.write_register(STEP_WIDTH, step_width as u32)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+        defmt::info!("STEP_WIDTH(0x78) = {} written", step_width);
 
         // 8. Write velocity biquad filter if configured, disable if not.
         // If the cutoff is nonzero but out of the valid 10-1000 Hz range,
