@@ -4066,8 +4066,12 @@ mod app {
                 let scheduled = stepper.next_step_clock();
                 match stepper.check_deadline(scheduled, now, CLOCK_FREQ) {
                     Ok(compare) => {
+                        let immediate = compare != scheduled;
+                        if immediate {
+                            stepper.rebase_next_step_clock(compare);
+                        }
                         tim5.ccr(0).write_value(compare);
-                        if compare != now.wrapping_add(2) {
+                        if !immediate {
                             // Step is in the future — schedule and return
                             return;
                         }
@@ -4110,8 +4114,12 @@ mod app {
                         let now = tim5.cnt().read();
                         match stepper.check_deadline(clock, now, CLOCK_FREQ) {
                             Ok(compare) => {
+                                let immediate = compare != clock;
+                                if immediate {
+                                    stepper.rebase_next_step_clock(compare);
+                                }
                                 tim5.ccr(0).write_value(compare);
-                                if compare != now.wrapping_add(2) {
+                                if !immediate {
                                     return; // Future step: wait for next interrupt
                                 }
                                 // Immediate: loop to execute next step
