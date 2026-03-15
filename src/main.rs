@@ -141,6 +141,18 @@ mod app {
                 Self::ConfigFault => 7,
             }
         }
+
+        fn from_commission_error(error: foci_core::autotune::CommissionError) -> Self {
+            match error {
+                foci_core::autotune::CommissionError::Spi => Self::SpiError,
+                foci_core::autotune::CommissionError::AdcFault => Self::AdcFault,
+                foci_core::autotune::CommissionError::EncoderFault
+                | foci_core::autotune::CommissionError::CoilFault
+                | foci_core::autotune::CommissionError::PhaseFault
+                | foci_core::autotune::CommissionError::NoCurrent => Self::EncoderFault,
+                _ => Self::InternalError,
+            }
+        }
     }
 
     /// CommissioningBackend implementation for OpenFFBoard.
@@ -236,7 +248,9 @@ mod app {
         }
 
         fn step_width(&self) -> u32 {
-            STEP_WIDTH_VALUE.load(core::sync::atomic::Ordering::Relaxed) as u32
+            STEP_WIDTH_VALUE
+                .load(core::sync::atomic::Ordering::Relaxed)
+                .max(0) as u32
         }
     }
 
@@ -2255,15 +2269,28 @@ mod app {
                     }
                     crate::commission::StepResult::InnerFailed(error) => {
                         let oid = engine.oid();
+                        let is_calibrate = engine.is_calibrate();
                         commission_engine = None;
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
                         foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
-                        klipper_reply!(
-                            foci_commission_phase,
-                            oid: u8 = oid,
-                            phase: u8 = 0,
-                            status: u8 = error.status_code()
-                        );
+                        if is_calibrate {
+                            let cal_error = CalibrationError::from_commission_error(error);
+                            klipper_reply!(
+                                foci_calibrate_response,
+                                oid: u8 = oid,
+                                status: u8 = cal_error.status_code(),
+                                adc_i0: u16 = 0,
+                                adc_i1: u16 = 0,
+                                encoder_count: u32 = 0
+                            );
+                        } else {
+                            klipper_reply!(
+                                foci_commission_phase,
+                                oid: u8 = oid,
+                                phase: u8 = 0,
+                                status: u8 = error.status_code()
+                            );
+                        }
                     }
                     crate::commission::StepResult::OuterDone(outer) => {
                         let oid = engine.oid();
@@ -2333,81 +2360,62 @@ mod app {
                         let oid = engine.oid();
                         commission_engine = None;
                         // Keep COMMISSION_IN_FLIGHT set until the full
-                        // calibration sequence (ADC + align + closedloop)
-                        // completes, to prevent overlapping requests.
-                        // Do NOT call restore_safe_state: hardware must remain
-                        // active for encoder alignment and closed-loop entry.
+                        // calibration sequence (diagnostics + align +
+                        // closedloop) completes, to prevent overlapping
+                        // requests.
 
                         let current_limit =
                             CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
 
-                        // Encoder alignment + closed-loop entry. ADC cal was
-                        // already performed by the commissioning engine.
-                        match tmc_align_encoder(tmc, current_limit).await {
-                            Ok(encoder_count) => {
-                                match tmc_enter_closedloop(tmc, None, stored_position_gains).await {
-                                    Ok(()) => {
-                                        // Apply autotuned gains if available
-                                        if let Some(gains) = stored_gains {
-                                            let (flux_reg, torque_reg) = gains.to_registers();
-                                            let _ = tmc
-                                                .write_register(
-                                                    tmc4671::registers::PID_FLUX_P_FLUX_I,
-                                                    flux_reg,
-                                                )
-                                                .await;
-                                            let _ = tmc
-                                                .write_register(
-                                                    tmc4671::registers::PID_TORQUE_P_TORQUE_I,
-                                                    torque_reg,
-                                                )
-                                                .await;
-                                        }
-                                        // Re-apply current limit after closed-loop
-                                        // entry (TMC4671 resets it on mode change).
-                                        let _ = tmc
-                                            .write_register(
-                                                tmc4671::registers::PID_TORQUE_FLUX_LIMITS,
-                                                current_limit,
-                                            )
-                                            .await;
-
-                                        calibrated = true;
-                                        motor_enabled = true;
-                                        MOTOR_ARMED
-                                            .store(true, core::sync::atomic::Ordering::Relaxed);
-                                        arm_queued_steps_if_ready();
-                                        defmt::info!("foci_calibrate complete: oid={}", oid);
-                                        COMMISSION_IN_FLIGHT
-                                            .store(false, core::sync::atomic::Ordering::Relaxed);
-                                        klipper_reply!(
-                                            foci_calibrate_response,
-                                            oid: u8 = oid,
-                                            status: u8 = 0,
-                                            adc_i0: u16 = cal_result.adc_i0,
-                                            adc_i1: u16 = cal_result.adc_i1,
-                                            encoder_count: u32 = encoder_count
-                                        );
-                                    }
-                                    Err(e) => {
-                                        defmt::error!("CalibrateDone: closed-loop failed: {}", e);
-                                        foci_core::selftest::restore_safe_state(tmc, enable_pin)
-                                            .await;
-                                        COMMISSION_IN_FLIGHT
-                                            .store(false, core::sync::atomic::Ordering::Relaxed);
-                                        klipper_reply!(
-                                            foci_calibrate_response,
-                                            oid: u8 = oid,
-                                            status: u8 = e.status_code(),
-                                            adc_i0: u16 = 0,
-                                            adc_i1: u16 = 0,
-                                            encoder_count: u32 = 0
-                                        );
-                                    }
+                        // ADC calibration and encoder alignment were already
+                        // performed by the commissioning engine. Closed-loop
+                        // entry must preserve PHI_E_SELECTION=3.
+                        match tmc_enter_closedloop(tmc, None, stored_position_gains).await {
+                            Ok(()) => {
+                                // Apply autotuned gains if available
+                                if let Some(gains) = stored_gains {
+                                    let (flux_reg, torque_reg) = gains.to_registers();
+                                    let _ = tmc
+                                        .write_register(
+                                            tmc4671::registers::PID_FLUX_P_FLUX_I,
+                                            flux_reg,
+                                        )
+                                        .await;
+                                    let _ = tmc
+                                        .write_register(
+                                            tmc4671::registers::PID_TORQUE_P_TORQUE_I,
+                                            torque_reg,
+                                        )
+                                        .await;
                                 }
+                                // Re-apply current limit after closed-loop
+                                // entry (TMC4671 resets it on mode change).
+                                let _ = tmc
+                                    .write_register(
+                                        tmc4671::registers::PID_TORQUE_FLUX_LIMITS,
+                                        current_limit,
+                                    )
+                                    .await;
+
+                                enable_pin.set_high();
+                                calibrated = true;
+                                motor_enabled = true;
+                                MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+                                arm_queued_steps_if_ready();
+                                defmt::info!("foci_calibrate complete: oid={}", oid);
+                                COMMISSION_IN_FLIGHT
+                                    .store(false, core::sync::atomic::Ordering::Relaxed);
+                                klipper_reply!(
+                                    foci_calibrate_response,
+                                    oid: u8 = oid,
+                                    status: u8 = 0,
+                                    adc_i0: u16 = cal_result.adc_i0,
+                                    adc_i1: u16 = cal_result.adc_i1,
+                                    encoder_count: u32 = cal_result.encoder_count
+                                );
                             }
                             Err(e) => {
-                                defmt::error!("CalibrateDone: encoder align failed: {}", e);
+                                defmt::error!("CalibrateDone: closed-loop failed: {}", e);
                                 foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
                                 COMMISSION_IN_FLIGHT
                                     .store(false, core::sync::atomic::Ordering::Relaxed);
@@ -3539,157 +3547,11 @@ mod app {
         }
     }
 
-    /// Align the ABN encoder to the D-axis using open-loop voltage mode,
-    /// waiting for the rotor to settle, then zeroing the encoder count.
-    ///
-    /// Uses UQ_UD_EXT mode (mode 8) to apply a direct D-axis voltage at
-    /// PHI_E=0. This matches the TMC-API reference implementation and
-    /// provides sufficient force to overcome motor detent torque regardless
-    /// of impedance. PID-regulated torque mode (mode 1) was previously used
-    /// but was insufficient for motors with strong detent torque.
-    ///
-    /// Steps:
-    /// 1. Set PHI_E_SELECTION=1 (external) and PHI_E_EXT=0
-    /// 2. Capture ABN_DECODER_COUNT before alignment
-    /// 3. Apply D-axis voltage via UQ_UD_EXT (UD=excitation_voltage, UQ=0)
-    /// 4. Enter open-loop voltage mode (MODE_MOTION=8)
-    /// 5. Hold for settling (rotor aligns to nearest D-axis pole)
-    /// 6. Validate encoder (movement detected or stable non-zero count)
-    /// 7. Zero ABN_DECODER_COUNT and PHI_E_PHI_M_OFFSET
-    /// 8. Switch PHI_E to ABN encoder (while still driving)
-    /// 9. Stop drive (UQ_UD_EXT=0, MODE=0)
-    ///
-    /// **Post-condition:** PHI_E_SELECTION=3 (ABN encoder), motor stopped.
-    /// The angle reference is locked to ABN before the drive stops, so the
-    /// rotor cannot drift to a detent position and corrupt the alignment.
-    /// `tmc_enter_closedloop` must NOT overwrite PHI_E_SELECTION.
-    ///
-    /// Returns the encoder count before zeroing on success.
-    async fn tmc_align_encoder(
-        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
-        current_limit_reg: u32,
-    ) -> Result<u32, CalibrationError> {
-        use tmc4671::registers::*;
-
-        // Reject alignment if current limit is not configured.
-        // With current_limit_reg=0, flux_target=0 and the rotor never aligns,
-        // but the encoder stability check passes (both reads are 0), producing
-        // a silently miscalibrated encoder.
-        if current_limit_reg == 0 {
-            defmt::error!("encoder align: current limit not set");
-            return Err(CalibrationError::SpiError);
-        }
-
-        // 1. PHI_E source: external, angle = 0 (D-axis).
-        // The D-axis is at phi_e=0 in the 16-bit electrical angle space.
-        // With 50 pole pairs, the rotor travels at most half a pole pitch
-        // (0.2mm) to reach the nearest D-axis alignment point.
-        let _ = tmc.write_register(PHI_E_SELECTION, 1).await;
-        let _ = tmc.write_register(PHI_E_EXT, 0).await;
-
-        // 2. Capture the encoder count before alignment. Do not seed or
-        // otherwise perturb this register: calibration must prove that the
-        // alignment drive itself produced encoder movement before zeroing the
-        // electrical reference.
-        let count_before = tmc
-            .read_register(ABN_DECODER_COUNT)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-
-        // 3. Raise voltage limit for alignment. ADC calibration sets
-        // PIDOUT_UQ_UD_LIMITS to 1024 as a safety measure, but that clips
-        // alignment voltages above 1024. Raise to allow the alignment
-        // voltage through. Closedloop entry sets the operational limit.
-        let _ = tmc.write_register(PIDOUT_UQ_UD_LIMITS, 2000).await;
-
-        // 4. D-axis voltage for alignment: UD = 1000, UQ = 0.
-        // Uses open-loop voltage mode (UQ_UD_EXT, mode 8) matching the
-        // TMC-API reference implementation. The voltage must be sufficient
-        // to overcome motor detent torque but not so high as to overdrive
-        // the magnetic circuit. Original FOCI implementation used 1000.
-        // UQ_UD_EXT layout: bits[31:16] = UQ, bits[15:0] = UD
-        let _ = tmc.write_register(UQ_UD_EXT, 1000u32).await;
-
-        // 5. Enter open-loop voltage mode (MODE_MOTION=8).
-        // UQ_UD_EXT is an open-loop voltage path; keep MODE_PID_TYPE clear,
-        // matching the selftest and commissioning voltage-mode routines.
-        let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 8).await;
-
-        // 6. Hold for settling (rotor aligns to nearest D-axis pole)
-        Mono::delay(500_u64.millis()).await;
-
-        // 7. Validate encoder: stable count, detect movement or prior counts.
-        let count1 = tmc
-            .read_register(ABN_DECODER_COUNT)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        Mono::delay(10_u64.millis()).await;
-        let count2 = tmc
-            .read_register(ABN_DECODER_COUNT)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-
-        // Check encoder presence: compare against the pre-alignment count.
-        // A one-count twitch is not enough to establish a valid electrical
-        // zero; it can be caused by jitter or by the old cold-boot seed path.
-        const MIN_ALIGN_MOVEMENT_COUNTS: u32 = 4;
-        let movement1 = (count1 as i32 - count_before as i32).unsigned_abs();
-        let movement2 = (count2 as i32 - count_before as i32).unsigned_abs();
-        let movement = movement1.max(movement2);
-        // Allow +/-2 encoder counts of jitter during settling.
-        let stable = (count1 as i32 - count2 as i32).unsigned_abs() <= 2;
-        if movement < MIN_ALIGN_MOVEMENT_COUNTS {
-            defmt::error!(
-                "encoder align: insufficient movement: before={}, after={},{} movement={}",
-                count_before,
-                count1,
-                count2,
-                movement
-            );
-            let _ = tmc.write_register(UQ_UD_EXT, 0).await;
-            let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
-            return Err(CalibrationError::EncoderFault);
-        }
-        if !stable {
-            defmt::error!(
-                "encoder align: encoder unstable: count1={}, count2={}",
-                count1,
-                count2
-            );
-            let _ = tmc.write_register(UQ_UD_EXT, 0).await;
-            let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
-            return Err(CalibrationError::EncoderFault);
-        }
-
-        // 8. Zero encoder count and offset at the D-axis position.
-        // CRITICAL: the motor is still held in voltage mode while we do this.
-        let old_count = count1;
-        let _ = tmc.write_register(ABN_DECODER_COUNT, 0).await;
-        let _ = tmc.write_register(ABN_DECODER_PHI_E_PHI_M_OFFSET, 0).await;
-
-        // 9. Switch PHI_E to ABN encoder WHILE STILL DRIVING.
-        // The motor is actively held at the D-axis position, so the ABN-
-        // derived PHI_E (count=0, offset=0 -> PHI_E=0) matches the external
-        // PHI_E=0 we were using. This avoids an unpowered gap between
-        // alignment and closed-loop entry where the rotor could snap to a
-        // detent position and corrupt the angle reference.
-        let _ = tmc.write_register(PHI_E_SELECTION, 3).await;
-
-        // 10. Stop drive: zero voltage first, then stop mode.
-        // PHI_E is now locked to ABN encoder — the angle reference survives
-        // the brief coast until tmc_enter_closedloop engages position mode.
-        let _ = tmc.write_register(UQ_UD_EXT, 0).await;
-        let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x0000_0000).await;
-
-        defmt::info!("encoder aligned: old_count={}", old_count);
-        Ok(old_count)
-    }
-
     /// Configure TMC4671 for closed-loop position mode with ABN encoder feedback.
     ///
-    /// **Pre-condition:** `tmc_align_encoder` has already set PHI_E_SELECTION=3
-    /// (ABN encoder) with the encoder zeroed at the D-axis. This function must
-    /// NOT overwrite PHI_E_SELECTION.
+    /// **Pre-condition:** the commissioning engine's `EncoderAlign` phase has
+    /// already set PHI_E_SELECTION=3 (ABN encoder) with the encoder zeroed at
+    /// the D-axis. This function must NOT overwrite PHI_E_SELECTION.
     ///
     /// Steps:
     /// 1. Set flux/torque PID gains
@@ -3747,9 +3609,9 @@ mod app {
         // motion. 16000 tested working in Phase 1 (up to 200+ mm/s).
         let _ = tmc.write_register(PIDOUT_UQ_UD_LIMITS, 16000).await;
 
-        // NOTE: PHI_E_SELECTION is NOT written here. tmc_align_encoder
-        // already set it to 3 (ABN encoder) while the motor was held in
-        // voltage mode, locking the angle reference before the drive stopped.
+        // NOTE: PHI_E_SELECTION is NOT written here. EncoderAlign already
+        // set it to 3 (ABN encoder) while the motor was held in voltage
+        // mode, locking the angle reference before the drive stopped.
 
         // 6. Zero position: writing PID_POSITION_ACTUAL also writes
         // PID_POSITION_TARGET to the same value (per datasheet 0x6B),

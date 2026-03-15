@@ -173,19 +173,15 @@ pub struct OuterResult {
     pub b_eff: u32,
 }
 
-/// Result of ADC-only calibration.
-///
-/// Returned by `CalibrateDone` -- hardware remains in post-ADC state
-/// (enable pin high, outputs active) so the caller can proceed with
-/// encoder alignment.
+/// Result of the calibration subset requested by `new_calibrate`.
 #[derive(Debug, Clone, defmt::Format)]
 pub struct AdcCalResult {
     /// ADC I0 offset.
     pub adc_i0: u16,
     /// ADC I1 offset.
     pub adc_i1: u16,
-    /// Encoder count captured at end of ADC calibration.
-    pub encoder_baseline: u32,
+    /// Encoder count captured before the alignment phase zeroed it.
+    pub encoder_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +212,21 @@ const ENCODER_DIR_STEPS: u16 = 50;
 
 /// Per-step dwell time for encoder direction sweep (microseconds).
 const ENCODER_DIR_STEP_US: u64 = 10_000;
+
+/// Settling time after applying encoder alignment voltage.
+const ENCODER_ALIGN_SETTLE_US: u64 = 500_000;
+
+/// Stability double-read delay after encoder alignment settle.
+const ENCODER_ALIGN_STABILITY_US: u64 = 10_000;
+
+/// Allowed encoder jitter during the alignment double-read.
+const ENCODER_ALIGN_STABILITY_COUNTS: u32 = 2;
+
+/// Voltage limit used only while applying alignment voltage.
+const ENCODER_ALIGN_VOLTAGE_LIMIT: u32 = 2000;
+
+/// D-axis voltage used by the legacy alignment path and TMC-API reference.
+const ENCODER_ALIGN_VOLTAGE: u32 = 1000;
 
 // ---------------------------------------------------------------------------
 // Electrical identification constants (Phase 5)
@@ -398,6 +409,35 @@ enum EncoderCheckState {
     DirFinalize { count_start: i32 },
 }
 
+/// Encoder D-axis alignment sub-state.
+#[derive(Debug, defmt::Format)]
+enum EncoderAlignState {
+    /// Configure external PHI_E=0 voltage drive and record starting count.
+    Setup,
+    /// Wait for rotor to settle at the nearest D-axis pole.
+    Settle {
+        count_before: u32,
+        deadline_us: u64,
+        min_movement: u32,
+    },
+    /// First post-settle encoder read.
+    StabilityCheck1 {
+        count_before: u32,
+        min_movement: u32,
+    },
+    /// Second encoder read after a short delay for stability validation.
+    StabilityCheck2 {
+        count_before: u32,
+        count1: u32,
+        deadline_us: u64,
+        min_movement: u32,
+    },
+    /// Zero encoder count and offset while the rotor is still held.
+    Commit { old_count: u32 },
+    /// Stop open-loop drive after PHI_E has been locked to ABN.
+    StopDrive { old_count: u32 },
+}
+
 /// Accumulated per-coil measurements for electrical identification.
 #[derive(Debug, Clone, defmt::Format)]
 struct ElectricalIdData {
@@ -501,6 +541,8 @@ enum InnerPhase {
         state: EncoderCheckState,
         encoder_baseline: u32,
     },
+    /// Encoder D-axis alignment and zeroing.
+    EncoderAlign { state: EncoderAlignState },
     /// Phase 5: Electrical identification (R, L, theta_e).
     ElectricalId {
         state: ElectricalIdState,
@@ -874,6 +916,7 @@ enum EngineMode {
         phase: InnerPhase,
         profile: CommissionProfile,
         stop_after: PhaseId,
+        adc_cal: Option<AdcCalResult>,
     },
     Outer {
         phase: OuterPhase,
@@ -902,18 +945,19 @@ pub struct CommissioningEngine {
 }
 
 impl CommissioningEngine {
-    /// Create an engine for ADC calibration only.
+    /// Create an engine for calibration.
     ///
-    /// The engine stops after ADC offset calibration, returning
-    /// `StepResult::CalibrateDone` with the measured offsets.
-    /// Hardware remains active for encoder alignment.
+    /// The engine runs diagnostics through encoder alignment, then returns
+    /// `StepResult::CalibrateDone` with the measured ADC offsets and encoder
+    /// count before zeroing.
     pub fn new_calibrate(oid: u8) -> Self {
         Self {
             oid,
             engine_mode: EngineMode::Inner {
                 phase: InnerPhase::AdcCalibrate(AdcCalState::Setup),
                 profile: CommissionProfile::Balanced,
-                stop_after: PhaseId::AdcCalibrate,
+                stop_after: PhaseId::EncoderAlign,
+                adc_cal: None,
             },
             buf: TransientBuffer::new(),
         }
@@ -931,6 +975,7 @@ impl CommissioningEngine {
                 phase: InnerPhase::AdcCalibrate(AdcCalState::Setup),
                 profile: CommissionProfile::Balanced,
                 stop_after: PhaseId::ElectricalId,
+                adc_cal: None,
             },
             buf: TransientBuffer::new(),
         }
@@ -944,6 +989,7 @@ impl CommissioningEngine {
                 phase: InnerPhase::AdcCalibrate(AdcCalState::Setup),
                 profile,
                 stop_after: PhaseId::CurrentValidate,
+                adc_cal: None,
             },
             buf: TransientBuffer::new(),
         }
@@ -988,6 +1034,17 @@ impl CommissioningEngine {
         self.oid
     }
 
+    /// Whether this engine was launched by `foci_calibrate`.
+    pub fn is_calibrate(&self) -> bool {
+        matches!(
+            self.engine_mode,
+            EngineMode::Inner {
+                stop_after: PhaseId::EncoderAlign,
+                ..
+            }
+        )
+    }
+
     /// Advance the state machine by one tick (max 1ms).
     ///
     /// Returns a [`StepResult`] indicating whether to continue,
@@ -1006,7 +1063,18 @@ impl CommissioningEngine {
                 ref mut phase,
                 profile,
                 stop_after,
-            } => Self::step_inner(phase, &mut self.buf, *profile, *stop_after, backend).await,
+                adc_cal,
+            } => {
+                Self::step_inner(
+                    phase,
+                    &mut self.buf,
+                    *profile,
+                    *stop_after,
+                    adc_cal,
+                    backend,
+                )
+                .await
+            }
             EngineMode::Outer {
                 ref mut phase,
                 profile,
@@ -1051,11 +1119,12 @@ impl CommissioningEngine {
         buf: &mut TransientBuffer,
         profile: CommissionProfile,
         stop_after: PhaseId,
+        adc_cal: &mut Option<AdcCalResult>,
         backend: &mut B,
     ) -> StepResult {
         match phase {
             InnerPhase::AdcCalibrate(_) => {
-                Self::step_adc_calibrate(phase, stop_after, backend).await
+                Self::step_adc_calibrate(phase, stop_after, adc_cal, backend).await
             }
             InnerPhase::CoilCheck { .. } => Self::step_coil_check(phase, backend).await,
             InnerPhase::PhaseWiringCheck {
@@ -1070,6 +1139,9 @@ impl CommissioningEngine {
             }
             InnerPhase::EncoderCheck { .. } => {
                 Self::step_encoder_check(phase, stop_after, backend).await
+            }
+            InnerPhase::EncoderAlign { .. } => {
+                Self::step_encoder_align(phase, stop_after, adc_cal, backend).await
             }
             InnerPhase::ElectricalId { .. } => {
                 Self::step_elec_id(phase, buf, stop_after, backend).await
@@ -1097,6 +1169,7 @@ impl CommissioningEngine {
     async fn step_adc_calibrate<B: CommissioningBackend>(
         phase: &mut InnerPhase,
         stop_after: PhaseId,
+        adc_cal: &mut Option<AdcCalResult>,
         backend: &mut B,
     ) -> StepResult {
         use tmc4671::registers::*;
@@ -1245,16 +1318,17 @@ impl CommissioningEngine {
 
                 // Capture encoder baseline for later presence check.
                 let encoder_baseline = backend.read_encoder_count().await;
+                let result = AdcCalResult {
+                    adc_i0: offset_i0,
+                    adc_i1: offset_i1,
+                    encoder_count: encoder_baseline,
+                };
+                *adc_cal = Some(result.clone());
 
                 // Check if we should stop after ADC calibration.
                 // CalibrateDone does NOT restore safe state -- hardware
                 // must remain active for encoder alignment.
                 if stop_after == PhaseId::AdcCalibrate {
-                    let result = AdcCalResult {
-                        adc_i0: offset_i0,
-                        adc_i1: offset_i1,
-                        encoder_baseline,
-                    };
                     return StepResult::CalibrateDone(result);
                 }
 
@@ -1570,9 +1644,210 @@ impl CommissioningEngine {
                     return StepResult::SelftestDone;
                 }
 
-                // Direction detected. Transition to ElectricalId.
+                // Direction detected. Transition to EncoderAlign, which
+                // locks PHI_E_SELECTION to ABN at a known D-axis zero before
+                // any later closed-loop or electrical-ID work.
                 // Direction value (0=forward, 1=reversed) is carried as
                 // commissioning-local data; persistence is outside this plan.
+                *phase = InnerPhase::EncoderAlign {
+                    state: EncoderAlignState::Setup,
+                };
+                StepResult::PhaseChanged(PhaseId::EncoderAlign)
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Encoder D-axis Alignment
+    // -------------------------------------------------------------------
+
+    /// Advance encoder D-axis alignment sub-state.
+    ///
+    /// This is the non-blocking engine equivalent of the old blocking
+    /// alignment helper. It applies plain voltage mode
+    /// (`MODE_RAMP_MODE_MOTION=8`, with MODE_PID_TYPE clear), verifies
+    /// the encoder moved and settled, zeros ABN count/offset while still
+    /// driving, then locks PHI_E to ABN before stopping the drive.
+    async fn step_encoder_align<B: CommissioningBackend>(
+        phase: &mut InnerPhase,
+        stop_after: PhaseId,
+        adc_cal: &mut Option<AdcCalResult>,
+        backend: &mut B,
+    ) -> StepResult {
+        use tmc4671::registers::*;
+
+        let state = match phase {
+            InnerPhase::EncoderAlign { state } => state,
+            _ => return StepResult::Continue,
+        };
+
+        match state {
+            EncoderAlignState::Setup => {
+                if backend.current_limit() == 0 || backend.step_width() == 0 {
+                    return Self::fail_inner(phase, CommissionError::NoCurrent);
+                }
+
+                if backend.write_register(PHI_E_SELECTION, 1).await.is_err()
+                    || backend.write_register(PHI_E_EXT, 0).await.is_err()
+                    || backend
+                        .write_register(PIDOUT_UQ_UD_LIMITS, ENCODER_ALIGN_VOLTAGE_LIMIT)
+                        .await
+                        .is_err()
+                    || backend
+                        .write_register(UQ_UD_EXT, ENCODER_ALIGN_VOLTAGE)
+                        .await
+                        .is_err()
+                    || backend
+                        .write_register(MODE_RAMP_MODE_MOTION, 8)
+                        .await
+                        .is_err()
+                {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+
+                let phi_ok = backend
+                    .read_register(PHI_E_SELECTION)
+                    .await
+                    .is_ok_and(|v| v == 1);
+                let mode_ok = backend
+                    .read_register(MODE_RAMP_MODE_MOTION)
+                    .await
+                    .is_ok_and(|v| v == 8);
+                if !phi_ok || !mode_ok {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+
+                let count_before = match backend.read_register(ABN_DECODER_COUNT).await {
+                    Ok(v) => v,
+                    Err(_) => return Self::fail_inner(phase, CommissionError::Spi),
+                };
+
+                backend.set_enable_pin(true);
+
+                let step_width = backend.step_width().max(1);
+                let min_movement = (65536u32 / (20 * step_width)).max(2);
+                let deadline = backend.elapsed_us().wrapping_add(ENCODER_ALIGN_SETTLE_US);
+                *state = EncoderAlignState::Settle {
+                    count_before,
+                    deadline_us: deadline,
+                    min_movement,
+                };
+                StepResult::Continue
+            }
+
+            EncoderAlignState::Settle {
+                count_before,
+                deadline_us,
+                min_movement,
+            } => {
+                if backend.elapsed_us().wrapping_sub(*deadline_us) < 0x8000_0000 {
+                    *state = EncoderAlignState::StabilityCheck1 {
+                        count_before: *count_before,
+                        min_movement: *min_movement,
+                    };
+                }
+                StepResult::Continue
+            }
+
+            EncoderAlignState::StabilityCheck1 {
+                count_before,
+                min_movement,
+            } => {
+                let count1 = match backend.read_register(ABN_DECODER_COUNT).await {
+                    Ok(v) => v,
+                    Err(_) => return Self::fail_inner(phase, CommissionError::Spi),
+                };
+                let deadline = backend
+                    .elapsed_us()
+                    .wrapping_add(ENCODER_ALIGN_STABILITY_US);
+                *state = EncoderAlignState::StabilityCheck2 {
+                    count_before: *count_before,
+                    count1,
+                    deadline_us: deadline,
+                    min_movement: *min_movement,
+                };
+                StepResult::Continue
+            }
+
+            EncoderAlignState::StabilityCheck2 {
+                count_before,
+                count1,
+                deadline_us,
+                min_movement,
+            } => {
+                if backend.elapsed_us().wrapping_sub(*deadline_us) >= 0x8000_0000 {
+                    return StepResult::Continue;
+                }
+
+                let count2 = match backend.read_register(ABN_DECODER_COUNT).await {
+                    Ok(v) => v,
+                    Err(_) => return Self::fail_inner(phase, CommissionError::Spi),
+                };
+
+                let movement1 = (*count1 as i32 - *count_before as i32).unsigned_abs();
+                let movement2 = (count2 as i32 - *count_before as i32).unsigned_abs();
+                let movement = movement1.max(movement2);
+                let stable = (*count1 as i32 - count2 as i32).unsigned_abs()
+                    <= ENCODER_ALIGN_STABILITY_COUNTS;
+                if movement < *min_movement || !stable {
+                    let _ = backend.write_register(UQ_UD_EXT, 0).await;
+                    let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+                    backend.set_enable_pin(false);
+                    return Self::fail_inner(phase, CommissionError::EncoderFault);
+                }
+
+                *state = EncoderAlignState::Commit { old_count: *count1 };
+                StepResult::Continue
+            }
+
+            EncoderAlignState::Commit { old_count } => {
+                if backend.write_register(ABN_DECODER_COUNT, 0).await.is_err()
+                    || backend
+                        .write_register(ABN_DECODER_PHI_E_PHI_M_OFFSET, 0)
+                        .await
+                        .is_err()
+                    || backend.write_register(PHI_E_SELECTION, 3).await.is_err()
+                {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+
+                let phi_ok = backend
+                    .read_register(PHI_E_SELECTION)
+                    .await
+                    .is_ok_and(|v| v == 3);
+                if !phi_ok {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+
+                *state = EncoderAlignState::StopDrive {
+                    old_count: *old_count,
+                };
+                StepResult::Continue
+            }
+
+            EncoderAlignState::StopDrive { old_count } => {
+                if backend.write_register(UQ_UD_EXT, 0).await.is_err()
+                    || backend
+                        .write_register(MODE_RAMP_MODE_MOTION, 0)
+                        .await
+                        .is_err()
+                {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+                backend.set_enable_pin(false);
+
+                if let Some(result) = adc_cal.as_mut() {
+                    result.encoder_count = *old_count;
+                }
+
+                if stop_after == PhaseId::EncoderAlign {
+                    return StepResult::CalibrateDone(adc_cal.clone().unwrap_or(AdcCalResult {
+                        adc_i0: 0,
+                        adc_i1: 0,
+                        encoder_count: *old_count,
+                    }));
+                }
+
                 let voltage = backend.excitation_voltage() as u32;
                 *phase = InnerPhase::ElectricalId {
                     state: ElectricalIdState::ResSetup { coil: 0 },
