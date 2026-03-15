@@ -12,6 +12,8 @@ pub mod pac {
 }
 
 mod commission;
+#[macro_use]
+mod macros;
 
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [UART4, UART5, USART3])]
 mod app {
@@ -3576,59 +3578,93 @@ mod app {
         // 1. Flux and torque PID: use stored gains or conservative defaults
         let gains = stored_gains.unwrap_or(foci_core::pid::DEFAULT_INNER_GAINS);
         let (flux_reg, torque_reg) = gains.to_registers();
-        let _ = tmc.write_register(PID_FLUX_P_FLUX_I, flux_reg).await;
-        let _ = tmc.write_register(PID_TORQUE_P_TORQUE_I, torque_reg).await;
+        tmc.write_register(PID_FLUX_P_FLUX_I, flux_reg)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+        tmc.write_register(PID_TORQUE_P_TORQUE_I, torque_reg)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
 
         // 2. Velocity PID: use stored gains or defaults (P=4.5, I=0)
         let (vel_p, vel_i) = stored_position_gains
             .map(|(_, _, vp, vi)| (vp, vi))
             .unwrap_or((1152, 0));
         let velocity_pi: u32 = (vel_p as u32) << 16 | vel_i as u32;
-        let _ = tmc
-            .write_register(PID_VELOCITY_P_VELOCITY_I, velocity_pi)
-            .await;
+        tmc.write_register(PID_VELOCITY_P_VELOCITY_I, velocity_pi)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
 
         // 3. Position PID: use stored gains or defaults (P=2.5, I=0)
         let (pos_p, pos_i) = stored_position_gains
             .map(|(pp, pi, _, _)| (pp, pi))
             .unwrap_or((640, 0));
         let position_pi: u32 = (pos_p as u32) << 16 | pos_i as u32;
-        let _ = tmc
-            .write_register(PID_POSITION_P_POSITION_I, position_pi)
-            .await;
+        tmc.write_register(PID_POSITION_P_POSITION_I, position_pi)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
         POSITION_P_VALUE.store(pos_p, core::sync::atomic::Ordering::Relaxed);
         POSITION_I_VALUE.store(pos_i, core::sync::atomic::Ordering::Relaxed);
 
         // 4. Velocity limit: host-configured or unconstrained default.
         // Caps position PID output velocity to prevent integrator windup runaway.
         let vel_limit = VELOCITY_LIMIT_CFG.load(core::sync::atomic::Ordering::Relaxed);
-        let _ = tmc.write_register(PID_VELOCITY_LIMIT, vel_limit).await;
+        tmc.write_register(PID_VELOCITY_LIMIT, vel_limit)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
 
         // 5. Raise voltage limit for actual operation. ADC cal sets it to
         // 1024 as a safety measure, but position PID needs headroom to drive
         // motion. 16000 tested working in Phase 1 (up to 200+ mm/s).
-        let _ = tmc.write_register(PIDOUT_UQ_UD_LIMITS, 16000).await;
+        tmc.write_register(PIDOUT_UQ_UD_LIMITS, 16000)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+        let voltage_limit_rb = tmc
+            .read_register(PIDOUT_UQ_UD_LIMITS)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+        if voltage_limit_rb != 16000 {
+            defmt::error!(
+                "closed-loop: PIDOUT_UQ_UD_LIMITS readback mismatch: expected=16000 got={}",
+                voltage_limit_rb
+            );
+            return Err(CalibrationError::SpiError);
+        }
 
         // NOTE: PHI_E_SELECTION is NOT written here. EncoderAlign already
         // set it to 3 (ABN encoder) while the motor was held in voltage
         // mode, locking the angle reference before the drive stopped.
+        let phi_e_selection = tmc
+            .read_register(PHI_E_SELECTION)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+        if phi_e_selection != 3 {
+            defmt::error!(
+                "closed-loop: PHI_E_SELECTION readback mismatch: expected=3 got={}",
+                phi_e_selection
+            );
+            return Err(CalibrationError::SpiError);
+        }
 
         // 6. Zero position: writing PID_POSITION_ACTUAL also writes
         // PID_POSITION_TARGET to the same value (per datasheet 0x6B),
         // avoiding an unwanted position error on mode entry.
-        let _ = tmc.write_register(PID_POSITION_ACTUAL, 0).await;
+        tmc.write_register(PID_POSITION_ACTUAL, 0)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
 
         // Zero position integrator to prevent stale error sum from prior session.
         // Must come after PID_POSITION_ACTUAL=0 so the integrator doesn't
         // immediately re-accumulate from a nonzero position error.
-        let _ = tmc
-            .write_sub_register(PID_ERROR_PID_POSITION_ERROR_SUM, 0)
-            .await;
+        tmc.write_sub_register(PID_ERROR_PID_POSITION_ERROR_SUM, 0)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
 
         // 7. Explicit POSITION_SELECTION=0 (phi_e). Don't rely on power-on
         // default — survives fault/reset/re-calibration because closedloop
         // entry always runs.
-        let _ = tmc.write_register(POSITION_SELECTION, 0).await;
+        tmc.write_register(POSITION_SELECTION, 0)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
 
         // 8. Write STEP_WIDTH for hardware step/dir input. Each STEP pulse
         // increments the TMC4671's internal position target by this value.
@@ -3648,6 +3684,18 @@ mod app {
         tmc.write_register(STEP_WIDTH, step_width as u32)
             .await
             .map_err(|_| CalibrationError::SpiError)?;
+        let step_width_rb = tmc
+            .read_register(STEP_WIDTH)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+        if step_width_rb != step_width as u32 {
+            defmt::error!(
+                "closed-loop: STEP_WIDTH readback mismatch: expected={} got={}",
+                step_width,
+                step_width_rb
+            );
+            return Err(CalibrationError::SpiError);
+        }
         defmt::info!("STEP_WIDTH(0x78) = {} written", step_width);
 
         // 8. Write velocity biquad filter if configured, disable if not.
@@ -3658,29 +3706,19 @@ mod app {
             if let Some(coeffs) =
                 foci_core::biquad::butterworth_lowpass(filter_hz, TMC_CONFIG.pwm_maxcnt)
             {
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_V_A_1, coeffs.a_1 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_V_A_2, coeffs.a_2 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_V_B_0, coeffs.b_0 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_V_B_1, coeffs.b_1 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_V_B_2, coeffs.b_2 as u32)
-                    .await;
-                let _ = tmc.write_sub_register(CONFIG_BIQUAD_V_ENABLE, 1).await;
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_V_A_1, coeffs.a_1 as u32, "Velocity");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_V_A_2, coeffs.a_2 as u32, "Velocity");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_V_B_0, coeffs.b_0 as u32, "Velocity");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_V_B_1, coeffs.b_1 as u32, "Velocity");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_V_B_2, coeffs.b_2 as u32, "Velocity");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_V_ENABLE, 1, "Velocity");
                 defmt::info!("Velocity biquad: {}Hz enabled", filter_hz);
             } else {
-                let _ = tmc.write_sub_register(CONFIG_BIQUAD_V_ENABLE, 0).await;
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_V_ENABLE, 0, "Velocity");
                 defmt::warn!("Velocity biquad: {}Hz out of range, disabled", filter_hz);
             }
         } else {
-            let _ = tmc.write_sub_register(CONFIG_BIQUAD_V_ENABLE, 0).await;
+            write_filter_subreg!(tmc, CONFIG_BIQUAD_V_ENABLE, 0, "Velocity");
         }
 
         // 9. Write torque biquad filter if configured, disable if not.
@@ -3689,29 +3727,19 @@ mod app {
             if let Some(coeffs) =
                 foci_core::biquad::butterworth_lowpass(filter_hz, TMC_CONFIG.pwm_maxcnt)
             {
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_T_A_1, coeffs.a_1 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_T_A_2, coeffs.a_2 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_T_B_0, coeffs.b_0 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_T_B_1, coeffs.b_1 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_T_B_2, coeffs.b_2 as u32)
-                    .await;
-                let _ = tmc.write_sub_register(CONFIG_BIQUAD_T_ENABLE, 1).await;
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_T_A_1, coeffs.a_1 as u32, "Torque");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_T_A_2, coeffs.a_2 as u32, "Torque");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_T_B_0, coeffs.b_0 as u32, "Torque");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_T_B_1, coeffs.b_1 as u32, "Torque");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_T_B_2, coeffs.b_2 as u32, "Torque");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_T_ENABLE, 1, "Torque");
                 defmt::info!("Torque biquad: {}Hz enabled", filter_hz);
             } else {
-                let _ = tmc.write_sub_register(CONFIG_BIQUAD_T_ENABLE, 0).await;
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_T_ENABLE, 0, "Torque");
                 defmt::warn!("Torque biquad: {}Hz out of range, disabled", filter_hz);
             }
         } else {
-            let _ = tmc.write_sub_register(CONFIG_BIQUAD_T_ENABLE, 0).await;
+            write_filter_subreg!(tmc, CONFIG_BIQUAD_T_ENABLE, 0, "Torque");
         }
 
         // 10. Write position target biquad filter if configured, disable if not.
@@ -3720,29 +3748,19 @@ mod app {
             if let Some(coeffs) =
                 foci_core::biquad::butterworth_lowpass(filter_hz, TMC_CONFIG.pwm_maxcnt)
             {
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_X_A_1, coeffs.a_1 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_X_A_2, coeffs.a_2 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_X_B_0, coeffs.b_0 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_X_B_1, coeffs.b_1 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_X_B_2, coeffs.b_2 as u32)
-                    .await;
-                let _ = tmc.write_sub_register(CONFIG_BIQUAD_X_ENABLE, 1).await;
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_X_A_1, coeffs.a_1 as u32, "Position");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_X_A_2, coeffs.a_2 as u32, "Position");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_X_B_0, coeffs.b_0 as u32, "Position");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_X_B_1, coeffs.b_1 as u32, "Position");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_X_B_2, coeffs.b_2 as u32, "Position");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_X_ENABLE, 1, "Position");
                 defmt::info!("Position biquad: {}Hz enabled", filter_hz);
             } else {
-                let _ = tmc.write_sub_register(CONFIG_BIQUAD_X_ENABLE, 0).await;
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_X_ENABLE, 0, "Position");
                 defmt::warn!("Position biquad: {}Hz out of range, disabled", filter_hz);
             }
         } else {
-            let _ = tmc.write_sub_register(CONFIG_BIQUAD_X_ENABLE, 0).await;
+            write_filter_subreg!(tmc, CONFIG_BIQUAD_X_ENABLE, 0, "Position");
         }
 
         // 11. Write flux biquad filter if configured, disable if not.
@@ -3751,29 +3769,19 @@ mod app {
             if let Some(coeffs) =
                 foci_core::biquad::butterworth_lowpass(filter_hz, TMC_CONFIG.pwm_maxcnt)
             {
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_F_A_1, coeffs.a_1 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_F_A_2, coeffs.a_2 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_F_B_0, coeffs.b_0 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_F_B_1, coeffs.b_1 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_F_B_2, coeffs.b_2 as u32)
-                    .await;
-                let _ = tmc.write_sub_register(CONFIG_BIQUAD_F_ENABLE, 1).await;
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_F_A_1, coeffs.a_1 as u32, "Flux");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_F_A_2, coeffs.a_2 as u32, "Flux");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_F_B_0, coeffs.b_0 as u32, "Flux");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_F_B_1, coeffs.b_1 as u32, "Flux");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_F_B_2, coeffs.b_2 as u32, "Flux");
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_F_ENABLE, 1, "Flux");
                 defmt::info!("Flux biquad: {}Hz enabled", filter_hz);
             } else {
-                let _ = tmc.write_sub_register(CONFIG_BIQUAD_F_ENABLE, 0).await;
+                write_filter_subreg!(tmc, CONFIG_BIQUAD_F_ENABLE, 0, "Flux");
                 defmt::warn!("Flux biquad: {}Hz out of range, disabled", filter_hz);
             }
         } else {
-            let _ = tmc.write_sub_register(CONFIG_BIQUAD_F_ENABLE, 0).await;
+            write_filter_subreg!(tmc, CONFIG_BIQUAD_F_ENABLE, 0, "Flux");
         }
 
         // NOTE: PID_VELOCITY_OFFSET is NOT cleared here — writing to 0x67
@@ -3781,7 +3789,20 @@ mod app {
         // The register is cleared during disable and restore_safe_state instead.
 
         // 12. Enter position mode: MODE_PID_TYPE=1 (bit 31), MODE_MOTION=3 (position)
-        let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0003).await;
+        tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0003)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+        let mode_rb = tmc
+            .read_register(MODE_RAMP_MODE_MOTION)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+        if mode_rb != 0x8000_0003 {
+            defmt::error!(
+                "closed-loop: MODE_RAMP_MODE_MOTION readback mismatch: expected=0x80000003 got=0x{:08X}",
+                mode_rb
+            );
+            return Err(CalibrationError::SpiError);
+        }
 
         // 13. Runaway detection (20ms). If position error exceeds 40 steps
         // and is still growing, the feedback sign is wrong — fail fast.
