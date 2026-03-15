@@ -3561,32 +3561,10 @@ mod app {
         let _ = tmc.write_register(PHI_E_SELECTION, 1).await;
         let _ = tmc.write_register(PHI_E_EXT, 0).await;
 
-        // 2. Ensure encoder has non-zero count before alignment.
-        // On cold boot, ABN_DECODER_COUNT is 0. If the rotor is already
-        // at a D-axis point, the alignment won't move it and the encoder
-        // check fails. A brief open-loop nudge guarantees encoder counts
-        // are accumulated, proving the encoder is connected.
-        let count_pre_nudge = tmc
-            .read_register(ABN_DECODER_COUNT)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        // NOTE: encoder nudge disabled — it moved the motor to a random
-        // D-axis position that the alignment drive couldn't correct,
-        // causing ~50% alignment failure rate. Encoder connectivity is
-        // verified by checking for count change during the alignment
-        // drive itself (the alignment moves the motor, proving encoder
-        // is connected). The count_pre_nudge==0 case is handled by the
-        // existing movement check below (moved || count != 0).
-        if count_pre_nudge == 0 {
-            // On cold boot, ABN_DECODER_COUNT is 0. If the rotor is already
-            // at the D-axis, the alignment won't move it and the movement
-            // check would reject count=0 as "no movement". Seed the counter
-            // to 1 so the post-alignment check can detect that the alignment
-            // drive changed it (it will be zeroed after alignment anyway).
-            let _ = tmc.write_register(ABN_DECODER_COUNT, 1).await;
-            defmt::info!("encoder count=0 at alignment start, seeded to 1");
-        }
-
+        // 2. Capture the encoder count before alignment. Do not seed or
+        // otherwise perturb this register: calibration must prove that the
+        // alignment drive itself produced encoder movement before zeroing the
+        // electrical reference.
         let count_before = tmc
             .read_register(ABN_DECODER_COUNT)
             .await
@@ -3606,8 +3584,10 @@ mod app {
         // UQ_UD_EXT layout: bits[31:16] = UQ, bits[15:0] = UD
         let _ = tmc.write_register(UQ_UD_EXT, 1000u32).await;
 
-        // 5. Enter open-loop voltage mode (MODE_PID_TYPE=1, MODE_MOTION=8)
-        let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0008).await;
+        // 5. Enter open-loop voltage mode (MODE_MOTION=8).
+        // UQ_UD_EXT is an open-loop voltage path; keep MODE_PID_TYPE clear,
+        // matching the selftest and commissioning voltage-mode routines.
+        let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 8).await;
 
         // 6. Hold for settling (rotor aligns to nearest D-axis pole)
         Mono::delay(500_u64.millis()).await;
@@ -3623,18 +3603,22 @@ mod app {
             .await
             .map_err(|_| CalibrationError::SpiError)?;
 
-        // Check encoder presence: compare against pre-alignment count.
-        // Verify the alignment produced encoder movement OR that the count
-        // is stable and non-zero (prior motion accumulated).
-        let moved = count1 != count_before || count2 != count_before;
+        // Check encoder presence: compare against the pre-alignment count.
+        // A one-count twitch is not enough to establish a valid electrical
+        // zero; it can be caused by jitter or by the old cold-boot seed path.
+        const MIN_ALIGN_MOVEMENT_COUNTS: u32 = 4;
+        let movement1 = (count1 as i32 - count_before as i32).unsigned_abs();
+        let movement2 = (count2 as i32 - count_before as i32).unsigned_abs();
+        let movement = movement1.max(movement2);
         // Allow +/-2 encoder counts of jitter during settling.
         let stable = (count1 as i32 - count2 as i32).unsigned_abs() <= 2;
-        if !moved && count1 == 0 {
+        if movement < MIN_ALIGN_MOVEMENT_COUNTS {
             defmt::error!(
-                "encoder align: no movement (before={}, after={},{})",
+                "encoder align: insufficient movement: before={}, after={},{} movement={}",
                 count_before,
                 count1,
-                count2
+                count2,
+                movement
             );
             let _ = tmc.write_register(UQ_UD_EXT, 0).await;
             let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
