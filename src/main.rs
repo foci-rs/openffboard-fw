@@ -691,14 +691,14 @@ mod app {
                     return;
                 }
 
-                // Arm timer on first move if motor is armed.
-                // Fire immediately — P3 ISR will pop the move and schedule.
-                if matches!(result, QueueStepResult::QueuedFirstMove)
-                    && MOTOR_ARMED.load(Relaxed)
-                    && !TIMER_ACTIVE.load(Relaxed)
-                {
-                    let now = read_tim5();
-                    arm_step_timer(now.wrapping_add(1));
+                // Arm timer if the motor is ready. This normally happens
+                // on the first queued move, but also recovers if moves were
+                // queued while asynchronous calibration was still running.
+                if matches!(
+                    result,
+                    QueueStepResult::QueuedFirstMove | QueueStepResult::Queued
+                ) {
+                    arm_queued_steps_if_ready();
                 }
             }
         }
@@ -2350,6 +2350,7 @@ mod app {
                                         motor_enabled = true;
                                         MOTOR_ARMED
                                             .store(true, core::sync::atomic::Ordering::Relaxed);
+                                        arm_queued_steps_if_ready();
                                         defmt::info!("foci_calibrate complete: oid={}", oid);
                                         COMMISSION_IN_FLIGHT
                                             .store(false, core::sync::atomic::Ordering::Relaxed);
@@ -2450,14 +2451,7 @@ mod app {
 
                             // If queue already has moves (burst-drain scenario),
                             // arm timer to start processing them
-                            let queue_has_moves =
-                                unsafe { !(*core::ptr::addr_of_mut!(STEP_QUEUE)).is_empty() };
-                            if queue_has_moves
-                                && !TIMER_ACTIVE.load(core::sync::atomic::Ordering::Relaxed)
-                            {
-                                let now = read_tim5();
-                                arm_step_timer(now.wrapping_add(1));
-                            }
+                            arm_queued_steps_if_ready();
 
                             defmt::info!("Motor enabled (calibrated, step/dir armed)");
                         } else {
@@ -3984,6 +3978,29 @@ mod app {
         tim5.sr().modify(|w| w.set_ccif(0, false)); // Clear pending CC1
         tim5.dier().modify(|w| w.set_ccie(0, true)); // Enable CC1 interrupt
         TIMER_ACTIVE.store(true, Relaxed);
+    }
+
+    /// Arm TIM5 CC1 when motion is ready and queued.
+    ///
+    /// This is used from both P2 command handling and P1 calibration/enable
+    /// completion. During asynchronous auto-calibration, Klipper can queue
+    /// moves before the TMC4671 is in closed-loop mode; once calibration
+    /// completes, this starts the ISR that drains those deferred moves.
+    fn arm_queued_steps_if_ready() {
+        use core::sync::atomic::Ordering::Relaxed;
+
+        if !MOTOR_ARMED.load(Relaxed) || TIMER_ACTIVE.load(Relaxed) {
+            return;
+        }
+
+        // SAFETY: This mirrors the existing queue inspection in SetEnable.
+        // P2 is the sole producer while the timer is inactive; this helper
+        // only needs a best-effort empty/nonempty check before arming P3.
+        let queue_has_moves = unsafe { !(*core::ptr::addr_of_mut!(STEP_QUEUE)).is_empty() };
+        if queue_has_moves {
+            let now = read_tim5();
+            arm_step_timer(now.wrapping_add(1));
+        }
     }
 
     /// TIM5 CC1 step timer interrupt.
