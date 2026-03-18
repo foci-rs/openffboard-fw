@@ -254,6 +254,10 @@ mod app {
                 .load(core::sync::atomic::Ordering::Relaxed)
                 .max(0) as u32
         }
+
+        fn operational_velocity_limit(&self) -> u32 {
+            VELOCITY_LIMIT_CFG.load(core::sync::atomic::Ordering::Relaxed)
+        }
     }
 
     /// USB wake signal. The OTG_FS ISR signals this to wake usb_task.

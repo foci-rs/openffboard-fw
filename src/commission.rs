@@ -93,6 +93,13 @@ pub trait CommissioningBackend {
     /// Used by position-loop tuning as the position step size.
     /// Returns 0 if the encoder has not been configured.
     fn step_width(&self) -> u32;
+
+    /// Configured operational PID_VELOCITY_LIMIT value.
+    ///
+    /// Phase 10 may use a small limit derived from mechanical ID to keep the
+    /// validation step bounded. Once velocity validation passes, later phases
+    /// should return to the operational limit used for normal motion.
+    fn operational_velocity_limit(&self) -> u32;
 }
 
 /// Result of a `step()` call.
@@ -789,6 +796,8 @@ struct VelocityValidateData {
     saturation_count: u16,
     /// Current limit for saturation detection (from `backend.current_limit()`).
     torque_limit: u32,
+    /// Operational velocity limit to restore after validation.
+    operational_velocity_limit: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -3443,6 +3452,7 @@ impl CommissioningEngine {
             prev_encoder_for_velocity: 0,
             saturation_count: 0,
             torque_limit: backend.current_limit() & 0xFFFF,
+            operational_velocity_limit: backend.operational_velocity_limit(),
         };
 
         *phase = OuterPhase::VelocityValidate {
@@ -3876,7 +3886,15 @@ impl CommissioningEngine {
                 let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
 
                 let carried_safety = *safety;
-                let accepted_gains = data.gains;
+                let mut accepted_gains = data.gains;
+                accepted_gains.velocity_limit = data.operational_velocity_limit.max(1);
+                if backend
+                    .write_register(PID_VELOCITY_LIMIT, accepted_gains.velocity_limit)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_outer(phase, CommissionError::Spi);
+                }
                 let velocity_chatter = data.max_chatter > VEL_VALIDATE_CHATTER_THRESHOLD;
 
                 defmt::info!(
