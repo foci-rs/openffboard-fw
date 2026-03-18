@@ -673,6 +673,28 @@ const POS_TUNE_MAX_P: u16 = 16384;
 /// 5% of P = P * 5 / 100.
 const POS_TUNE_I_PERCENT: u32 = 5;
 
+/// Conservative velocity-loop runtime fallback used when autotuned outer gains
+/// exceed the accepted safety envelope. These are the same defaults used by
+/// closed-loop entry when no outer gains are configured.
+const OUTER_FALLBACK_VELOCITY_P: u16 = 1152;
+const OUTER_FALLBACK_VELOCITY_I: u16 = 0;
+
+/// Conservative position-loop runtime fallback used with
+/// `OUTER_FALLBACK_VELOCITY_*`.
+const OUTER_FALLBACK_POSITION_P: u16 = 640;
+const OUTER_FALLBACK_POSITION_I: u16 = 0;
+
+/// Maximum accepted autotuned velocity P gain.
+///
+/// The current mechanical-ID scaling can saturate the velocity P register on
+/// real hardware. Accepting those gains caused immediate velocity/position
+/// limit windup during normal motion, so keep runtime gains near the known-good
+/// default envelope until the mechanical model scaling is reworked.
+const OUTER_MAX_VELOCITY_P: u16 = OUTER_FALLBACK_VELOCITY_P * 4;
+const OUTER_MAX_VELOCITY_I: u16 = 512;
+const OUTER_MAX_POSITION_P: u16 = OUTER_FALLBACK_POSITION_P * 4;
+const OUTER_MAX_POSITION_I: u16 = 128;
+
 /// Sampling interval for position capture (microseconds). 1 kHz.
 const POS_TUNE_SAMPLE_PERIOD_US: u64 = 1000;
 
@@ -4356,7 +4378,7 @@ impl CommissioningEngine {
 
     /// Assemble and emit the final outer commissioning result.
     fn step_commit(phase: &mut OuterPhase) -> StepResult {
-        let (velocity_gains, position_gains, filter_config, j_eff, b_eff) = match phase {
+        let (mut velocity_gains, mut position_gains, filter_config, j_eff, b_eff) = match phase {
             OuterPhase::Commit {
                 velocity_gains,
                 position_gains,
@@ -4373,8 +4395,28 @@ impl CommissioningEngine {
             _ => return StepResult::Continue,
         };
 
+        let mut status = CommissionStatus::Accepted;
+        if velocity_gains.velocity_p > OUTER_MAX_VELOCITY_P
+            || velocity_gains.velocity_i > OUTER_MAX_VELOCITY_I
+            || position_gains.position_p > OUTER_MAX_POSITION_P
+            || position_gains.position_i > OUTER_MAX_POSITION_I
+        {
+            defmt::warn!(
+                "outer commit: rejecting unsafe gains vel_p={}, vel_i={}, pos_p={}, pos_i={}",
+                velocity_gains.velocity_p,
+                velocity_gains.velocity_i,
+                position_gains.position_p,
+                position_gains.position_i
+            );
+            velocity_gains.velocity_p = OUTER_FALLBACK_VELOCITY_P;
+            velocity_gains.velocity_i = OUTER_FALLBACK_VELOCITY_I;
+            position_gains.position_p = OUTER_FALLBACK_POSITION_P;
+            position_gains.position_i = OUTER_FALLBACK_POSITION_I;
+            status = CommissionStatus::AcceptedWithWarnings;
+        }
+
         let result = OuterResult {
-            status: CommissionStatus::Accepted,
+            status,
             velocity_p: velocity_gains.velocity_p,
             velocity_i: velocity_gains.velocity_i,
             velocity_limit: velocity_gains.velocity_limit,
