@@ -3887,14 +3887,14 @@ impl CommissioningEngine {
 
                 let carried_safety = *safety;
                 let mut accepted_gains = data.gains;
+                // Keep the bounded validation velocity limit in hardware for
+                // Phase 11. Position tuning intentionally uses small, local
+                // step responses; restoring the runtime limit here lets the
+                // first position step violate the outer safety envelope.
+                //
+                // The final reported gains still carry the operational limit
+                // so SAVE_CONFIG does not persist the commissioning test limit.
                 accepted_gains.velocity_limit = data.operational_velocity_limit.max(1);
-                if backend
-                    .write_register(PID_VELOCITY_LIMIT, accepted_gains.velocity_limit)
-                    .await
-                    .is_err()
-                {
-                    return Self::fail_outer(phase, CommissionError::Spi);
-                }
                 let velocity_chatter = data.max_chatter > VEL_VALIDATE_CHATTER_THRESHOLD;
 
                 defmt::info!(
