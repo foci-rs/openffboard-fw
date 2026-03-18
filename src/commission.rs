@@ -2971,12 +2971,21 @@ impl CommissioningEngine {
                     .await
                     .is_err()
                     || backend.write_register(PWM_SV_CHOP, 7).await.is_err()
+                    || backend.write_register(PHI_E_SELECTION, 3).await.is_err()
                     || backend
                         .write_register(MODE_RAMP_MODE_MOTION, 1)
                         .await
                         .is_err()
                 {
                     return Self::fail_outer(phase, CommissionError::Spi);
+                }
+
+                let phi_ok = backend
+                    .read_register(PHI_E_SELECTION)
+                    .await
+                    .is_ok_and(|v| v == 3);
+                if !phi_ok {
+                    return Self::fail_outer(phase, CommissionError::EncoderNotAligned);
                 }
 
                 backend.set_enable_pin(true);
