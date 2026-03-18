@@ -3290,84 +3290,72 @@ impl CommissioningEngine {
             return (0, 0, 0);
         }
 
-        // Compute velocity as position differences (counts per sample period).
-        // First velocity is relative to the reference position.
-        let first_velocity = (samples[0] as i32).wrapping_sub(reference_position);
-
-        let mut peak_velocity: i32 = first_velocity;
-        let mut delay_samples: u16 = 0;
-        let mut found_onset = false;
-
-        // Track velocity onset.
-        let abs_first = if first_velocity < 0 {
-            -first_velocity
-        } else {
-            first_velocity
-        };
-        if abs_first >= MECH_ID_VELOCITY_ONSET_THRESHOLD {
-            found_onset = true;
-        }
-
-        // Accumulate acceleration from early samples.
-        let accel_limit = MECH_ID_ACCEL_SAMPLES.min(samples.len());
-        let mut accel_sum: i32 = 0;
-        let mut accel_count: u32 = 0;
-
-        // First acceleration point.
-        if accel_limit >= 2 {
-            let vel0 = first_velocity;
-            let vel1 = (samples[1] as i32).wrapping_sub(samples[0] as i32);
-            accel_sum += vel1 - vel0;
-            accel_count += 1;
-        }
-
-        let mut prev_velocity = first_velocity;
-
-        for i in 1..samples.len() {
-            let velocity = (samples[i] as i32).wrapping_sub(samples[i - 1] as i32);
-
-            // Track velocity onset.
-            if !found_onset {
-                let abs_vel = if velocity < 0 { -velocity } else { velocity };
-                if abs_vel >= MECH_ID_VELOCITY_ONSET_THRESHOLD {
-                    found_onset = true;
-                    delay_samples = i as u16;
-                } else {
-                    delay_samples = i as u16;
-                }
-            }
-
-            // Peak velocity (signed, tracking the direction of motion).
-            let abs_cur = if velocity < 0 { -velocity } else { velocity };
-            let abs_peak = if peak_velocity < 0 {
-                -peak_velocity
+        // Convert absolute encoder samples into per-sample velocity. Sample 0
+        // is measured relative to the caller's reference position because
+        // there is no previous captured sample yet.
+        let velocity_at = |idx: usize| -> i32 {
+            if idx == 0 {
+                (samples[0] as i32).wrapping_sub(reference_position)
             } else {
-                peak_velocity
-            };
+                (samples[idx] as i32).wrapping_sub(samples[idx - 1] as i32)
+            }
+        };
+
+        let mut peak_velocity: i32 = 0;
+        let mut onset_idx: Option<usize> = None;
+
+        // Find the first sample with real motion and track the signed peak
+        // velocity. Mechanical ID runs against an unloaded motor, but current
+        // buildup and static friction can leave a quiet prefix at the start of
+        // the capture. Treating that prefix as the acceleration window caused
+        // false zero-acceleration failures on hardware.
+        for i in 0..samples.len() {
+            let velocity = velocity_at(i);
+            let abs_cur = velocity.unsigned_abs();
+            let abs_peak = peak_velocity.unsigned_abs();
             if abs_cur > abs_peak {
                 peak_velocity = velocity;
             }
 
-            // Acceleration from early samples.
-            if i < accel_limit && i >= 2 {
-                let accel = velocity - prev_velocity;
-                accel_sum += accel;
-                accel_count += 1;
+            if onset_idx.is_none() && abs_cur >= MECH_ID_VELOCITY_ONSET_THRESHOLD as u32 {
+                onset_idx = Some(i);
             }
-
-            prev_velocity = velocity;
         }
 
-        // Average initial acceleration.
-        let initial_accel = if accel_count > 0 {
-            accel_sum / accel_count as i32
+        let onset_idx = match onset_idx {
+            Some(idx) => idx,
+            None => return (0, peak_velocity, samples.len() as u16),
+        };
+        let delay_samples = onset_idx as u16;
+
+        // Estimate initial acceleration from the first few samples after
+        // motion onset, preserving sign so the caller can compare forward and
+        // reverse captures. We use the velocity step to the local peak rather
+        // than an average over the whole window so integer quantization cannot
+        // round a small but real acceleration down to zero.
+        let previous_velocity = if onset_idx == 0 {
+            0
         } else {
-            first_velocity // Fallback: use first velocity as proxy.
+            velocity_at(onset_idx - 1)
         };
 
-        // If onset was never found, the motor didn't move.
-        if !found_onset {
-            delay_samples = samples.len() as u16;
+        let direction_positive = velocity_at(onset_idx) >= 0;
+        let end = (onset_idx + MECH_ID_ACCEL_SAMPLES).min(samples.len());
+        let mut window_peak = velocity_at(onset_idx);
+        for i in onset_idx + 1..end {
+            let velocity = velocity_at(i);
+            if direction_positive {
+                if velocity > window_peak {
+                    window_peak = velocity;
+                }
+            } else if velocity < window_peak {
+                window_peak = velocity;
+            }
+        }
+
+        let mut initial_accel = window_peak.wrapping_sub(previous_velocity);
+        if initial_accel == 0 {
+            initial_accel = velocity_at(onset_idx);
         }
 
         (initial_accel, peak_velocity, delay_samples)
