@@ -412,8 +412,11 @@ enum EncoderCheckState {
 /// Encoder D-axis alignment sub-state.
 #[derive(Debug, defmt::Format)]
 enum EncoderAlignState {
-    /// Configure external PHI_E=0 voltage drive and record starting count.
-    Setup,
+    /// Configure external PHI_E=0 voltage drive.
+    Setup {
+        /// Encoder count captured before the direction sweep that ended at PHI_E=0.
+        count_before: u32,
+    },
     /// Wait for rotor to settle at the nearest D-axis pole.
     Settle {
         count_before: u32,
@@ -1650,7 +1653,9 @@ impl CommissioningEngine {
                 // Direction value (0=forward, 1=reversed) is carried as
                 // commissioning-local data; persistence is outside this plan.
                 *phase = InnerPhase::EncoderAlign {
-                    state: EncoderAlignState::Setup,
+                    state: EncoderAlignState::Setup {
+                        count_before: *count_start as u32,
+                    },
                 };
                 StepResult::PhaseChanged(PhaseId::EncoderAlign)
             }
@@ -1682,7 +1687,7 @@ impl CommissioningEngine {
         };
 
         match state {
-            EncoderAlignState::Setup => {
+            EncoderAlignState::Setup { count_before } => {
                 if backend.current_limit() == 0 || backend.step_width() == 0 {
                     return Self::fail_inner(phase, CommissionError::NoCurrent);
                 }
@@ -1717,18 +1722,13 @@ impl CommissioningEngine {
                     return Self::fail_inner(phase, CommissionError::Spi);
                 }
 
-                let count_before = match backend.read_register(ABN_DECODER_COUNT).await {
-                    Ok(v) => v,
-                    Err(_) => return Self::fail_inner(phase, CommissionError::Spi),
-                };
-
                 backend.set_enable_pin(true);
 
                 let step_width = backend.step_width().max(1);
                 let min_movement = (65536u32 / (20 * step_width)).max(2);
                 let deadline = backend.elapsed_us().wrapping_add(ENCODER_ALIGN_SETTLE_US);
                 *state = EncoderAlignState::Settle {
-                    count_before,
+                    count_before: *count_before,
                     deadline_us: deadline,
                     min_movement,
                 };
