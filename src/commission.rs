@@ -602,6 +602,17 @@ const MECH_ID_SYMMETRY_THRESHOLD_PCT: u32 = 30;
 /// constrained by the conservative safe-state ceiling.
 const OUTER_PIDOUT_LIMIT: u32 = 16000;
 
+/// Velocity mode with MODE_PID_TYPE set for the TMC4671 advanced PI structure.
+///
+/// The production closed-loop path uses advanced PID mode because the ADC
+/// setup also configures the PWM-synchronized velocity meter expected by that
+/// controller structure. Outer validation must exercise the same controller
+/// path it is tuning.
+const OUTER_VELOCITY_MODE: u32 = 0x8000_0002;
+
+/// Position mode with MODE_PID_TYPE set, matching production closed-loop entry.
+const OUTER_POSITION_MODE: u32 = 0x8000_0003;
+
 /// Minimum number of acceleration samples used for inertia estimate.
 /// First few samples before friction/damping dominates.
 const MECH_ID_ACCEL_SAMPLES: usize = 8;
@@ -3493,9 +3504,10 @@ impl CommissioningEngine {
                     return Self::fail_outer(phase, CommissionError::Spi);
                 }
 
-                // Switch to velocity mode (MODE=2).
+                // Switch to velocity mode using the same advanced PI
+                // controller structure as production closed-loop entry.
                 if backend
-                    .write_register(MODE_RAMP_MODE_MOTION, 2)
+                    .write_register(MODE_RAMP_MODE_MOTION, OUTER_VELOCITY_MODE)
                     .await
                     .is_err()
                 {
@@ -3939,9 +3951,10 @@ impl CommissioningEngine {
 
         match state {
             PositionTuneState::Setup => {
-                // Switch to position mode (MODE=3).
+                // Switch to position mode using the same advanced PI
+                // controller structure as production closed-loop entry.
                 if backend
-                    .write_register(MODE_RAMP_MODE_MOTION, 3)
+                    .write_register(MODE_RAMP_MODE_MOTION, OUTER_POSITION_MODE)
                     .await
                     .is_err()
                 {
