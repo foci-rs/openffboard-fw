@@ -596,6 +596,12 @@ const MECH_ID_SETTLE_US: u64 = 500_000;
 /// If |J_fwd - J_rev| / avg > 30%, mechanical ID fails.
 const MECH_ID_SYMMETRY_THRESHOLD_PCT: u32 = 30;
 
+/// Operational PID output voltage limit for outer commissioning.
+///
+/// Matches closed-loop entry so torque, velocity, and position tests are not
+/// constrained by the conservative safe-state ceiling.
+const OUTER_PIDOUT_LIMIT: u32 = 16000;
+
 /// Minimum number of acceleration samples used for inertia estimate.
 /// First few samples before friction/damping dominates.
 const MECH_ID_ACCEL_SAMPLES: usize = 8;
@@ -2961,9 +2967,14 @@ impl CommissioningEngine {
                 // Ensure we are in torque mode (MODE=1) with current-loop
                 // gains already written by inner commissioning.
                 if backend
-                    .write_register(MODE_RAMP_MODE_MOTION, 1)
+                    .write_register(PIDOUT_UQ_UD_LIMITS, OUTER_PIDOUT_LIMIT)
                     .await
                     .is_err()
+                    || backend.write_register(PWM_SV_CHOP, 7).await.is_err()
+                    || backend
+                        .write_register(MODE_RAMP_MODE_MOTION, 1)
+                        .await
+                        .is_err()
                 {
                     return Self::fail_outer(phase, CommissionError::Spi);
                 }
