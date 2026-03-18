@@ -2968,6 +2968,8 @@ impl CommissioningEngine {
                     return Self::fail_outer(phase, CommissionError::Spi);
                 }
 
+                backend.set_enable_pin(true);
+
                 // Zero torque target before starting capture.
                 let _ = backend.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
 
