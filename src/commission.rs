@@ -2852,6 +2852,12 @@ impl CommissioningEngine {
         safety: &mut OuterSafetyLimits,
         backend: &mut B,
     ) -> bool {
+        // Safety limits are initialized by MechanicalId::Setup after it reads
+        // the real encoder baseline. Skip the pre-setup placeholder values.
+        if safety.torque_cap == 0 {
+            return false;
+        }
+
         let encoder_raw = backend.read_encoder_count().await;
         let encoder_count = encoder_raw as i32;
 
