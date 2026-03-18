@@ -2347,7 +2347,19 @@ mod app {
                             flux_filter_hz: u16 = outer.flux_filter_hz,
                             torque_filter_hz: u16 = outer.torque_filter_hz,
                             j_eff: u32 = outer.j_eff,
-                            b_eff: u32 = outer.b_eff
+                            b_eff: u32 = outer.b_eff,
+                            warning_code: u8 = outer.warning_code,
+                            mech_torque_step: u16 = outer.mech_torque_step,
+                            mech_fwd_accel: u32 = outer.mech_fwd_accel,
+                            mech_rev_accel: u32 = outer.mech_rev_accel,
+                            mech_fwd_peak_velocity: u32 = outer.mech_fwd_peak_velocity,
+                            mech_rev_peak_velocity: u32 = outer.mech_rev_peak_velocity,
+                            mech_fwd_travel: u32 = outer.mech_fwd_travel,
+                            mech_rev_travel: u32 = outer.mech_rev_travel,
+                            synth_velocity_p: u16 = outer.synth_velocity_p,
+                            synth_velocity_i: u16 = outer.synth_velocity_i,
+                            synth_position_p: u16 = outer.synth_position_p,
+                            synth_position_i: u16 = outer.synth_position_i
                         );
                     }
                     crate::commission::StepResult::OuterFailed(error) => {

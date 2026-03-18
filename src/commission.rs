@@ -178,6 +178,30 @@ pub struct OuterResult {
     pub j_eff: u32,
     /// Identified effective damping from mechanical ID (internal units).
     pub b_eff: u32,
+    /// Warning reason for accepted-with-warning results (0 = none).
+    pub warning_code: u8,
+    /// Torque step used by the final mechanical-ID attempt.
+    pub mech_torque_step: u16,
+    /// Forward initial acceleration, absolute encoder counts/ms^2.
+    pub mech_fwd_accel: u32,
+    /// Reverse initial acceleration, absolute encoder counts/ms^2.
+    pub mech_rev_accel: u32,
+    /// Forward peak velocity, absolute encoder counts/ms.
+    pub mech_fwd_peak_velocity: u32,
+    /// Reverse peak velocity, absolute encoder counts/ms.
+    pub mech_rev_peak_velocity: u32,
+    /// Forward total travel during mechanical ID, encoder counts.
+    pub mech_fwd_travel: u32,
+    /// Reverse total travel during mechanical ID, encoder counts.
+    pub mech_rev_travel: u32,
+    /// Velocity P before safety fallback, if synthesis reached that far.
+    pub synth_velocity_p: u16,
+    /// Velocity I before safety fallback, if synthesis reached that far.
+    pub synth_velocity_i: u16,
+    /// Position P before safety fallback, if position tuning reached that far.
+    pub synth_position_p: u16,
+    /// Position I before safety fallback, if position tuning reached that far.
+    pub synth_position_i: u16,
 }
 
 /// Result of the calibration subset requested by `new_calibrate`.
@@ -587,9 +611,14 @@ const POSITION_WINDOW_COUNTS: i32 = 8192;
 // Mechanical identification constants (Phase 8)
 // ---------------------------------------------------------------------------
 
-/// Torque step as a fraction of run_current (25% = 25/100).
-/// Spec says 20-30%; 25% is a safe midpoint.
-const MECH_ID_TORQUE_STEP_PERCENT: u32 = 25;
+/// Torque step attempts as fractions of run_current.
+///
+/// Start at the spec midpoint, then retry with stronger bounded torque if the
+/// encoder response is too quantized to identify a useful mechanical model.
+const MECH_ID_TORQUE_STEP_PERCENT_0: u32 = 25;
+const MECH_ID_TORQUE_STEP_PERCENT_1: u32 = 40;
+const MECH_ID_TORQUE_STEP_PERCENT_2: u32 = 60;
+const MECH_ID_MAX_ATTEMPTS: u8 = 3;
 
 /// Sampling interval for encoder capture (microseconds).
 /// 1 kHz = 1000us between samples.
@@ -628,6 +657,15 @@ const MECH_ID_ACCEL_SAMPLES: usize = 8;
 /// In encoder counts per sample period.
 const MECH_ID_VELOCITY_ONSET_THRESHOLD: i32 = 2;
 
+/// Minimum mechanical-ID signal before model-based gain synthesis is trusted.
+///
+/// The safety envelope caps velocity at 8 counts/ms, so these thresholds stay
+/// below that cap while rejecting the observed 1-count acceleration and
+/// 2-count/ms peak velocity case that produced saturated gains.
+const MECH_ID_MIN_ACCEL_COUNTS_PER_MS2: u32 = 2;
+const MECH_ID_MIN_PEAK_VELOCITY_COUNTS_PER_MS: u32 = 4;
+const MECH_ID_MIN_TRAVEL_COUNTS: u32 = 64;
+
 // ---------------------------------------------------------------------------
 // Velocity validation constants (Phase 10)
 // ---------------------------------------------------------------------------
@@ -665,10 +703,6 @@ const POS_TUNE_INITIAL_P: u16 = 128;
 const POS_TUNE_P_MUL_NUM: u32 = 3;
 const POS_TUNE_P_MUL_DEN: u32 = 2;
 
-/// Maximum position P gain: cap derived from velocity bandwidth.
-/// Capped at 16384 = 64.0 in Q8.8 as a hard upper limit.
-const POS_TUNE_MAX_P: u16 = 16384;
-
 /// Position I gain as fraction of P for Nominal/HighInertia modes.
 /// 5% of P = P * 5 / 100.
 const POS_TUNE_I_PERCENT: u32 = 5;
@@ -694,6 +728,16 @@ const OUTER_MAX_VELOCITY_P: u16 = OUTER_FALLBACK_VELOCITY_P * 4;
 const OUTER_MAX_VELOCITY_I: u16 = 512;
 const OUTER_MAX_POSITION_P: u16 = OUTER_FALLBACK_POSITION_P * 4;
 const OUTER_MAX_POSITION_I: u16 = 128;
+
+/// Maximum position P tested during ramp-up.
+///
+/// Keep Phase 11 inside the same envelope that the final commit guard accepts
+/// so tuning never exercises gains that would be rejected for runtime use.
+const POS_TUNE_MAX_P: u16 = OUTER_MAX_POSITION_P;
+
+const OUTER_WARNING_NONE: u8 = 0;
+const OUTER_WARNING_LOW_CONFIDENCE_MECH_ID: u8 = 1;
+const OUTER_WARNING_UNSAFE_SYNTH_GAINS: u8 = 2;
 
 /// Sampling interval for position capture (microseconds). 1 kHz.
 const POS_TUNE_SAMPLE_PERIOD_US: u64 = 1000;
@@ -733,6 +777,8 @@ enum MechanicalIdState {
 struct MechanicalIdData {
     /// Starting encoder position recorded at setup.
     start_position: i32,
+    /// Retry attempt index for adaptive torque steps.
+    attempt: u8,
     /// Torque step amplitude (PIDOUT units).
     torque_step: u16,
     /// Forward capture: per-sample velocity (encoder counts/ms).
@@ -740,23 +786,75 @@ struct MechanicalIdData {
     forward_initial_accel: i32,
     forward_peak_velocity: i32,
     forward_delay_samples: u16,
+    forward_travel: u32,
     /// Reverse capture: same metrics.
     reverse_initial_accel: i32,
     reverse_peak_velocity: i32,
     reverse_delay_samples: u16,
+    reverse_travel: u32,
 }
 
 impl MechanicalIdData {
     fn new(start_position: i32, torque_step: u16) -> Self {
         Self {
             start_position,
+            attempt: 0,
             torque_step,
             forward_initial_accel: 0,
             forward_peak_velocity: 0,
             forward_delay_samples: 0,
+            forward_travel: 0,
             reverse_initial_accel: 0,
             reverse_peak_velocity: 0,
             reverse_delay_samples: 0,
+            reverse_travel: 0,
+        }
+    }
+
+    fn reset_captures(&mut self) {
+        self.forward_initial_accel = 0;
+        self.forward_peak_velocity = 0;
+        self.forward_delay_samples = 0;
+        self.forward_travel = 0;
+        self.reverse_initial_accel = 0;
+        self.reverse_peak_velocity = 0;
+        self.reverse_delay_samples = 0;
+        self.reverse_travel = 0;
+    }
+}
+
+/// Mechanical-ID diagnostics carried into the final host result.
+#[derive(Debug, Clone, Copy, defmt::Format)]
+struct OuterDiagnostics {
+    warning_code: u8,
+    mech_torque_step: u16,
+    mech_fwd_accel: u32,
+    mech_rev_accel: u32,
+    mech_fwd_peak_velocity: u32,
+    mech_rev_peak_velocity: u32,
+    mech_fwd_travel: u32,
+    mech_rev_travel: u32,
+    synth_velocity_p: u16,
+    synth_velocity_i: u16,
+    synth_position_p: u16,
+    synth_position_i: u16,
+}
+
+impl OuterDiagnostics {
+    fn from_mechanical_id(data: &MechanicalIdData) -> Self {
+        Self {
+            warning_code: OUTER_WARNING_NONE,
+            mech_torque_step: data.torque_step,
+            mech_fwd_accel: data.forward_initial_accel.unsigned_abs(),
+            mech_rev_accel: data.reverse_initial_accel.unsigned_abs(),
+            mech_fwd_peak_velocity: data.forward_peak_velocity.unsigned_abs(),
+            mech_rev_peak_velocity: data.reverse_peak_velocity.unsigned_abs(),
+            mech_fwd_travel: data.forward_travel,
+            mech_rev_travel: data.reverse_travel,
+            synth_velocity_p: 0,
+            synth_velocity_i: 0,
+            synth_position_p: 0,
+            synth_position_i: 0,
         }
     }
 }
@@ -820,6 +918,8 @@ struct VelocityValidateData {
     torque_limit: u32,
     /// Operational velocity limit to restore after validation.
     operational_velocity_limit: u32,
+    /// Diagnostics carried into the final result.
+    diagnostics: OuterDiagnostics,
 }
 
 // ---------------------------------------------------------------------------
@@ -866,6 +966,8 @@ struct PositionTuneData {
     j_eff: u32,
     /// Identified effective damping from mechanical ID (internal units).
     b_eff: u32,
+    /// Diagnostics carried into the final result.
+    diagnostics: OuterDiagnostics,
 }
 
 /// Outer safety limits, computed once at the start of outer commissioning.
@@ -910,6 +1012,7 @@ enum OuterPhase {
         model: MechanicalModel,
         /// Peak velocity from mechanical ID (for velocity limit derivation).
         peak_velocity: u32,
+        diagnostics: OuterDiagnostics,
         safety: OuterSafetyLimits,
     },
     /// Phase 10: Velocity-loop step-response validation.
@@ -942,6 +1045,7 @@ enum OuterPhase {
         j_eff: u32,
         /// Identified effective damping from mechanical ID (internal units).
         b_eff: u32,
+        diagnostics: OuterDiagnostics,
         safety: OuterSafetyLimits,
     },
     /// Phase 13: Assemble and transmit results.
@@ -953,6 +1057,7 @@ enum OuterPhase {
         j_eff: u32,
         /// Identified effective damping from mechanical ID (internal units).
         b_eff: u32,
+        diagnostics: OuterDiagnostics,
     },
     /// All outer phases completed.
     Done(OuterResult),
@@ -2959,6 +3064,89 @@ impl CommissioningEngine {
         StepResult::OuterFailed(err)
     }
 
+    fn mech_id_torque_percent(attempt: u8) -> u32 {
+        match attempt {
+            0 => MECH_ID_TORQUE_STEP_PERCENT_0,
+            1 => MECH_ID_TORQUE_STEP_PERCENT_1,
+            _ => MECH_ID_TORQUE_STEP_PERCENT_2,
+        }
+    }
+
+    fn mech_id_torque_step(current_limit: u32, attempt: u8) -> u16 {
+        let percent = Self::mech_id_torque_percent(attempt);
+        (current_limit * percent / 100).max(1).min(u16::MAX as u32) as u16
+    }
+
+    fn mech_id_low_confidence(
+        fwd_accel: u32,
+        rev_accel: u32,
+        fwd_peak: u32,
+        rev_peak: u32,
+        fwd_travel: u32,
+        rev_travel: u32,
+    ) -> bool {
+        fwd_accel.min(rev_accel) < MECH_ID_MIN_ACCEL_COUNTS_PER_MS2
+            || fwd_peak.min(rev_peak) < MECH_ID_MIN_PEAK_VELOCITY_COUNTS_PER_MS
+            || fwd_travel.min(rev_travel) < MECH_ID_MIN_TRAVEL_COUNTS
+    }
+
+    fn retry_mechanical_id(
+        state: &mut MechanicalIdState,
+        data: &mut MechanicalIdData,
+        reason: &str,
+    ) -> bool {
+        if data.attempt + 1 >= MECH_ID_MAX_ATTEMPTS {
+            return false;
+        }
+
+        data.attempt += 1;
+        data.reset_captures();
+        *state = MechanicalIdState::Setup;
+        defmt::warn!(
+            "mech-id: {} on attempt {}, retrying at {}% current",
+            reason,
+            data.attempt,
+            Self::mech_id_torque_percent(data.attempt)
+        );
+        true
+    }
+
+    fn fallback_outer_result(
+        velocity_limit: u32,
+        j_eff: u32,
+        b_eff: u32,
+        mut diagnostics: OuterDiagnostics,
+        warning_code: u8,
+    ) -> OuterResult {
+        diagnostics.warning_code = warning_code;
+        OuterResult {
+            status: CommissionStatus::AcceptedWithWarnings,
+            velocity_p: OUTER_FALLBACK_VELOCITY_P,
+            velocity_i: OUTER_FALLBACK_VELOCITY_I,
+            velocity_limit,
+            position_p: OUTER_FALLBACK_POSITION_P,
+            position_i: OUTER_FALLBACK_POSITION_I,
+            velocity_filter_hz: 0,
+            position_filter_hz: 0,
+            flux_filter_hz: 0,
+            torque_filter_hz: 0,
+            j_eff,
+            b_eff,
+            warning_code: diagnostics.warning_code,
+            mech_torque_step: diagnostics.mech_torque_step,
+            mech_fwd_accel: diagnostics.mech_fwd_accel,
+            mech_rev_accel: diagnostics.mech_rev_accel,
+            mech_fwd_peak_velocity: diagnostics.mech_fwd_peak_velocity,
+            mech_rev_peak_velocity: diagnostics.mech_rev_peak_velocity,
+            mech_fwd_travel: diagnostics.mech_fwd_travel,
+            mech_rev_travel: diagnostics.mech_rev_travel,
+            synth_velocity_p: diagnostics.synth_velocity_p,
+            synth_velocity_i: diagnostics.synth_velocity_i,
+            synth_position_p: diagnostics.synth_position_p,
+            synth_position_i: diagnostics.synth_position_i,
+        }
+    }
+
     // -------------------------------------------------------------------
     // Phase 8: Mechanical Identification
     // -------------------------------------------------------------------
@@ -2998,7 +3186,7 @@ impl CommissioningEngine {
                 // Compute torque step from configured run_current.
                 let current_limit = backend.current_limit() & 0xFFFF;
                 let torque_step = if current_limit > 0 {
-                    (current_limit * MECH_ID_TORQUE_STEP_PERCENT / 100).max(1) as u16
+                    Self::mech_id_torque_step(current_limit, data.attempt)
                 } else {
                     return Self::fail_outer(phase, CommissionError::NoCurrent);
                 };
@@ -3045,7 +3233,8 @@ impl CommissioningEngine {
                 buf.reset(MECH_ID_SAMPLE_PERIOD_US as u16);
 
                 defmt::info!(
-                    "mech-id: start pos={}, torque_step={}, current_limit={}",
+                    "mech-id: attempt={}, start pos={}, torque_step={}, current_limit={}",
+                    data.attempt,
                     start_position,
                     torque_step,
                     current_limit
@@ -3090,17 +3279,19 @@ impl CommissioningEngine {
                     let _ = backend.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
 
                     // Extract forward metrics from buffer before reset.
-                    let (initial_accel, peak_velocity, delay_samples) =
+                    let (initial_accel, peak_velocity, delay_samples, travel) =
                         Self::extract_mech_metrics(buf, data.start_position);
                     data.forward_initial_accel = initial_accel;
                     data.forward_peak_velocity = peak_velocity;
                     data.forward_delay_samples = delay_samples;
+                    data.forward_travel = travel;
 
                     defmt::info!(
-                        "mech-id fwd: accel={}, peak_vel={}, delay={}",
+                        "mech-id fwd: accel={}, peak_vel={}, delay={}, travel={}",
                         initial_accel,
                         peak_velocity,
-                        delay_samples
+                        delay_samples,
+                        travel
                     );
 
                     let deadline = backend.elapsed_us().wrapping_add(MECH_ID_SETTLE_US);
@@ -3160,7 +3351,7 @@ impl CommissioningEngine {
                     } else {
                         data.start_position
                     };
-                    let (initial_accel, peak_velocity, delay_samples) =
+                    let (initial_accel, peak_velocity, delay_samples, travel) =
                         Self::extract_mech_metrics(buf, reverse_start);
                     // Store as absolute values for symmetry comparison.
                     data.reverse_initial_accel = if initial_accel < 0 {
@@ -3174,12 +3365,14 @@ impl CommissioningEngine {
                         peak_velocity
                     };
                     data.reverse_delay_samples = delay_samples;
+                    data.reverse_travel = travel;
 
                     defmt::info!(
-                        "mech-id rev: accel={}, peak_vel={}, delay={}",
+                        "mech-id rev: accel={}, peak_vel={}, delay={}, travel={}",
                         data.reverse_initial_accel,
                         data.reverse_peak_velocity,
-                        delay_samples
+                        delay_samples,
+                        travel
                     );
 
                     let deadline = backend.elapsed_us().wrapping_add(MECH_ID_SETTLE_US);
@@ -3222,7 +3415,10 @@ impl CommissioningEngine {
 
                 // Gate: both accelerations must be positive and non-zero.
                 if fwd_accel == 0 || rev_accel == 0 {
-                    defmt::warn!("mech-id: zero acceleration detected");
+                    if Self::retry_mechanical_id(state, data, "zero acceleration") {
+                        return StepResult::Continue;
+                    }
+                    defmt::warn!("mech-id: zero acceleration detected after retries");
                     return Self::fail_outer(phase, CommissionError::MechanicalIdFailed);
                 }
 
@@ -3245,8 +3441,11 @@ impl CommissioningEngine {
                 };
                 let asymmetry_pct = (j_diff * 100) / j_avg;
                 if asymmetry_pct > MECH_ID_SYMMETRY_THRESHOLD_PCT {
+                    if Self::retry_mechanical_id(state, data, "asymmetric response") {
+                        return StepResult::Continue;
+                    }
                     defmt::warn!(
-                        "mech-id: asymmetry {}% exceeds {}%",
+                        "mech-id: asymmetry {}% exceeds {}% after retries",
                         asymmetry_pct,
                         MECH_ID_SYMMETRY_THRESHOLD_PCT
                     );
@@ -3299,6 +3498,31 @@ impl CommissioningEngine {
                     model.theta_mech_us
                 );
 
+                let diagnostics = OuterDiagnostics::from_mechanical_id(data);
+                if Self::mech_id_low_confidence(
+                    fwd_accel,
+                    rev_accel,
+                    fwd_peak,
+                    rev_peak,
+                    data.forward_travel,
+                    data.reverse_travel,
+                ) {
+                    if Self::retry_mechanical_id(state, data, "low-confidence response") {
+                        return StepResult::Continue;
+                    }
+
+                    defmt::warn!("mech-id: low-confidence data, using fallback outer gains");
+                    let result = Self::fallback_outer_result(
+                        backend.operational_velocity_limit(),
+                        model.j_eff,
+                        model.b_eff,
+                        diagnostics,
+                        OUTER_WARNING_LOW_CONFIDENCE_MECH_ID,
+                    );
+                    *phase = OuterPhase::Done(result.clone());
+                    return StepResult::OuterDone(result);
+                }
+
                 // Carry safety limits forward to VelocityTune.
                 let carried_safety = match phase {
                     OuterPhase::MechanicalId { safety, .. } => *safety,
@@ -3308,6 +3532,7 @@ impl CommissioningEngine {
                 *phase = OuterPhase::VelocityTune {
                     model,
                     peak_velocity: peak_avg,
+                    diagnostics,
                     safety: carried_safety,
                 };
                 StepResult::PhaseChanged(PhaseId::VelocityTune)
@@ -3326,10 +3551,13 @@ impl CommissioningEngine {
     /// # Parameters
     /// - `buf`: Transient buffer filled with encoder position samples
     /// - `reference_position`: Starting position for velocity computation
-    fn extract_mech_metrics(buf: &TransientBuffer, reference_position: i32) -> (i32, i32, u16) {
+    fn extract_mech_metrics(
+        buf: &TransientBuffer,
+        reference_position: i32,
+    ) -> (i32, i32, u16, u32) {
         let samples = buf.samples();
         if samples.len() < 2 {
-            return (0, 0, 0);
+            return (0, 0, 0, 0);
         }
 
         // Convert absolute encoder samples into per-sample velocity. Sample 0
@@ -3345,6 +3573,7 @@ impl CommissioningEngine {
 
         let mut peak_velocity: i32 = 0;
         let mut onset_idx: Option<usize> = None;
+        let mut max_travel: u32 = 0;
 
         // Find the first sample with real motion and track the signed peak
         // velocity. Mechanical ID runs against an unloaded motor, but current
@@ -3353,6 +3582,12 @@ impl CommissioningEngine {
         // false zero-acceleration failures on hardware.
         for i in 0..samples.len() {
             let velocity = velocity_at(i);
+            let travel = (samples[i] as i32)
+                .wrapping_sub(reference_position)
+                .unsigned_abs();
+            if travel > max_travel {
+                max_travel = travel;
+            }
             let abs_cur = velocity.unsigned_abs();
             let abs_peak = peak_velocity.unsigned_abs();
             if abs_cur > abs_peak {
@@ -3366,7 +3601,7 @@ impl CommissioningEngine {
 
         let onset_idx = match onset_idx {
             Some(idx) => idx,
-            None => return (0, peak_velocity, samples.len() as u16),
+            None => return (0, peak_velocity, samples.len() as u16, max_travel),
         };
         let delay_samples = onset_idx as u16;
 
@@ -3400,7 +3635,7 @@ impl CommissioningEngine {
             initial_accel = velocity_at(onset_idx);
         }
 
-        (initial_accel, peak_velocity, delay_samples)
+        (initial_accel, peak_velocity, delay_samples, max_travel)
     }
 
     // -------------------------------------------------------------------
@@ -3420,12 +3655,13 @@ impl CommissioningEngine {
         theta_e_us: u32,
         backend: &mut B,
     ) -> StepResult {
-        let (model, peak_velocity, safety) = match phase {
+        let (model, peak_velocity, mut diagnostics, safety) = match phase {
             OuterPhase::VelocityTune {
                 model,
                 peak_velocity,
+                diagnostics,
                 safety,
-            } => (*model, *peak_velocity, *safety),
+            } => (*model, *peak_velocity, *diagnostics, *safety),
             _ => return StepResult::Continue,
         };
 
@@ -3445,6 +3681,21 @@ impl CommissioningEngine {
                 return Self::fail_outer(phase, CommissionError::MechanicalIdFailed);
             }
         };
+
+        diagnostics.synth_velocity_p = gains.velocity_p;
+        diagnostics.synth_velocity_i = gains.velocity_i;
+
+        let mut gains = gains;
+        if gains.velocity_p > OUTER_MAX_VELOCITY_P || gains.velocity_i > OUTER_MAX_VELOCITY_I {
+            diagnostics.warning_code = OUTER_WARNING_UNSAFE_SYNTH_GAINS;
+            defmt::warn!(
+                "velocity tune: synthesized P={}, I={} outside envelope, using fallback",
+                gains.velocity_p,
+                gains.velocity_i
+            );
+            gains.velocity_p = OUTER_FALLBACK_VELOCITY_P;
+            gains.velocity_i = OUTER_FALLBACK_VELOCITY_I;
+        }
 
         defmt::info!(
             "velocity tune: P={}, I={}, limit={}, bw={}Hz, lambda={}ms",
@@ -3475,6 +3726,7 @@ impl CommissioningEngine {
             saturation_count: 0,
             torque_limit: backend.current_limit() & 0xFFFF,
             operational_velocity_limit: backend.operational_velocity_limit(),
+            diagnostics,
         };
 
         *phase = OuterPhase::VelocityValidate {
@@ -3856,7 +4108,22 @@ impl CommissioningEngine {
                             data.peak_velocity,
                             config,
                         ) {
-                            Some(new_gains) => {
+                            Some(mut new_gains) => {
+                                data.diagnostics.synth_velocity_p = new_gains.velocity_p;
+                                data.diagnostics.synth_velocity_i = new_gains.velocity_i;
+                                if new_gains.velocity_p > OUTER_MAX_VELOCITY_P
+                                    || new_gains.velocity_i > OUTER_MAX_VELOCITY_I
+                                {
+                                    data.diagnostics.warning_code =
+                                        OUTER_WARNING_UNSAFE_SYNTH_GAINS;
+                                    defmt::warn!(
+                                        "vel retry: synthesized P={}, I={} outside envelope, using fallback",
+                                        new_gains.velocity_p,
+                                        new_gains.velocity_i
+                                    );
+                                    new_gains.velocity_p = OUTER_FALLBACK_VELOCITY_P;
+                                    new_gains.velocity_i = OUTER_FALLBACK_VELOCITY_I;
+                                }
                                 defmt::info!(
                                     "vel retry: P={}, I={}, lambda={}ms",
                                     new_gains.velocity_p,
@@ -3952,6 +4219,7 @@ impl CommissioningEngine {
                     current_bandwidth_hz,
                     j_eff,
                     b_eff,
+                    diagnostics: data.diagnostics,
                 };
 
                 *phase = OuterPhase::PositionTune {
@@ -4159,6 +4427,7 @@ impl CommissioningEngine {
                 let current_bandwidth_hz = data.current_bandwidth_hz;
                 let j_eff = data.j_eff;
                 let b_eff = data.b_eff;
+                let diagnostics = data.diagnostics;
                 // Position oscillation is "early" if the first stable P was
                 // reached only at the minimum value (suggesting the system
                 // is marginal for position control).
@@ -4174,6 +4443,7 @@ impl CommissioningEngine {
                     current_bandwidth_hz,
                     j_eff,
                     b_eff,
+                    diagnostics,
                     safety: carried_safety,
                 };
                 StepResult::PhaseChanged(PhaseId::FilterTune)
@@ -4202,6 +4472,7 @@ impl CommissioningEngine {
             current_bandwidth_hz,
             j_eff,
             b_eff,
+            diagnostics,
         ) = match phase {
             OuterPhase::FilterTune {
                 velocity_gains,
@@ -4212,6 +4483,7 @@ impl CommissioningEngine {
                 current_bandwidth_hz,
                 j_eff,
                 b_eff,
+                diagnostics,
                 ..
             } => (
                 *velocity_gains,
@@ -4222,6 +4494,7 @@ impl CommissioningEngine {
                 *current_bandwidth_hz,
                 *j_eff,
                 *b_eff,
+                *diagnostics,
             ),
             _ => return StepResult::Continue,
         };
@@ -4280,6 +4553,7 @@ impl CommissioningEngine {
             filter_config,
             j_eff,
             b_eff,
+            diagnostics,
         };
         StepResult::PhaseChanged(PhaseId::Commit)
     }
@@ -4378,24 +4652,38 @@ impl CommissioningEngine {
 
     /// Assemble and emit the final outer commissioning result.
     fn step_commit(phase: &mut OuterPhase) -> StepResult {
-        let (mut velocity_gains, mut position_gains, filter_config, j_eff, b_eff) = match phase {
-            OuterPhase::Commit {
-                velocity_gains,
-                position_gains,
-                filter_config,
-                j_eff,
-                b_eff,
-            } => (
-                *velocity_gains,
-                *position_gains,
-                *filter_config,
-                *j_eff,
-                *b_eff,
-            ),
-            _ => return StepResult::Continue,
-        };
+        let (mut velocity_gains, mut position_gains, filter_config, j_eff, b_eff, mut diagnostics) =
+            match phase {
+                OuterPhase::Commit {
+                    velocity_gains,
+                    position_gains,
+                    filter_config,
+                    j_eff,
+                    b_eff,
+                    diagnostics,
+                } => (
+                    *velocity_gains,
+                    *position_gains,
+                    *filter_config,
+                    *j_eff,
+                    *b_eff,
+                    *diagnostics,
+                ),
+                _ => return StepResult::Continue,
+            };
 
-        let mut status = CommissionStatus::Accepted;
+        if diagnostics.synth_velocity_p == 0 && diagnostics.synth_velocity_i == 0 {
+            diagnostics.synth_velocity_p = velocity_gains.velocity_p;
+            diagnostics.synth_velocity_i = velocity_gains.velocity_i;
+        }
+        diagnostics.synth_position_p = position_gains.position_p;
+        diagnostics.synth_position_i = position_gains.position_i;
+
+        let mut status = if diagnostics.warning_code == OUTER_WARNING_NONE {
+            CommissionStatus::Accepted
+        } else {
+            CommissionStatus::AcceptedWithWarnings
+        };
         if velocity_gains.velocity_p > OUTER_MAX_VELOCITY_P
             || velocity_gains.velocity_i > OUTER_MAX_VELOCITY_I
             || position_gains.position_p > OUTER_MAX_POSITION_P
@@ -4412,6 +4700,7 @@ impl CommissioningEngine {
             velocity_gains.velocity_i = OUTER_FALLBACK_VELOCITY_I;
             position_gains.position_p = OUTER_FALLBACK_POSITION_P;
             position_gains.position_i = OUTER_FALLBACK_POSITION_I;
+            diagnostics.warning_code = OUTER_WARNING_UNSAFE_SYNTH_GAINS;
             status = CommissionStatus::AcceptedWithWarnings;
         }
 
@@ -4428,6 +4717,18 @@ impl CommissioningEngine {
             torque_filter_hz: filter_config.torque_filter_hz.unwrap_or(0) as u16,
             j_eff,
             b_eff,
+            warning_code: diagnostics.warning_code,
+            mech_torque_step: diagnostics.mech_torque_step,
+            mech_fwd_accel: diagnostics.mech_fwd_accel,
+            mech_rev_accel: diagnostics.mech_rev_accel,
+            mech_fwd_peak_velocity: diagnostics.mech_fwd_peak_velocity,
+            mech_rev_peak_velocity: diagnostics.mech_rev_peak_velocity,
+            mech_fwd_travel: diagnostics.mech_fwd_travel,
+            mech_rev_travel: diagnostics.mech_rev_travel,
+            synth_velocity_p: diagnostics.synth_velocity_p,
+            synth_velocity_i: diagnostics.synth_velocity_i,
+            synth_position_p: diagnostics.synth_position_p,
+            synth_position_i: diagnostics.synth_position_i,
         };
 
         defmt::info!(
