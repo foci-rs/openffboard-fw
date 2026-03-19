@@ -2476,7 +2476,7 @@ mod app {
                     }
                     crate::commission::StepResult::CommissionDone(_) => {
                         // TODO(task-4): implement CommissionDone handler
-                        let oid = engine.oid();
+                        let _oid = engine.oid();
                         commission_engine = None;
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
                     }
@@ -2921,7 +2921,7 @@ mod app {
                         }
                         calibrated = false;
                         commission_engine =
-                            Some(crate::commission::CommissioningEngine::new_inner(
+                            Some(crate::commission::CommissioningEngine::new_commission(
                                 oid,
                                 foci_core::autotune::CommissionProfile::from_u8(profile),
                             ));
