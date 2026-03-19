@@ -750,9 +750,10 @@ const OUTER_MAX_POSITION_I: u16 = 128;
 /// so tuning never exercises gains that would be rejected for runtime use.
 const POS_TUNE_MAX_P: u16 = OUTER_MAX_POSITION_P;
 
-/// Response-tuned velocity remains soft on current hardware, so keep position P
-/// at the known-safe fallback value instead of ramping into output limits.
-const POS_RESPONSE_TUNE_MAX_P: u16 = OUTER_FALLBACK_POSITION_P;
+/// Response-tuned velocity remains bounded by the same final guard as model
+/// tuning. Phase 11 now commands and measures position steps in consistent
+/// units, so it can ramp within the normal accepted envelope.
+const POS_RESPONSE_TUNE_MAX_P: u16 = OUTER_MAX_POSITION_P;
 
 const OUTER_WARNING_NONE: u8 = 0;
 const OUTER_WARNING_LOW_CONFIDENCE_MECH_ID: u8 = 1;
