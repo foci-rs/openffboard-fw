@@ -750,10 +750,10 @@ const OUTER_MAX_POSITION_I: u16 = 128;
 /// so tuning never exercises gains that would be rejected for runtime use.
 const POS_TUNE_MAX_P: u16 = OUTER_MAX_POSITION_P;
 
-/// Response-tuned velocity is deliberately soft. Keep position P above the
-/// fallback but below the full model-tuned envelope so a few encoder counts of
-/// residual error do not command a large hold velocity.
-const POS_RESPONSE_TUNE_MAX_P: u16 = OUTER_FALLBACK_POSITION_P * 2;
+/// Response-tuned velocity is deliberately soft. Keep position P at the
+/// fallback value so a few encoder counts of residual error do not command
+/// large hold velocity and current-loop integral effort.
+const POS_RESPONSE_TUNE_MAX_P: u16 = OUTER_FALLBACK_POSITION_P;
 
 const OUTER_WARNING_NONE: u8 = 0;
 const OUTER_WARNING_LOW_CONFIDENCE_MECH_ID: u8 = 1;
