@@ -2115,7 +2115,7 @@ impl CommissioningEngine {
                             flux_filter_hz: 0,
                             inner_result: None,
                         };
-                        StepResult::PhaseChanged(PhaseId::EncoderAlign)
+                        StepResult::PhaseChanged(PhaseId::ClosedLoopEntry)
                     }
                     InnerSequence::Selftest | InnerSequence::Commission => {
                         let voltage = backend.excitation_voltage() as u32;
@@ -3041,7 +3041,7 @@ impl CommissioningEngine {
                             flux_filter_hz: 0,
                             inner_result: Some(result),
                         };
-                        StepResult::PhaseChanged(PhaseId::CurrentValidate)
+                        StepResult::PhaseChanged(PhaseId::ClosedLoopEntry)
                     }
                     _ => {
                         // Selftest/Calibrate never reach current validate.
