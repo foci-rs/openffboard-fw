@@ -116,8 +116,6 @@ mod app {
         AdcFault,
         /// ABN encoder not responding or count stuck at zero.
         EncoderFault,
-        /// PID loop not tracking target (torque or position diverging).
-        PidFault,
         /// Motor already enabled (calibration not needed).
         AlreadyEnabled,
         /// Internal firmware error (queue full, channel not initialized, etc.).
@@ -137,7 +135,7 @@ mod app {
                 Self::SpiError => 1,
                 Self::AdcFault => 2,
                 Self::EncoderFault => 3,
-                Self::PidFault => 4,
+                // Code 4 was PidFault (removed with tmc_enter_closedloop).
                 Self::AlreadyEnabled => 5,
                 Self::InternalError => 6,
                 Self::ConfigFault => 7,
@@ -1356,8 +1354,8 @@ mod app {
         // Pre-flight: STEP_WIDTH_VALUE must have been populated by a prior
         // tmc_set_encoder command. If it hasn't, fail before touching hardware
         // — otherwise calibration would succeed but the motor would silently
-        // refuse to respond to step pulses. See also the hard check inside
-        // tmc_enter_closedloop.
+        // refuse to respond to step pulses. The engine's ClosedLoopEntry
+        // phase also checks this via backend.step_width().
         if STEP_WIDTH_VALUE.load(Relaxed) <= 0 {
             defmt::error!(
                 "foci_calibrate rejected: STEP_WIDTH not configured (host must call tmc_set_encoder first)"
@@ -2154,9 +2152,6 @@ mod app {
         let mut stored_gains: Option<foci_core::pid::InnerLoopGains> = None;
 
         // Stored position/velocity PID gains from host.
-        // None = use defaults during calibration.
-        let mut stored_position_gains: Option<(u16, u16, u16, u16)> = None;
-
         // Active commissioning engine. Set when a CommissionInner/Outer
         // request arrives, cleared when the engine finishes or fails.
         let mut commission_engine: Option<crate::commission::CommissioningEngine> = None;
@@ -2206,7 +2201,6 @@ mod app {
                 motor_enabled = false;
                 calibrated = false;
                 stored_gains = None;
-                stored_position_gains = None;
                 // Clear any in-flight commissioning engine and restore safe
                 // hardware state (zero targets, disable outputs) so the motor
                 // is not left energized in whatever mode the engine last set.
@@ -2318,13 +2312,7 @@ mod app {
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
                         foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
 
-                        // Persist outer gains so closed-loop entry uses them.
-                        stored_position_gains = Some((
-                            outer.position_p,
-                            outer.position_i,
-                            outer.velocity_p,
-                            outer.velocity_i,
-                        ));
+                        // Persist outer gains to atomics for closed-loop entry.
                         POSITION_P_VALUE
                             .store(outer.position_p, core::sync::atomic::Ordering::Relaxed);
                         POSITION_I_VALUE
@@ -2391,76 +2379,50 @@ mod app {
                     crate::commission::StepResult::CalibrateDone(cal_result) => {
                         let oid = engine.oid();
                         commission_engine = None;
-                        // Keep COMMISSION_IN_FLIGHT set until the full
-                        // calibration sequence (diagnostics + align +
-                        // closedloop) completes, to prevent overlapping
-                        // requests.
 
+                        // The engine's ClosedLoopEntry phase already
+                        // configured PID gains, limits, filters, and
+                        // entered position mode. Apply stored current-loop
+                        // gains on top (the Calibrate path used defaults).
+                        if let Some(gains) = stored_gains {
+                            let (flux_reg, torque_reg) = gains.to_registers();
+                            let _ = tmc
+                                .write_register(tmc4671::registers::PID_FLUX_P_FLUX_I, flux_reg)
+                                .await;
+                            let _ = tmc
+                                .write_register(
+                                    tmc4671::registers::PID_TORQUE_P_TORQUE_I,
+                                    torque_reg,
+                                )
+                                .await;
+                        }
+
+                        // Re-apply current limit (TMC4671 resets it on
+                        // mode change).
                         let current_limit =
                             CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
+                        let _ = tmc
+                            .write_register(
+                                tmc4671::registers::PID_TORQUE_FLUX_LIMITS,
+                                current_limit,
+                            )
+                            .await;
 
-                        // ADC calibration and encoder alignment were already
-                        // performed by the commissioning engine. Closed-loop
-                        // entry must preserve PHI_E_SELECTION=3.
-                        match tmc_enter_closedloop(tmc, None, stored_position_gains).await {
-                            Ok(()) => {
-                                // Apply autotuned gains if available
-                                if let Some(gains) = stored_gains {
-                                    let (flux_reg, torque_reg) = gains.to_registers();
-                                    let _ = tmc
-                                        .write_register(
-                                            tmc4671::registers::PID_FLUX_P_FLUX_I,
-                                            flux_reg,
-                                        )
-                                        .await;
-                                    let _ = tmc
-                                        .write_register(
-                                            tmc4671::registers::PID_TORQUE_P_TORQUE_I,
-                                            torque_reg,
-                                        )
-                                        .await;
-                                }
-                                // Re-apply current limit after closed-loop
-                                // entry (TMC4671 resets it on mode change).
-                                let _ = tmc
-                                    .write_register(
-                                        tmc4671::registers::PID_TORQUE_FLUX_LIMITS,
-                                        current_limit,
-                                    )
-                                    .await;
-
-                                enable_pin.set_high();
-                                calibrated = true;
-                                motor_enabled = true;
-                                MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
-                                arm_queued_steps_if_ready();
-                                defmt::info!("foci_calibrate complete: oid={}", oid);
-                                COMMISSION_IN_FLIGHT
-                                    .store(false, core::sync::atomic::Ordering::Relaxed);
-                                klipper_reply!(
-                                    foci_calibrate_response,
-                                    oid: u8 = oid,
-                                    status: u8 = 0,
-                                    adc_i0: u16 = cal_result.adc_i0,
-                                    adc_i1: u16 = cal_result.adc_i1,
-                                    encoder_count: u32 = cal_result.encoder_count
-                                );
-                            }
-                            Err(e) => {
-                                defmt::error!("CalibrateDone: closed-loop failed: {}", e);
-                                foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
-                                COMMISSION_IN_FLIGHT
-                                    .store(false, core::sync::atomic::Ordering::Relaxed);
-                                klipper_reply!(
-                                    foci_calibrate_response,
-                                    oid: u8 = oid,
-                                    status: u8 = e.status_code(),
-                                    adc_i0: u16 = 0,
-                                    adc_i1: u16 = 0,
-                                    encoder_count: u32 = 0
-                                );
-                            }
-                        }
+                        enable_pin.set_high();
+                        calibrated = true;
+                        motor_enabled = true;
+                        MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+                        arm_queued_steps_if_ready();
+                        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+                        defmt::info!("foci_calibrate complete: oid={}", oid);
+                        klipper_reply!(
+                            foci_calibrate_response,
+                            oid: u8 = oid,
+                            status: u8 = 0,
+                            adc_i0: u16 = cal_result.adc_i0,
+                            adc_i1: u16 = cal_result.adc_i1,
+                            encoder_count: u32 = cal_result.encoder_count
+                        );
                     }
                     crate::commission::StepResult::SelftestDone => {
                         let oid = engine.oid();
@@ -2474,11 +2436,65 @@ mod app {
                             status: u8 = 0
                         );
                     }
-                    crate::commission::StepResult::CommissionDone(_) => {
-                        // TODO(task-4): implement CommissionDone handler
-                        let _oid = engine.oid();
+                    crate::commission::StepResult::CommissionDone(commission_result) => {
+                        let oid = engine.oid();
                         commission_engine = None;
+
+                        // The engine's ClosedLoopEntry phase already
+                        // configured PID gains, limits, filters, and
+                        // entered position mode. Re-apply current limit.
+                        let current_limit =
+                            CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
+                        let _ = tmc
+                            .write_register(
+                                tmc4671::registers::PID_TORQUE_FLUX_LIMITS,
+                                current_limit,
+                            )
+                            .await;
+
+                        // Persist inner gains so future calibrate uses them.
+                        let inner = &commission_result.inner;
+                        stored_gains = Some(foci_core::pid::InnerLoopGains {
+                            flux_p: inner.flux_p,
+                            flux_i: inner.flux_i,
+                            torque_p: inner.torque_p,
+                            torque_i: inner.torque_i,
+                        });
+
+                        enable_pin.set_high();
+                        calibrated = true;
+                        motor_enabled = true;
+                        MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+                        arm_queued_steps_if_ready();
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+
+                        let status = match inner.status {
+                            foci_core::autotune::CommissionStatus::Accepted => 0u8,
+                            foci_core::autotune::CommissionStatus::AcceptedWithWarnings => 1,
+                            foci_core::autotune::CommissionStatus::InnerOnly => 2,
+                            foci_core::autotune::CommissionStatus::Failed(e) => e.status_code(),
+                        };
+                        defmt::info!("foci_commission complete: oid={} status={}", oid, status);
+                        klipper_reply!(
+                            foci_commission_result,
+                            oid: u8 = oid,
+                            status: u8 = status,
+                            r_mohm: u32 = inner.r_mohm,
+                            l_uh: u32 = inner.l_uh,
+                            flux_p: u16 = inner.flux_p,
+                            flux_i: u16 = inner.flux_i,
+                            torque_p: u16 = inner.torque_p,
+                            torque_i: u16 = inner.torque_i,
+                            lambda_us: u32 = inner.lambda_us,
+                            theta_e_us: u32 = inner.theta_e_us,
+                            ringing_count: u8 = inner.ringing_count,
+                            bandwidth_hz: u32 = inner.bandwidth_hz,
+                            fallback_velocity_p: u16 = commission_result.fallback_velocity_p,
+                            fallback_velocity_i: u16 = commission_result.fallback_velocity_i,
+                            fallback_position_p: u16 = commission_result.fallback_position_p,
+                            fallback_position_i: u16 = commission_result.fallback_position_i,
+                            fallback_velocity_limit: u32 = commission_result.fallback_velocity_limit
+                        );
                     }
                 }
                 // For Done/Failed cases, fall through to normal processing
@@ -2597,8 +2613,6 @@ mod app {
                         velocity_p,
                         velocity_i,
                     } => {
-                        stored_position_gains =
-                            Some((position_p, position_i, velocity_p, velocity_i));
                         POSITION_P_VALUE.store(position_p, core::sync::atomic::Ordering::Relaxed);
                         POSITION_I_VALUE.store(position_i, core::sync::atomic::Ordering::Relaxed);
                         defmt::info!(
@@ -3657,297 +3671,6 @@ mod app {
 
         clear_pid_error_sums(tmc).await?;
         tmc.write_register(STATUS_FLAGS, 0).await.map_err(|_| ())?;
-        Ok(())
-    }
-
-    /// Configure TMC4671 for closed-loop position mode with ABN encoder feedback.
-    ///
-    /// **Pre-condition:** the commissioning engine's `EncoderAlign` phase has
-    /// already set PHI_E_SELECTION=3 (ABN encoder) with the encoder zeroed at
-    /// the D-axis. This function must NOT overwrite PHI_E_SELECTION.
-    ///
-    /// Steps:
-    /// 1. Set flux/torque PID gains
-    /// 2. Set velocity PID gains (host-configured or defaults)
-    /// 3. Set position PID gains (host-configured or defaults)
-    /// 4. Set PID_VELOCITY_LIMIT (anti-windup)
-    /// 5. Raise PIDOUT_UQ_UD_LIMITS for operation
-    /// 6. Zero PID_POSITION_ACTUAL (also zeros target)
-    /// 7. Zero PID error sums (integrators)
-    /// 8-11. Write biquad filters if configured
-    /// 12. Enter position mode: MODE_RAMP_MODE_MOTION = 0x8000_0003
-    /// 13. Validate: position error is not diverging
-    ///
-    /// Assumes ADC calibration and encoder alignment have already been performed.
-    async fn tmc_enter_closedloop(
-        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
-        stored_gains: Option<foci_core::pid::InnerLoopGains>,
-        stored_position_gains: Option<(u16, u16, u16, u16)>,
-    ) -> Result<(), CalibrationError> {
-        use tmc4671::registers::*;
-
-        // 1. Flux and torque PID: use stored gains or conservative defaults
-        let gains = stored_gains.unwrap_or(foci_core::pid::DEFAULT_INNER_GAINS);
-        let (flux_reg, torque_reg) = gains.to_registers();
-        tmc.write_register(PID_FLUX_P_FLUX_I, flux_reg)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        tmc.write_register(PID_TORQUE_P_TORQUE_I, torque_reg)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-
-        // 2. Velocity PID: use stored gains or defaults (P=4.5, I=0)
-        let (vel_p, vel_i) = stored_position_gains
-            .map(|(_, _, vp, vi)| (vp, vi))
-            .unwrap_or((1152, 0));
-        let velocity_pi: u32 = (vel_p as u32) << 16 | vel_i as u32;
-        tmc.write_register(PID_VELOCITY_P_VELOCITY_I, velocity_pi)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-
-        // 3. Position PID: use stored gains or defaults (P=2.5, I=0)
-        let (pos_p, pos_i) = stored_position_gains
-            .map(|(pp, pi, _, _)| (pp, pi))
-            .unwrap_or((640, 0));
-        let position_pi: u32 = (pos_p as u32) << 16 | pos_i as u32;
-        tmc.write_register(PID_POSITION_P_POSITION_I, position_pi)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        POSITION_P_VALUE.store(pos_p, core::sync::atomic::Ordering::Relaxed);
-        POSITION_I_VALUE.store(pos_i, core::sync::atomic::Ordering::Relaxed);
-
-        // 4. Velocity limit: host-configured or unconstrained default.
-        // Caps position PID output velocity to prevent integrator windup runaway.
-        let vel_limit = VELOCITY_LIMIT_CFG.load(core::sync::atomic::Ordering::Relaxed);
-        tmc.write_register(PID_VELOCITY_LIMIT, vel_limit)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-
-        // 5. Raise voltage limit for actual operation. ADC cal sets it to
-        // 1024 as a safety measure, but position PID needs headroom to drive
-        // motion. 16000 tested working in Phase 1 (up to 200+ mm/s).
-        tmc.write_register(PIDOUT_UQ_UD_LIMITS, 16000)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        let voltage_limit_rb = tmc
-            .read_register(PIDOUT_UQ_UD_LIMITS)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        if voltage_limit_rb != 16000 {
-            defmt::error!(
-                "closed-loop: PIDOUT_UQ_UD_LIMITS readback mismatch: expected=16000 got={}",
-                voltage_limit_rb
-            );
-            return Err(CalibrationError::SpiError);
-        }
-
-        // NOTE: PHI_E_SELECTION is NOT written here. EncoderAlign already
-        // set it to 3 (ABN encoder) while the motor was held in voltage
-        // mode, locking the angle reference before the drive stopped.
-        let phi_e_selection = tmc
-            .read_register(PHI_E_SELECTION)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        if phi_e_selection != 3 {
-            defmt::error!(
-                "closed-loop: PHI_E_SELECTION readback mismatch: expected=3 got={}",
-                phi_e_selection
-            );
-            return Err(CalibrationError::SpiError);
-        }
-
-        // 6. Zero position: writing PID_POSITION_ACTUAL also writes
-        // PID_POSITION_TARGET to the same value (per datasheet 0x6B),
-        // avoiding an unwanted position error on mode entry.
-        tmc.write_register(PID_POSITION_ACTUAL, 0)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-
-        // Zero PID integrators to prevent stale commissioning or motion error
-        // sums from biasing closed-loop hold. Must come after
-        // PID_POSITION_ACTUAL=0 so the position integrator doesn't
-        // immediately re-accumulate from a nonzero position error.
-        clear_pid_error_sums(tmc)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        tmc.write_register(STATUS_FLAGS, 0)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-
-        // 7. Explicit POSITION_SELECTION=0 (phi_e). Don't rely on power-on
-        // default — survives fault/reset/re-calibration because closedloop
-        // entry always runs.
-        tmc.write_register(POSITION_SELECTION, 0)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-
-        // 8. Write STEP_WIDTH for hardware step/dir input. Each STEP pulse
-        // increments the TMC4671's internal position target by this value.
-        // A zero value means tmc_set_encoder was never called (or failed)
-        // to populate STEP_WIDTH_VALUE. Continuing would produce a motor
-        // that calibrates and enables successfully but silently refuses
-        // to move under step pulses — the exact invisible-failure class
-        // this guard is designed to prevent. Fail loudly instead.
-        let step_width = STEP_WIDTH_VALUE.load(core::sync::atomic::Ordering::Relaxed);
-        if step_width <= 0 {
-            defmt::error!(
-                "STEP_WIDTH = {}, aborting closedloop entry — host must call tmc_set_encoder first",
-                step_width
-            );
-            return Err(CalibrationError::ConfigFault);
-        }
-        tmc.write_register(STEP_WIDTH, step_width as u32)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        let step_width_rb = tmc
-            .read_register(STEP_WIDTH)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        if step_width_rb != step_width as u32 {
-            defmt::error!(
-                "closed-loop: STEP_WIDTH readback mismatch: expected={} got={}",
-                step_width,
-                step_width_rb
-            );
-            return Err(CalibrationError::SpiError);
-        }
-        defmt::info!("STEP_WIDTH(0x78) = {} written", step_width);
-
-        // 8. Write velocity biquad filter if configured, disable if not.
-        // If the cutoff is nonzero but out of the valid 10-1000 Hz range,
-        // butterworth_lowpass returns None — explicitly disable in that case.
-        let filter_hz = VELOCITY_FILTER_HZ.load(core::sync::atomic::Ordering::Relaxed);
-        if filter_hz > 0 {
-            if let Some(coeffs) =
-                foci_core::biquad::butterworth_lowpass(filter_hz, TMC_CONFIG.pwm_maxcnt)
-            {
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_V_A_1, coeffs.a_1 as u32, "Velocity");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_V_A_2, coeffs.a_2 as u32, "Velocity");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_V_B_0, coeffs.b_0 as u32, "Velocity");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_V_B_1, coeffs.b_1 as u32, "Velocity");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_V_B_2, coeffs.b_2 as u32, "Velocity");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_V_ENABLE, 1, "Velocity");
-                defmt::info!("Velocity biquad: {}Hz enabled", filter_hz);
-            } else {
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_V_ENABLE, 0, "Velocity");
-                defmt::warn!("Velocity biquad: {}Hz out of range, disabled", filter_hz);
-            }
-        } else {
-            write_filter_subreg!(tmc, CONFIG_BIQUAD_V_ENABLE, 0, "Velocity");
-        }
-
-        // 9. Write torque biquad filter if configured, disable if not.
-        let filter_hz = TORQUE_FILTER_HZ.load(core::sync::atomic::Ordering::Relaxed);
-        if filter_hz > 0 {
-            if let Some(coeffs) =
-                foci_core::biquad::butterworth_lowpass(filter_hz, TMC_CONFIG.pwm_maxcnt)
-            {
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_T_A_1, coeffs.a_1 as u32, "Torque");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_T_A_2, coeffs.a_2 as u32, "Torque");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_T_B_0, coeffs.b_0 as u32, "Torque");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_T_B_1, coeffs.b_1 as u32, "Torque");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_T_B_2, coeffs.b_2 as u32, "Torque");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_T_ENABLE, 1, "Torque");
-                defmt::info!("Torque biquad: {}Hz enabled", filter_hz);
-            } else {
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_T_ENABLE, 0, "Torque");
-                defmt::warn!("Torque biquad: {}Hz out of range, disabled", filter_hz);
-            }
-        } else {
-            write_filter_subreg!(tmc, CONFIG_BIQUAD_T_ENABLE, 0, "Torque");
-        }
-
-        // 10. Write position target biquad filter if configured, disable if not.
-        let filter_hz = POSITION_FILTER_HZ.load(core::sync::atomic::Ordering::Relaxed);
-        if filter_hz > 0 {
-            if let Some(coeffs) =
-                foci_core::biquad::butterworth_lowpass(filter_hz, TMC_CONFIG.pwm_maxcnt)
-            {
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_X_A_1, coeffs.a_1 as u32, "Position");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_X_A_2, coeffs.a_2 as u32, "Position");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_X_B_0, coeffs.b_0 as u32, "Position");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_X_B_1, coeffs.b_1 as u32, "Position");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_X_B_2, coeffs.b_2 as u32, "Position");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_X_ENABLE, 1, "Position");
-                defmt::info!("Position biquad: {}Hz enabled", filter_hz);
-            } else {
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_X_ENABLE, 0, "Position");
-                defmt::warn!("Position biquad: {}Hz out of range, disabled", filter_hz);
-            }
-        } else {
-            write_filter_subreg!(tmc, CONFIG_BIQUAD_X_ENABLE, 0, "Position");
-        }
-
-        // 11. Write flux biquad filter if configured, disable if not.
-        let filter_hz = FLUX_FILTER_HZ.load(core::sync::atomic::Ordering::Relaxed);
-        if filter_hz > 0 {
-            if let Some(coeffs) =
-                foci_core::biquad::butterworth_lowpass(filter_hz, TMC_CONFIG.pwm_maxcnt)
-            {
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_F_A_1, coeffs.a_1 as u32, "Flux");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_F_A_2, coeffs.a_2 as u32, "Flux");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_F_B_0, coeffs.b_0 as u32, "Flux");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_F_B_1, coeffs.b_1 as u32, "Flux");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_F_B_2, coeffs.b_2 as u32, "Flux");
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_F_ENABLE, 1, "Flux");
-                defmt::info!("Flux biquad: {}Hz enabled", filter_hz);
-            } else {
-                write_filter_subreg!(tmc, CONFIG_BIQUAD_F_ENABLE, 0, "Flux");
-                defmt::warn!("Flux biquad: {}Hz out of range, disabled", filter_hz);
-            }
-        } else {
-            write_filter_subreg!(tmc, CONFIG_BIQUAD_F_ENABLE, 0, "Flux");
-        }
-
-        // NOTE: PID_VELOCITY_OFFSET is NOT cleared here — writing to 0x67
-        // during closedloop entry caused intermittent encoder alignment failures.
-        // The register is cleared during disable and restore_safe_state instead.
-
-        // 12. Enter position mode: MODE_PID_TYPE=1 (bit 31), MODE_MOTION=3 (position)
-        tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0003)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        let mode_rb = tmc
-            .read_register(MODE_RAMP_MODE_MOTION)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        if mode_rb != 0x8000_0003 {
-            defmt::error!(
-                "closed-loop: MODE_RAMP_MODE_MOTION readback mismatch: expected=0x80000003 got=0x{:08X}",
-                mode_rb
-            );
-            return Err(CalibrationError::SpiError);
-        }
-
-        // 13. Runaway detection (20ms). If position error exceeds 40 steps
-        // and is still growing, the feedback sign is wrong — fail fast.
-        // Encoder polarity errors are also caught in Stage 2 torque
-        // tracking, but this is a secondary safety net for position mode.
-        // Settling is NOT checked: P-only position control has steady-state
-        // offset and normal PID oscillation would cause false positives.
-        const RUNAWAY_THRESHOLD: u32 = 32760; // ~40 steps
-
-        Mono::delay(10.millis()).await;
-        let pos1 = tmc
-            .read_register(PID_POSITION_ACTUAL)
-            .await
-            .map_err(|_| CalibrationError::SpiError)? as i32;
-        Mono::delay(10.millis()).await;
-        let pos2 = tmc
-            .read_register(PID_POSITION_ACTUAL)
-            .await
-            .map_err(|_| CalibrationError::SpiError)? as i32;
-        if pos2.unsigned_abs() > RUNAWAY_THRESHOLD && pos2.unsigned_abs() > pos1.unsigned_abs() {
-            defmt::error!(
-                "closed-loop: runaway detected: pos1={}, pos2={}",
-                pos1,
-                pos2
-            );
-            let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
-            return Err(CalibrationError::PidFault);
-        }
-
-        defmt::info!("TMC4671 closed-loop position mode active");
         Ok(())
     }
 
