@@ -715,6 +715,13 @@ const POS_TUNE_P_MUL_DEN: u32 = 2;
 /// 5% of P = P * 5 / 100.
 const POS_TUNE_I_PERCENT: u32 = 5;
 
+/// Motor-local position step for position-loop tuning, in ABN encoder counts.
+///
+/// The TMC position target is written in electrical-position units, while
+/// response capture uses ABN counts. Keep the commanded move small enough for
+/// installed mechanics but larger than one-count quantization noise.
+const POS_TUNE_STEP_COUNTS: u32 = 8;
+
 /// Conservative velocity-loop runtime fallback used when autotuned outer gains
 /// exceed the accepted safety envelope. These are the same defaults used by
 /// closed-loop entry when no outer gains are configured.
@@ -974,10 +981,14 @@ struct PositionTuneData {
     current_p: u16,
     /// Last known stable P gain (no oscillation).
     stable_p: u16,
-    /// Position step target (encoder counts) — one step_width.
-    step_target: u32,
-    /// Starting position for step.
-    step_start: i32,
+    /// Position step target in ABN encoder counts.
+    step_target_counts: u32,
+    /// Position step target in TMC electrical-position units.
+    step_target_tmc: u32,
+    /// Starting ABN encoder count for response measurement.
+    step_start_counts: i32,
+    /// Starting TMC position for target writes.
+    step_start_tmc: i32,
     /// Whether oscillation was detected early (at the first P value).
     oscillation_at_minimum: bool,
     /// Accepted velocity gains from Phase 10.
@@ -4341,16 +4352,13 @@ impl CommissioningEngine {
                     accepted_gains.velocity_limit
                 );
 
-                // Use the configured step_width as the position step size.
-                // Falls back to 256 counts if the encoder is not configured.
-                let step_target: u32 = {
-                    let sw = backend.step_width();
-                    if sw > 0 {
-                        sw
-                    } else {
-                        256
-                    }
-                };
+                // Position capture is measured in ABN counts, but
+                // PID_POSITION_TARGET is written in TMC electrical-position
+                // units. Convert the small motor-local test move through the
+                // configured STEP_WIDTH so the command and measurement agree.
+                let step_width = backend.step_width().max(1);
+                let step_target_counts = POS_TUNE_STEP_COUNTS;
+                let step_target_tmc = step_width.saturating_mul(step_target_counts);
 
                 let j_eff = data.model.j_eff;
                 let b_eff = data.model.b_eff;
@@ -4358,8 +4366,10 @@ impl CommissioningEngine {
                 let pos_data = PositionTuneData {
                     current_p: POS_TUNE_INITIAL_P,
                     stable_p: 0,
-                    step_target,
-                    step_start: 0,
+                    step_target_counts,
+                    step_target_tmc,
+                    step_start_counts: 0,
+                    step_start_tmc: 0,
                     oscillation_at_minimum: false,
                     velocity_gains: accepted_gains,
                     velocity_chatter,
@@ -4427,12 +4437,19 @@ impl CommissioningEngine {
                     return Self::fail_outer(phase, CommissionError::Spi);
                 }
 
-                // Record current position as step start.
+                // Record both position domains. ABN counts are used for
+                // response measurement; PID_POSITION_ACTUAL is the TMC target
+                // domain used by PID_POSITION_TARGET.
                 let encoder_raw = backend.read_encoder_count().await;
-                data.step_start = encoder_raw as i32;
+                data.step_start_counts = encoder_raw as i32;
+                let position_raw = match backend.read_register(PID_POSITION_ACTUAL).await {
+                    Ok(v) => v as i32,
+                    Err(_) => return Self::fail_outer(phase, CommissionError::Spi),
+                };
+                data.step_start_tmc = position_raw;
 
                 // Command a position step.
-                let target = (encoder_raw as i32).wrapping_add(data.step_target as i32);
+                let target = position_raw.wrapping_add(data.step_target_tmc as i32);
                 if backend
                     .write_register(PID_POSITION_TARGET, target as u32)
                     .await
@@ -4460,14 +4477,14 @@ impl CommissioningEngine {
                 // detector compares against the step amplitude, not absolute
                 // encoder counts.
                 let relative = (encoder_raw as i32)
-                    .wrapping_sub(data.step_start)
+                    .wrapping_sub(data.step_start_counts)
                     .unsigned_abs();
                 buf.push(relative);
 
                 if buf.is_full() {
                     // Return to start position.
                     let _ = backend
-                        .write_register(PID_POSITION_TARGET, data.step_start as u32)
+                        .write_register(PID_POSITION_TARGET, data.step_start_tmc as u32)
                         .await;
 
                     let deadline = backend.elapsed_us().wrapping_add(POS_TUNE_SETTLE_US);
@@ -4489,7 +4506,7 @@ impl CommissioningEngine {
 
             PositionTuneState::Analyze => {
                 // Check for oscillation in the captured response.
-                let target_abs = data.step_target;
+                let target_abs = data.step_target_counts;
                 let oscillation = foci_core::autotune::detect_position_oscillation(buf, target_abs);
 
                 defmt::info!(
@@ -4540,8 +4557,13 @@ impl CommissioningEngine {
 
                         // Record new step start and command step.
                         let encoder_raw = backend.read_encoder_count().await;
-                        data.step_start = encoder_raw as i32;
-                        let target = (encoder_raw as i32).wrapping_add(data.step_target as i32);
+                        data.step_start_counts = encoder_raw as i32;
+                        let position_raw = match backend.read_register(PID_POSITION_ACTUAL).await {
+                            Ok(v) => v as i32,
+                            Err(_) => return Self::fail_outer(phase, CommissionError::Spi),
+                        };
+                        data.step_start_tmc = position_raw;
+                        let target = position_raw.wrapping_add(data.step_target_tmc as i32);
                         let _ = backend
                             .write_register(PID_POSITION_TARGET, target as u32)
                             .await;
