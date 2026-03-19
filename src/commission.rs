@@ -4495,12 +4495,20 @@ impl CommissioningEngine {
 
                 let final_p = data.stable_p;
 
-                // Add small position I for Nominal/HighInertia modes.
-                let final_i = match mode {
-                    OperatingMode::Nominal | OperatingMode::HighInertia => {
-                        (final_p as u32 * POS_TUNE_I_PERCENT / 100).max(1) as u16
+                // Response-tuned velocity gains are deliberately conservative:
+                // the tuner has not measured a steady-state position bias, so
+                // leave position integral disabled to avoid windup on installed
+                // mechanics.
+                let response_tuned = data.velocity_gains.effective_bandwidth_hz == 0;
+                let final_i = if response_tuned {
+                    0
+                } else {
+                    match mode {
+                        OperatingMode::Nominal | OperatingMode::HighInertia => {
+                            (final_p as u32 * POS_TUNE_I_PERCENT / 100).max(1) as u16
+                        }
+                        OperatingMode::Unloaded => 0,
                     }
-                    OperatingMode::Unloaded => 0,
                 };
 
                 defmt::info!("pos tune: final P={}, I={}", final_p, final_i);
