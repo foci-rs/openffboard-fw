@@ -2417,6 +2417,11 @@ mod app {
                         POSITION_P_VALUE.store(640, core::sync::atomic::Ordering::Relaxed);
                         POSITION_I_VALUE.store(0, core::sync::atomic::Ordering::Relaxed);
 
+                        // Re-apply biquad filters from stored atomics.
+                        // The engine's ClosedLoopEntry disabled all filters
+                        // (no access to filter Hz atomics).
+                        apply_stored_filters(tmc).await;
+
                         enable_pin.set_high();
                         calibrated = true;
                         motor_enabled = true;
@@ -3733,6 +3738,110 @@ mod app {
         clear_pid_error_sums(tmc).await?;
         tmc.write_register(STATUS_FLAGS, 0).await.map_err(|_| ())?;
         Ok(())
+    }
+
+    /// Re-apply biquad filters from stored atomics.
+    ///
+    /// Called after CalibrateDone to restore filters that the engine's
+    /// ClosedLoopEntry phase disabled (it has no access to the filter
+    /// Hz atomics). Best-effort: warns on failure, does not abort.
+    async fn apply_stored_filters(tmc: &mut Tmc4671Spi<TmcSpiDevice>) {
+        use core::sync::atomic::Ordering::Relaxed;
+        use tmc4671::registers::*;
+
+        let pwm_maxcnt = TMC_CONFIG.pwm_maxcnt;
+
+        // Velocity biquad.
+        let filter_hz = VELOCITY_FILTER_HZ.load(Relaxed);
+        if filter_hz > 0 {
+            if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt) {
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_V_A_1, coeffs.a_1 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_V_A_2, coeffs.a_2 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_V_B_0, coeffs.b_0 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_V_B_1, coeffs.b_1 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_V_B_2, coeffs.b_2 as u32)
+                    .await;
+                let _ = tmc.write_sub_register(CONFIG_BIQUAD_V_ENABLE, 1).await;
+            }
+        }
+
+        // Torque biquad.
+        let filter_hz = TORQUE_FILTER_HZ.load(Relaxed);
+        if filter_hz > 0 {
+            if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt) {
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_T_A_1, coeffs.a_1 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_T_A_2, coeffs.a_2 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_T_B_0, coeffs.b_0 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_T_B_1, coeffs.b_1 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_T_B_2, coeffs.b_2 as u32)
+                    .await;
+                let _ = tmc.write_sub_register(CONFIG_BIQUAD_T_ENABLE, 1).await;
+            }
+        }
+
+        // Position biquad.
+        let filter_hz = POSITION_FILTER_HZ.load(Relaxed);
+        if filter_hz > 0 {
+            if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt) {
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_X_A_1, coeffs.a_1 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_X_A_2, coeffs.a_2 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_X_B_0, coeffs.b_0 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_X_B_1, coeffs.b_1 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_X_B_2, coeffs.b_2 as u32)
+                    .await;
+                let _ = tmc.write_sub_register(CONFIG_BIQUAD_X_ENABLE, 1).await;
+            }
+        }
+
+        // Flux biquad.
+        let filter_hz = FLUX_FILTER_HZ.load(Relaxed);
+        if filter_hz > 0 {
+            if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt) {
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_F_A_1, coeffs.a_1 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_F_A_2, coeffs.a_2 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_F_B_0, coeffs.b_0 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_F_B_1, coeffs.b_1 as u32)
+                    .await;
+                let _ = tmc
+                    .write_sub_register(CONFIG_BIQUAD_F_B_2, coeffs.b_2 as u32)
+                    .await;
+                let _ = tmc.write_sub_register(CONFIG_BIQUAD_F_ENABLE, 1).await;
+            }
+        }
     }
 
     /// Stop hardware stepper: disable timer, set need_reset, drain queue.
