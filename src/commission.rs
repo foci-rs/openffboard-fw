@@ -9,9 +9,9 @@
 //! electrical-ID and current-tune plans.
 
 use foci_core::autotune::{
-    CommissionError, CommissionProfile, CommissionStatus, CurrentGains, CurrentValidation,
-    ElectricalModel, MechanicalModel, OperatingMode, PhaseId, TransientBuffer, ValidationResult,
-    VelocityGains, VelocityValidation,
+    ClosedLoopEntryState, CommissionError, CommissionProfile, CommissionStatus, CurrentGains,
+    CurrentValidation, ElectricalModel, MechanicalModel, OperatingMode, PhaseId, TransientBuffer,
+    ValidationResult, VelocityGains, VelocityValidation,
 };
 use foci_core::config::TmcConfig;
 use tmc4671::registers::Register;
@@ -122,6 +122,10 @@ pub enum StepResult {
     CalibrateDone(AdcCalResult),
     /// Selftest phases completed. Hardware restored to safe state.
     SelftestDone,
+    /// Stage 1 commissioning complete. Motor is in closed-loop position mode.
+    /// Carries inner result + fallback outer gains for the Python host to
+    /// cache and persist.
+    CommissionDone(CommissionResult),
 }
 
 /// Result of inner (electrical) commissioning.
@@ -213,6 +217,27 @@ pub struct AdcCalResult {
     pub adc_i1: u16,
     /// Encoder count captured before the alignment phase zeroed it.
     pub encoder_count: u32,
+}
+
+/// Result of Stage 1 commissioning.
+///
+/// Combines the inner result (current-loop gains, electrical model) with
+/// the fallback outer gains applied during closed-loop entry. Matches the
+/// wire result `foci_commission_result`.
+#[derive(Debug, Clone, defmt::Format)]
+pub struct CommissionResult {
+    /// Inner commissioning result (current-loop gains, electrical model).
+    pub inner: InnerResult,
+    /// Fallback velocity P gain (Q8.8) written during closed-loop entry.
+    pub fallback_velocity_p: u16,
+    /// Fallback velocity I gain (Q8.8) written during closed-loop entry.
+    pub fallback_velocity_i: u16,
+    /// Fallback position P gain (Q8.8) written during closed-loop entry.
+    pub fallback_position_p: u16,
+    /// Fallback position I gain (Q8.8) written during closed-loop entry.
+    pub fallback_position_i: u16,
+    /// Fallback PID velocity limit register value.
+    pub fallback_velocity_limit: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -588,6 +613,39 @@ enum InnerPhase {
     CurrentValidate {
         state: CurrentValidateState,
         data: CurrentValidateData,
+    },
+    /// Closed-loop position mode entry with PID gains, filters, and stability check.
+    ClosedLoopEntry {
+        /// Current sub-state.
+        state: ClosedLoopEntryState,
+        /// Current-loop flux P gain (Q8.8) to write.
+        flux_p: u16,
+        /// Current-loop flux I gain (Q8.8) to write.
+        flux_i: u16,
+        /// Current-loop torque P gain (Q8.8) to write.
+        torque_p: u16,
+        /// Current-loop torque I gain (Q8.8) to write.
+        torque_i: u16,
+        /// Outer velocity P gain (Q8.8) to write.
+        velocity_p: u16,
+        /// Outer velocity I gain (Q8.8) to write.
+        velocity_i: u16,
+        /// Outer position P gain (Q8.8) to write.
+        position_p: u16,
+        /// Outer position I gain (Q8.8) to write.
+        position_i: u16,
+        /// PID velocity limit register value.
+        velocity_limit: u32,
+        /// Velocity biquad filter cutoff (Hz), 0 = disabled.
+        velocity_filter_hz: u16,
+        /// Torque biquad filter cutoff (Hz), 0 = disabled.
+        torque_filter_hz: u16,
+        /// Position biquad filter cutoff (Hz), 0 = disabled.
+        position_filter_hz: u16,
+        /// Flux biquad filter cutoff (Hz), 0 = disabled.
+        flux_filter_hz: u16,
+        /// Inner result carried forward for CommissionDone (Commission sequence only).
+        inner_result: Option<InnerResult>,
     },
     /// All inner phases completed successfully.
     Done(InnerResult),
@@ -1345,6 +1403,9 @@ impl CommissioningEngine {
             }
             InnerPhase::CurrentValidate { .. } => {
                 Self::step_current_validate(phase, buf, profile, backend).await
+            }
+            InnerPhase::ClosedLoopEntry { .. } => {
+                Self::step_closed_loop_entry(phase, backend).await
             }
             InnerPhase::Done(result) => StepResult::InnerDone(result.clone()),
             InnerPhase::Failed(err) => StepResult::InnerFailed(*err),
@@ -2929,6 +2990,365 @@ impl CommissioningEngine {
                     ringing_count,
                     bandwidth_hz: data.gains.effective_bandwidth_hz,
                 };
+                *phase = InnerPhase::Done(result.clone());
+                StepResult::InnerDone(result)
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 8: Closed-Loop Entry
+    // -------------------------------------------------------------------
+
+    /// Advance closed-loop entry sub-state.
+    ///
+    /// Mirrors the register write sequence from `tmc_enter_closedloop`
+    /// (gains, limits, PHI_E verification, position zeroing, integrator
+    /// clear, STEP_WIDTH, biquad filters, position mode entry, stability
+    /// check) but uses the engine's per-tick state machine pattern.
+    async fn step_closed_loop_entry<B: CommissioningBackend>(
+        phase: &mut InnerPhase,
+        backend: &mut B,
+    ) -> StepResult {
+        use tmc4671::registers::*;
+
+        let (
+            cle_state,
+            flux_p,
+            flux_i,
+            torque_p,
+            torque_i,
+            velocity_p,
+            velocity_i,
+            position_p,
+            position_i,
+            velocity_limit,
+            velocity_filter_hz,
+            torque_filter_hz,
+            position_filter_hz,
+            flux_filter_hz,
+            inner_result,
+        ) = match phase {
+            InnerPhase::ClosedLoopEntry {
+                state,
+                flux_p,
+                flux_i,
+                torque_p,
+                torque_i,
+                velocity_p,
+                velocity_i,
+                position_p,
+                position_i,
+                velocity_limit,
+                velocity_filter_hz,
+                torque_filter_hz,
+                position_filter_hz,
+                flux_filter_hz,
+                inner_result,
+            } => (
+                state,
+                *flux_p,
+                *flux_i,
+                *torque_p,
+                *torque_i,
+                *velocity_p,
+                *velocity_i,
+                *position_p,
+                *position_i,
+                *velocity_limit,
+                *velocity_filter_hz,
+                *torque_filter_hz,
+                *position_filter_hz,
+                *flux_filter_hz,
+                inner_result,
+            ),
+            _ => return StepResult::Continue,
+        };
+
+        match cle_state {
+            ClosedLoopEntryState::WriteGains => {
+                // 1. Flux and torque PID gains.
+                let flux_reg = (flux_p as u32) << 16 | flux_i as u32;
+                let torque_reg = (torque_p as u32) << 16 | torque_i as u32;
+                if backend
+                    .write_register(PID_FLUX_P_FLUX_I, flux_reg)
+                    .await
+                    .is_err()
+                    || backend
+                        .write_register(PID_TORQUE_P_TORQUE_I, torque_reg)
+                        .await
+                        .is_err()
+                {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+
+                // 2. Velocity PID gains.
+                let velocity_reg = (velocity_p as u32) << 16 | velocity_i as u32;
+                if backend
+                    .write_register(PID_VELOCITY_P_VELOCITY_I, velocity_reg)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+
+                // 3. Position PID gains.
+                let position_reg = (position_p as u32) << 16 | position_i as u32;
+                if backend
+                    .write_register(PID_POSITION_P_POSITION_I, position_reg)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+
+                *cle_state = ClosedLoopEntryState::WriteLimits;
+                StepResult::Continue
+            }
+
+            ClosedLoopEntryState::WriteLimits => {
+                // 4. Velocity limit.
+                if backend
+                    .write_register(PID_VELOCITY_LIMIT, velocity_limit)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+
+                // 5. Raise voltage limit for actual operation.
+                // ADC cal sets it to 1024 as a safety measure.
+                if backend
+                    .write_register(PIDOUT_UQ_UD_LIMITS, 16000)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+                let voltage_limit_readback = backend.read_register(PIDOUT_UQ_UD_LIMITS).await;
+                match voltage_limit_readback {
+                    Ok(val) if val == 16000 => {}
+                    _ => {
+                        defmt::error!("closed-loop: PIDOUT_UQ_UD_LIMITS readback mismatch");
+                        return Self::fail_inner(phase, CommissionError::Spi);
+                    }
+                }
+
+                *cle_state = ClosedLoopEntryState::VerifyPhiE;
+                StepResult::Continue
+            }
+
+            ClosedLoopEntryState::VerifyPhiE => {
+                // PHI_E_SELECTION must be 3 (ABN encoder) from alignment.
+                match backend.read_register(PHI_E_SELECTION).await {
+                    Ok(3) => {}
+                    Ok(val) => {
+                        defmt::error!("closed-loop: PHI_E_SELECTION={}, expected 3", val);
+                        return Self::fail_inner(phase, CommissionError::Spi);
+                    }
+                    Err(_) => {
+                        return Self::fail_inner(phase, CommissionError::Spi);
+                    }
+                }
+
+                *cle_state = ClosedLoopEntryState::ZeroAndClear;
+                StepResult::Continue
+            }
+
+            ClosedLoopEntryState::ZeroAndClear => {
+                // 6. Zero position (also zeros target per datasheet 0x6B).
+                if backend
+                    .write_register(PID_POSITION_ACTUAL, 0)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+
+                // Clear PID integrators.
+                Self::write_sub_register(backend, PID_ERROR_PID_TORQUE_ERROR_SUM, 0).await;
+                Self::write_sub_register(backend, PID_ERROR_PID_FLUX_ERROR_SUM, 0).await;
+                Self::write_sub_register(backend, PID_ERROR_PID_VELOCITY_ERROR_SUM, 0).await;
+                Self::write_sub_register(backend, PID_ERROR_PID_POSITION_ERROR_SUM, 0).await;
+
+                // Clear status flags.
+                let _ = backend.write_register(STATUS_FLAGS, 0).await;
+
+                *cle_state = ClosedLoopEntryState::WritePositionConfig;
+                StepResult::Continue
+            }
+
+            ClosedLoopEntryState::WritePositionConfig => {
+                // 7. Explicit POSITION_SELECTION=0 (phi_e).
+                if backend.write_register(POSITION_SELECTION, 0).await.is_err() {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+
+                // 8. Write STEP_WIDTH for hardware step/dir input.
+                let step_width = backend.step_width();
+                if step_width == 0 {
+                    defmt::error!("STEP_WIDTH=0, aborting closed-loop entry");
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+                if backend
+                    .write_register(STEP_WIDTH, step_width)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+                // Readback verification.
+                match backend.read_register(STEP_WIDTH).await {
+                    Ok(val) if val == step_width => {}
+                    _ => {
+                        defmt::error!("closed-loop: STEP_WIDTH readback mismatch");
+                        return Self::fail_inner(phase, CommissionError::Spi);
+                    }
+                }
+                defmt::info!("STEP_WIDTH(0x78) = {} written", step_width);
+
+                *cle_state = ClosedLoopEntryState::WriteFilters;
+                StepResult::Continue
+            }
+
+            ClosedLoopEntryState::WriteFilters => {
+                let pwm_maxcnt = backend.pwm_maxcnt();
+
+                // Best-effort filter writes (warn on failure, don't abort).
+                if velocity_filter_hz > 0 {
+                    Self::write_biquad_velocity(backend, velocity_filter_hz, pwm_maxcnt).await;
+                } else {
+                    Self::write_sub_register(backend, CONFIG_BIQUAD_V_ENABLE, 0).await;
+                }
+
+                if torque_filter_hz > 0 {
+                    Self::write_biquad_torque(backend, torque_filter_hz, pwm_maxcnt).await;
+                } else {
+                    Self::write_sub_register(backend, CONFIG_BIQUAD_T_ENABLE, 0).await;
+                }
+
+                if position_filter_hz > 0 {
+                    Self::write_biquad_position(backend, position_filter_hz, pwm_maxcnt).await;
+                } else {
+                    Self::write_sub_register(backend, CONFIG_BIQUAD_X_ENABLE, 0).await;
+                }
+
+                if flux_filter_hz > 0 {
+                    Self::write_biquad_flux(backend, flux_filter_hz, pwm_maxcnt).await;
+                } else {
+                    Self::write_sub_register(backend, CONFIG_BIQUAD_F_ENABLE, 0).await;
+                }
+
+                *cle_state = ClosedLoopEntryState::EnterPositionMode;
+                StepResult::Continue
+            }
+
+            ClosedLoopEntryState::EnterPositionMode => {
+                // MODE_PID_TYPE=1 (bit 31), MODE_MOTION=3 (position).
+                if backend
+                    .write_register(MODE_RAMP_MODE_MOTION, 0x8000_0003)
+                    .await
+                    .is_err()
+                {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+                // Readback verification.
+                match backend.read_register(MODE_RAMP_MODE_MOTION).await {
+                    Ok(0x8000_0003) => {}
+                    _ => {
+                        defmt::error!("closed-loop: MODE_RAMP_MODE_MOTION readback mismatch");
+                        return Self::fail_inner(phase, CommissionError::Spi);
+                    }
+                }
+
+                // Schedule stability check after 10ms.
+                let now = backend.elapsed_us();
+                *cle_state = ClosedLoopEntryState::StabilityCheck1 {
+                    position_1: 0,
+                    deadline_us: now + 10_000,
+                };
+                StepResult::Continue
+            }
+
+            ClosedLoopEntryState::StabilityCheck1 {
+                position_1: _,
+                deadline_us,
+            } => {
+                if backend.elapsed_us() < *deadline_us {
+                    return StepResult::Continue;
+                }
+
+                // Read first position sample.
+                match backend.read_register(PID_POSITION_ACTUAL).await {
+                    Ok(val) => {
+                        let pos1 = val as i32;
+                        let now = backend.elapsed_us();
+                        *cle_state = ClosedLoopEntryState::StabilityCheck2 {
+                            position_1: pos1,
+                            deadline_us: now + 20_000,
+                        };
+                    }
+                    Err(_) => {
+                        return Self::fail_inner(phase, CommissionError::Spi);
+                    }
+                }
+                StepResult::Continue
+            }
+
+            ClosedLoopEntryState::StabilityCheck2 {
+                position_1,
+                deadline_us,
+            } => {
+                if backend.elapsed_us() < *deadline_us {
+                    return StepResult::Continue;
+                }
+
+                // Read second position sample and check for runaway.
+                let pos2 = match backend.read_register(PID_POSITION_ACTUAL).await {
+                    Ok(val) => val as i32,
+                    Err(_) => {
+                        return Self::fail_inner(phase, CommissionError::Spi);
+                    }
+                };
+
+                // Runaway detection: if position error is large and growing,
+                // the feedback sign is wrong.
+                const RUNAWAY_THRESHOLD: u32 = 32760; // ~40 steps
+                if pos2.unsigned_abs() > RUNAWAY_THRESHOLD
+                    && pos2.unsigned_abs() > position_1.unsigned_abs()
+                {
+                    defmt::error!(
+                        "closed-loop: runaway detected: pos1={}, pos2={}",
+                        position_1,
+                        pos2
+                    );
+                    let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+
+                defmt::info!("closed-loop position mode active (engine)");
+
+                // Stability check passed. The caller (routing logic in
+                // Task 3) will inspect inner_result to decide between
+                // CalibrateDone and CommissionDone. For now, transition
+                // to Done with a placeholder — the routing in Task 3
+                // will intercept before reaching Done.
+                //
+                // Temporary: use inner_result if available, otherwise
+                // a default InnerResult for the Calibrate path.
+                let result = inner_result.take().unwrap_or(InnerResult {
+                    status: CommissionStatus::Accepted,
+                    r_mohm: 0,
+                    l_uh: 0,
+                    flux_p: 0,
+                    flux_i: 0,
+                    torque_p: 0,
+                    torque_i: 0,
+                    lambda_us: 0,
+                    theta_e_us: 0,
+                    ringing_count: 0,
+                    bandwidth_hz: 0,
+                });
                 *phase = InnerPhase::Done(result.clone());
                 StepResult::InnerDone(result)
             }

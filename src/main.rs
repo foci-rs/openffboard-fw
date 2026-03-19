@@ -2474,6 +2474,12 @@ mod app {
                             status: u8 = 0
                         );
                     }
+                    crate::commission::StepResult::CommissionDone(_) => {
+                        // TODO(task-4): implement CommissionDone handler
+                        let oid = engine.oid();
+                        commission_engine = None;
+                        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 // For Done/Failed cases, fall through to normal processing
             }
@@ -3622,12 +3628,20 @@ mod app {
         Ok(())
     }
 
-    async fn settle_hold_and_clear_pid_errors(tmc: &mut Tmc4671Spi<TmcSpiDevice>) -> Result<(), ()> {
+    async fn settle_hold_and_clear_pid_errors(
+        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
+    ) -> Result<(), ()> {
         use core::sync::atomic::Ordering::Relaxed;
         use tmc4671::registers::*;
 
-        let target = tmc.read_register(PID_POSITION_TARGET).await.map_err(|_| ())?;
-        let actual = tmc.read_register(PID_POSITION_ACTUAL).await.map_err(|_| ())?;
+        let target = tmc
+            .read_register(PID_POSITION_TARGET)
+            .await
+            .map_err(|_| ())?;
+        let actual = tmc
+            .read_register(PID_POSITION_ACTUAL)
+            .await
+            .map_err(|_| ())?;
         let step_width = STEP_WIDTH_VALUE.load(Relaxed).unsigned_abs().max(1);
         let deadband = step_width.saturating_mul(HOLD_SETTLE_DEADBAND_COUNTS);
         let error = (actual as i32).wrapping_sub(target as i32);
