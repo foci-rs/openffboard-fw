@@ -698,6 +698,7 @@ const VEL_RESPONSE_STEP_TARGET: u32 = 4;
 const VEL_RESPONSE_LIMIT: u32 = VELOCITY_CAP_COUNTS_PER_MS as u32;
 const VEL_RESPONSE_P_MUL_NUM: u32 = 3;
 const VEL_RESPONSE_P_MUL_DEN: u32 = 2;
+const VEL_RESPONSE_VALIDATE_TAU_MS: u32 = 50;
 
 // ---------------------------------------------------------------------------
 // Position-loop tuning constants (Phase 11)
@@ -3142,6 +3143,47 @@ impl CommissioningEngine {
         }
     }
 
+    fn response_mech_model(
+        data: &MechanicalIdData,
+        torque: u32,
+        fwd_accel: u32,
+        rev_accel: u32,
+        fwd_peak: u32,
+        rev_peak: u32,
+    ) -> (MechanicalModel, u32) {
+        let accel_avg = ((fwd_accel.max(1) + rev_accel.max(1)) / 2).max(1);
+        let peak_avg = ((fwd_peak + rev_peak) / 2).max(1);
+        let j_eff = (torque * 1000) / accel_avg;
+        let b_eff = (torque * 1000) / peak_avg;
+        let avg_delay_samples = (data.forward_delay_samples + data.reverse_delay_samples) / 2;
+
+        (
+            MechanicalModel {
+                j_eff,
+                b_eff,
+                tau_mech_ms: VEL_RESPONSE_VALIDATE_TAU_MS,
+                theta_mech_us: (avg_delay_samples as u64 * MECH_ID_SAMPLE_PERIOD_US) as u32,
+                t_f: 0,
+            },
+            peak_avg,
+        )
+    }
+
+    fn response_velocity_phase(
+        model: MechanicalModel,
+        peak_velocity: u32,
+        mut diagnostics: OuterDiagnostics,
+        safety: OuterSafetyLimits,
+    ) -> OuterPhase {
+        diagnostics.warning_code = OUTER_WARNING_LOW_CONFIDENCE_MECH_ID;
+        OuterPhase::VelocityTune {
+            model,
+            peak_velocity,
+            diagnostics,
+            safety,
+        }
+    }
+
     // -------------------------------------------------------------------
     // Phase 8: Mechanical Identification
     // -------------------------------------------------------------------
@@ -3408,13 +3450,32 @@ impl CommissioningEngine {
                 };
                 let rev_accel = data.reverse_initial_accel as u32;
 
+                let fwd_peak = if data.forward_peak_velocity < 0 {
+                    (-data.forward_peak_velocity) as u32
+                } else {
+                    data.forward_peak_velocity as u32
+                };
+                let rev_peak = data.reverse_peak_velocity as u32;
+                let peak_avg = (fwd_peak + rev_peak) / 2;
+
                 // Gate: both accelerations must be positive and non-zero.
                 if fwd_accel == 0 || rev_accel == 0 {
                     if Self::retry_mechanical_id(state, data, "zero acceleration") {
                         return StepResult::Continue;
                     }
-                    defmt::warn!("mech-id: zero acceleration detected after retries");
-                    return Self::fail_outer(phase, CommissionError::MechanicalIdFailed);
+                    defmt::warn!(
+                        "mech-id: zero acceleration after retries, using response velocity tuning"
+                    );
+                    let (model, peak_velocity) = Self::response_mech_model(
+                        data, torque, fwd_accel, rev_accel, fwd_peak, rev_peak,
+                    );
+                    *phase = Self::response_velocity_phase(
+                        model,
+                        peak_velocity,
+                        OuterDiagnostics::from_mechanical_id(data),
+                        *safety,
+                    );
+                    return StepResult::PhaseChanged(PhaseId::VelocityTune);
                 }
 
                 // J_eff = torque / initial_acceleration.
@@ -3440,23 +3501,23 @@ impl CommissioningEngine {
                         return StepResult::Continue;
                     }
                     defmt::warn!(
-                        "mech-id: asymmetry {}% exceeds {}% after retries",
+                        "mech-id: asymmetry {}% exceeds {}% after retries, using response velocity tuning",
                         asymmetry_pct,
                         MECH_ID_SYMMETRY_THRESHOLD_PCT
                     );
-                    return Self::fail_outer(phase, CommissionError::MechanicalIdFailed);
+                    let (model, peak_velocity) = Self::response_mech_model(
+                        data, torque, fwd_accel, rev_accel, fwd_peak, rev_peak,
+                    );
+                    *phase = Self::response_velocity_phase(
+                        model,
+                        peak_velocity,
+                        OuterDiagnostics::from_mechanical_id(data),
+                        *safety,
+                    );
+                    return StepResult::PhaseChanged(PhaseId::VelocityTune);
                 }
 
                 let j_eff = j_avg;
-
-                // B_eff from peak velocity (steady-state approximation).
-                let fwd_peak = if data.forward_peak_velocity < 0 {
-                    (-data.forward_peak_velocity) as u32
-                } else {
-                    data.forward_peak_velocity as u32
-                };
-                let rev_peak = data.reverse_peak_velocity as u32;
-                let peak_avg = (fwd_peak + rev_peak) / 2;
 
                 // B_eff = torque / steady_state_velocity.
                 // Scale to match J_eff units.
@@ -3507,18 +3568,7 @@ impl CommissioningEngine {
                     }
 
                     defmt::warn!("mech-id: low-confidence data, using response velocity tuning");
-                    let carried_safety = match phase {
-                        OuterPhase::MechanicalId { safety, .. } => *safety,
-                        _ => unreachable!(),
-                    };
-                    let mut diagnostics = diagnostics;
-                    diagnostics.warning_code = OUTER_WARNING_LOW_CONFIDENCE_MECH_ID;
-                    *phase = OuterPhase::VelocityTune {
-                        model,
-                        peak_velocity: peak_avg,
-                        diagnostics,
-                        safety: carried_safety,
-                    };
+                    *phase = Self::response_velocity_phase(model, peak_avg, diagnostics, *safety);
                     return StepResult::PhaseChanged(PhaseId::VelocityTune);
                 }
 
@@ -4077,9 +4127,14 @@ impl CommissioningEngine {
                     symmetry_pct: symmetry,
                 };
 
+                let validation_tau_ms = if data.strategy == VelocityTuneStrategy::ResponseRamp {
+                    VEL_RESPONSE_VALIDATE_TAU_MS
+                } else {
+                    data.model.tau_mech_ms.max(1)
+                };
                 let result = foci_core::autotune::classify_velocity_validation(
                     &merged,
-                    data.model.tau_mech_ms,
+                    validation_tau_ms,
                     foci_core::autotune::TRANSIENT_LEN as u16 * 2, // Total samples across both captures.
                 );
 
