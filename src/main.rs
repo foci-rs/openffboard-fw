@@ -384,6 +384,7 @@ mod app {
     /// encoder counts. Within this window the controller is fighting encoder
     /// quantization and belt/motor compliance more than useful position error.
     const HOLD_SETTLE_DEADBAND_COUNTS: u32 = 4;
+    const HOLD_SETTLE_DELAY_MS: u8 = 100;
 
     /// Current step interval in TIM5 clock ticks, written by P3 after
     /// every step event. Written to 0 when the step queue drains (both
@@ -2171,6 +2172,7 @@ mod app {
         // Track whether feedforward was active on the previous tick, so we
         // can zero PID_VELOCITY_OFFSET on the deactivation edge.
         let mut feedforward_was_active = false;
+        let mut pid_error_clear_countdown_ms: u8 = 0;
 
         // Main loop: wait for channel message or 1ms timeout.
         // On message: handle request. On timeout: write position target.
@@ -3098,44 +3100,21 @@ mod app {
             }
             feedforward_was_active = ff_active;
 
+            if PID_ERROR_SUMS_CLEAR.swap(false, core::sync::atomic::Ordering::Relaxed) {
+                pid_error_clear_countdown_ms = HOLD_SETTLE_DELAY_MS;
+            }
             if motor_enabled
                 && commission_engine.is_none()
-                && PID_ERROR_SUMS_CLEAR.swap(false, core::sync::atomic::Ordering::Relaxed)
+                && !TIMER_ACTIVE.load(core::sync::atomic::Ordering::Relaxed)
+                && pid_error_clear_countdown_ms > 0
             {
-                if let Ok(target) = tmc
-                    .read_register(tmc4671::registers::PID_POSITION_TARGET)
-                    .await
-                {
-                    if let Ok(actual) = tmc
-                        .read_register(tmc4671::registers::PID_POSITION_ACTUAL)
-                        .await
-                    {
-                        let step_width = STEP_WIDTH_VALUE
-                            .load(core::sync::atomic::Ordering::Relaxed)
-                            .unsigned_abs()
-                            .max(1);
-                        let deadband = step_width.saturating_mul(HOLD_SETTLE_DEADBAND_COUNTS);
-                        let error = (actual as i32).wrapping_sub(target as i32);
-                        if error.unsigned_abs() <= deadband {
-                            // With ABN feedback active, PID_POSITION_ACTUAL is
-                            // driven by encoder phase. Accept tiny settled
-                            // error by moving the internal TMC hold target to
-                            // the measured actual position; firmware/Klipper
-                            // logical step counts remain unchanged.
-                            let _ = tmc
-                                .write_register(tmc4671::registers::PID_POSITION_TARGET, actual)
-                                .await;
-                        }
+                pid_error_clear_countdown_ms -= 1;
+                if pid_error_clear_countdown_ms == 0 {
+                    if settle_hold_and_clear_pid_errors(tmc).await.is_err() {
+                        defmt::warn!("TMC4671 PID settle/clear failed");
+                    } else {
+                        defmt::info!("TMC4671 PID settled and cleared after motion");
                     }
-                }
-
-                if clear_pid_error_sums(tmc).await.is_err() {
-                    defmt::warn!("TMC4671 PID error sum clear failed");
-                } else {
-                    let _ = tmc
-                        .write_register(tmc4671::registers::STATUS_FLAGS, 0)
-                        .await;
-                    defmt::info!("TMC4671 PID error sums cleared after motion");
                 }
             }
 
@@ -3640,6 +3619,30 @@ mod app {
         tmc.write_sub_register(PID_ERROR_PID_POSITION_ERROR_SUM, 0)
             .await
             .map_err(|_| ())?;
+        Ok(())
+    }
+
+    async fn settle_hold_and_clear_pid_errors(tmc: &mut Tmc4671Spi<TmcSpiDevice>) -> Result<(), ()> {
+        use core::sync::atomic::Ordering::Relaxed;
+        use tmc4671::registers::*;
+
+        let target = tmc.read_register(PID_POSITION_TARGET).await.map_err(|_| ())?;
+        let actual = tmc.read_register(PID_POSITION_ACTUAL).await.map_err(|_| ())?;
+        let step_width = STEP_WIDTH_VALUE.load(Relaxed).unsigned_abs().max(1);
+        let deadband = step_width.saturating_mul(HOLD_SETTLE_DEADBAND_COUNTS);
+        let error = (actual as i32).wrapping_sub(target as i32);
+        if error.unsigned_abs() <= deadband {
+            // With ABN feedback active, PID_POSITION_ACTUAL is driven by
+            // encoder phase. Accept tiny settled error by moving the internal
+            // TMC hold target to the measured actual position; firmware and
+            // Klipper logical step counts remain unchanged.
+            tmc.write_register(PID_POSITION_TARGET, actual)
+                .await
+                .map_err(|_| ())?;
+        }
+
+        clear_pid_error_sums(tmc).await?;
+        tmc.write_register(STATUS_FLAGS, 0).await.map_err(|_| ())?;
         Ok(())
     }
 
