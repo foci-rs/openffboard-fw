@@ -319,6 +319,12 @@ mod app {
     static FEEDFORWARD_RESET: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
 
+    /// Signal the tick loop to clear TMC4671 PID error sums after motion.
+    /// The step ISR cannot use SPI, so it sets this flag when the hardware
+    /// step queue drains and P1 performs the register writes on the next tick.
+    static PID_ERROR_SUMS_CLEAR: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
     /// Configurable PID velocity limit (caps position PID output).
     /// Prevents integrator-driven velocity runaway when position I > 0.
     /// Override via tmc_set_velocity_limit command from host config.
@@ -558,6 +564,7 @@ mod app {
         VELOCITY_FEEDFORWARD.store(false, core::sync::atomic::Ordering::Relaxed);
         VELOCITY_LIMIT_CFG.store(500_000, core::sync::atomic::Ordering::Relaxed);
         FEEDFORWARD_RESET.store(false, core::sync::atomic::Ordering::Relaxed);
+        PID_ERROR_SUMS_CLEAR.store(false, core::sync::atomic::Ordering::Relaxed);
         ENCODER_REVERSED.store(false, core::sync::atomic::Ordering::Relaxed);
         STEPPER_POSITION_TARGET.store(0, core::sync::atomic::Ordering::Relaxed);
         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
@@ -3086,6 +3093,20 @@ mod app {
             }
             feedforward_was_active = ff_active;
 
+            if motor_enabled
+                && commission_engine.is_none()
+                && PID_ERROR_SUMS_CLEAR.swap(false, core::sync::atomic::Ordering::Relaxed)
+            {
+                if clear_pid_error_sums(tmc).await.is_err() {
+                    defmt::warn!("TMC4671 PID error sum clear failed");
+                } else {
+                    let _ = tmc
+                        .write_register(tmc4671::registers::STATUS_FLAGS, 0)
+                        .await;
+                    defmt::info!("TMC4671 PID error sums cleared after motion");
+                }
+            }
+
             // TrSync: check timeouts and send periodic status reports.
             //
             // Runs every 1ms tick. For each active TrSync:
@@ -3565,6 +3586,31 @@ mod app {
         }
     }
 
+    /// Clear TMC4671 PID error accumulators.
+    ///
+    /// The current-loop sums can saturate during commissioning and step
+    /// transients, then keep STATUS_FLAGS asserted even after the commanded
+    /// position has returned to zero. Clearing all four sums at lifecycle
+    /// boundaries removes stale integral state without changing configured
+    /// gains or the active position target.
+    async fn clear_pid_error_sums(tmc: &mut Tmc4671Spi<TmcSpiDevice>) -> Result<(), ()> {
+        use tmc4671::registers::*;
+
+        tmc.write_sub_register(PID_ERROR_PID_TORQUE_ERROR_SUM, 0)
+            .await
+            .map_err(|_| ())?;
+        tmc.write_sub_register(PID_ERROR_PID_FLUX_ERROR_SUM, 0)
+            .await
+            .map_err(|_| ())?;
+        tmc.write_sub_register(PID_ERROR_PID_VELOCITY_ERROR_SUM, 0)
+            .await
+            .map_err(|_| ())?;
+        tmc.write_sub_register(PID_ERROR_PID_POSITION_ERROR_SUM, 0)
+            .await
+            .map_err(|_| ())?;
+        Ok(())
+    }
+
     /// Configure TMC4671 for closed-loop position mode with ABN encoder feedback.
     ///
     /// **Pre-condition:** the commissioning engine's `EncoderAlign` phase has
@@ -3578,7 +3624,7 @@ mod app {
     /// 4. Set PID_VELOCITY_LIMIT (anti-windup)
     /// 5. Raise PIDOUT_UQ_UD_LIMITS for operation
     /// 6. Zero PID_POSITION_ACTUAL (also zeros target)
-    /// 7. Zero PID_POSITION_ERROR_SUM (integrator)
+    /// 7. Zero PID error sums (integrators)
     /// 8-11. Write biquad filters if configured
     /// 12. Enter position mode: MODE_RAMP_MODE_MOTION = 0x8000_0003
     /// 13. Validate: position error is not diverging
@@ -3668,10 +3714,14 @@ mod app {
             .await
             .map_err(|_| CalibrationError::SpiError)?;
 
-        // Zero position integrator to prevent stale error sum from prior session.
-        // Must come after PID_POSITION_ACTUAL=0 so the integrator doesn't
+        // Zero PID integrators to prevent stale commissioning or motion error
+        // sums from biasing closed-loop hold. Must come after
+        // PID_POSITION_ACTUAL=0 so the position integrator doesn't
         // immediately re-accumulate from a nonzero position error.
-        tmc.write_sub_register(PID_ERROR_PID_POSITION_ERROR_SUM, 0)
+        clear_pid_error_sums(tmc)
+            .await
+            .map_err(|_| CalibrationError::SpiError)?;
+        tmc.write_register(STATUS_FLAGS, 0)
             .await
             .map_err(|_| CalibrationError::SpiError)?;
 
@@ -3865,6 +3915,7 @@ mod app {
         TIMER_ACTIVE.store(false, Relaxed);
         STEPPER_NEED_RESET.store(true, Relaxed);
         STEP_INTERVAL.store(0, Relaxed);
+        PID_ERROR_SUMS_CLEAR.store(true, Relaxed);
         // Drain queue (safe: P3 is disabled by the CC1IE clear above)
         // SAFETY: P3 (timer ISR) is quiesced — we are the sole accessor.
         unsafe { while (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue().is_some() {} }
@@ -3980,6 +4031,7 @@ mod app {
                         tim5.dier().modify(|w| w.set_ccie(0, false));
                         TIMER_ACTIVE.store(false, Relaxed);
                         STEP_INTERVAL.store(0, Relaxed);
+                        PID_ERROR_SUMS_CLEAR.store(true, Relaxed);
                         return;
                     }
                 }
