@@ -3959,15 +3959,19 @@ mod app {
                     Some(m) => {
                         let dir_changed = stepper.load_move(m);
                         STEP_INTERVAL.store(stepper.current_interval(), Relaxed);
+                        // Always drive DIR before a segment's first STEP edge.
+                        // The software stepper defaults to forward=true while
+                        // PA0 powers up low; only writing on direction changes
+                        // left the first forward segment and the following
+                        // reverse segment at the same hardware DIR level.
+                        let dir_val = if stepper.dir_state() {
+                            embassy_stm32::pac::gpio::vals::Odr::HIGH
+                        } else {
+                            embassy_stm32::pac::gpio::vals::Odr::LOW
+                        };
+                        gpio_a.odr().modify(|w| w.set_odr(0, dir_val));
+                        STEP_DIRECTION.store(stepper.dir_state(), Relaxed);
                         if dir_changed {
-                            // Set DIR GPIO (PA0) before first step pulse
-                            let dir_val = if stepper.dir_state() {
-                                embassy_stm32::pac::gpio::vals::Odr::HIGH
-                            } else {
-                                embassy_stm32::pac::gpio::vals::Odr::LOW
-                            };
-                            gpio_a.odr().modify(|w| w.set_odr(0, dir_val));
-                            STEP_DIRECTION.store(stepper.dir_state(), Relaxed);
                             FEEDFORWARD_RESET.store(true, Relaxed);
                         }
                     }
