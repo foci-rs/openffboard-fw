@@ -2411,6 +2411,12 @@ mod app {
                             )
                             .await;
 
+                        // Sync position/velocity atomics to match the
+                        // conservative defaults the engine wrote to hardware.
+                        // The homing I-suppression reads these atomics.
+                        POSITION_P_VALUE.store(640, core::sync::atomic::Ordering::Relaxed);
+                        POSITION_I_VALUE.store(0, core::sync::atomic::Ordering::Relaxed);
+
                         enable_pin.set_high();
                         calibrated = true;
                         motor_enabled = true;
@@ -2463,6 +2469,22 @@ mod app {
                             torque_p: inner.torque_p,
                             torque_i: inner.torque_i,
                         });
+
+                        // Sync position/velocity atomics to match the
+                        // fallback values the engine wrote to hardware.
+                        // The homing I-suppression reads these atomics.
+                        POSITION_P_VALUE.store(
+                            commission_result.fallback_position_p,
+                            core::sync::atomic::Ordering::Relaxed,
+                        );
+                        POSITION_I_VALUE.store(
+                            commission_result.fallback_position_i,
+                            core::sync::atomic::Ordering::Relaxed,
+                        );
+                        VELOCITY_LIMIT_CFG.store(
+                            commission_result.fallback_velocity_limit,
+                            core::sync::atomic::Ordering::Relaxed,
+                        );
 
                         enable_pin.set_high();
                         calibrated = true;
