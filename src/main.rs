@@ -1521,7 +1521,7 @@ mod app {
             );
             return;
         }
-        if !tmc_send(foci_core::tmc::tmc_commission_inner(oid, profile)) {
+        if !tmc_send(foci_core::tmc::tmc_commission(oid, profile)) {
             COMMISSION_IN_FLIGHT.store(false, Relaxed);
             klipper_reply!(
                 foci_commission_phase,
@@ -2002,6 +2002,9 @@ mod app {
             TmcRequest::SetVelocityFeedforward { .. } => {}
             TmcRequest::CommissionInner { .. } => {
                 defmt::warn!("handle_tmc_request: CommissionInner handled by main loop");
+            }
+            TmcRequest::Commission { .. } => {
+                defmt::warn!("handle_tmc_request: Commission handled by main loop");
             }
             TmcRequest::CommissionOuter { .. } => {
                 defmt::warn!("handle_tmc_request: CommissionOuter handled by main loop");
@@ -2905,6 +2908,42 @@ mod app {
                         );
                     }
                     TmcRequest::CommissionInner { oid, profile } => {
+                        if motor_enabled {
+                            COMMISSION_IN_FLIGHT
+                                .store(false, core::sync::atomic::Ordering::Relaxed);
+                            klipper_reply!(
+                                foci_commission_phase,
+                                oid: u8 = oid,
+                                phase: u8 = 0,
+                                status: u8 =
+                                    foci_core::autotune::CommissionError::MotorEnabled
+                                        .status_code()
+                            );
+                            continue;
+                        }
+                        let current_limit =
+                            CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
+                        if current_limit == 0 {
+                            COMMISSION_IN_FLIGHT
+                                .store(false, core::sync::atomic::Ordering::Relaxed);
+                            klipper_reply!(
+                                foci_commission_phase,
+                                oid: u8 = oid,
+                                phase: u8 = 0,
+                                status: u8 =
+                                    foci_core::autotune::CommissionError::NoCurrent
+                                        .status_code()
+                            );
+                            continue;
+                        }
+                        calibrated = false;
+                        commission_engine =
+                            Some(crate::commission::CommissioningEngine::new_commission(
+                                oid,
+                                foci_core::autotune::CommissionProfile::from_u8(profile),
+                            ));
+                    }
+                    TmcRequest::Commission { oid, profile } => {
                         if motor_enabled {
                             COMMISSION_IN_FLIGHT
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
