@@ -743,6 +743,10 @@ const OUTER_MAX_POSITION_I: u16 = 128;
 /// so tuning never exercises gains that would be rejected for runtime use.
 const POS_TUNE_MAX_P: u16 = OUTER_MAX_POSITION_P;
 
+/// Response-tuned velocity remains soft on current hardware, so cap position P
+/// one ramp step below the value that produced persistent x/v output limiting.
+const POS_RESPONSE_TUNE_MAX_P: u16 = 1458;
+
 const OUTER_WARNING_NONE: u8 = 0;
 const OUTER_WARNING_LOW_CONFIDENCE_MECH_ID: u8 = 1;
 const OUTER_WARNING_UNSAFE_SYNTH_GAINS: u8 = 2;
@@ -4506,14 +4510,26 @@ impl CommissioningEngine {
                     // Clean response — record this as stable and increase P.
                     data.stable_p = data.current_p;
 
-                    let new_p =
-                        (data.current_p as u32 * POS_TUNE_P_MUL_NUM / POS_TUNE_P_MUL_DEN) as u16;
-                    if new_p >= POS_TUNE_MAX_P || new_p <= data.current_p {
+                    let response_tuned = data.velocity_gains.effective_bandwidth_hz == 0;
+                    let max_p = if response_tuned {
+                        POS_RESPONSE_TUNE_MAX_P
+                    } else {
+                        POS_TUNE_MAX_P
+                    };
+                    if data.current_p >= max_p {
                         // Hit cap — finalize with current stable P.
                         defmt::info!("pos tune: P cap reached at {}", data.stable_p);
                         *state = PositionTuneState::Finalize;
                     } else {
                         // Try higher P.
+                        let new_p = (data.current_p as u32 * POS_TUNE_P_MUL_NUM
+                            / POS_TUNE_P_MUL_DEN)
+                            .min(max_p as u32) as u16;
+                        if new_p <= data.current_p {
+                            defmt::info!("pos tune: P cap reached at {}", data.stable_p);
+                            *state = PositionTuneState::Finalize;
+                            return StepResult::Continue;
+                        }
                         data.current_p = new_p;
 
                         // Write new P to registers.
