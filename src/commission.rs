@@ -2091,15 +2091,19 @@ impl CommissioningEngine {
 
                 match sequence {
                     InnerSequence::Calibrate => {
-                        // Transition to ClosedLoopEntry with saved gains
-                        // from backend (firmware atomics).
+                        // Transition to ClosedLoopEntry with conservative
+                        // default gains. The CalibrateDone handler in
+                        // main.rs will overwrite current-loop gains with
+                        // stored_gains (from prior commissioning) and
+                        // re-apply filters from atomics.
+                        let defaults = foci_core::pid::DEFAULT_INNER_GAINS;
                         let vel_limit = backend.operational_velocity_limit();
                         *phase = InnerPhase::ClosedLoopEntry {
                             state: ClosedLoopEntryState::WriteGains,
-                            flux_p: 0,
-                            flux_i: 0,
-                            torque_p: 0,
-                            torque_i: 0,
+                            flux_p: defaults.flux_p,
+                            flux_i: defaults.flux_i,
+                            torque_p: defaults.torque_p,
+                            torque_i: defaults.torque_i,
                             velocity_p: 1152, // 4.5 in Q8.8 (conservative default)
                             velocity_i: 0,
                             position_p: 640, // 2.5 in Q8.8 (conservative default)
@@ -2111,9 +2115,6 @@ impl CommissioningEngine {
                             flux_filter_hz: 0,
                             inner_result: None,
                         };
-                        // Note: actual gains are overwritten by the
-                        // CalibrateDone handler in main.rs which applies
-                        // stored_gains. The zeros here are placeholders.
                         StepResult::PhaseChanged(PhaseId::EncoderAlign)
                     }
                     InnerSequence::Selftest | InnerSequence::Commission => {
