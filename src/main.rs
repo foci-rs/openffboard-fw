@@ -380,6 +380,11 @@ mod app {
     /// register 0x78 during closedloop entry.
     static STEP_WIDTH_VALUE: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 
+    /// Acceptable residual following error after a completed move, in ABN
+    /// encoder counts. Within this window the controller is fighting encoder
+    /// quantization and belt/motor compliance more than useful position error.
+    const HOLD_SETTLE_DEADBAND_COUNTS: u32 = 4;
+
     /// Current step interval in TIM5 clock ticks, written by P3 after
     /// every step event. Written to 0 when the step queue drains (both
     /// the ISR empty-queue branch and stepper_stop). Read by tmc_control
@@ -3097,6 +3102,31 @@ mod app {
                 && commission_engine.is_none()
                 && PID_ERROR_SUMS_CLEAR.swap(false, core::sync::atomic::Ordering::Relaxed)
             {
+                if let Ok(target) = tmc
+                    .read_register(tmc4671::registers::PID_POSITION_TARGET)
+                    .await
+                {
+                    if let Ok(actual) = tmc
+                        .read_register(tmc4671::registers::PID_POSITION_ACTUAL)
+                        .await
+                    {
+                        let step_width = STEP_WIDTH_VALUE
+                            .load(core::sync::atomic::Ordering::Relaxed)
+                            .unsigned_abs()
+                            .max(1);
+                        let deadband = step_width.saturating_mul(HOLD_SETTLE_DEADBAND_COUNTS);
+                        let error = (actual as i32).wrapping_sub(target as i32);
+                        if error.unsigned_abs() <= deadband {
+                            // Writing PID_POSITION_ACTUAL also writes target.
+                            // Use the current target so small post-move error
+                            // is accepted without changing the commanded frame.
+                            let _ = tmc
+                                .write_register(tmc4671::registers::PID_POSITION_ACTUAL, target)
+                                .await;
+                        }
+                    }
+                }
+
                 if clear_pid_error_sums(tmc).await.is_err() {
                     defmt::warn!("TMC4671 PID error sum clear failed");
                 } else {
