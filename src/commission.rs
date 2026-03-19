@@ -744,8 +744,8 @@ const OUTER_MAX_POSITION_I: u16 = 128;
 const POS_TUNE_MAX_P: u16 = OUTER_MAX_POSITION_P;
 
 /// Response-tuned velocity remains soft on current hardware, so cap position P
-/// one ramp step below the value that produced persistent x/v output limiting.
-const POS_RESPONSE_TUNE_MAX_P: u16 = 1458;
+/// two ramp steps below the value that produced persistent x/v output limiting.
+const POS_RESPONSE_TUNE_MAX_P: u16 = 972;
 
 const OUTER_WARNING_NONE: u8 = 0;
 const OUTER_WARNING_LOW_CONFIDENCE_MECH_ID: u8 = 1;
