@@ -692,6 +692,13 @@ const VEL_VALIDATE_CHATTER_THRESHOLD: u32 = 3;
 const VEL_RETRY_LAMBDA_MUL_NUM: u32 = 3;
 const VEL_RETRY_LAMBDA_MUL_DEN: u32 = 2;
 
+/// Motor-local response tuning uses small velocity targets so an installed
+/// mechanism stays within the existing outer safety envelope.
+const VEL_RESPONSE_STEP_TARGET: u32 = 4;
+const VEL_RESPONSE_LIMIT: u32 = VELOCITY_CAP_COUNTS_PER_MS as u32;
+const VEL_RESPONSE_P_MUL_NUM: u32 = 3;
+const VEL_RESPONSE_P_MUL_DEN: u32 = 2;
+
 // ---------------------------------------------------------------------------
 // Position-loop tuning constants (Phase 11)
 // ---------------------------------------------------------------------------
@@ -890,13 +897,27 @@ enum VelocityValidateState {
     Finalize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+enum VelocityTuneStrategy {
+    /// Validate gains synthesized from the mechanical model.
+    Model,
+    /// Tune motor-local velocity P from bounded closed-loop response.
+    ResponseRamp,
+}
+
 /// Accumulated data for velocity-loop validation.
 #[derive(Debug, defmt::Format)]
 struct VelocityValidateData {
     /// Synthesized velocity gains for the current attempt.
     gains: VelocityGains,
+    /// Last response-ramp gain set that validated cleanly.
+    accepted_gains: VelocityGains,
+    /// Whether `accepted_gains` came from a passing response-ramp attempt.
+    has_accepted_gains: bool,
     /// The mechanical model from Phase 8 (needed for retry re-synthesis).
     model: MechanicalModel,
+    /// Velocity tuning strategy for this run.
+    strategy: VelocityTuneStrategy,
     /// Current attempt (0 = first, 1 = retry).
     attempt: u8,
     /// Velocity step amplitude (encoder counts/ms or velocity target units).
@@ -3111,39 +3132,13 @@ impl CommissioningEngine {
         true
     }
 
-    fn fallback_outer_result(
-        velocity_limit: u32,
-        j_eff: u32,
-        b_eff: u32,
-        mut diagnostics: OuterDiagnostics,
-        warning_code: u8,
-    ) -> OuterResult {
-        diagnostics.warning_code = warning_code;
-        OuterResult {
-            status: CommissionStatus::AcceptedWithWarnings,
+    fn response_velocity_gains() -> VelocityGains {
+        VelocityGains {
             velocity_p: OUTER_FALLBACK_VELOCITY_P,
             velocity_i: OUTER_FALLBACK_VELOCITY_I,
-            velocity_limit,
-            position_p: OUTER_FALLBACK_POSITION_P,
-            position_i: OUTER_FALLBACK_POSITION_I,
-            velocity_filter_hz: 0,
-            position_filter_hz: 0,
-            flux_filter_hz: 0,
-            torque_filter_hz: 0,
-            j_eff,
-            b_eff,
-            warning_code: diagnostics.warning_code,
-            mech_torque_step: diagnostics.mech_torque_step,
-            mech_fwd_accel: diagnostics.mech_fwd_accel,
-            mech_rev_accel: diagnostics.mech_rev_accel,
-            mech_fwd_peak_velocity: diagnostics.mech_fwd_peak_velocity,
-            mech_rev_peak_velocity: diagnostics.mech_rev_peak_velocity,
-            mech_fwd_travel: diagnostics.mech_fwd_travel,
-            mech_rev_travel: diagnostics.mech_rev_travel,
-            synth_velocity_p: diagnostics.synth_velocity_p,
-            synth_velocity_i: diagnostics.synth_velocity_i,
-            synth_position_p: diagnostics.synth_position_p,
-            synth_position_i: diagnostics.synth_position_i,
+            velocity_limit: VEL_RESPONSE_LIMIT,
+            effective_bandwidth_hz: 0,
+            lambda_vel_ms: 0,
         }
     }
 
@@ -3511,16 +3506,20 @@ impl CommissioningEngine {
                         return StepResult::Continue;
                     }
 
-                    defmt::warn!("mech-id: low-confidence data, using fallback outer gains");
-                    let result = Self::fallback_outer_result(
-                        backend.operational_velocity_limit(),
-                        model.j_eff,
-                        model.b_eff,
+                    defmt::warn!("mech-id: low-confidence data, using response velocity tuning");
+                    let carried_safety = match phase {
+                        OuterPhase::MechanicalId { safety, .. } => *safety,
+                        _ => unreachable!(),
+                    };
+                    let mut diagnostics = diagnostics;
+                    diagnostics.warning_code = OUTER_WARNING_LOW_CONFIDENCE_MECH_ID;
+                    *phase = OuterPhase::VelocityTune {
+                        model,
+                        peak_velocity: peak_avg,
                         diagnostics,
-                        OUTER_WARNING_LOW_CONFIDENCE_MECH_ID,
-                    );
-                    *phase = OuterPhase::Done(result.clone());
-                    return StepResult::OuterDone(result);
+                        safety: carried_safety,
+                    };
+                    return StepResult::PhaseChanged(PhaseId::VelocityTune);
                 }
 
                 // Carry safety limits forward to VelocityTune.
@@ -3665,57 +3664,77 @@ impl CommissioningEngine {
             _ => return StepResult::Continue,
         };
 
-        let config = backend.tmc_config();
-        let gains = match foci_core::autotune::simc_velocity_gains(
-            &model,
-            profile,
-            mode,
-            inner_lambda_us,
-            theta_e_us,
-            peak_velocity,
-            config,
-        ) {
-            Some(gains) => gains,
-            None => {
-                defmt::warn!("velocity tune: synthesis returned None");
-                return Self::fail_outer(phase, CommissionError::MechanicalIdFailed);
+        let (gains, strategy, step_target) = if diagnostics.warning_code
+            == OUTER_WARNING_LOW_CONFIDENCE_MECH_ID
+        {
+            let gains = Self::response_velocity_gains();
+            (
+                gains,
+                VelocityTuneStrategy::ResponseRamp,
+                VEL_RESPONSE_STEP_TARGET,
+            )
+        } else {
+            let config = backend.tmc_config();
+            let gains = match foci_core::autotune::simc_velocity_gains(
+                &model,
+                profile,
+                mode,
+                inner_lambda_us,
+                theta_e_us,
+                peak_velocity,
+                config,
+            ) {
+                Some(gains) => gains,
+                None => {
+                    defmt::warn!("velocity tune: synthesis returned None");
+                    return Self::fail_outer(phase, CommissionError::MechanicalIdFailed);
+                }
+            };
+
+            diagnostics.synth_velocity_p = gains.velocity_p;
+            diagnostics.synth_velocity_i = gains.velocity_i;
+
+            if gains.velocity_p > OUTER_MAX_VELOCITY_P || gains.velocity_i > OUTER_MAX_VELOCITY_I {
+                diagnostics.warning_code = OUTER_WARNING_UNSAFE_SYNTH_GAINS;
+                defmt::warn!(
+                    "velocity tune: synthesized P={}, I={} outside envelope, using response tuning",
+                    gains.velocity_p,
+                    gains.velocity_i
+                );
+                (
+                    Self::response_velocity_gains(),
+                    VelocityTuneStrategy::ResponseRamp,
+                    VEL_RESPONSE_STEP_TARGET,
+                )
+            } else {
+                let step_target = if gains.velocity_limit > 0 {
+                    (gains.velocity_limit * VEL_VALIDATE_STEP_PERCENT / 100).max(1)
+                } else {
+                    return Self::fail_outer(phase, CommissionError::VelocityValidationFailed);
+                };
+                (gains, VelocityTuneStrategy::Model, step_target)
             }
         };
 
-        diagnostics.synth_velocity_p = gains.velocity_p;
-        diagnostics.synth_velocity_i = gains.velocity_i;
-
-        let mut gains = gains;
-        if gains.velocity_p > OUTER_MAX_VELOCITY_P || gains.velocity_i > OUTER_MAX_VELOCITY_I {
-            diagnostics.warning_code = OUTER_WARNING_UNSAFE_SYNTH_GAINS;
-            defmt::warn!(
-                "velocity tune: synthesized P={}, I={} outside envelope, using fallback",
-                gains.velocity_p,
-                gains.velocity_i
-            );
-            gains.velocity_p = OUTER_FALLBACK_VELOCITY_P;
-            gains.velocity_i = OUTER_FALLBACK_VELOCITY_I;
-        }
-
         defmt::info!(
-            "velocity tune: P={}, I={}, limit={}, bw={}Hz, lambda={}ms",
+            "velocity tune: P={}, I={}, limit={}, bw={}Hz, lambda={}ms, strategy={}",
             gains.velocity_p,
             gains.velocity_i,
             gains.velocity_limit,
             gains.effective_bandwidth_hz,
-            gains.lambda_vel_ms
+            gains.lambda_vel_ms,
+            match strategy {
+                VelocityTuneStrategy::Model => "model",
+                VelocityTuneStrategy::ResponseRamp => "response",
+            }
         );
-
-        // Compute velocity step target: 15% of velocity_limit.
-        let step_target = if gains.velocity_limit > 0 {
-            (gains.velocity_limit * VEL_VALIDATE_STEP_PERCENT / 100).max(1)
-        } else {
-            return Self::fail_outer(phase, CommissionError::VelocityValidationFailed);
-        };
 
         let data = VelocityValidateData {
             gains,
+            accepted_gains: gains,
+            has_accepted_gains: false,
             model,
+            strategy,
             attempt: 0,
             step_target,
             forward_metrics: None,
@@ -4075,6 +4094,72 @@ impl CommissioningEngine {
                     symmetry
                 );
 
+                if data.strategy == VelocityTuneStrategy::ResponseRamp {
+                    match result {
+                        ValidationResult::Pass => {
+                            data.accepted_gains = data.gains;
+                            data.has_accepted_gains = true;
+
+                            let next_p = data.gains.velocity_p as u32 * VEL_RESPONSE_P_MUL_NUM
+                                / VEL_RESPONSE_P_MUL_DEN;
+                            if next_p > OUTER_MAX_VELOCITY_P as u32
+                                || next_p <= data.gains.velocity_p as u32
+                            {
+                                defmt::info!(
+                                    "vel response: cap reached, accepted P={}, I={}",
+                                    data.accepted_gains.velocity_p,
+                                    data.accepted_gains.velocity_i
+                                );
+                                let _ = backend.write_register(PID_VELOCITY_TARGET, 0).await;
+                                let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+                                let deadline =
+                                    backend.elapsed_us().wrapping_add(VEL_VALIDATE_SETTLE_US);
+                                *state = VelocityValidateState::SafeState {
+                                    deadline_us: deadline,
+                                };
+                            } else {
+                                data.attempt = data.attempt.saturating_add(1);
+                                data.gains.velocity_p = next_p as u16;
+                                data.gains.velocity_i = 0;
+                                defmt::info!(
+                                    "vel response: clean response, trying P={}, I=0",
+                                    data.gains.velocity_p
+                                );
+                                *state = VelocityValidateState::WriteGains;
+                            }
+                        }
+                        ValidationResult::Marginal | ValidationResult::Fail => {
+                            let failed_p = data.gains.velocity_p;
+                            if data.has_accepted_gains {
+                                data.gains = data.accepted_gains;
+                            } else {
+                                data.gains = Self::response_velocity_gains();
+                            }
+                            defmt::warn!(
+                                "vel response: {} at P={}, accepting P={}",
+                                match result {
+                                    ValidationResult::Fail => "fail",
+                                    _ => "marginal",
+                                },
+                                failed_p,
+                                if data.has_accepted_gains {
+                                    data.accepted_gains.velocity_p
+                                } else {
+                                    OUTER_FALLBACK_VELOCITY_P
+                                }
+                            );
+                            let _ = backend.write_register(PID_VELOCITY_TARGET, 0).await;
+                            let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+                            let deadline =
+                                backend.elapsed_us().wrapping_add(VEL_VALIDATE_SETTLE_US);
+                            *state = VelocityValidateState::SafeState {
+                                deadline_us: deadline,
+                            };
+                        }
+                    }
+                    return StepResult::Continue;
+                }
+
                 match result {
                     ValidationResult::Pass => {
                         // Success — restore safe state then transition.
@@ -4117,12 +4202,13 @@ impl CommissioningEngine {
                                     data.diagnostics.warning_code =
                                         OUTER_WARNING_UNSAFE_SYNTH_GAINS;
                                     defmt::warn!(
-                                        "vel retry: synthesized P={}, I={} outside envelope, using fallback",
+                                        "vel retry: synthesized P={}, I={} outside envelope, using response tuning",
                                         new_gains.velocity_p,
                                         new_gains.velocity_i
                                     );
-                                    new_gains.velocity_p = OUTER_FALLBACK_VELOCITY_P;
-                                    new_gains.velocity_i = OUTER_FALLBACK_VELOCITY_I;
+                                    new_gains = Self::response_velocity_gains();
+                                    data.strategy = VelocityTuneStrategy::ResponseRamp;
+                                    data.step_target = VEL_RESPONSE_STEP_TARGET;
                                 }
                                 defmt::info!(
                                     "vel retry: P={}, I={}, lambda={}ms",
@@ -4131,9 +4217,12 @@ impl CommissioningEngine {
                                     new_gains.lambda_vel_ms
                                 );
                                 data.gains = new_gains;
-                                data.step_target =
-                                    (new_gains.velocity_limit * VEL_VALIDATE_STEP_PERCENT / 100)
+                                if data.strategy == VelocityTuneStrategy::Model {
+                                    data.step_target = (new_gains.velocity_limit
+                                        * VEL_VALIDATE_STEP_PERCENT
+                                        / 100)
                                         .max(1);
+                                }
                                 *state = VelocityValidateState::WriteGains;
                             }
                             None => {
