@@ -3117,11 +3117,13 @@ mod app {
                         let deadband = step_width.saturating_mul(HOLD_SETTLE_DEADBAND_COUNTS);
                         let error = (actual as i32).wrapping_sub(target as i32);
                         if error.unsigned_abs() <= deadband {
-                            // Writing PID_POSITION_ACTUAL also writes target.
-                            // Use the current target so small post-move error
-                            // is accepted without changing the commanded frame.
+                            // With ABN feedback active, PID_POSITION_ACTUAL is
+                            // driven by encoder phase. Accept tiny settled
+                            // error by moving the internal TMC hold target to
+                            // the measured actual position; firmware/Klipper
+                            // logical step counts remain unchanged.
                             let _ = tmc
-                                .write_register(tmc4671::registers::PID_POSITION_ACTUAL, target)
+                                .write_register(tmc4671::registers::PID_POSITION_TARGET, actual)
                                 .await;
                         }
                     }
