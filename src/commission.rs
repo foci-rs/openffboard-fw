@@ -1214,7 +1214,7 @@ enum EngineMode {
 
 /// Cooperative commissioning state machine.
 ///
-/// Created when a `foci_commission_inner` or `foci_commission_outer`
+/// Created when a `foci_commission`, `foci_tune`, or `foci_calibrate`
 /// command arrives. Stored as `Option<CommissioningEngine>` in the
 /// P1 `tmc_control` task. Each 1kHz tick calls `step()`.
 pub struct CommissioningEngine {

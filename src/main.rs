@@ -2336,10 +2336,10 @@ mod app {
                         // check and terminal reply are complete, preventing
                         // a new foci_tune from racing the restore window.
 
-                        // Classify the original error: Spi and Shutdown are
-                        // safety faults that must hard-disable immediately.
-                        // All other errors are soft failures eligible for
-                        // entry-gain restore.
+                        // Classify the original error: Spi, Shutdown, and
+                        // SafetyEnvelopeViolation are safety faults that
+                        // must hard-disable immediately. All other errors
+                        // are soft failures eligible for entry-gain restore.
                         use foci_core::autotune::CommissionError as CE;
                         let is_safety_fault =
                             matches!(error, CE::Spi | CE::Shutdown | CE::SafetyEnvelopeViolation);
