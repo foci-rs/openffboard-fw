@@ -3755,20 +3755,13 @@ impl CommissioningEngine {
         false
     }
 
-    /// Map a safety violation to the appropriate phase-specific error.
-    fn safety_error_for_phase(phase: &OuterPhase) -> CommissionError {
-        match phase {
-            OuterPhase::MechanicalId { .. } => CommissionError::MechanicalIdFailed,
-            OuterPhase::VelocityTune { .. } | OuterPhase::VelocityValidate { .. } => {
-                CommissionError::VelocityValidationFailed
-            }
-            OuterPhase::PositionTune { .. } | OuterPhase::FilterTune { .. } => {
-                CommissionError::PositionTuneFailed
-            }
-            OuterPhase::Commit { .. } | OuterPhase::Done(_) | OuterPhase::Failed(_) => {
-                CommissionError::Shutdown // Terminal phases; safety shouldn't fire here.
-            }
-        }
+    /// Map a safety-envelope violation to the dedicated error variant.
+    ///
+    /// Always returns `SafetyEnvelopeViolation` so the OuterFailed handler
+    /// can classify it as a safety fault requiring hard disable, distinct
+    /// from normal phase failures that are eligible for soft restore.
+    fn safety_error_for_phase(_phase: &OuterPhase) -> CommissionError {
+        CommissionError::SafetyEnvelopeViolation
     }
 
     /// Transition outer phase to Failed.

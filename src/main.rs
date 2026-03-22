@@ -2341,7 +2341,8 @@ mod app {
                         // All other errors are soft failures eligible for
                         // entry-gain restore.
                         use foci_core::autotune::CommissionError as CE;
-                        let is_safety_fault = matches!(error, CE::Spi | CE::Shutdown);
+                        let is_safety_fault =
+                            matches!(error, CE::Spi | CE::Shutdown | CE::SafetyEnvelopeViolation);
 
                         let restore_failure: Option<CE> = if is_safety_fault {
                             Some(error)
