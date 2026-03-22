@@ -1352,9 +1352,17 @@ impl CommissioningEngine {
     ) -> Result<(), CommissionError> {
         use tmc4671::registers::*;
 
-        // 1. Zero targets.
+        // 1. Zero torque, velocity targets, and velocity offset.
         backend
             .write_register(PID_TORQUE_FLUX_TARGET, 0)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend
+            .write_register(PID_VELOCITY_TARGET, 0)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend
+            .write_register(PID_VELOCITY_OFFSET, 0)
             .await
             .map_err(|_| CommissionError::Spi)?;
 
@@ -1400,19 +1408,28 @@ impl CommissioningEngine {
             .await
             .map_err(|_| CommissionError::Spi)?;
 
-        // Reload filters (best-effort).
+        // Reload filters (best-effort). Explicitly disable when Hz=0
+        // to restore the full entry filter state.
         let pwm_maxcnt = backend.pwm_maxcnt();
         if snapshot.velocity_filter_hz > 0 {
             Self::write_biquad_velocity(backend, snapshot.velocity_filter_hz, pwm_maxcnt).await;
+        } else {
+            Self::write_sub_register(backend, CONFIG_BIQUAD_V_ENABLE, 0).await;
         }
         if snapshot.torque_filter_hz > 0 {
             Self::write_biquad_torque(backend, snapshot.torque_filter_hz, pwm_maxcnt).await;
+        } else {
+            Self::write_sub_register(backend, CONFIG_BIQUAD_T_ENABLE, 0).await;
         }
         if snapshot.position_filter_hz > 0 {
             Self::write_biquad_position(backend, snapshot.position_filter_hz, pwm_maxcnt).await;
+        } else {
+            Self::write_sub_register(backend, CONFIG_BIQUAD_X_ENABLE, 0).await;
         }
         if snapshot.flux_filter_hz > 0 {
             Self::write_biquad_flux(backend, snapshot.flux_filter_hz, pwm_maxcnt).await;
+        } else {
+            Self::write_sub_register(backend, CONFIG_BIQUAD_F_ENABLE, 0).await;
         }
 
         // 6. Reload voltage limit.
@@ -1432,6 +1449,41 @@ impl CommissioningEngine {
             .write_register(MODE_RAMP_MODE_MOTION, 0x8000_0003)
             .await
             .map_err(|_| CommissionError::Spi)?;
+
+        // 9. Stability check: verify position hold after 10ms.
+        let deadline = backend.elapsed_us().wrapping_add(10_000);
+        loop {
+            if backend.elapsed_us().wrapping_sub(deadline) < 0x8000_0000_0000_0000 {
+                break;
+            }
+        }
+        let pos1 = backend
+            .read_register(PID_POSITION_ACTUAL)
+            .await
+            .map_err(|_| CommissionError::Spi)? as i32;
+
+        let deadline2 = backend.elapsed_us().wrapping_add(10_000);
+        loop {
+            if backend.elapsed_us().wrapping_sub(deadline2) < 0x8000_0000_0000_0000 {
+                break;
+            }
+        }
+        let pos2 = backend
+            .read_register(PID_POSITION_ACTUAL)
+            .await
+            .map_err(|_| CommissionError::Spi)? as i32;
+
+        let drift = (pos2.wrapping_sub(pos1)).unsigned_abs();
+        if drift > 2 {
+            defmt::error!(
+                "restore: unstable hold: pos1={}, pos2={}, drift={}",
+                pos1,
+                pos2,
+                drift
+            );
+            let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+            return Err(CommissionError::Spi);
+        }
 
         Ok(())
     }
