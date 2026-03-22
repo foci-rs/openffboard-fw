@@ -2346,14 +2346,47 @@ mod app {
                             .await
                             {
                                 Ok(()) => {
-                                    enable_pin.set_high();
-                                    calibrated = true;
-                                    motor_enabled = true;
-                                    MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
-                                    defmt::warn!(
-                                        "Stage 2 soft failure ({}), entry gains restored",
-                                        error
-                                    );
+                                    // Stability check: wait 10ms, read pos,
+                                    // wait 10ms, read again, verify drift <= 2.
+                                    Mono::delay(10.millis()).await;
+                                    let pos1 = tmc
+                                        .read_register(tmc4671::registers::PID_POSITION_ACTUAL)
+                                        .await
+                                        .unwrap_or(0)
+                                        as i32;
+                                    Mono::delay(10.millis()).await;
+                                    let pos2 = tmc
+                                        .read_register(tmc4671::registers::PID_POSITION_ACTUAL)
+                                        .await
+                                        .unwrap_or(0)
+                                        as i32;
+                                    let drift = (pos2.wrapping_sub(pos1)).unsigned_abs();
+                                    if drift > 2 {
+                                        defmt::error!(
+                                            "restore: unstable hold: pos1={}, pos2={}, drift={}",
+                                            pos1,
+                                            pos2,
+                                            drift
+                                        );
+                                        let _ = tmc
+                                            .write_register(
+                                                tmc4671::registers::MODE_RAMP_MODE_MOTION,
+                                                0,
+                                            )
+                                            .await;
+                                        foci_core::selftest::restore_safe_state(tmc, enable_pin)
+                                            .await;
+                                    } else {
+                                        enable_pin.set_high();
+                                        calibrated = true;
+                                        motor_enabled = true;
+                                        MOTOR_ARMED
+                                            .store(true, core::sync::atomic::Ordering::Relaxed);
+                                        defmt::warn!(
+                                            "Stage 2 soft failure ({}), entry gains restored",
+                                            error
+                                        );
+                                    }
                                 }
                                 Err(restore_err) => {
                                     defmt::error!(
