@@ -2331,7 +2331,7 @@ mod app {
                             foci_core::autotune::CommissionStatus::Failed(e) => e.status_code(),
                         };
                         klipper_reply!(
-                            foci_commission_outer_result,
+                            foci_tune_result,
                             oid: u8 = oid,
                             status: u8 = status,
                             velocity_p: u16 = outer.velocity_p,
