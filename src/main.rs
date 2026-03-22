@@ -2236,42 +2236,6 @@ mod app {
                         Mono::delay(1.millis()).await;
                         continue;
                     }
-                    crate::commission::StepResult::InnerDone(inner) => {
-                        let oid = engine.oid();
-                        commission_engine = None;
-                        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
-                        foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
-
-                        // Persist inner gains so closed-loop entry uses them.
-                        stored_gains = Some(foci_core::pid::InnerLoopGains {
-                            flux_p: inner.flux_p,
-                            flux_i: inner.flux_i,
-                            torque_p: inner.torque_p,
-                            torque_i: inner.torque_i,
-                        });
-
-                        let status = match inner.status {
-                            foci_core::autotune::CommissionStatus::Accepted => 0u8,
-                            foci_core::autotune::CommissionStatus::AcceptedWithWarnings => 1,
-                            foci_core::autotune::CommissionStatus::InnerOnly => 2,
-                            foci_core::autotune::CommissionStatus::Failed(e) => e.status_code(),
-                        };
-                        klipper_reply!(
-                            foci_commission_inner_result,
-                            oid: u8 = oid,
-                            status: u8 = status,
-                            r_mohm: u32 = inner.r_mohm,
-                            l_uh: u32 = inner.l_uh,
-                            flux_p: u16 = inner.flux_p,
-                            flux_i: u16 = inner.flux_i,
-                            torque_p: u16 = inner.torque_p,
-                            torque_i: u16 = inner.torque_i,
-                            lambda_us: u32 = inner.lambda_us,
-                            theta_e_us: u32 = inner.theta_e_us,
-                            ringing_count: u8 = inner.ringing_count,
-                            bandwidth_hz: u32 = inner.bandwidth_hz
-                        );
-                    }
                     crate::commission::StepResult::InnerFailed(error) => {
                         let oid = engine.oid();
                         let is_calibrate = engine.is_calibrate();
