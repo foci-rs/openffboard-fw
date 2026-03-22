@@ -2336,11 +2336,16 @@ mod app {
                         // check and terminal reply are complete, preventing
                         // a new foci_tune from racing the restore window.
 
-                        // Attempt soft-failure restore. Track the actual
-                        // failure for accurate host reporting: None = success,
-                        // Some(err) = the specific reason restore failed.
+                        // Classify the original error: Spi and Shutdown are
+                        // safety faults that must hard-disable immediately.
+                        // All other errors are soft failures eligible for
+                        // entry-gain restore.
                         use foci_core::autotune::CommissionError as CE;
-                        let restore_failure: Option<CE> = if let Some(snapshot) = snapshot {
+                        let is_safety_fault = matches!(error, CE::Spi | CE::Shutdown);
+
+                        let restore_failure: Option<CE> = if is_safety_fault {
+                            Some(error)
+                        } else if let Some(snapshot) = snapshot {
                             let mut restore_backend = OpenFFBoardBackend { tmc, enable_pin };
                             match crate::commission::CommissioningEngine::restore_entry_gains(
                                 &snapshot,
