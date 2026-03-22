@@ -2267,6 +2267,9 @@ mod app {
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
                         // Motor stays enabled with tuned gains from the
                         // Commit phase. No restore_safe_state.
+                        enable_pin.set_high();
+                        calibrated = true;
+                        motor_enabled = true;
                         MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
 
                         // Persist outer gains to atomics for closed-loop entry.
@@ -2343,6 +2346,9 @@ mod app {
                             .await
                             {
                                 Ok(()) => {
+                                    enable_pin.set_high();
+                                    calibrated = true;
+                                    motor_enabled = true;
                                     MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
                                     defmt::warn!(
                                         "Stage 2 soft failure ({}), entry gains restored",
