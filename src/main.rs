@@ -129,7 +129,7 @@ mod app {
     }
 
     impl CalibrationError {
-        /// Map to a numeric status code for `foci_calibrate_response`.
+        /// Map to a numeric status code for `foci_calibrate_result`.
         fn status_code(&self) -> u8 {
             match self {
                 Self::SpiError => 1,
@@ -1369,7 +1369,7 @@ mod app {
                 "foci_calibrate rejected: STEP_WIDTH not configured (host must call tmc_set_encoder first)"
             );
             klipper_reply!(
-                foci_calibrate_response,
+                foci_calibrate_result,
                 oid: u8 = oid,
                 status: u8 = CalibrationError::ConfigFault.status_code(),
                 adc_i0: u16 = 0,
@@ -1381,7 +1381,7 @@ mod app {
         if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
             defmt::warn!("foci_calibrate rejected: commission in flight");
             klipper_reply!(
-                foci_calibrate_response,
+                foci_calibrate_result,
                 oid: u8 = oid,
                 status: u8 = CalibrationError::InternalError.status_code(),
                 adc_i0: u16 = 0,
@@ -1393,7 +1393,7 @@ mod app {
         if !tmc_send(foci_core::tmc::tmc_calibrate(oid)) {
             COMMISSION_IN_FLIGHT.store(false, Relaxed);
             klipper_reply!(
-                foci_calibrate_response,
+                foci_calibrate_result,
                 oid: u8 = oid,
                 status: u8 = CalibrationError::InternalError.status_code(),
                 adc_i0: u16 = 0,
@@ -2245,7 +2245,7 @@ mod app {
                         if is_calibrate {
                             let cal_error = CalibrationError::from_commission_error(error);
                             klipper_reply!(
-                                foci_calibrate_response,
+                                foci_calibrate_result,
                                 oid: u8 = oid,
                                 status: u8 = cal_error.status_code(),
                                 adc_i0: u16 = 0,
@@ -2434,7 +2434,7 @@ mod app {
                             COMMISSION_IN_FLIGHT
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             klipper_reply!(
-                                foci_calibrate_response,
+                                foci_calibrate_result,
                                 oid: u8 = oid,
                                 status: u8 = CalibrationError::SpiError.status_code(),
                                 adc_i0: u16 = 0,
@@ -2458,7 +2458,7 @@ mod app {
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
                         defmt::info!("foci_calibrate complete: oid={}", oid);
                         klipper_reply!(
-                            foci_calibrate_response,
+                            foci_calibrate_result,
                             oid: u8 = oid,
                             status: u8 = 0,
                             adc_i0: u16 = cal_result.adc_i0,
@@ -2629,7 +2629,7 @@ mod app {
                             COMMISSION_IN_FLIGHT
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             klipper_reply!(
-                                foci_calibrate_response,
+                                foci_calibrate_result,
                                 oid: u8 = oid,
                                 status: u8 = CalibrationError::AlreadyEnabled.status_code(),
                                 adc_i0: u16 = 0,
