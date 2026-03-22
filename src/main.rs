@@ -410,6 +410,14 @@ mod app {
     /// Position I gain for cross-priority access (Q8.8).
     static POSITION_I_VALUE: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 
+    /// Velocity P gain for cross-priority access (Q8.8).
+    /// Default 1152 = 4.5 in Q8.8 (conservative).
+    static VELOCITY_P_VALUE: core::sync::atomic::AtomicU16 =
+        core::sync::atomic::AtomicU16::new(1152);
+
+    /// Velocity I gain for cross-priority access (Q8.8).
+    static VELOCITY_I_VALUE: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+
     /// Lock-free move queue for hardware step/dir.
     /// P2 enqueues, P3 dequeues. When timer is disabled, P1/P2 may drain.
     ///
@@ -2215,6 +2223,10 @@ mod app {
                 // loop entry uses defaults, not stale commissioned values.
                 use core::sync::atomic::Ordering::Relaxed as R;
                 VELOCITY_LIMIT_CFG.store(500_000, R);
+                POSITION_P_VALUE.store(640, R);
+                POSITION_I_VALUE.store(0, R);
+                VELOCITY_P_VALUE.store(1152, R);
+                VELOCITY_I_VALUE.store(0, R);
                 VELOCITY_FILTER_HZ.store(0, R);
                 POSITION_FILTER_HZ.store(0, R);
                 FLUX_FILTER_HZ.store(0, R);
@@ -2320,6 +2332,10 @@ mod app {
                             .store(outer.position_p, core::sync::atomic::Ordering::Relaxed);
                         POSITION_I_VALUE
                             .store(outer.position_i, core::sync::atomic::Ordering::Relaxed);
+                        VELOCITY_P_VALUE
+                            .store(outer.velocity_p, core::sync::atomic::Ordering::Relaxed);
+                        VELOCITY_I_VALUE
+                            .store(outer.velocity_i, core::sync::atomic::Ordering::Relaxed);
 
                         // Persist velocity limit for closed-loop entry.
                         VELOCITY_LIMIT_CFG
@@ -2383,39 +2399,67 @@ mod app {
                         let oid = engine.oid();
                         commission_engine = None;
 
-                        // The engine's ClosedLoopEntry phase already
-                        // configured PID gains, limits, filters, and
-                        // entered position mode. Apply stored current-loop
-                        // gains on top (the Calibrate path used defaults).
-                        if let Some(gains) = stored_gains {
-                            let (flux_reg, torque_reg) = gains.to_registers();
-                            let _ = tmc
-                                .write_register(tmc4671::registers::PID_FLUX_P_FLUX_I, flux_reg)
-                                .await;
+                        // The engine's ClosedLoopEntry phase entered position
+                        // mode with conservative defaults. Re-apply the
+                        // saved gain set from atomics (host-configured or
+                        // outer-commissioned values).
+                        {
+                            use core::sync::atomic::Ordering::Relaxed;
+
+                            // Current-loop gains from prior commissioning.
+                            if let Some(gains) = stored_gains {
+                                let (flux_reg, torque_reg) = gains.to_registers();
+                                let _ = tmc
+                                    .write_register(tmc4671::registers::PID_FLUX_P_FLUX_I, flux_reg)
+                                    .await;
+                                let _ = tmc
+                                    .write_register(
+                                        tmc4671::registers::PID_TORQUE_P_TORQUE_I,
+                                        torque_reg,
+                                    )
+                                    .await;
+                            }
+
+                            // Velocity gains from host config or outer commissioning.
+                            let velocity_p = VELOCITY_P_VALUE.load(Relaxed);
+                            let velocity_i = VELOCITY_I_VALUE.load(Relaxed);
+                            let velocity_reg = (velocity_p as u32) << 16 | velocity_i as u32;
                             let _ = tmc
                                 .write_register(
-                                    tmc4671::registers::PID_TORQUE_P_TORQUE_I,
-                                    torque_reg,
+                                    tmc4671::registers::PID_VELOCITY_P_VELOCITY_I,
+                                    velocity_reg,
+                                )
+                                .await;
+
+                            // Position gains from host config or outer commissioning.
+                            let position_p = POSITION_P_VALUE.load(Relaxed);
+                            let position_i = POSITION_I_VALUE.load(Relaxed);
+                            let position_reg = (position_p as u32) << 16 | position_i as u32;
+                            let _ = tmc
+                                .write_register(
+                                    tmc4671::registers::PID_POSITION_P_POSITION_I,
+                                    position_reg,
+                                )
+                                .await;
+
+                            // Velocity limit.
+                            let velocity_limit = VELOCITY_LIMIT_CFG.load(Relaxed);
+                            let _ = tmc
+                                .write_register(
+                                    tmc4671::registers::PID_VELOCITY_LIMIT,
+                                    velocity_limit,
+                                )
+                                .await;
+
+                            // Current limit (TMC4671 resets on mode change).
+                            let current_limit = CURRENT_LIMIT_REG.load(Relaxed);
+                            let _ = tmc
+                                .write_register(
+                                    tmc4671::registers::PID_TORQUE_FLUX_LIMITS,
+                                    current_limit,
                                 )
                                 .await;
                         }
-
-                        // Re-apply current limit (TMC4671 resets it on
-                        // mode change).
-                        let current_limit =
-                            CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
-                        let _ = tmc
-                            .write_register(
-                                tmc4671::registers::PID_TORQUE_FLUX_LIMITS,
-                                current_limit,
-                            )
-                            .await;
-
-                        // Sync position/velocity atomics to match the
-                        // conservative defaults the engine wrote to hardware.
-                        // The homing I-suppression reads these atomics.
-                        POSITION_P_VALUE.store(640, core::sync::atomic::Ordering::Relaxed);
-                        POSITION_I_VALUE.store(0, core::sync::atomic::Ordering::Relaxed);
 
                         // Re-apply biquad filters from stored atomics.
                         // The engine's ClosedLoopEntry disabled all filters
@@ -2645,6 +2689,8 @@ mod app {
                     } => {
                         POSITION_P_VALUE.store(position_p, core::sync::atomic::Ordering::Relaxed);
                         POSITION_I_VALUE.store(position_i, core::sync::atomic::Ordering::Relaxed);
+                        VELOCITY_P_VALUE.store(velocity_p, core::sync::atomic::Ordering::Relaxed);
+                        VELOCITY_I_VALUE.store(velocity_i, core::sync::atomic::Ordering::Relaxed);
                         defmt::info!(
                             "Position gains received: pos P={} I={}, vel P={} I={}",
                             position_p,
