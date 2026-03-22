@@ -3224,14 +3224,25 @@ impl CommissioningEngine {
                     return Self::fail_inner(phase, CommissionError::Spi);
                 }
 
-                // Clear PID integrators.
-                Self::write_sub_register(backend, PID_ERROR_PID_TORQUE_ERROR_SUM, 0).await;
-                Self::write_sub_register(backend, PID_ERROR_PID_FLUX_ERROR_SUM, 0).await;
-                Self::write_sub_register(backend, PID_ERROR_PID_VELOCITY_ERROR_SUM, 0).await;
-                Self::write_sub_register(backend, PID_ERROR_PID_POSITION_ERROR_SUM, 0).await;
-
-                // Clear status flags.
-                let _ = backend.write_register(STATUS_FLAGS, 0).await;
+                // Clear PID integrators. These must succeed — entering
+                // position mode with stale error sums causes transients.
+                let integrators_ok = async {
+                    Self::write_sub_register_checked(backend, PID_ERROR_PID_TORQUE_ERROR_SUM, 0)
+                        .await?;
+                    Self::write_sub_register_checked(backend, PID_ERROR_PID_FLUX_ERROR_SUM, 0)
+                        .await?;
+                    Self::write_sub_register_checked(backend, PID_ERROR_PID_VELOCITY_ERROR_SUM, 0)
+                        .await?;
+                    Self::write_sub_register_checked(backend, PID_ERROR_PID_POSITION_ERROR_SUM, 0)
+                        .await?;
+                    backend
+                        .write_register(STATUS_FLAGS, 0)
+                        .await
+                        .map_err(|_| ())
+                };
+                if integrators_ok.await.is_err() {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
 
                 *cle_state = ClosedLoopEntryState::WritePositionConfig;
                 StepResult::Continue
@@ -5272,6 +5283,22 @@ impl CommissioningEngine {
     ) {
         let _ = backend.write_register(sub.addr, sub.sub_addr as u32).await;
         let _ = backend.write_register(sub.data, value).await;
+    }
+
+    /// Write a sub-register, returning `Err(())` if either SPI transfer fails.
+    async fn write_sub_register_checked<B: CommissioningBackend>(
+        backend: &mut B,
+        sub: tmc4671::registers::SubRegister,
+        value: u32,
+    ) -> Result<(), ()> {
+        backend
+            .write_register(sub.addr, sub.sub_addr as u32)
+            .await
+            .map_err(|_| ())?;
+        backend
+            .write_register(sub.data, value)
+            .await
+            .map_err(|_| ())
     }
 
     /// Write velocity biquad filter coefficients.
