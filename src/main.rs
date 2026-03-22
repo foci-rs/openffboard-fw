@@ -2747,7 +2747,10 @@ mod app {
                         current_ringing_count,
                         current_bandwidth_hz,
                     } => {
-                        if motor_enabled {
+                        // Stage 2 requires the motor to be enabled and
+                        // holding in closed-loop position mode (from Stage 1
+                        // or a prior calibrate). Reject if not ready.
+                        if !motor_enabled || !calibrated {
                             COMMISSION_IN_FLIGHT
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             klipper_reply!(
@@ -2755,7 +2758,7 @@ mod app {
                                 oid: u8 = oid,
                                 phase: u8 = 0,
                                 status: u8 =
-                                    foci_core::autotune::CommissionError::MotorEnabled
+                                    foci_core::autotune::CommissionError::EncoderNotAligned
                                         .status_code()
                             );
                             continue;
@@ -2775,7 +2778,6 @@ mod app {
                             );
                             continue;
                         }
-                        calibrated = false;
                         let entry_snapshot = {
                             use core::sync::atomic::Ordering::Relaxed;
                             crate::commission::EntrySnapshot {
