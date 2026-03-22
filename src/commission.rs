@@ -1161,6 +1161,35 @@ enum OuterPhase {
     Failed(CommissionError),
 }
 
+/// Snapshot of outer gains at Stage 2 entry, for soft-failure restoration.
+///
+/// Current-loop gains are not included because Stage 2 never mutates them.
+/// Built by the caller in `main.rs` from firmware atomics and passed to
+/// `new_outer()`.
+#[derive(Debug, Clone, Copy, defmt::Format)]
+pub struct EntrySnapshot {
+    /// Velocity P gain (Q8.8).
+    pub velocity_p: u16,
+    /// Velocity I gain (Q8.8).
+    pub velocity_i: u16,
+    /// Position P gain (Q8.8).
+    pub position_p: u16,
+    /// Position I gain (Q8.8).
+    pub position_i: u16,
+    /// PID velocity limit register value.
+    pub velocity_limit: u32,
+    /// PIDOUT_UQ_UD_LIMITS operational value.
+    pub voltage_limit: u32,
+    /// Velocity biquad filter cutoff (Hz), 0 = disabled.
+    pub velocity_filter_hz: u16,
+    /// Torque biquad filter cutoff (Hz), 0 = disabled.
+    pub torque_filter_hz: u16,
+    /// Position biquad filter cutoff (Hz), 0 = disabled.
+    pub position_filter_hz: u16,
+    /// Flux biquad filter cutoff (Hz), 0 = disabled.
+    pub flux_filter_hz: u16,
+}
+
 /// Which commissioning mode is active.
 #[derive(Debug, defmt::Format)]
 enum EngineMode {
@@ -1182,6 +1211,8 @@ enum EngineMode {
         current_ringing: bool,
         /// Current-loop effective bandwidth Hz from inner commissioning.
         current_bandwidth_hz: u32,
+        /// Gains snapshot at entry for soft-failure restoration.
+        entry_snapshot: EntrySnapshot,
     },
 }
 
@@ -1252,6 +1283,9 @@ impl CommissioningEngine {
     }
 
     /// Create an engine for outer (mechanical) commissioning.
+    ///
+    /// `entry_snapshot` captures the active outer gains at entry for
+    /// soft-failure restoration. Built by the caller from firmware atomics.
     pub fn new_outer(
         oid: u8,
         profile: CommissionProfile,
@@ -1260,6 +1294,7 @@ impl CommissioningEngine {
         theta_e_us: u32,
         current_ringing: bool,
         current_bandwidth_hz: u32,
+        entry_snapshot: EntrySnapshot,
     ) -> Self {
         // Safety limits and data are initialized with placeholder values.
         // The MechanicalIdState::Setup sub-state reads the actual encoder
@@ -1280,6 +1315,7 @@ impl CommissioningEngine {
                 theta_e_us,
                 current_ringing,
                 current_bandwidth_hz,
+                entry_snapshot,
             },
             buf: TransientBuffer::new(),
         }
@@ -1299,6 +1335,109 @@ impl CommissioningEngine {
                 ..
             }
         )
+    }
+
+    /// Return the entry snapshot for the outer engine, if active.
+    pub fn entry_snapshot(&self) -> Option<EntrySnapshot> {
+        match &self.engine_mode {
+            EngineMode::Outer { entry_snapshot, .. } => Some(*entry_snapshot),
+            _ => None,
+        }
+    }
+
+    /// Restore outer gains from an entry snapshot after Stage 2 soft failure.
+    ///
+    /// Follows the spec's restore sequence: zero targets, disable mode,
+    /// clear integrators, reload outer gains + filters from snapshot,
+    /// reload voltage limit, zero position, re-enter position mode.
+    pub async fn restore_entry_gains<B: CommissioningBackend>(
+        snapshot: &EntrySnapshot,
+        backend: &mut B,
+    ) -> Result<(), CommissionError> {
+        use tmc4671::registers::*;
+
+        // 1. Zero targets.
+        backend
+            .write_register(PID_TORQUE_FLUX_TARGET, 0)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+
+        // 2. Disable motion mode.
+        backend
+            .write_register(MODE_RAMP_MODE_MOTION, 0)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+
+        // 3. Clear PID integrators.
+        Self::write_sub_register_checked(backend, PID_ERROR_PID_TORQUE_ERROR_SUM, 0)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        Self::write_sub_register_checked(backend, PID_ERROR_PID_FLUX_ERROR_SUM, 0)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        Self::write_sub_register_checked(backend, PID_ERROR_PID_VELOCITY_ERROR_SUM, 0)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        Self::write_sub_register_checked(backend, PID_ERROR_PID_POSITION_ERROR_SUM, 0)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+
+        // 4. Clear status flags.
+        backend
+            .write_register(STATUS_FLAGS, 0)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+
+        // 5. Reload outer gains from snapshot.
+        let velocity_reg = (snapshot.velocity_p as u32) << 16 | snapshot.velocity_i as u32;
+        backend
+            .write_register(PID_VELOCITY_P_VELOCITY_I, velocity_reg)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        let position_reg = (snapshot.position_p as u32) << 16 | snapshot.position_i as u32;
+        backend
+            .write_register(PID_POSITION_P_POSITION_I, position_reg)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend
+            .write_register(PID_VELOCITY_LIMIT, snapshot.velocity_limit)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+
+        // Reload filters (best-effort).
+        let pwm_maxcnt = backend.pwm_maxcnt();
+        if snapshot.velocity_filter_hz > 0 {
+            Self::write_biquad_velocity(backend, snapshot.velocity_filter_hz, pwm_maxcnt).await;
+        }
+        if snapshot.torque_filter_hz > 0 {
+            Self::write_biquad_torque(backend, snapshot.torque_filter_hz, pwm_maxcnt).await;
+        }
+        if snapshot.position_filter_hz > 0 {
+            Self::write_biquad_position(backend, snapshot.position_filter_hz, pwm_maxcnt).await;
+        }
+        if snapshot.flux_filter_hz > 0 {
+            Self::write_biquad_flux(backend, snapshot.flux_filter_hz, pwm_maxcnt).await;
+        }
+
+        // 6. Reload voltage limit.
+        backend
+            .write_register(PIDOUT_UQ_UD_LIMITS, snapshot.voltage_limit)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+
+        // 7. Zero position (also zeros target per datasheet 0x6B).
+        backend
+            .write_register(PID_POSITION_ACTUAL, 0)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+
+        // 8. Re-enter position mode.
+        backend
+            .write_register(MODE_RAMP_MODE_MOTION, 0x8000_0003)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+
+        Ok(())
     }
 
     /// Advance the state machine by one tick (max 1ms).
@@ -1331,6 +1470,7 @@ impl CommissioningEngine {
                 theta_e_us,
                 current_ringing,
                 current_bandwidth_hz,
+                ..
             } => {
                 Self::step_outer(
                     phase,

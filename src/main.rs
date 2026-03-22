@@ -2773,6 +2773,21 @@ mod app {
                             continue;
                         }
                         calibrated = false;
+                        let entry_snapshot = {
+                            use core::sync::atomic::Ordering::Relaxed;
+                            crate::commission::EntrySnapshot {
+                                velocity_p: VELOCITY_P_VALUE.load(Relaxed),
+                                velocity_i: VELOCITY_I_VALUE.load(Relaxed),
+                                position_p: POSITION_P_VALUE.load(Relaxed),
+                                position_i: POSITION_I_VALUE.load(Relaxed),
+                                velocity_limit: VELOCITY_LIMIT_CFG.load(Relaxed),
+                                voltage_limit: 16000,
+                                velocity_filter_hz: VELOCITY_FILTER_HZ.load(Relaxed),
+                                torque_filter_hz: TORQUE_FILTER_HZ.load(Relaxed),
+                                position_filter_hz: POSITION_FILTER_HZ.load(Relaxed),
+                                flux_filter_hz: FLUX_FILTER_HZ.load(Relaxed),
+                            }
+                        };
                         commission_engine =
                             Some(crate::commission::CommissioningEngine::new_outer(
                                 oid,
@@ -2782,6 +2797,7 @@ mod app {
                                 theta_e_us,
                                 current_ringing_count > 1,
                                 current_bandwidth_hz,
+                                entry_snapshot,
                             ));
                     }
                     TmcRequest::SelfTest { oid } => {
