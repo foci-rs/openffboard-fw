@@ -24,12 +24,26 @@ fn main() {
         "memory.x"
     };
     fs::copy(memory_x, out_dir.join("memory.x")).unwrap();
+
+    // Generate CCMRAM linker section supplement
+    let ccmram_x = out_dir.join("ccmram.x");
+    fs::write(
+        &ccmram_x,
+        "SECTIONS {\n\
+         \x20 .ccmram (NOLOAD) : ALIGN(4) {\n\
+         \x20   *(.ccmram .ccmram.*)\n\
+         \x20 } > CCMRAM\n\
+         }\n",
+    )
+    .expect("failed to write ccmram.x");
+
     println!("cargo:rustc-link-search={}", out_dir.display());
 
     // Linker configuration
     println!("cargo:rustc-link-arg-bins=--nmagic");
     println!("cargo:rustc-link-arg-bins=-Tlink.x");
     println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
+    println!("cargo:rustc-link-arg-bins=-Tccmram.x");
     println!("cargo:rerun-if-changed=memory.x");
     println!("cargo:rerun-if-changed=memory-dev.x");
     println!("cargo:rerun-if-changed=build.rs");
