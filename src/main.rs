@@ -2336,62 +2336,62 @@ mod app {
                         // check and terminal reply are complete, preventing
                         // a new foci_tune from racing the restore window.
 
-                        // Attempt soft-failure restore if snapshot available.
-                        let restore_ok = if let Some(snapshot) = snapshot {
+                        // Attempt soft-failure restore. Track the actual
+                        // failure for accurate host reporting: None = success,
+                        // Some(err) = the specific reason restore failed.
+                        use foci_core::autotune::CommissionError as CE;
+                        let restore_failure: Option<CE> = if let Some(snapshot) = snapshot {
                             let mut restore_backend = OpenFFBoardBackend { tmc, enable_pin };
-                            let restore_result =
-                                crate::commission::CommissioningEngine::restore_entry_gains(
-                                    &snapshot,
-                                    &mut restore_backend,
-                                )
-                                .await;
-
-                            if restore_result.is_ok() {
-                                // Stability check with cooperative delay.
-                                // SPI read failures are safety faults.
-                                let stability = async {
+                            match crate::commission::CommissioningEngine::restore_entry_gains(
+                                &snapshot,
+                                &mut restore_backend,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    // Stability check with cooperative delay.
                                     Mono::delay(10.millis()).await;
                                     let pos1 = tmc
                                         .read_register(tmc4671::registers::PID_POSITION_ACTUAL)
-                                        .await
-                                        .map_err(|_| ())?;
+                                        .await;
                                     Mono::delay(10.millis()).await;
                                     let pos2 = tmc
                                         .read_register(tmc4671::registers::PID_POSITION_ACTUAL)
-                                        .await
-                                        .map_err(|_| ())?;
-                                    let drift =
-                                        (pos2 as i32).wrapping_sub(pos1 as i32).unsigned_abs();
-                                    if drift > 2 {
-                                        defmt::error!(
-                                            "restore: unstable: pos1={}, pos2={}, drift={}",
-                                            pos1,
-                                            pos2,
-                                            drift
-                                        );
-                                        Err(())
-                                    } else {
-                                        Ok(())
+                                        .await;
+                                    match (pos1, pos2) {
+                                        (Ok(p1), Ok(p2)) => {
+                                            let drift =
+                                                (p2 as i32).wrapping_sub(p1 as i32).unsigned_abs();
+                                            if drift > 2 {
+                                                defmt::error!(
+                                                    "restore: unstable: p1={}, p2={}, drift={}",
+                                                    p1,
+                                                    p2,
+                                                    drift
+                                                );
+                                                Some(CE::CurrentValidationFailed)
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        _ => {
+                                            defmt::error!("restore: stability read SPI failed");
+                                            Some(CE::Spi)
+                                        }
                                     }
-                                };
-                                stability.await.is_ok()
-                            } else {
-                                defmt::error!("Stage 2 restore SPI failed, disabling");
-                                false
+                                }
+                                Err(restore_err) => {
+                                    defmt::error!("Stage 2 restore failed: {}", restore_err);
+                                    Some(restore_err)
+                                }
                             }
                         } else {
-                            false
+                            Some(CE::Spi)
                         };
 
-                        if restore_ok {
-                            // Soft failure: motor holding with entry gains.
-                            enable_pin.set_high();
-                            calibrated = true;
-                            motor_enabled = true;
-                            MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
-                            defmt::warn!("Stage 2 soft failure ({}), entry gains restored", error);
-                        } else {
+                        let reply_status = if let Some(fault) = restore_failure {
                             // Safety fault: hard disable, clear all state.
+                            // Report the actual restore failure to the host.
                             let _ = tmc
                                 .write_register(tmc4671::registers::MODE_RAMP_MODE_MOTION, 0)
                                 .await;
@@ -2400,15 +2400,24 @@ mod app {
                             motor_enabled = false;
                             MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
                             stepper_stop();
-                            defmt::error!("Stage 2 safety fault ({}), motor disabled", error);
-                        }
+                            defmt::error!("Stage 2 safety fault ({}), motor disabled", fault);
+                            fault.status_code()
+                        } else {
+                            // Soft failure: motor holding with entry gains.
+                            enable_pin.set_high();
+                            calibrated = true;
+                            motor_enabled = true;
+                            MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+                            defmt::warn!("Stage 2 soft failure ({}), entry gains restored", error);
+                            error.status_code()
+                        };
 
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
                         klipper_reply!(
                             foci_commission_phase,
                             oid: u8 = oid,
                             phase: u8 = 0,
-                            status: u8 = error.status_code()
+                            status: u8 = reply_status
                         );
                     }
                     crate::commission::StepResult::CalibrateDone(cal_result) => {
