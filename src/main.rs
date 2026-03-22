@@ -2402,68 +2402,79 @@ mod app {
                         // The engine's ClosedLoopEntry phase entered position
                         // mode with conservative defaults. Re-apply the
                         // saved gain set from atomics (host-configured or
-                        // outer-commissioned values).
-                        {
+                        // outer-commissioned values). SPI failures abort
+                        // and restore safe state -- reporting success with
+                        // wrong gains active is worse than failing.
+                        //
+                        // NOTE: the stability check ran with conservative
+                        // defaults, not the saved gains. A post-restore
+                        // stability re-check is not implemented (the old
+                        // tmc_enter_closedloop didn't have one either).
+                        let gain_restore = async {
                             use core::sync::atomic::Ordering::Relaxed;
+                            use tmc4671::registers::*;
 
                             // Current-loop gains from prior commissioning.
                             if let Some(gains) = stored_gains {
                                 let (flux_reg, torque_reg) = gains.to_registers();
-                                let _ = tmc
-                                    .write_register(tmc4671::registers::PID_FLUX_P_FLUX_I, flux_reg)
-                                    .await;
-                                let _ = tmc
-                                    .write_register(
-                                        tmc4671::registers::PID_TORQUE_P_TORQUE_I,
-                                        torque_reg,
-                                    )
-                                    .await;
+                                tmc.write_register(PID_FLUX_P_FLUX_I, flux_reg)
+                                    .await
+                                    .map_err(|_| ())?;
+                                tmc.write_register(PID_TORQUE_P_TORQUE_I, torque_reg)
+                                    .await
+                                    .map_err(|_| ())?;
                             }
 
-                            // Velocity gains from host config or outer commissioning.
+                            // Velocity gains.
                             let velocity_p = VELOCITY_P_VALUE.load(Relaxed);
                             let velocity_i = VELOCITY_I_VALUE.load(Relaxed);
                             let velocity_reg = (velocity_p as u32) << 16 | velocity_i as u32;
-                            let _ = tmc
-                                .write_register(
-                                    tmc4671::registers::PID_VELOCITY_P_VELOCITY_I,
-                                    velocity_reg,
-                                )
-                                .await;
+                            tmc.write_register(PID_VELOCITY_P_VELOCITY_I, velocity_reg)
+                                .await
+                                .map_err(|_| ())?;
 
-                            // Position gains from host config or outer commissioning.
+                            // Position gains.
                             let position_p = POSITION_P_VALUE.load(Relaxed);
                             let position_i = POSITION_I_VALUE.load(Relaxed);
                             let position_reg = (position_p as u32) << 16 | position_i as u32;
-                            let _ = tmc
-                                .write_register(
-                                    tmc4671::registers::PID_POSITION_P_POSITION_I,
-                                    position_reg,
-                                )
-                                .await;
+                            tmc.write_register(PID_POSITION_P_POSITION_I, position_reg)
+                                .await
+                                .map_err(|_| ())?;
 
                             // Velocity limit.
                             let velocity_limit = VELOCITY_LIMIT_CFG.load(Relaxed);
-                            let _ = tmc
-                                .write_register(
-                                    tmc4671::registers::PID_VELOCITY_LIMIT,
-                                    velocity_limit,
-                                )
-                                .await;
+                            tmc.write_register(PID_VELOCITY_LIMIT, velocity_limit)
+                                .await
+                                .map_err(|_| ())?;
 
                             // Current limit (TMC4671 resets on mode change).
                             let current_limit = CURRENT_LIMIT_REG.load(Relaxed);
-                            let _ = tmc
-                                .write_register(
-                                    tmc4671::registers::PID_TORQUE_FLUX_LIMITS,
-                                    current_limit,
-                                )
-                                .await;
+                            tmc.write_register(PID_TORQUE_FLUX_LIMITS, current_limit)
+                                .await
+                                .map_err(|_| ())?;
+
+                            Ok::<(), ()>(())
+                        };
+                        if gain_restore.await.is_err() {
+                            defmt::error!("CalibrateDone: saved gain restore SPI failed");
+                            foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                            COMMISSION_IN_FLIGHT
+                                .store(false, core::sync::atomic::Ordering::Relaxed);
+                            klipper_reply!(
+                                foci_calibrate_response,
+                                oid: u8 = oid,
+                                status: u8 = CalibrationError::SpiError.status_code(),
+                                adc_i0: u16 = 0,
+                                adc_i1: u16 = 0,
+                                encoder_count: u32 = 0
+                            );
+                            continue;
                         }
 
                         // Re-apply biquad filters from stored atomics.
                         // The engine's ClosedLoopEntry disabled all filters
-                        // (no access to filter Hz atomics).
+                        // (no access to filter Hz atomics). Filters are
+                        // best-effort -- failure does not abort calibration.
                         apply_stored_filters(tmc).await;
 
                         enable_pin.set_high();
@@ -2519,15 +2530,23 @@ mod app {
                             torque_i: inner.torque_i,
                         });
 
-                        // Sync position/velocity atomics to match the
+                        // Sync all outer-gain atomics to match the
                         // fallback values the engine wrote to hardware.
-                        // The homing I-suppression reads these atomics.
+                        // CalibrateDone reads these on the next re-enable.
                         POSITION_P_VALUE.store(
                             commission_result.fallback_position_p,
                             core::sync::atomic::Ordering::Relaxed,
                         );
                         POSITION_I_VALUE.store(
                             commission_result.fallback_position_i,
+                            core::sync::atomic::Ordering::Relaxed,
+                        );
+                        VELOCITY_P_VALUE.store(
+                            commission_result.fallback_velocity_p,
+                            core::sync::atomic::Ordering::Relaxed,
+                        );
+                        VELOCITY_I_VALUE.store(
+                            commission_result.fallback_velocity_i,
                             core::sync::atomic::Ordering::Relaxed,
                         );
                         VELOCITY_LIMIT_CFG.store(
