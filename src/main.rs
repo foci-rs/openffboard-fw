@@ -2301,7 +2301,9 @@ mod app {
                         let oid = engine.oid();
                         commission_engine = None;
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
-                        foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                        // Motor stays enabled with tuned gains from the
+                        // Commit phase. No restore_safe_state.
+                        MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
 
                         // Persist outer gains to atomics for closed-loop entry.
                         POSITION_P_VALUE
