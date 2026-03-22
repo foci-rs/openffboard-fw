@@ -3385,6 +3385,22 @@ impl CommissioningEngine {
                     return Self::fail_inner(phase, CommissionError::Spi);
                 }
 
+                // Stability check: position must not be drifting.
+                // Threshold of 2 encoder counts between 10ms and 30ms
+                // readings indicates the motor is holding position.
+                const STABILITY_THRESHOLD: u32 = 2;
+                let drift = (pos2.wrapping_sub(*position_1)).unsigned_abs();
+                if drift > STABILITY_THRESHOLD {
+                    defmt::error!(
+                        "closed-loop: unstable: pos1={}, pos2={}, drift={}",
+                        position_1,
+                        pos2,
+                        drift
+                    );
+                    let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
+
                 defmt::info!("closed-loop position mode active (engine)");
 
                 match sequence {
