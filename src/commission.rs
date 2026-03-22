@@ -109,8 +109,6 @@ pub enum StepResult {
     Continue,
     /// A phase transition occurred. Report to host.
     PhaseChanged(PhaseId),
-    /// Inner commissioning completed successfully.
-    InnerDone(InnerResult),
     /// Inner commissioning failed.
     InnerFailed(CommissionError),
     /// Outer commissioning completed successfully.
@@ -647,8 +645,6 @@ enum InnerPhase {
         /// Inner result carried forward for CommissionDone (Commission sequence only).
         inner_result: Option<InnerResult>,
     },
-    /// All inner phases completed successfully.
-    Done(InnerResult),
     /// A phase failed.
     Failed(CommissionError),
 }
@@ -1543,7 +1539,6 @@ impl CommissioningEngine {
             InnerPhase::ClosedLoopEntry { .. } => {
                 Self::step_closed_loop_entry(phase, sequence, adc_cal, backend).await
             }
-            InnerPhase::Done(result) => StepResult::InnerDone(result.clone()),
             InnerPhase::Failed(err) => StepResult::InnerFailed(*err),
         }
     }
@@ -3183,10 +3178,8 @@ impl CommissioningEngine {
                         };
                         StepResult::PhaseChanged(PhaseId::ClosedLoopEntry)
                     }
-                    _ => {
-                        // Selftest/Calibrate never reach current validate.
-                        *phase = InnerPhase::Done(result.clone());
-                        StepResult::InnerDone(result)
+                    InnerSequence::Calibrate | InnerSequence::Selftest => {
+                        unreachable!("Calibrate/Selftest never reach CurrentValidate")
                     }
                 }
             }
