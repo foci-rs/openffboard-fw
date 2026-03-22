@@ -1498,27 +1498,9 @@ mod app {
         defmt::info!("Velocity limit: {}", limit);
     }
 
-    /// Trigger R/L measurement and PI gain computation.
+    /// Start Stage 1 commissioning (diagnostics + current tune + closed-loop entry).
     #[klipper_command]
-    pub fn foci_autotune(_context: &mut State, oid: u8) {
-        if !tmc_send(foci_core::tmc::tmc_autotune(oid)) {
-            klipper_reply!(
-                foci_autotune_result,
-                oid: u8 = oid,
-                status: u8 = 1,
-                resistance_mohm: u32 = 0,
-                inductance_uh: u32 = 0,
-                flux_p: u16 = 0,
-                flux_i: u16 = 0,
-                torque_p: u16 = 0,
-                torque_i: u16 = 0
-            );
-        }
-    }
-
-    /// Start inner commissioning (diagnostics + electrical ID + current tune).
-    #[klipper_command]
-    pub fn foci_commission_inner(_context: &mut State, oid: u8, profile: u8) {
+    pub fn foci_commission(_context: &mut State, oid: u8, profile: u8) {
         use core::sync::atomic::Ordering::Relaxed;
         if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
             klipper_reply!(
@@ -1540,9 +1522,9 @@ mod app {
         }
     }
 
-    /// Start outer commissioning (mechanical ID + velocity/position/filters).
+    /// Start Stage 2 installed tuning (mechanical ID + velocity/position/filters).
     #[klipper_command]
-    pub fn foci_commission_outer(
+    pub fn foci_tune(
         _context: &mut State,
         oid: u8,
         profile: u8,
@@ -1562,7 +1544,7 @@ mod app {
             );
             return;
         }
-        if !tmc_send(foci_core::tmc::tmc_commission_outer(
+        if !tmc_send(foci_core::tmc::tmc_tune(
             oid,
             profile,
             mode,
@@ -1991,9 +1973,6 @@ mod app {
             TmcRequest::SetPidGains { .. } => {
                 defmt::warn!("handle_tmc_request: SetPidGains handled by main loop");
             }
-            TmcRequest::Autotune { .. } => {
-                defmt::warn!("handle_tmc_request: Autotune handled by main loop");
-            }
             TmcRequest::SetEnable(_) => {
                 defmt::warn!("handle_tmc_request: SetEnable handled by main loop");
             }
@@ -2008,14 +1987,11 @@ mod app {
                 defmt::warn!("handle_tmc_request: SetPositionGains handled by main loop");
             }
             TmcRequest::SetVelocityFeedforward { .. } => {}
-            TmcRequest::CommissionInner { .. } => {
-                defmt::warn!("handle_tmc_request: CommissionInner handled by main loop");
-            }
             TmcRequest::Commission { .. } => {
                 defmt::warn!("handle_tmc_request: Commission handled by main loop");
             }
-            TmcRequest::CommissionOuter { .. } => {
-                defmt::warn!("handle_tmc_request: CommissionOuter handled by main loop");
+            TmcRequest::Tune { .. } => {
+                defmt::warn!("handle_tmc_request: Tune handled by main loop");
             }
             #[cfg(feature = "dev")]
             TmcRequest::Init => {
@@ -2163,7 +2139,7 @@ mod app {
         let mut stored_gains: Option<foci_core::pid::InnerLoopGains> = None;
 
         // Stored position/velocity PID gains from host.
-        // Active commissioning engine. Set when a CommissionInner/Outer
+        // Active commissioning engine. Set when a Commission/Tune
         // request arrives, cleared when the engine finishes or fails.
         let mut commission_engine: Option<crate::commission::CommissioningEngine> = None;
 
@@ -2723,318 +2699,6 @@ mod app {
                         // Feedforward flag is already set by the atomic in the
                         // command handler; this arm exists for exhaustiveness.
                     }
-                    TmcRequest::Autotune { oid } => {
-                        if motor_enabled {
-                            klipper_reply!(
-                                foci_autotune_result,
-                                oid: u8 = oid,
-                                status: u8 = 2,
-                                resistance_mohm: u32 = 0,
-                                inductance_uh: u32 = 0,
-                                flux_p: u16 = 0,
-                                flux_i: u16 = 0,
-                                torque_p: u16 = 0,
-                                torque_i: u16 = 0
-                            );
-                            continue;
-                        }
-
-                        let current_limit =
-                            CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
-                        if current_limit == 0 {
-                            klipper_reply!(
-                                foci_autotune_result,
-                                oid: u8 = oid,
-                                status: u8 = 3,
-                                resistance_mohm: u32 = 0,
-                                inductance_uh: u32 = 0,
-                                flux_p: u16 = 0,
-                                flux_i: u16 = 0,
-                                torque_p: u16 = 0,
-                                torque_i: u16 = 0
-                            );
-                            continue;
-                        }
-
-                        // Autotune drives the motor — invalidate calibration
-                        // state so the next enable re-runs the full sequence.
-                        calibrated = false;
-
-                        // Helper: check for hardware fault between measurement
-                        // steps. The STATUS EXTI ISR queues TMC_DISABLE_SIGNAL
-                        // but the main loop only polls it after the match arm
-                        // returns. Check explicitly so faults during the
-                        // multi-second measurement are caught promptly.
-                        //
-                        // try_take() consumes the signal, so re-signal after
-                        // detection. The re-fired signal persists in the Signal
-                        // until the main loop's emergency handler (bottom of the
-                        // loop, after the select+match block) calls try_take()
-                        // on the next iteration and runs shutdown reporting.
-                        let fault_pending = || -> bool {
-                            if TMC_DISABLE_SIGNAL.try_take().is_some() {
-                                TMC_DISABLE_SIGNAL.signal(());
-                                true
-                            } else {
-                                false
-                            }
-                        };
-
-                        // Macro for autotune abort: safe state + reply + continue
-                        macro_rules! autotune_abort {
-                            ($status:expr, $r:expr, $l:expr) => {{
-                                foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
-                                klipper_reply!(
-                                    foci_autotune_result,
-                                    oid: u8 = oid,
-                                    status: u8 = $status,
-                                    resistance_mohm: u32 = $r,
-                                    inductance_uh: u32 = $l,
-                                    flux_p: u16 = 0,
-                                    flux_i: u16 = 0,
-                                    torque_p: u16 = 0,
-                                    torque_i: u16 = 0
-                                );
-                                continue;
-                            }};
-                        }
-
-                        // ADC calibration must run before R/L measurement.
-                        // Without it, current readings are uncalibrated.
-                        if let Err(e) = tmc_adc_calibrate(tmc, enable_pin).await {
-                            defmt::error!("Autotune ADC calibration failed: {}", e);
-                            autotune_abort!(4, 0, 0);
-                        }
-
-                        // Check for fault after ADC calibration
-                        if fault_pending() {
-                            defmt::error!("Autotune aborted: hardware fault during ADC cal");
-                            autotune_abort!(4, 0, 0);
-                        }
-
-                        // Measure R with PWM-rate averaging (1000 samples per coil)
-                        let r_currents = match foci_core::selftest::autotune_measure_resistance(
-                            tmc,
-                            enable_pin,
-                            &mut Mono,
-                            &TMC_CONFIG,
-                        )
-                        .await
-                        {
-                            Some(r) => r,
-                            None => {
-                                autotune_abort!(4, 0, 0);
-                            }
-                        };
-
-                        // Check for fault after R measurement
-                        if fault_pending() {
-                            defmt::error!("Autotune aborted: hardware fault during R measurement");
-                            autotune_abort!(4, 0, 0);
-                        }
-
-                        // Measure L with square-wave di/dt.
-                        // Time the measurement with DWT cycle counter so we
-                        // know the actual dt per cycle (SPI overhead dominates).
-                        let dwt_start = read_tim5();
-                        let l_result = match foci_core::selftest::autotune_measure_inductance(
-                            tmc,
-                            enable_pin,
-                            &mut Mono,
-                            &TMC_CONFIG,
-                        )
-                        .await
-                        {
-                            Some(l) => l,
-                            None => {
-                                autotune_abort!(4, 0, 0);
-                            }
-                        };
-                        let dwt_end = read_tim5();
-                        // Total wall-clock cycles for both coils, minus settle/cooldown.
-                        // The measurement function includes 120ms of delays (10ms pre-toggle
-                        // + 50ms cooldown per coil) that would inflate dt_us by ~12%.
-                        let dwt_raw = dwt_end.wrapping_sub(dwt_start);
-                        const SETTLE_CYCLES: u32 = foci_core::selftest::DIDT_SETTLE_MS * 168_000;
-                        let dwt_elapsed = dwt_raw.saturating_sub(SETTLE_CYCLES);
-
-                        foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
-
-                        // Check for fault after L measurement
-                        if fault_pending() {
-                            defmt::error!("Autotune aborted: hardware fault during L measurement");
-                            klipper_reply!(
-                                foci_autotune_result,
-                                oid: u8 = oid,
-                                status: u8 = 4,
-                                resistance_mohm: u32 = 0,
-                                inductance_uh: u32 = 0,
-                                flux_p: u16 = 0,
-                                flux_i: u16 = 0,
-                                torque_p: u16 = 0,
-                                torque_i: u16 = 0
-                            );
-                            continue;
-                        }
-
-                        // Build internal measurement for gain computation
-                        let current_avg = ((r_currents.0 as u32 + r_currents.1 as u32) / 2) as u16;
-
-                        // Compute average dI using wall-clock timing.
-                        // L_int = V * total_time / sum_delta_I (per coil)
-                        // For the gain formula we need dI per unit time:
-                        //   dI_per_sec = sum_delta / total_time_s
-                        // But it's simpler to pass V, sum_delta, and elapsed
-                        // time separately and let the gain formula handle it.
-                        //
-                        // For now (Phase 1), compute approximate physical L:
-                        //   L = V * dt / dI (per cycle, in internal units)
-                        //   L_physical = L_int * R_physical / R_int (approximate)
-                        //
-                        // Use DWT elapsed to get actual dt per cycle:
-                        //   total_cycles_both_coils = count_a + count_b
-                        //   (includes settle time, but settle is small vs measurement)
-                        let total_count = l_result.count.0 as u64 + l_result.count.1 as u64;
-                        let total_sum_delta = l_result.sum_delta.0 + l_result.sum_delta.1;
-
-                        // Average dI per cycle (using actual timing)
-                        // delta_i_avg = sum_delta / count (per cycle, internal units)
-                        let delta_i_avg = if total_count > 0 {
-                            (total_sum_delta / total_count) as u16
-                        } else {
-                            0u16
-                        };
-
-                        // Actual dt per cycle in microseconds:
-                        // dt_us = dwt_elapsed / CPU_MHZ / total_cycles_measured
-                        // But total_cycles_measured includes 2 coils' settle time.
-                        // Better: dt_us = dwt_elapsed / (168 * total_count)
-                        // (each count entry is one SPI write+read cycle)
-                        const CPU_MHZ: u32 = 168;
-                        let dt_us = if total_count > 0 {
-                            dwt_elapsed as u64 / (CPU_MHZ as u64 * total_count)
-                        } else {
-                            0
-                        };
-
-                        // Excitation voltage used during R/L measurement (from config)
-                        let excitation = TMC_CONFIG.excitation_voltage as u32;
-
-                        // Approximate physical R/L for user display
-                        let r_mohm: u32 = if current_avg > 0 {
-                            excitation * 1000 / current_avg as u32
-                        } else {
-                            0
-                        };
-                        // L_uh = V * dt_us / dI (internal units cancel in ratio)
-                        // Then convert to physical: multiply by R_physical/R_int
-                        // Simplified: L_uh = R_mohm * dt_us / 1000
-                        //   (because V/dI ~ R_int, and R_mohm/R_int gives the
-                        //    physical scaling... but actually:
-                        //    L_int = V * dt / dI, L_phys = L_int * scale
-                        //    Since R_int = V/I and R_phys = R_mohm/1000:
-                        //    scale = R_phys/R_int = R_mohm * I / (V * 1000)
-                        //    L_phys = V * dt / dI * R_mohm * I / (V * 1000)
-                        //           = dt * R_mohm * I / (dI * 1000)
-                        //    L_uh = dt_us * R_mohm * I / (dI * 1000)
-                        let l_uh: u32 = if delta_i_avg > 0 {
-                            (dt_us * r_mohm as u64 * current_avg as u64
-                                / (delta_i_avg as u64 * 1000)) as u32
-                        } else {
-                            0
-                        };
-
-                        defmt::info!(
-                            "Autotune: V={} I={} dI={} dt={}us R~{}mOhm L~{}uH (DWT={})",
-                            excitation,
-                            current_avg,
-                            delta_i_avg,
-                            dt_us,
-                            r_mohm,
-                            l_uh,
-                            dwt_elapsed,
-                        );
-
-                        // Phase 2: compute P-only gains from internal measurements
-                        let internal = foci_core::pid::InternalMeasurement {
-                            voltage: excitation as u16,
-                            current_avg,
-                            delta_i_avg,
-                            dt_us: dt_us as u32,
-                        };
-                        let gains =
-                            foci_core::pid::compute_gains_from_internal(&internal, &TMC_CONFIG);
-
-                        // Write to TMC4671 — abort if SPI fails
-                        let (flux_reg, torque_reg) = gains.to_registers();
-                        if tmc
-                            .write_register(tmc4671::registers::PID_FLUX_P_FLUX_I, flux_reg)
-                            .await
-                            .is_err()
-                            || tmc
-                                .write_register(
-                                    tmc4671::registers::PID_TORQUE_P_TORQUE_I,
-                                    torque_reg,
-                                )
-                                .await
-                                .is_err()
-                        {
-                            defmt::error!("Autotune: SPI write failed for gain registers");
-                            autotune_abort!(5, r_mohm, l_uh);
-                        }
-
-                        stored_gains = Some(gains);
-
-                        defmt::info!("Autotune gains: P={} I={}", gains.flux_p, gains.flux_i,);
-
-                        klipper_reply!(
-                            foci_autotune_result,
-                            oid: u8 = oid,
-                            status: u8 = 0,
-                            resistance_mohm: u32 = r_mohm,
-                            inductance_uh: u32 = l_uh,
-                            flux_p: u16 = gains.flux_p,
-                            flux_i: u16 = gains.flux_i,
-                            torque_p: u16 = gains.torque_p,
-                            torque_i: u16 = gains.torque_i
-                        );
-                    }
-                    TmcRequest::CommissionInner { oid, profile } => {
-                        if motor_enabled {
-                            COMMISSION_IN_FLIGHT
-                                .store(false, core::sync::atomic::Ordering::Relaxed);
-                            klipper_reply!(
-                                foci_commission_phase,
-                                oid: u8 = oid,
-                                phase: u8 = 0,
-                                status: u8 =
-                                    foci_core::autotune::CommissionError::MotorEnabled
-                                        .status_code()
-                            );
-                            continue;
-                        }
-                        let current_limit =
-                            CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
-                        if current_limit == 0 {
-                            COMMISSION_IN_FLIGHT
-                                .store(false, core::sync::atomic::Ordering::Relaxed);
-                            klipper_reply!(
-                                foci_commission_phase,
-                                oid: u8 = oid,
-                                phase: u8 = 0,
-                                status: u8 =
-                                    foci_core::autotune::CommissionError::NoCurrent
-                                        .status_code()
-                            );
-                            continue;
-                        }
-                        calibrated = false;
-                        commission_engine =
-                            Some(crate::commission::CommissioningEngine::new_commission(
-                                oid,
-                                foci_core::autotune::CommissionProfile::from_u8(profile),
-                            ));
-                    }
                     TmcRequest::Commission { oid, profile } => {
                         if motor_enabled {
                             COMMISSION_IN_FLIGHT
@@ -3071,7 +2735,7 @@ mod app {
                                 foci_core::autotune::CommissionProfile::from_u8(profile),
                             ));
                     }
-                    TmcRequest::CommissionOuter {
+                    TmcRequest::Tune {
                         oid,
                         profile,
                         mode,
@@ -3498,51 +3162,28 @@ mod app {
     /// Steps:
     /// 1. Safety shutdown: enable_pin low, MODE=0, voltage limit=1024, zero targets
     /// 2. PWM config: polarities=0, PWM frequency and BBM from TMC_CONFIG, CHOP=0 for calibration
-    /// 3. ADC config: DSADC decimation from TMC_CONFIG, ADC_I_SELECT for 2-phase routing
-    /// 4. Motor type: 2-phase stepper (type 2), 50 pole pairs
-    /// 5. ADC offset calibration: scale=256, enable, wait 250 ms, sample 128x, write offsets
-    /// 6. Re-enable PWM chopping: PWM_SV_CHOP=7
+    /// Configure TMC4671 for open-loop stepper operation with current regulation.
     ///
-    /// Returns `(offset_i0, offset_i1)` on success. Critical register writes are
-    /// verified by read-back; ADC offsets are range-checked.
-    ///
-    /// This function is shared by both the dev open-loop path and the production
-    /// closed-loop enable sequence.
+    /// Performs hardware init, ADC offset calibration, and configures torque
+    /// mode with PHI_E_EXT for open-loop angle control. Self-contained dev
+    /// helper; production ADC calibration uses the commissioning engine's
+    /// cooperative AdcCalibrate phase.
     ///
     /// Register values verified against TMC4671-LA datasheet rev 2.08.
-    async fn tmc_adc_calibrate(
+    #[cfg(feature = "dev")]
+    async fn tmc_enter_openloop(
         tmc: &mut Tmc4671Spi<TmcSpiDevice>,
         enable_pin: &mut Output<'static>,
-    ) -> Result<(u16, u16), CalibrationError> {
+    ) {
         use tmc4671::registers::*;
 
+        // --- ADC calibration (inlined from former tmc_adc_calibrate) ---
+
         // 1. SAFETY FIRST: stop motor, disable outputs, set voltage limit
-        // The power-on default PIDOUT_UQ_UD_LIMITS is 32767 (full voltage).
-        // We MUST set a safe limit before ANYTHING else touches the motor.
         enable_pin.set_low();
-        tmc.write_register(MODE_RAMP_MODE_MOTION, 0x0000_0000)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        let voltage_limit: u32 = 1024;
-        tmc.write_register(PIDOUT_UQ_UD_LIMITS, voltage_limit)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        // Verify voltage limit write
-        let readback = tmc
-            .read_register(PIDOUT_UQ_UD_LIMITS)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        if readback != voltage_limit {
-            defmt::error!(
-                "PIDOUT_UQ_UD_LIMITS verify failed: wrote={}, read={}",
-                voltage_limit,
-                readback
-            );
-            return Err(CalibrationError::SpiError);
-        }
-        // Also zero the torque target to prevent any current drive
+        let _ = tmc.write_register(MODE_RAMP_MODE_MOTION, 0).await;
+        let _ = tmc.write_register(PIDOUT_UQ_UD_LIMITS, 1024).await;
         let _ = tmc.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
-        // And zero the UQ/UD external values
         let _ = tmc.write_register(UQ_UD_EXT, 0).await;
 
         // 2. PWM configuration (chopping disabled for ADC calibration)
@@ -3553,94 +3194,51 @@ mod app {
         let _ = tmc
             .write_register(PWM_BBM_H_BBM_L, TMC_CONFIG.bbm_register())
             .await;
-        // PWM_SV=0 (SVPWM off per DS 4.9.7 - stepper only), CHOP=0 for ADC cal
-        tmc.write_register(PWM_SV_CHOP, 0)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        // Verify MODE=0 and PWM_SV_CHOP=0 — critical for safe ADC calibration
-        let mode_rb = tmc
-            .read_register(MODE_RAMP_MODE_MOTION)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        let chop_rb = tmc
-            .read_register(PWM_SV_CHOP)
-            .await
-            .map_err(|_| CalibrationError::SpiError)?;
-        if mode_rb != 0 || chop_rb != 0 {
-            defmt::error!(
-                "ADC cal pre-check failed: MODE={:#010x}, PWM_SV_CHOP={}",
-                mode_rb,
-                chop_rb
-            );
-            return Err(CalibrationError::SpiError);
+        if tmc.write_register(PWM_SV_CHOP, 0).await.is_err() {
+            defmt::error!("open-loop init: PWM_SV_CHOP write failed");
+            return;
         }
 
         // 3. ADC configuration
-        // DSADC_MCFG: leave at power-on default (ANALOG mode, internal ADC)
         let _ = tmc
             .write_register(DSADC_MDEC_B_MDEC_A, TMC_CONFIG.dsadc_mdec_register())
             .await;
-        // bits[29:28] ADC_I_WY_SELECT=1 (WY phase current from ADC_I1)
-        // bits[27:26] ADC_I_V_SELECT=0  (V unused for stepper FOC2)
-        // bits[25:24] ADC_I_UX_SELECT=0 (UX phase current from ADC_I0, default)
-        // bits[15:8]  ADC_I1_SELECT=1   (I1 sourced from internal DSADC ch1)
         let _ = tmc.write_register(ADC_I_SELECT, (1 << 28) | (1 << 8)).await;
 
-        // 4. Motor type: 2-phase stepper (type 2 per datasheet), 50 pole pairs
+        // 4. Motor type: 2-phase stepper (type 2), 50 pole pairs
         let _ = tmc
             .write_register(MOTOR_TYPE_N_POLE_PAIRS, (2 << 16) | 50)
             .await;
 
-        // 4b. Velocity meter: PWM-synchronized (selection=1).
-        // Required for advanced PI mode (datasheet section 4.6.11, p.51):
-        // "This option is recommended for usage with the advanced PI controller
-        // structure. Otherwise, the controller structure might tend to be
-        // unstable due to non-matched sampling."
-        // VELOCITY_SELECTION: bits[7:0]=0 (follows PHI_E_SELECTION),
-        // bits[15:8]=1 (PWM-synchronized velocity meter for advanced PI).
-        // Note: phi_m_abn (9) for position/velocity was tested but doesn't
-        // work with SPI-written position targets — phi_m wraps at 65536
-        // (one revolution) while the emulated stepper accumulates without
-        // wrapping, causing position target overflow. The reference driver
-        // avoids this by using hardware step/dir input instead of SPI.
+        // 4b. Velocity meter: PWM-synchronized for advanced PI stability
         let _ = tmc.write_register(VELOCITY_SELECTION, (1 << 8) | 0).await;
 
-        // 5. ADC offset calibration
-        // With PWM_CHOP=0, no current flows even with motor connected.
-        // This matches the Python driver's _calibrate_adc() method.
+        // 5. ADC offset calibration (PWM_CHOP=0, no current flows)
         let _ = tmc.write_register(ADC_I0_SCALE_OFFSET, 256 << 16).await;
         let _ = tmc.write_register(ADC_I1_SCALE_OFFSET, 256 << 16).await;
-
-        // Enable to power the ADC, but CHOP=0 means no PWM switching
         enable_pin.set_high();
         Mono::delay(250_u64.millis()).await;
 
-        // Sample ADC values 128 times and average for offset
         let mut sum_i0: i32 = 0;
         let mut sum_i1: i32 = 0;
         const N_SAMPLES: i32 = 128;
         for _ in 0..N_SAMPLES {
             if let Ok(raw) = tmc.read_register(ADC_IWY_IUX).await {
-                let i_ux = (raw & 0xFFFF) as i16 as i32;
-                let i_wy = ((raw >> 16) & 0xFFFF) as i16 as i32;
-                sum_i0 += i_ux;
-                sum_i1 += i_wy;
+                sum_i0 += (raw & 0xFFFF) as i16 as i32;
+                sum_i1 += ((raw >> 16) & 0xFFFF) as i16 as i32;
             }
             Mono::delay(1_u64.millis()).await;
         }
-        // Cast via i16 to u16: negative values wrap correctly for the
-        // TMC4671's unsigned offset subtraction register.
         let offset_i0 = (sum_i0 / N_SAMPLES) as i16 as u16;
         let offset_i1 = (sum_i1 / N_SAMPLES) as i16 as u16;
 
-        // Validate ADC offsets are in expected range (centered around 33000)
         if !(30000..=36000).contains(&offset_i0) || !(30000..=36000).contains(&offset_i1) {
             defmt::error!(
                 "ADC offset out of range: I0={}, I1={} (expected 30000..=36000)",
                 offset_i0,
                 offset_i1
             );
-            return Err(CalibrationError::AdcFault);
+            return;
         }
 
         let _ = tmc
@@ -3649,36 +3247,12 @@ mod app {
         let _ = tmc
             .write_register(ADC_I1_SCALE_OFFSET, (256 << 16) | offset_i1 as u32)
             .await;
+        defmt::info!("ADC calibrated: I0={}, I1={}", offset_i0, offset_i1);
 
-        defmt::info!(
-            "ADC calibrated: I0 offset={}, I1 offset={}",
-            offset_i0,
-            offset_i1
-        );
-
-        // 6. Re-enable PWM chopping after calibration (SVPWM stays off for stepper)
+        // 6. Re-enable PWM chopping
         let _ = tmc.write_register(PWM_SV_CHOP, 7).await;
 
-        Ok((offset_i0, offset_i1))
-    }
-
-    /// Configure TMC4671 for open-loop stepper operation with current regulation.
-    ///
-    /// Calls `tmc_adc_calibrate` for hardware init and ADC offset calibration,
-    /// then configures torque mode with PHI_E_EXT for open-loop angle control.
-    ///
-    /// Register values verified against TMC4671-LA datasheet rev 2.08.
-    #[cfg(feature = "dev")]
-    async fn tmc_enter_openloop(
-        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
-        enable_pin: &mut Output<'static>,
-    ) {
-        use tmc4671::registers::*;
-
-        if let Err(e) = tmc_adc_calibrate(tmc, enable_pin).await {
-            defmt::error!("ADC calibration failed in open-loop init: {}", e);
-            return;
-        }
+        // --- Open-loop configuration ---
 
         // 7. PID gains for torque (current) control
         // Conservative Q8.8 PID gains: P = 1.577 * 256 = 404, I = 0.1 * 256 = 26.
