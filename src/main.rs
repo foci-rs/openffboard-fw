@@ -2363,9 +2363,40 @@ mod app {
                     }
                     crate::commission::StepResult::OuterFailed(error) => {
                         let oid = engine.oid();
+                        let snapshot = engine.entry_snapshot();
                         commission_engine = None;
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
-                        foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+
+                        // Soft-failure: restore entry gains and leave motor
+                        // holding. Falls back to hard disable if the restore
+                        // itself fails (SPI error).
+                        if let Some(snapshot) = snapshot {
+                            let mut restore_backend = OpenFFBoardBackend { tmc, enable_pin };
+                            match crate::commission::CommissioningEngine::restore_entry_gains(
+                                &snapshot,
+                                &mut restore_backend,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+                                    defmt::warn!(
+                                        "Stage 2 soft failure ({}), entry gains restored",
+                                        error
+                                    );
+                                }
+                                Err(restore_err) => {
+                                    defmt::error!(
+                                        "Stage 2 restore failed ({}), disabling",
+                                        restore_err
+                                    );
+                                    foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                                }
+                            }
+                        } else {
+                            foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                        }
+
                         klipper_reply!(
                             foci_commission_phase,
                             oid: u8 = oid,
