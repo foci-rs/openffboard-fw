@@ -76,6 +76,11 @@ mod app {
 
     const TMC_CHANNEL_SIZE: usize = 8;
 
+    /// SPI budget for fast trace preset (us). Includes margin over ~55us measured.
+    const TRACE_SPI_BUDGET_FAST_US: u64 = 80;
+    /// SPI budget for full trace preset (us). Includes margin over ~110us measured.
+    const TRACE_SPI_BUDGET_FULL_US: u64 = 150;
+
     /// Number of TMC4671 motor channels on OpenFFBoard (single-motor board).
     const TMC_MOTOR_COUNT: u8 = 1;
 
@@ -1839,6 +1844,20 @@ mod app {
             });
         }
 
+        // Enable DWT CYCCNT for first-sample SPI timing measurement.
+        // CYCCNT is disabled on reset; requires DEMCR.TRCENA + DWT.CYCCNTENA.
+        {
+            let dcb = unsafe { &*cortex_m::peripheral::DCB::PTR };
+            unsafe {
+                dcb.demcr.modify(|v| v | (1 << 24)); // TRCENA
+            }
+            let dwt = unsafe { &*cortex_m::peripheral::DWT::PTR };
+            unsafe {
+                dwt.cyccnt.write(0);
+                dwt.ctrl.modify(|v| v | 1); // CYCCNTENA
+            }
+        }
+
         // Initialize trace buffer in CCM RAM
         unsafe {
             // Use addr_of_mut! to avoid creating a reference to the mutable static
@@ -2121,6 +2140,170 @@ mod app {
             }
         }
         Ok(())
+    }
+
+    /// Read trace registers and store a sample. Called from tmc_control tick.
+    /// `tick_deadline` is the absolute time of the next tick.
+    async fn trace_sample_tick(
+        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
+        tick_deadline: <Mono as rtic_monotonics::Monotonic>::Instant,
+    ) {
+        use tmc4671::registers::*;
+
+        let buf = unsafe { trace_buf() };
+        if !buf.is_capturing() {
+            return;
+        }
+
+        let preset = buf.preset();
+        let engine_tick = buf.engine_tick();
+
+        // Full preset decimation: skip odd ticks (500 Hz effective)
+        if preset == foci_core::trace::PRESET_FULL && engine_tick % 2 != 0 {
+            buf.tick_no_sample(false); // intentional decimation, not a drop
+            return;
+        }
+
+        // Pre-read deadline check
+        let budget_us = if preset == foci_core::trace::PRESET_FULL {
+            TRACE_SPI_BUDGET_FULL_US
+        } else {
+            TRACE_SPI_BUDGET_FAST_US
+        };
+        let now = Mono::now();
+        if tick_deadline
+            .checked_duration_since(now)
+            .map_or(true, |d| d.to_micros() < budget_us)
+        {
+            buf.tick_no_sample(true); // budget drop
+            return;
+        }
+
+        // First sample: measure actual SPI duration via DWT CYCCNT
+        let is_first_sample = engine_tick == 0;
+        let cyccnt_before = if is_first_sample {
+            cortex_m::peripheral::DWT::cycle_count()
+        } else {
+            0
+        };
+
+        // Read fast-preset registers. Any SPI failure discards the whole
+        // sample — storing zeros would be indistinguishable from real data.
+        macro_rules! read_or_drop {
+            ($expr:expr) => {
+                match $expr.await {
+                    Ok(v) => v,
+                    Err(_) => {
+                        buf.tick_no_sample(true);
+                        return;
+                    }
+                }
+            };
+        }
+
+        let position_target = read_or_drop!(tmc.read_register(PID_POSITION_TARGET)) as i32;
+        let position_actual = read_or_drop!(tmc.read_register(PID_POSITION_ACTUAL)) as i32;
+        let torque_flux_actual = read_or_drop!(tmc.read_register(PID_TORQUE_FLUX_ACTUAL));
+        let abn_count = read_or_drop!(tmc.read_register(ABN_DECODER_COUNT)) as i32;
+        let status_flags = read_or_drop!(tmc.read_register(STATUS_FLAGS));
+        let velocity_actual =
+            read_or_drop!(tmc.read_sub_register(INTERIM_PIDOUT_TARGET_VELOCITY)) as i32;
+
+        if preset == foci_core::trace::PRESET_FULL {
+            // Read additional full-preset registers
+            let torque_flux_target = read_or_drop!(tmc.read_register(PID_TORQUE_FLUX_TARGET));
+            let velocity_offset = read_or_drop!(tmc.read_register(PID_VELOCITY_OFFSET)) as i32;
+            let error_sum_position =
+                read_or_drop!(tmc.read_sub_register(PID_ERROR_PID_POSITION_ERROR_SUM)) as i32;
+            let error_sum_velocity =
+                read_or_drop!(tmc.read_sub_register(PID_ERROR_PID_VELOCITY_ERROR_SUM)) as i32;
+            let error_sum_torque =
+                read_or_drop!(tmc.read_sub_register(PID_ERROR_PID_TORQUE_ERROR_SUM)) as i32;
+
+            // First sample: log measured SPI duration
+            if is_first_sample {
+                let elapsed_cycles =
+                    cortex_m::peripheral::DWT::cycle_count().wrapping_sub(cyccnt_before);
+                // 168 MHz -> cycles / 168 = microseconds
+                let elapsed_us = elapsed_cycles / 168;
+                defmt::info!(
+                    "trace: full SPI read {} us ({} cycles)",
+                    elapsed_us,
+                    elapsed_cycles
+                );
+                if elapsed_us as u64 > TRACE_SPI_BUDGET_FULL_US {
+                    defmt::warn!(
+                        "trace: full SPI read {} us exceeds budget {} us",
+                        elapsed_us,
+                        TRACE_SPI_BUDGET_FULL_US
+                    );
+                }
+            }
+
+            // Post-read deadline check
+            if Mono::now() > tick_deadline {
+                buf.tick_no_sample(true);
+                defmt::warn!("trace: tick overrun, full sample discarded");
+                return;
+            }
+
+            buf.push_full(foci_core::trace::TraceSampleFull {
+                fast: foci_core::trace::TraceSampleFast {
+                    engine_tick: 0, // set by push
+                    phase_id: 0,    // set by push
+                    flags: 0,       // set by push
+                    position_target,
+                    position_actual,
+                    torque_flux_actual,
+                    velocity_actual,
+                    status_flags,
+                    abn_count,
+                },
+                torque_flux_target,
+                velocity_offset,
+                error_sum_position,
+                error_sum_velocity,
+                error_sum_torque,
+            });
+        } else {
+            // First sample: log measured SPI duration
+            if is_first_sample {
+                let elapsed_cycles =
+                    cortex_m::peripheral::DWT::cycle_count().wrapping_sub(cyccnt_before);
+                let elapsed_us = elapsed_cycles / 168;
+                defmt::info!(
+                    "trace: fast SPI read {} us ({} cycles)",
+                    elapsed_us,
+                    elapsed_cycles
+                );
+                if elapsed_us as u64 > TRACE_SPI_BUDGET_FAST_US {
+                    defmt::warn!(
+                        "trace: fast SPI read {} us exceeds budget {} us",
+                        elapsed_us,
+                        TRACE_SPI_BUDGET_FAST_US
+                    );
+                }
+            }
+
+            // Post-read deadline check
+            if Mono::now() > tick_deadline {
+                buf.tick_no_sample(true);
+                defmt::warn!("trace: tick overrun, fast sample discarded");
+                return;
+            }
+
+            buf.push_fast(foci_core::trace::TraceSampleFast {
+                engine_tick: 0,
+                phase_id: 0,
+                flags: 0,
+                position_target,
+                position_actual,
+                torque_flux_actual,
+                velocity_actual,
+                status_flags,
+                abn_count,
+            });
+        }
     }
 
     /// TMC4671 control task. Runs at priority 1 (preempted by protocol tasks).
@@ -3027,6 +3210,11 @@ mod app {
                 Either::Second(()) => {}
             }
 
+            // Capture tick start for deadline computation. Must be after
+            // select() resolves — placing it before would include the 1ms
+            // idle wait, making deadline checks ineffective.
+            let tick_start = Mono::now();
+
             // Check emergency disable (non-blocking). Triggered by EXTI
             // STATUS interrupt or enter_shutdown. Disables motor and reports
             // the fault to Klipper so the host knows the MCU is down.
@@ -3105,6 +3293,12 @@ mod app {
                     .await;
             }
             feedforward_was_active = ff_active;
+
+            // Trace capture: read registers and store sample.
+            // Deadline = tick start + 1ms. Budget check inside ensures
+            // trace SPI reads don't overrun the tick period.
+            let tick_deadline = tick_start + fugit::Duration::<u64, 1, 1_000_000>::millis(1);
+            trace_sample_tick(tmc, tick_deadline).await;
 
             if PID_ERROR_SUMS_CLEAR.swap(false, core::sync::atomic::Ordering::Relaxed) {
                 pid_error_clear_countdown_ms = HOLD_SETTLE_DELAY_MS;
