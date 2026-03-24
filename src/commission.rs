@@ -654,8 +654,10 @@ enum InnerPhase {
 // ---------------------------------------------------------------------------
 
 /// Default velocity cap in encoder counts per millisecond.
-/// 2 rev/s at 4096 counts/rev = 8192 counts/s = ~8 counts/ms.
-const VELOCITY_CAP_COUNTS_PER_MS: i32 = 8;
+/// 4 rev/s at 4096 counts/rev = 16384 counts/s = ~16 counts/ms.
+/// Raised from 8 (2 rev/s) because MechanicalId at 60% torque
+/// on low-inertia motors exceeds 8 counts/ms.
+const VELOCITY_CAP_COUNTS_PER_MS: i32 = 16;
 
 /// Default position window: +/- encoder counts from start position.
 /// 2 revolutions at 4096 counts/rev = 8192 counts.
