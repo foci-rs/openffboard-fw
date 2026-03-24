@@ -3353,7 +3353,13 @@ impl CommissioningEngine {
             }
 
             ClosedLoopEntryState::VerifyPhiE => {
-                // PHI_E_SELECTION must be 3 (ABN encoder) from alignment.
+                // Set PHI_E_SELECTION to ABN encoder (3). For Calibrate this
+                // is already 3 from EncoderAlign::Commit; for Commission the
+                // intervening ElectricalId/CurrentTune phases reset it to 1
+                // (external phi_e for voltage-mode sweeps).
+                if backend.write_register(PHI_E_SELECTION, 3).await.is_err() {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
                 match backend.read_register(PHI_E_SELECTION).await {
                     Ok(3) => {}
                     Ok(val) => {
