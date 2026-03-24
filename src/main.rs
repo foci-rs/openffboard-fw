@@ -360,8 +360,9 @@ mod app {
     /// Step count (incremented by P3 ISR, read by P1/P2 for stepper_get_position).
     static STEPPER_POSITION: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 
-    /// Set by stepper_stop(), cleared by reset_step_clock. When true,
-    /// queue_step discards moves. Starts false to match Klipper stepper.c
+    /// Set by trsync-triggered stops (timeout, endstop trigger), cleared by
+    /// reset_step_clock. When true, queue_step discards moves. NOT set by
+    /// motor disable or queue drain — matches Klipper C stepper.c semantics.
     /// (SF_NEED_RESET is NOT set by config_stepper — only by stepper_stop).
     static STEPPER_NEED_RESET: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
@@ -3375,6 +3376,7 @@ mod app {
                         // Check timeout — if expired, stop hardware stepper
                         if state.trsync[idx].check_timeout(now_clock) {
                             stepper_stop();
+                            STEPPER_NEED_RESET.store(true, core::sync::atomic::Ordering::Relaxed);
                         }
 
                         // Send periodic status report if due
@@ -3441,6 +3443,8 @@ mod app {
                                 if let Some(&ts_idx) = state.trsync_by_oid.get(&trsync_oid) {
                                     state.trsync[ts_idx].trigger(reason);
                                     stepper_stop();
+                                    STEPPER_NEED_RESET
+                                        .store(true, core::sync::atomic::Ordering::Relaxed);
                                 } else {
                                     defmt::error!(
                                         "endstop trigger: unknown trsync_oid={}",
@@ -3903,6 +3907,11 @@ mod app {
     /// Stop hardware stepper: disable timer, set need_reset, drain queue.
     ///
     /// Safe to call from P1 or P2. P3 is quiesced by disabling TIM5 CC1.
+    /// Disarm the step timer, drain the queue, and clear interval.
+    /// Does NOT set STEPPER_NEED_RESET — callers that need it (trsync
+    /// stop) must set it explicitly. Klipper's stepcompress only sends
+    /// reset_step_clock after trsync-triggered stops, not after motor
+    /// disable/re-enable cycles.
     fn stepper_stop() {
         use core::sync::atomic::Ordering::Relaxed;
         let tim5 = embassy_stm32::pac::TIM5;
@@ -3911,7 +3920,6 @@ mod app {
         // Clear any pending CC1 flag
         tim5.sr().modify(|w| w.set_ccif(0, false));
         TIMER_ACTIVE.store(false, Relaxed);
-        STEPPER_NEED_RESET.store(true, Relaxed);
         STEP_INTERVAL.store(0, Relaxed);
         PID_ERROR_SUMS_CLEAR.store(true, Relaxed);
         // Drain queue (safe: P3 is disabled by the CC1IE clear above)
