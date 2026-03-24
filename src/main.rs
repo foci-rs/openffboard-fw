@@ -76,10 +76,10 @@ mod app {
 
     const TMC_CHANNEL_SIZE: usize = 8;
 
-    /// SPI budget for fast trace preset (us). Includes margin over ~55us measured.
-    const TRACE_SPI_BUDGET_FAST_US: u64 = 80;
-    /// SPI budget for full trace preset (us). Includes margin over ~110us measured.
-    const TRACE_SPI_BUDGET_FULL_US: u64 = 150;
+    /// SPI budget for fast trace preset (us). DWT measured ~227us on hardware.
+    const TRACE_SPI_BUDGET_FAST_US: u64 = 300;
+    /// SPI budget for full trace preset (us). Estimated ~450us from fast ratio.
+    const TRACE_SPI_BUDGET_FULL_US: u64 = 550;
 
     /// Number of TMC4671 motor channels on OpenFFBoard (single-motor board).
     const TMC_MOTOR_COUNT: u8 = 1;
