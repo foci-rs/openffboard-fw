@@ -418,6 +418,15 @@ mod app {
     /// Velocity I gain for cross-priority access (Q8.8).
     static VELOCITY_I_VALUE: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 
+    /// Trace capture buffer in CCM RAM. Initialized via `reset()` in init.
+    ///
+    /// SAFETY: Only accessed from tmc_control (P1) after init. MaybeUninit
+    /// because CCM RAM has no default initialization; init() writes a valid
+    /// TraceBuffer via ptr::write before any read.
+    #[link_section = ".ccmram"]
+    static mut TRACE_BUF: core::mem::MaybeUninit<foci_core::trace::TraceBuffer> =
+        core::mem::MaybeUninit::uninit();
+
     /// Lock-free move queue for hardware step/dir.
     /// P2 enqueues, P3 dequeues. When timer is disabled, P1/P2 may drain.
     ///
@@ -440,6 +449,18 @@ mod app {
     static TMC_REQUEST_SENDER: Mutex<
         RefCell<Option<Sender<'static, TmcRequest, TMC_CHANNEL_SIZE>>>,
     > = Mutex::new(RefCell::new(None));
+
+    /// Get a mutable reference to the trace buffer.
+    ///
+    /// # Safety
+    ///
+    /// Must only be called from tmc_control (P1) after init has completed.
+    #[inline]
+    unsafe fn trace_buf() -> &'static mut foci_core::trace::TraceBuffer {
+        // Use addr_of_mut! to avoid creating a reference to the mutable static
+        // (Rust 2024 edition compatibility). MaybeUninit<T> has the same layout as T.
+        &mut *core::ptr::addr_of_mut!(TRACE_BUF).cast::<foci_core::trace::TraceBuffer>()
+    }
 
     pub struct BufferTransportOutput;
     pub const TRANSPORT_OUTPUT: BufferTransportOutput = BufferTransportOutput;
@@ -1416,6 +1437,22 @@ mod app {
         }
     }
 
+    /// Query trace buffer metadata.
+    #[klipper_command]
+    pub fn foci_trace_info(_context: &mut State, oid: u8) {
+        if !tmc_send(foci_core::tmc::tmc_trace_info(oid)) {
+            defmt::warn!("trace_info: TMC channel full");
+        }
+    }
+
+    /// Fetch a trace sample by offset. gen must match current generation.
+    #[klipper_command]
+    pub fn foci_trace_fetch(_context: &mut State, oid: u8, offset: u16, gen: u8) {
+        if !tmc_send(foci_core::tmc::tmc_trace_fetch(oid, offset, gen)) {
+            defmt::warn!("trace_fetch: TMC channel full");
+        }
+    }
+
     /// Set inner loop PI gains from host (explicit override or saved values).
     #[klipper_command]
     pub fn tmc_set_pid_gains(
@@ -1802,6 +1839,30 @@ mod app {
             });
         }
 
+        // Initialize trace buffer in CCM RAM
+        unsafe {
+            // Use addr_of_mut! to avoid creating a reference to the mutable static
+            let ptr = core::ptr::addr_of_mut!(TRACE_BUF).cast::<foci_core::trace::TraceBuffer>();
+            // Validate address is in CCM range
+            let addr = ptr as usize;
+            defmt::assert!(
+                addr >= 0x1000_0000 && addr < 0x1001_0000,
+                "TRACE_BUF not in CCM RAM: {:#010x}",
+                addr
+            );
+            defmt::info!(
+                "trace: buffer at {:#010x}, size {} bytes",
+                addr,
+                core::mem::size_of::<foci_core::trace::TraceBuffer>()
+            );
+            core::ptr::write(ptr, {
+                let mut buf = core::mem::zeroed::<foci_core::trace::TraceBuffer>();
+                // reset() sets magic and all fields to valid initial state
+                buf.reset();
+                buf
+            });
+        }
+
         // Spawn tasks
         tmc_control::spawn().ok();
         usb_task::spawn().ok();
@@ -1987,6 +2048,63 @@ mod app {
                 defmt::warn!("handle_tmc_request: SetPositionGains handled by main loop");
             }
             TmcRequest::SetVelocityFeedforward { .. } => {}
+            // During active commissioning, trace requests queue until the
+            // engine reaches a terminal state (Continue/PhaseChanged both
+            // `continue` before rx.recv()). By that point stop() has run,
+            // so FetchResult::Busy is protocol-correct but not observable
+            // during commissioning. The Python FOCI_TRACE command runs
+            // after commissioning completes, so this is not a functional gap.
+            TmcRequest::TraceInfo { oid } => {
+                let info = unsafe { trace_buf() }.info(oid);
+                klipper_reply!(
+                    foci_trace_info_result,
+                    oid: u8 = oid,
+                    state: u8 = info.state,
+                    gen: u8 = info.generation,
+                    preset: u8 = info.preset,
+                    count: u16 = info.count,
+                    phase: u8 = info.phase_id,
+                    sample_period_us: u16 = info.sample_period_us,
+                    dropped: u16 = info.dropped
+                );
+            }
+            TmcRequest::TraceFetch { oid, offset, gen } => {
+                let buf = unsafe { trace_buf() };
+                match buf.fetch(oid, offset, gen) {
+                    foci_core::trace::FetchResult::Ok(ring_idx) => {
+                        let data = if buf.preset() == foci_core::trace::PRESET_FULL {
+                            buf.sample_bytes_full(ring_idx)
+                        } else {
+                            buf.sample_bytes_fast(ring_idx)
+                        };
+                        klipper_reply!(
+                            foci_trace_data,
+                            oid: u8 = oid,
+                            offset: u16 = offset,
+                            status: u8 = 0,
+                            data: &[u8] = data
+                        );
+                    }
+                    foci_core::trace::FetchResult::Busy => {
+                        klipper_reply!(
+                            foci_trace_data,
+                            oid: u8 = oid,
+                            offset: u16 = offset,
+                            status: u8 = 1,
+                            data: &[u8] = &[]
+                        );
+                    }
+                    foci_core::trace::FetchResult::Invalid => {
+                        klipper_reply!(
+                            foci_trace_data,
+                            oid: u8 = oid,
+                            offset: u16 = offset,
+                            status: u8 = 2,
+                            data: &[u8] = &[]
+                        );
+                    }
+                }
+            }
             TmcRequest::Commission { .. } => {
                 defmt::warn!("handle_tmc_request: Commission handled by main loop");
             }
