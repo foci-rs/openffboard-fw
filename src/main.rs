@@ -2519,15 +2519,34 @@ mod app {
             // Tick the commissioning engine if one is active.
             // Each step() does at most 1ms of work, then returns.
             if let Some(engine) = commission_engine.as_mut() {
+                // Capture deadline before engine.step() so SPI time consumed
+                // by the engine reduces the remaining trace budget.
+                let engine_tick_deadline =
+                    Mono::now() + fugit::Duration::<u64, 1, 1_000_000>::millis(1);
                 let mut backend = OpenFFBoardBackend { tmc, enable_pin };
                 let result = engine.step(&mut backend).await;
                 match result {
                     crate::commission::StepResult::Continue => {
+                        // Trace capture runs here — the main-loop trace call
+                        // is unreachable due to 'continue'.
+                        trace_sample_tick(tmc, engine_tick_deadline).await;
                         Mono::delay(1.millis()).await;
                         continue;
                     }
                     crate::commission::StepResult::PhaseChanged(phase_id) => {
                         let oid = engine.oid();
+                        // Start fast trace on ClosedLoopEntry for Stage 1
+                        // (Commission only, not Calibrate — spec excludes
+                        // Calibrate-on-enable and foci_calibrate CLE paths).
+                        if phase_id == foci_core::autotune::PhaseId::ClosedLoopEntry
+                            && !engine.is_calibrate()
+                            && !unsafe { trace_buf() }.is_capturing()
+                        {
+                            unsafe {
+                                trace_buf().start(oid, foci_core::trace::PRESET_FAST);
+                            }
+                        }
+                        unsafe { trace_buf().set_phase(phase_id.to_u8()) };
                         klipper_reply!(
                             foci_commission_phase,
                             oid: u8 = oid,
@@ -2538,6 +2557,7 @@ mod app {
                         continue;
                     }
                     crate::commission::StepResult::InnerFailed(error) => {
+                        unsafe { trace_buf().stop() };
                         let oid = engine.oid();
                         let is_calibrate = engine.is_calibrate();
                         commission_engine = None;
@@ -2563,6 +2583,7 @@ mod app {
                         }
                     }
                     crate::commission::StepResult::OuterDone(outer) => {
+                        unsafe { trace_buf().stop() };
                         let oid = engine.oid();
                         commission_engine = None;
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
@@ -2630,6 +2651,7 @@ mod app {
                         );
                     }
                     crate::commission::StepResult::OuterFailed(error) => {
+                        unsafe { trace_buf().stop() };
                         let oid = engine.oid();
                         let snapshot = engine.entry_snapshot();
                         commission_engine = None;
@@ -2838,6 +2860,7 @@ mod app {
                         );
                     }
                     crate::commission::StepResult::CommissionDone(commission_result) => {
+                        unsafe { trace_buf().stop() };
                         let oid = engine.oid();
                         commission_engine = None;
 
@@ -3090,6 +3113,10 @@ mod app {
                                 oid,
                                 foci_core::autotune::CommissionProfile::from_u8(profile),
                             ));
+                        // Trace start deferred to ClosedLoopEntry phase transition
+                        // (see PhaseChanged handler). Spec scopes Stage 1 trace to
+                        // ClosedLoopEntry only — starting here would add SPI reads
+                        // throughout inner diagnostics/electrical ID phases.
                     }
                     TmcRequest::Tune {
                         oid,
@@ -3157,6 +3184,11 @@ mod app {
                                 current_bandwidth_hz,
                                 entry_snapshot,
                             ));
+                        unsafe {
+                            trace_buf().start(oid, foci_core::trace::PRESET_FULL);
+                            trace_buf()
+                                .set_phase(foci_core::autotune::PhaseId::MechanicalId.to_u8());
+                        }
                     }
                     TmcRequest::SelfTest { oid } => {
                         if motor_enabled {
