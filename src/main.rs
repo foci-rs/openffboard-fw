@@ -2597,34 +2597,116 @@ mod app {
                         unsafe { trace_buf().stop() };
                         let oid = engine.oid();
                         commission_engine = None;
-                        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
-                        // Motor stays enabled with tuned gains from the
-                        // Commit phase. No restore_safe_state.
-                        enable_pin.set_high();
-                        calibrated = true;
-                        motor_enabled = true;
-                        MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
 
                         // Persist outer gains to atomics for closed-loop entry.
-                        POSITION_P_VALUE
-                            .store(outer.position_p, core::sync::atomic::Ordering::Relaxed);
-                        POSITION_I_VALUE
-                            .store(outer.position_i, core::sync::atomic::Ordering::Relaxed);
-                        VELOCITY_P_VALUE
-                            .store(outer.velocity_p, core::sync::atomic::Ordering::Relaxed);
-                        VELOCITY_I_VALUE
-                            .store(outer.velocity_i, core::sync::atomic::Ordering::Relaxed);
-
-                        // Persist velocity limit for closed-loop entry.
-                        VELOCITY_LIMIT_CFG
-                            .store(outer.velocity_limit, core::sync::atomic::Ordering::Relaxed);
-
-                        // Persist filter settings into atomics for closed-loop entry.
                         use core::sync::atomic::Ordering::Relaxed as R;
+                        POSITION_P_VALUE.store(outer.position_p, R);
+                        POSITION_I_VALUE.store(outer.position_i, R);
+                        VELOCITY_P_VALUE.store(outer.velocity_p, R);
+                        VELOCITY_I_VALUE.store(outer.velocity_i, R);
+                        VELOCITY_LIMIT_CFG.store(outer.velocity_limit, R);
                         VELOCITY_FILTER_HZ.store(outer.velocity_filter_hz, R);
                         POSITION_FILTER_HZ.store(outer.position_filter_hz, R);
                         FLUX_FILTER_HZ.store(outer.flux_filter_hz, R);
                         TORQUE_FILTER_HZ.store(outer.torque_filter_hz, R);
+
+                        // Restore TMC4671 to operational state. The outer
+                        // tuning phases leave the chip in stopped/torque
+                        // mode with safety-envelope limits. We must write
+                        // the tuned gains, operational limits, filters,
+                        // and re-enter position mode before declaring done.
+                        let restore = async {
+                            use tmc4671::registers::*;
+
+                            // Tuned velocity + position gains.
+                            let velocity_reg =
+                                (outer.velocity_p as u32) << 16 | outer.velocity_i as u32;
+                            tmc.write_register(PID_VELOCITY_P_VELOCITY_I, velocity_reg)
+                                .await
+                                .map_err(|_| ())?;
+                            let position_reg =
+                                (outer.position_p as u32) << 16 | outer.position_i as u32;
+                            tmc.write_register(PID_POSITION_P_POSITION_I, position_reg)
+                                .await
+                                .map_err(|_| ())?;
+
+                            // Operational limits (not safety caps).
+                            tmc.write_register(PID_VELOCITY_LIMIT, outer.velocity_limit)
+                                .await
+                                .map_err(|_| ())?;
+                            let current_limit = CURRENT_LIMIT_REG.load(R);
+                            tmc.write_register(PID_TORQUE_FLUX_LIMITS, current_limit)
+                                .await
+                                .map_err(|_| ())?;
+                            tmc.write_register(PIDOUT_UQ_UD_LIMITS, 1024)
+                                .await
+                                .map_err(|_| ())?;
+
+                            // Clear PID error sums before mode switch.
+                            tmc.write_register(PID_POSITION_ACTUAL, 0)
+                                .await
+                                .map_err(|_| ())?;
+                            let target =
+                                tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
+                            let target_scaled =
+                                target.wrapping_mul(STEP_WIDTH_VALUE.load(R) as u32);
+                            tmc.write_register(PID_POSITION_TARGET, target_scaled)
+                                .await
+                                .map_err(|_| ())?;
+
+                            // Enter position mode (advanced PID cascade).
+                            tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0003)
+                                .await
+                                .map_err(|_| ())?;
+
+                            Ok::<(), ()>(())
+                        };
+                        if restore.await.is_err() {
+                            defmt::error!("OuterDone: position-mode restore SPI failed");
+                            foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                            COMMISSION_IN_FLIGHT.store(false, R);
+                            motor_enabled = false;
+                            calibrated = false;
+                            klipper_reply!(
+                                foci_tune_result,
+                                oid: u8 = oid,
+                                status: u8 = foci_core::autotune::CommissionError::Spi
+                                    .status_code(),
+                                velocity_p: u16 = 0,
+                                velocity_i: u16 = 0,
+                                velocity_limit: u32 = 0,
+                                position_p: u16 = 0,
+                                position_i: u16 = 0,
+                                velocity_filter_hz: u16 = 0,
+                                position_filter_hz: u16 = 0,
+                                flux_filter_hz: u16 = 0,
+                                torque_filter_hz: u16 = 0,
+                                j_eff: u32 = 0,
+                                b_eff: u32 = 0,
+                                warning_code: u8 = 0,
+                                mech_torque_step: u16 = 0,
+                                mech_fwd_accel: u32 = 0,
+                                mech_rev_accel: u32 = 0,
+                                mech_fwd_peak_velocity: u32 = 0,
+                                mech_rev_peak_velocity: u32 = 0,
+                                mech_fwd_travel: u32 = 0,
+                                mech_rev_travel: u32 = 0,
+                                synth_velocity_p: u16 = 0,
+                                synth_velocity_i: u16 = 0,
+                                synth_position_p: u16 = 0,
+                                synth_position_i: u16 = 0
+                            );
+                            continue;
+                        }
+
+                        // Re-apply biquad filters from stored atomics.
+                        apply_stored_filters(tmc).await;
+
+                        enable_pin.set_high();
+                        calibrated = true;
+                        motor_enabled = true;
+                        MOTOR_ARMED.store(true, R);
+                        COMMISSION_IN_FLIGHT.store(false, R);
 
                         let status = match outer.status {
                             foci_core::autotune::CommissionStatus::Accepted => 0u8,
