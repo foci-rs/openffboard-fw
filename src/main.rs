@@ -1086,14 +1086,24 @@ mod app {
 
     /// Manually trigger a TrSync with the given reason code.
     ///
-    /// If the trigger is accepted (TrSync was Armed), stops all steppers
-    /// linked to this TrSync OID via stepper_stop_on_trigger.
+    /// If the trigger is accepted (TrSync was Armed), stops the hardware
+    /// stepper and sets STEPPER_NEED_RESET — matching the behavior of the
+    /// endstop trigger path (P2 ticker) and timeout path. The library
+    /// crate's `stop_linked_steppers` is a no-op; the board crate must
+    /// handle the hardware stop here.
     #[klipper_command]
     pub fn trsync_trigger(context: &mut State, oid: u8, reason: u8) {
-        if let Err(e) = klipper_mcu::commands::trsync::trsync_trigger(context, oid, reason) {
-            defmt::error!("trsync_trigger: {}", e);
-            if enter_shutdown(context) {
-                klipper_shutdown!("trsync_trigger failed", read_tim5());
+        match klipper_mcu::commands::trsync::trsync_trigger(context, oid, reason) {
+            Ok(true) => {
+                stepper_stop();
+                STEPPER_NEED_RESET.store(true, core::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(false) => {}
+            Err(e) => {
+                defmt::error!("trsync_trigger: {}", e);
+                if enter_shutdown(context) {
+                    klipper_shutdown!("trsync_trigger failed", read_tim5());
+                }
             }
         }
     }
