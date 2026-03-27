@@ -117,10 +117,6 @@ mod app {
     enum CalibrationError {
         /// SPI communication or register verification failed.
         SpiError,
-        /// ADC offset values are out of the expected range (30000..=36000).
-        AdcFault,
-        /// ABN encoder not responding or count stuck at zero.
-        EncoderFault,
         /// Motor already enabled (calibration not needed).
         AlreadyEnabled,
         /// Internal firmware error (queue full, channel not initialized, etc.).
@@ -138,24 +134,10 @@ mod app {
         fn status_code(&self) -> u8 {
             match self {
                 Self::SpiError => 1,
-                Self::AdcFault => 2,
-                Self::EncoderFault => 3,
                 // Code 4 was PidFault (removed with tmc_enter_closedloop).
                 Self::AlreadyEnabled => 5,
                 Self::InternalError => 6,
                 Self::ConfigFault => 7,
-            }
-        }
-
-        fn from_commission_error(error: foci_core::autotune::CommissionError) -> Self {
-            match error {
-                foci_core::autotune::CommissionError::Spi => Self::SpiError,
-                foci_core::autotune::CommissionError::AdcFault => Self::AdcFault,
-                foci_core::autotune::CommissionError::EncoderFault
-                | foci_core::autotune::CommissionError::CoilFault
-                | foci_core::autotune::CommissionError::PhaseFault
-                | foci_core::autotune::CommissionError::NoCurrent => Self::EncoderFault,
-                _ => Self::InternalError,
             }
         }
     }
@@ -2571,15 +2553,19 @@ mod app {
                         unsafe { trace_buf().stop() };
                         let oid = engine.oid();
                         let is_calibrate = engine.is_calibrate();
+                        defmt::error!("InnerFailed: calibrate={} error={}", is_calibrate, error,);
                         commission_engine = None;
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
                         foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
                         if is_calibrate {
-                            let cal_error = CalibrationError::from_commission_error(error);
+                            // Send raw CommissionError status code — the
+                            // old CalibrationError mapping was lossy (4
+                            // errors mapped to one code). Python handles
+                            // the full CommissionError code range (1-17).
                             klipper_reply!(
                                 foci_calibrate_result,
                                 oid: u8 = oid,
-                                status: u8 = cal_error.status_code(),
+                                status: u8 = error.status_code(),
                                 adc_i0: u16 = 0,
                                 adc_i1: u16 = 0,
                                 encoder_count: u32 = 0
