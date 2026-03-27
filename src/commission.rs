@@ -1738,13 +1738,14 @@ impl CommissioningEngine {
                 // Route based on sequence.
                 match sequence {
                     InnerSequence::Calibrate => {
-                        // Skip diagnostics, go straight to encoder alignment.
-                        *phase = InnerPhase::EncoderAlign {
-                            state: EncoderAlignState::Setup {
-                                count_before: encoder_baseline,
-                            },
+                        // Skip coil/wiring diagnostics, but still run the
+                        // encoder direction sweep used by commissioning so
+                        // the rotor is moved before D-axis alignment.
+                        *phase = InnerPhase::EncoderCheck {
+                            state: EncoderCheckState::DirSetup,
+                            encoder_baseline,
                         };
-                        StepResult::PhaseChanged(PhaseId::EncoderAlign)
+                        StepResult::PhaseChanged(PhaseId::EncoderCheck)
                     }
                     InnerSequence::Selftest | InnerSequence::Commission => {
                         // Run full diagnostics.
@@ -2050,9 +2051,10 @@ impl CommissioningEngine {
                     return Self::fail_inner(phase, CommissionError::EncoderFault);
                 }
 
-                // All sequences that reach EncoderCheck (Selftest, Commission)
-                // proceed to EncoderAlign. Calibrate skips directly from
-                // ADC calibration to EncoderAlign.
+                // All sequences that reach EncoderCheck proceed to
+                // EncoderAlign. Calibrate enters at DirSetup so it runs the
+                // direction sweep without repeating the presence check that
+                // depends on earlier coil-test motion.
                 let _ = sequence; // used for routing in other phases
 
                 // Direction detected. Transition to EncoderAlign, which
@@ -2198,6 +2200,16 @@ impl CommissioningEngine {
                 let stable = (*count1 as i32 - count2 as i32).unsigned_abs()
                     <= ENCODER_ALIGN_STABILITY_COUNTS;
                 if movement < *min_movement || !stable {
+                    defmt::warn!(
+                        "encoder-align FAIL: count_before={} count1={} count2={} \
+                         movement={} min={} stable={}",
+                        *count_before,
+                        *count1,
+                        count2,
+                        movement,
+                        *min_movement,
+                        stable
+                    );
                     let _ = backend.write_register(UQ_UD_EXT, 0).await;
                     let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
                     backend.set_enable_pin(false);
