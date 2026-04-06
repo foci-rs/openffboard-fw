@@ -264,6 +264,13 @@ const COIL_COOLDOWN_US: u64 = 50_000;
 /// Number of PHI_E steps for encoder direction sweep.
 const ENCODER_DIR_STEPS: u16 = 50;
 
+/// Final PHI_E_EXT value for encoder direction sweep.
+///
+/// Keep this away from 0/65536 so the sweep has a non-zero final rotor
+/// displacement. A full electrical revolution can end at the same stable
+/// angle it started from, producing a false ENCODER_FAULT.
+const ENCODER_DIR_TARGET_PHI: u32 = 32768;
+
 /// Per-step dwell time for encoder direction sweep (microseconds).
 const ENCODER_DIR_STEP_US: u64 = 10_000;
 
@@ -276,11 +283,14 @@ const ENCODER_ALIGN_STABILITY_US: u64 = 10_000;
 /// Allowed encoder jitter during the alignment double-read.
 const ENCODER_ALIGN_STABILITY_COUNTS: u32 = 2;
 
-/// Voltage limit used only while applying alignment voltage.
+/// Voltage limit used only while applying encoder movement current.
 const ENCODER_ALIGN_VOLTAGE_LIMIT: u32 = 2000;
 
-/// D-axis voltage used by the legacy alignment path and TMC-API reference.
-const ENCODER_ALIGN_VOLTAGE: u32 = 1000;
+/// Minimum D-axis current target used while forcing encoder movement.
+const ENCODER_MOVE_CURRENT_MIN: u32 = 100;
+
+/// Maximum D-axis current target used while forcing encoder movement.
+const ENCODER_MOVE_CURRENT_MAX: u32 = 1000;
 
 // ---------------------------------------------------------------------------
 // Electrical identification constants (Phase 5)
@@ -449,18 +459,16 @@ struct CoilObservation {
 /// Encoder check sub-state.
 #[derive(Debug, defmt::Format)]
 enum EncoderCheckState {
-    /// Record baseline encoder count (captured during coil tests).
-    CheckPresence,
-    /// Set up open-loop mode for direction sweep.
-    DirSetup,
+    /// Set up current-regulated mode for direction sweep.
+    Setup,
     /// Sweep PHI_E_EXT in steps, one per tick.
-    DirSweep {
+    Sweep {
         step: u16,
         deadline_us: u64,
         count_start: i32,
     },
     /// Read final count and determine direction.
-    DirFinalize { count_start: i32 },
+    Finalize { count_start: i32 },
 }
 
 /// Encoder D-axis alignment sub-state.
@@ -581,8 +589,6 @@ enum InnerPhase {
     /// Phase 2: Coil connectivity check.
     CoilCheck {
         state: CoilCheckState,
-        /// Encoder count captured before coil tests (for encoder presence).
-        encoder_baseline: u32,
         /// Coil A observation (filled after coil A test).
         coil_a: Option<CoilObservation>,
     },
@@ -590,14 +596,9 @@ enum InnerPhase {
     PhaseWiringCheck {
         coil_a: CoilObservation,
         coil_b: CoilObservation,
-        /// Encoder count captured before coil tests (carried forward).
-        encoder_baseline: u32,
     },
-    /// Phase 4: Encoder presence and direction detection.
-    EncoderCheck {
-        state: EncoderCheckState,
-        encoder_baseline: u32,
-    },
+    /// Phase 4: Encoder movement and direction detection.
+    EncoderCheck { state: EncoderCheckState },
     /// Encoder D-axis alignment and zeroing.
     EncoderAlign { state: EncoderAlignState },
     /// Phase 5: Electrical identification (R, L, theta_e).
@@ -1159,6 +1160,26 @@ enum OuterPhase {
     Failed(CommissionError),
 }
 
+/// Parameters for outer (mechanical) commissioning engine construction.
+///
+/// Groups the inner-loop characterization results and operating mode
+/// that `new_outer()` needs beyond `oid` and `entry_snapshot`.
+#[derive(Debug, Clone, Copy, defmt::Format)]
+pub struct OuterTuneParams {
+    /// Commissioning profile (conservative / balanced / aggressive).
+    pub profile: CommissionProfile,
+    /// Operating mode (step/dir vs position).
+    pub mode: OperatingMode,
+    /// Electrical time constant from Stage 1 (microseconds).
+    pub inner_lambda_us: u32,
+    /// Theta-E delay from Stage 1 (microseconds).
+    pub theta_e_us: u32,
+    /// Whether the Stage 1 current step response showed ringing.
+    pub current_ringing: bool,
+    /// Current-loop bandwidth from Stage 1 (Hz).
+    pub current_bandwidth_hz: u32,
+}
+
 /// Snapshot of outer gains at Stage 2 entry, for soft-failure restoration.
 ///
 /// Current-loop gains are not included because Stage 2 never mutates them.
@@ -1284,21 +1305,20 @@ impl CommissioningEngine {
     ///
     /// `entry_snapshot` captures the active outer gains at entry for
     /// soft-failure restoration. Built by the caller from firmware atomics.
-    pub fn new_outer(
-        oid: u8,
-        profile: CommissionProfile,
-        mode: OperatingMode,
-        inner_lambda_us: u32,
-        theta_e_us: u32,
-        current_ringing: bool,
-        current_bandwidth_hz: u32,
-        entry_snapshot: EntrySnapshot,
-    ) -> Self {
+    pub fn new_outer(oid: u8, params: OuterTuneParams, entry_snapshot: EntrySnapshot) -> Self {
         // Safety limits and data are initialized with placeholder values.
         // The MechanicalIdState::Setup sub-state reads the actual encoder
         // position and current limit from the backend on the first step().
         let safety = OuterSafetyLimits::new(0, 0);
         let data = MechanicalIdData::new(0, 0);
+        let OuterTuneParams {
+            profile,
+            mode,
+            inner_lambda_us,
+            theta_e_us,
+            current_ringing,
+            current_bandwidth_hz,
+        } = params;
         Self {
             oid,
             engine_mode: EngineMode::Outer {
@@ -1535,15 +1555,10 @@ impl CommissioningEngine {
                 Self::step_adc_calibrate(phase, sequence, adc_cal, backend).await
             }
             InnerPhase::CoilCheck { .. } => Self::step_coil_check(phase, backend).await,
-            InnerPhase::PhaseWiringCheck {
-                coil_a,
-                coil_b,
-                encoder_baseline,
-            } => {
+            InnerPhase::PhaseWiringCheck { coil_a, coil_b } => {
                 let a = *coil_a;
                 let b = *coil_b;
-                let baseline = *encoder_baseline;
-                Self::step_phase_wiring(phase, a, b, baseline)
+                Self::step_phase_wiring(phase, a, b)
             }
             InnerPhase::EncoderCheck { .. } => {
                 Self::step_encoder_check(phase, sequence, backend).await
@@ -1726,12 +1741,12 @@ impl CommissioningEngine {
                 // Re-enable PWM chopping.
                 let _ = backend.write_register(PWM_SV_CHOP, 7).await;
 
-                // Capture encoder baseline for later presence check.
-                let encoder_baseline = backend.read_encoder_count().await;
+                // Capture encoder count for the final calibration result.
+                let encoder_count = backend.read_encoder_count().await;
                 let result = AdcCalResult {
                     adc_i0: offset_i0,
                     adc_i1: offset_i1,
-                    encoder_count: encoder_baseline,
+                    encoder_count,
                 };
                 *adc_cal = Some(result.clone());
 
@@ -1742,8 +1757,7 @@ impl CommissioningEngine {
                         // encoder direction sweep used by commissioning so
                         // the rotor is moved before D-axis alignment.
                         *phase = InnerPhase::EncoderCheck {
-                            state: EncoderCheckState::DirSetup,
-                            encoder_baseline,
+                            state: EncoderCheckState::Setup,
                         };
                         StepResult::PhaseChanged(PhaseId::EncoderCheck)
                     }
@@ -1751,7 +1765,6 @@ impl CommissioningEngine {
                         // Run full diagnostics.
                         *phase = InnerPhase::CoilCheck {
                             state: CoilCheckState::CoilA(CoilTestState::Setup { phase: 0 }),
-                            encoder_baseline,
                             coil_a: None,
                         };
                         StepResult::PhaseChanged(PhaseId::CoilCheck)
@@ -1778,12 +1791,8 @@ impl CommissioningEngine {
         use tmc4671::registers::*;
 
         // Extract mutable fields from phase.
-        let (state, encoder_baseline, coil_a_obs) = match phase {
-            InnerPhase::CoilCheck {
-                state,
-                encoder_baseline,
-                coil_a,
-            } => (state, *encoder_baseline, coil_a),
+        let (state, coil_a_obs) = match phase {
+            InnerPhase::CoilCheck { state, coil_a } => (state, coil_a),
             _ => return StepResult::Continue,
         };
 
@@ -1891,7 +1900,6 @@ impl CommissioningEngine {
                             *phase = InnerPhase::PhaseWiringCheck {
                                 coil_a: a,
                                 coil_b: obs,
-                                encoder_baseline,
                             };
                             return StepResult::PhaseChanged(PhaseId::PhaseWiringCheck);
                         }
@@ -1925,7 +1933,6 @@ impl CommissioningEngine {
         phase: &mut InnerPhase,
         coil_a: CoilObservation,
         coil_b: CoilObservation,
-        encoder_baseline: u32,
     ) -> StepResult {
         // Phase wiring check: expected channel must dominate.
         if coil_a.other.unsigned_abs() >= coil_a.expected.unsigned_abs() {
@@ -1937,8 +1944,7 @@ impl CommissioningEngine {
 
         // Transition to encoder check.
         *phase = InnerPhase::EncoderCheck {
-            state: EncoderCheckState::CheckPresence,
-            encoder_baseline,
+            state: EncoderCheckState::Setup,
         };
         StepResult::PhaseChanged(PhaseId::EncoderCheck)
     }
@@ -1947,14 +1953,110 @@ impl CommissioningEngine {
     // Phase 4: Encoder Presence and Direction
     // -------------------------------------------------------------------
 
+    /// Start current-regulated open-loop encoder movement.
+    ///
+    /// Direct voltage mode (`MODE=8` + `UQ_UD_EXT`) is useful for coil
+    /// current measurements, but it can fail to move a loaded rotor far
+    /// enough for encoder validation. The dev open-loop path uses this
+    /// current-regulated pattern: external PHI_E, a D-axis flux target,
+    /// current-loop gains, and torque/flux current limits.
+    async fn start_encoder_current_drive<B: CommissioningBackend>(
+        backend: &mut B,
+        phi_e: u32,
+    ) -> Result<(), CommissionError> {
+        use tmc4671::registers::*;
+
+        let current_limit = backend.current_limit() & 0xFFFF;
+        if current_limit == 0 {
+            return Err(CommissionError::NoCurrent);
+        }
+
+        let target = (current_limit / 2)
+            .clamp(ENCODER_MOVE_CURRENT_MIN, ENCODER_MOVE_CURRENT_MAX)
+            .min(current_limit) as i16;
+        let defaults = foci_core::pid::DEFAULT_INNER_GAINS;
+        let flux_reg = (defaults.flux_p as u32) << 16 | defaults.flux_i as u32;
+        let torque_reg = (defaults.torque_p as u32) << 16 | defaults.torque_i as u32;
+        let target_reg: u32 = PidTorqueFluxTarget::new()
+            .with_pid_flux_target(target)
+            .with_pid_torque_target(0)
+            .into();
+
+        backend.set_enable_pin(false);
+        backend
+            .write_register(MODE_RAMP_MODE_MOTION, 0)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend
+            .write_register(PID_TORQUE_FLUX_TARGET, 0)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend
+            .write_register(UQ_UD_EXT, 0)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend
+            .write_register(PID_FLUX_P_FLUX_I, flux_reg)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend
+            .write_register(PID_TORQUE_P_TORQUE_I, torque_reg)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend
+            .write_register(PID_TORQUE_FLUX_LIMITS, backend.current_limit())
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend
+            .write_register(PIDOUT_UQ_UD_LIMITS, ENCODER_ALIGN_VOLTAGE_LIMIT)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend
+            .write_register(PHI_E_SELECTION, 1)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend
+            .write_register(PHI_E_EXT, phi_e)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend
+            .write_register(PID_TORQUE_FLUX_TARGET, target_reg)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend
+            .write_register(MODE_RAMP_MODE_MOTION, 0x8000_0001)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend.set_enable_pin(true);
+        Ok(())
+    }
+
+    /// Stop current-regulated open-loop encoder movement.
+    async fn stop_encoder_current_drive<B: CommissioningBackend>(
+        backend: &mut B,
+    ) -> Result<(), CommissionError> {
+        use tmc4671::registers::*;
+
+        backend
+            .write_register(PID_TORQUE_FLUX_TARGET, 0)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend
+            .write_register(UQ_UD_EXT, 0)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend
+            .write_register(MODE_RAMP_MODE_MOTION, 0)
+            .await
+            .map_err(|_| CommissionError::Spi)?;
+        backend.set_enable_pin(false);
+        Ok(())
+    }
+
     /// Advance encoder check sub-state.
     ///
-    /// Presence: compares current ABN count against baseline captured
-    /// before coil tests. Any non-zero delta = encoder present.
-    ///
-    /// Direction: sweeps one electrical revolution via PHI_E_EXT in
-    /// resumable sub-steps, then checks whether count increased or
-    /// decreased.
+    /// Sweeps to a displaced electrical angle via PHI_E_EXT in
+    /// resumable sub-steps, then checks whether the encoder count changed.
     async fn step_encoder_check<B: CommissioningBackend>(
         phase: &mut InnerPhase,
         sequence: InnerSequence,
@@ -1962,50 +2064,21 @@ impl CommissioningEngine {
     ) -> StepResult {
         use tmc4671::registers::*;
 
-        let (state, encoder_baseline) = match phase {
-            InnerPhase::EncoderCheck {
-                state,
-                encoder_baseline,
-            } => (state, *encoder_baseline),
+        let state = match phase {
+            InnerPhase::EncoderCheck { state } => state,
             _ => return StepResult::Continue,
         };
 
         match state {
-            EncoderCheckState::CheckPresence => {
-                let count_now = backend.read_encoder_count().await;
-                let delta = (count_now as i32)
-                    .wrapping_sub(encoder_baseline as i32)
-                    .unsigned_abs();
-                if delta == 0 {
-                    return Self::fail_inner(phase, CommissionError::EncoderFault);
-                }
-                *state = EncoderCheckState::DirSetup;
-                StepResult::Continue
-            }
-
-            EncoderCheckState::DirSetup => {
+            EncoderCheckState::Setup => {
                 let count_start = backend.read_encoder_count().await as i32;
 
-                // Set up open-loop voltage mode.
-                if backend.write_register(PHI_E_SELECTION, 1).await.is_err()
-                    || backend
-                        .write_register(UQ_UD_EXT, backend.excitation_voltage() as u32 & 0xFFFF)
-                        .await
-                        .is_err()
-                    || backend
-                        .write_register(MODE_RAMP_MODE_MOTION, 8)
-                        .await
-                        .is_err()
-                {
-                    return Self::fail_inner(phase, CommissionError::Spi);
+                if let Err(error) = Self::start_encoder_current_drive(backend, 0).await {
+                    return Self::fail_inner(phase, error);
                 }
-                backend.set_enable_pin(true);
-
-                // Write initial PHI_E_EXT=0.
-                let _ = backend.write_register(PHI_E_EXT, 0).await;
 
                 let deadline = backend.elapsed_us().wrapping_add(ENCODER_DIR_STEP_US);
-                *state = EncoderCheckState::DirSweep {
+                *state = EncoderCheckState::Sweep {
                     step: 0,
                     deadline_us: deadline,
                     count_start,
@@ -2013,7 +2086,7 @@ impl CommissioningEngine {
                 StepResult::Continue
             }
 
-            EncoderCheckState::DirSweep {
+            EncoderCheckState::Sweep {
                 step,
                 deadline_us,
                 count_start,
@@ -2026,35 +2099,47 @@ impl CommissioningEngine {
                 *step += 1;
                 if *step > ENCODER_DIR_STEPS {
                     let cs = *count_start;
-                    *state = EncoderCheckState::DirFinalize { count_start: cs };
+                    *state = EncoderCheckState::Finalize { count_start: cs };
                     return StepResult::Continue;
                 }
 
-                // Advance PHI_E_EXT.
-                let phi = (65536u64 * *step as u64 / ENCODER_DIR_STEPS as u64) as u32;
+                // Advance PHI_E_EXT toward a non-zero final angle. Ending
+                // at 65536/0 can return the rotor to the start angle and
+                // make a working encoder look stationary.
+                let phi = (ENCODER_DIR_TARGET_PHI as u64 * *step as u64 / ENCODER_DIR_STEPS as u64)
+                    as u32;
                 let _ = backend.write_register(PHI_E_EXT, phi).await;
 
                 *deadline_us = backend.elapsed_us().wrapping_add(ENCODER_DIR_STEP_US);
                 StepResult::Continue
             }
 
-            EncoderCheckState::DirFinalize { count_start } => {
+            EncoderCheckState::Finalize { count_start } => {
                 let count_end = backend.read_encoder_count().await as i32;
 
                 // Stop and disable (always, regardless of result).
-                let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
-                let _ = backend.write_register(UQ_UD_EXT, 0).await;
-                backend.set_enable_pin(false);
+                let _ = Self::stop_encoder_current_drive(backend).await;
 
                 let delta = count_end.wrapping_sub(*count_start);
+                defmt::info!(
+                    "encoder-dir: start={} end={} delta={}",
+                    *count_start,
+                    count_end,
+                    delta
+                );
                 if delta == 0 {
+                    defmt::warn!(
+                        "encoder-dir FAIL: start={} end={} delta=0",
+                        *count_start,
+                        count_end
+                    );
                     return Self::fail_inner(phase, CommissionError::EncoderFault);
                 }
 
                 // All sequences that reach EncoderCheck proceed to
-                // EncoderAlign. Calibrate enters at DirSetup so it runs the
-                // direction sweep without repeating the presence check that
-                // depends on earlier coil-test motion.
+                // EncoderAlign. Use the final sweep count as the alignment
+                // baseline because the rotor is still held at the displaced
+                // sweep angle; EncoderAlign::Setup will drive back to PHI=0.
                 let _ = sequence; // used for routing in other phases
 
                 // Direction detected. Transition to EncoderAlign, which
@@ -2064,7 +2149,7 @@ impl CommissioningEngine {
                 // commissioning-local data; persistence is outside this plan.
                 *phase = InnerPhase::EncoderAlign {
                     state: EncoderAlignState::Setup {
-                        count_before: *count_start as u32,
+                        count_before: count_end as u32,
                     },
                 };
                 StepResult::PhaseChanged(PhaseId::EncoderAlign)
@@ -2079,10 +2164,10 @@ impl CommissioningEngine {
     /// Advance encoder D-axis alignment sub-state.
     ///
     /// This is the non-blocking engine equivalent of the old blocking
-    /// alignment helper. It applies plain voltage mode
-    /// (`MODE_RAMP_MODE_MOTION=8`, with MODE_PID_TYPE clear), verifies
-    /// the encoder moved and settled, zeros ABN count/offset while still
-    /// driving, then locks PHI_E to ABN before stopping the drive.
+    /// alignment helper. It applies current-regulated open-loop drive,
+    /// verifies the encoder moved and settled, zeros ABN count/offset
+    /// while still driving, then locks PHI_E to ABN before stopping the
+    /// drive.
     async fn step_encoder_align<B: CommissioningBackend>(
         phase: &mut InnerPhase,
         sequence: InnerSequence,
@@ -2102,22 +2187,8 @@ impl CommissioningEngine {
                     return Self::fail_inner(phase, CommissionError::NoCurrent);
                 }
 
-                if backend.write_register(PHI_E_SELECTION, 1).await.is_err()
-                    || backend.write_register(PHI_E_EXT, 0).await.is_err()
-                    || backend
-                        .write_register(PIDOUT_UQ_UD_LIMITS, ENCODER_ALIGN_VOLTAGE_LIMIT)
-                        .await
-                        .is_err()
-                    || backend
-                        .write_register(UQ_UD_EXT, ENCODER_ALIGN_VOLTAGE)
-                        .await
-                        .is_err()
-                    || backend
-                        .write_register(MODE_RAMP_MODE_MOTION, 8)
-                        .await
-                        .is_err()
-                {
-                    return Self::fail_inner(phase, CommissionError::Spi);
+                if let Err(error) = Self::start_encoder_current_drive(backend, 0).await {
+                    return Self::fail_inner(phase, error);
                 }
 
                 let phi_ok = backend
@@ -2127,7 +2198,7 @@ impl CommissioningEngine {
                 let mode_ok = backend
                     .read_register(MODE_RAMP_MODE_MOTION)
                     .await
-                    .is_ok_and(|v| v == 8);
+                    .is_ok_and(|v| v == 0x8000_0001);
                 if !phi_ok || !mode_ok {
                     return Self::fail_inner(phase, CommissionError::Spi);
                 }
@@ -2210,9 +2281,7 @@ impl CommissioningEngine {
                         *min_movement,
                         stable
                     );
-                    let _ = backend.write_register(UQ_UD_EXT, 0).await;
-                    let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
-                    backend.set_enable_pin(false);
+                    let _ = Self::stop_encoder_current_drive(backend).await;
                     return Self::fail_inner(phase, CommissionError::EncoderFault);
                 }
 
@@ -2246,15 +2315,9 @@ impl CommissioningEngine {
             }
 
             EncoderAlignState::StopDrive { old_count } => {
-                if backend.write_register(UQ_UD_EXT, 0).await.is_err()
-                    || backend
-                        .write_register(MODE_RAMP_MODE_MOTION, 0)
-                        .await
-                        .is_err()
-                {
-                    return Self::fail_inner(phase, CommissionError::Spi);
+                if let Err(error) = Self::stop_encoder_current_drive(backend).await {
+                    return Self::fail_inner(phase, error);
                 }
-                backend.set_enable_pin(false);
 
                 if let Some(result) = adc_cal.as_mut() {
                     result.encoder_count = *old_count;
@@ -2796,7 +2859,7 @@ impl CommissioningEngine {
                         let _ = backend
                             .write_register(tmc4671::registers::PID_VELOCITY_OFFSET, 0)
                             .await;
-                        return StepResult::SelftestDone;
+                        StepResult::SelftestDone
                     }
                     InnerSequence::Commission => {
                         // Transition to CurrentTune carrying the model.
@@ -3355,7 +3418,7 @@ impl CommissioningEngine {
                 }
                 let voltage_limit_readback = backend.read_register(PIDOUT_UQ_UD_LIMITS).await;
                 match voltage_limit_readback {
-                    Ok(val) if val == 16000 => {}
+                    Ok(16000) => {}
                     _ => {
                         defmt::error!("closed-loop: PIDOUT_UQ_UD_LIMITS readback mismatch");
                         return Self::fail_inner(phase, CommissionError::Spi);
@@ -4087,7 +4150,7 @@ impl CommissioningEngine {
 
                     // For reverse capture, use the position at capture start
                     // (first sample) as the reference, not the original start.
-                    let reverse_start = if buf.len() > 0 {
+                    let reverse_start = if !buf.is_empty() {
                         buf.samples()[0] as i32
                     } else {
                         data.start_position
@@ -4194,11 +4257,7 @@ impl CommissioningEngine {
                     defmt::warn!("mech-id: zero average inertia");
                     return Self::fail_outer(phase, CommissionError::MechanicalIdFailed);
                 }
-                let j_diff = if j_eff_fwd > j_eff_rev {
-                    j_eff_fwd - j_eff_rev
-                } else {
-                    j_eff_rev - j_eff_fwd
-                };
+                let j_diff = j_eff_fwd.abs_diff(j_eff_rev);
                 let asymmetry_pct = (j_diff * 100) / j_avg;
                 if asymmetry_pct > MECH_ID_SYMMETRY_THRESHOLD_PCT {
                     if Self::retry_mechanical_id(state, data, "asymmetric response") {
@@ -4333,9 +4392,9 @@ impl CommissioningEngine {
         // buildup and static friction can leave a quiet prefix at the start of
         // the capture. Treating that prefix as the acceleration window caused
         // false zero-acceleration failures on hardware.
-        for i in 0..samples.len() {
+        for (i, &sample) in samples.iter().enumerate() {
             let velocity = velocity_at(i);
-            let travel = (samples[i] as i32)
+            let travel = (sample as i32)
                 .wrapping_sub(reference_position)
                 .unsigned_abs();
             if travel > max_travel {

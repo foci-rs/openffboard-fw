@@ -12,8 +12,6 @@ pub mod pac {
 }
 
 mod commission;
-#[macro_use]
-mod macros;
 
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [UART4, UART5, USART3])]
 mod app {
@@ -721,13 +719,12 @@ mod app {
         let queue_was_empty = unsafe { (*core::ptr::addr_of_mut!(STEP_QUEUE)).is_empty() };
 
         match queue_step_hw(need_reset, count, queue_was_empty) {
-            Ok(QueueStepResult::Discarded) => return,
+            Ok(QueueStepResult::Discarded) => (),
             Err(e) => {
                 defmt::error!("queue_step: oid={} {}", oid, e);
                 if enter_shutdown(context) {
                     klipper_shutdown!("queue_step failed", read_tim5());
                 }
-                return;
             }
             Ok(result) => {
                 // Prepare move with direction state
@@ -886,10 +883,8 @@ mod app {
         let _ = clock;
         match klipper_mcu::commands::digital_out::queue_digital_out(context, oid, on_ticks) {
             Ok(enabled) => {
-                if !tmc_send(TmcRequest::SetEnable(enabled)) {
-                    if enter_shutdown(context) {
-                        klipper_shutdown!("Motor enable/disable lost (queue full)", read_tim5());
-                    }
+                if !tmc_send(TmcRequest::SetEnable(enabled)) && enter_shutdown(context) {
+                    klipper_shutdown!("Motor enable/disable lost (queue full)", read_tim5());
                 }
             }
             Err(e) => {
@@ -906,10 +901,8 @@ mod app {
     pub fn update_digital_out(context: &mut State, oid: u8, value: u8) {
         match klipper_mcu::commands::digital_out::update_digital_out(context, oid, value) {
             Ok(enabled) => {
-                if !tmc_send(TmcRequest::SetEnable(enabled)) {
-                    if enter_shutdown(context) {
-                        klipper_shutdown!("Motor enable/disable lost (queue full)", read_tim5());
-                    }
+                if !tmc_send(TmcRequest::SetEnable(enabled)) && enter_shutdown(context) {
+                    klipper_shutdown!("Motor enable/disable lost (queue full)", read_tim5());
                 }
             }
             Err(e) => {
@@ -1289,10 +1282,8 @@ mod app {
     /// current scaling factor.
     #[klipper_command]
     pub fn tmc_set_current(context: &mut State, _oid: u8, run_ma: u32) {
-        if !tmc_send(foci_core::tmc::tmc_set_current(run_ma)) {
-            if enter_shutdown(context) {
-                klipper_shutdown!("tmc_set_current lost (queue full)", read_tim5());
-            }
+        if !tmc_send(foci_core::tmc::tmc_set_current(run_ma)) && enter_shutdown(context) {
+            klipper_shutdown!("tmc_set_current lost (queue full)", read_tim5());
         }
     }
 
@@ -1315,10 +1306,8 @@ mod app {
         let (req, step_width) = foci_core::tmc::tmc_set_encoder_hw(ppr, 50);
         STEP_WIDTH_VALUE.store(step_width, core::sync::atomic::Ordering::Relaxed);
         defmt::info!("channel={} ppr={} step_width={}", channel, ppr, step_width);
-        if !tmc_send(req) {
-            if enter_shutdown(context) {
-                klipper_shutdown!("tmc_set_encoder lost (queue full)", read_tim5());
-            }
+        if !tmc_send(req) && enter_shutdown(context) {
+            klipper_shutdown!("tmc_set_encoder lost (queue full)", read_tim5());
         }
     }
 
@@ -1333,10 +1322,8 @@ mod app {
             }
             return;
         }
-        if !tmc_send(foci_core::tmc::tmc_set_encoder_dir(invert != 0)) {
-            if enter_shutdown(context) {
-                klipper_shutdown!("tmc_set_encoder_dir lost (queue full)", read_tim5());
-            }
+        if !tmc_send(foci_core::tmc::tmc_set_encoder_dir(invert != 0)) && enter_shutdown(context) {
+            klipper_shutdown!("tmc_set_encoder_dir lost (queue full)", read_tim5());
         }
     }
 
@@ -1463,10 +1450,9 @@ mod app {
     ) {
         if !tmc_send(foci_core::tmc::tmc_set_pid_gains(
             flux_p, flux_i, torque_p, torque_i,
-        )) {
-            if enter_shutdown(context) {
-                klipper_shutdown!("tmc_set_pid_gains lost (queue full)", read_tim5());
-            }
+        )) && enter_shutdown(context)
+        {
+            klipper_shutdown!("tmc_set_pid_gains lost (queue full)", read_tim5());
         }
     }
 
@@ -1510,10 +1496,9 @@ mod app {
     ) {
         if !tmc_send(foci_core::tmc::tmc_set_position_gains(
             position_p, position_i, velocity_p, velocity_i,
-        )) {
-            if enter_shutdown(context) {
-                klipper_shutdown!("tmc_set_position_gains lost (queue full)", read_tim5());
-            }
+        )) && enter_shutdown(context)
+        {
+            klipper_shutdown!("tmc_set_position_gains lost (queue full)", read_tim5());
         }
     }
 
@@ -1557,10 +1542,10 @@ mod app {
         }
     }
 
-    /// Start Stage 2 installed tuning (mechanical ID + velocity/position/filters).
-    #[klipper_command]
-    pub fn foci_tune(
-        _context: &mut State,
+    /// Parameters for `foci_tune` grouped into a struct to satisfy
+    /// clippy's `too_many_arguments` lint. The `#[klipper_command]`
+    /// handler signature is protocol-bound and cannot be changed.
+    struct FociTuneParams {
         oid: u8,
         profile: u8,
         mode: u8,
@@ -1568,8 +1553,20 @@ mod app {
         theta_e: u32,
         current_ringing: u8,
         current_bw: u32,
-    ) {
+    }
+
+    /// Inner implementation of `foci_tune`.
+    fn foci_tune_inner(params: FociTuneParams) {
         use core::sync::atomic::Ordering::Relaxed;
+        let FociTuneParams {
+            oid,
+            profile,
+            mode,
+            inner_lambda,
+            theta_e,
+            current_ringing,
+            current_bw,
+        } = params;
         if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
             klipper_reply!(
                 foci_commission_phase,
@@ -1596,6 +1593,28 @@ mod app {
                 status: u8 = foci_core::autotune::CommissionError::QueueFull.status_code()
             );
         }
+    }
+
+    /// Start Stage 2 installed tuning (mechanical ID + velocity/position/filters).
+    #[klipper_command]
+    pub fn foci_tune(
+        oid: u8,
+        profile: u8,
+        mode: u8,
+        inner_lambda: u32,
+        theta_e: u32,
+        current_ringing: u8,
+        current_bw: u32,
+    ) {
+        foci_tune_inner(FociTuneParams {
+            oid,
+            profile,
+            mode,
+            inner_lambda,
+            theta_e,
+            current_ringing,
+            current_bw,
+        });
     }
 
     /// SPI transfer stub (returns empty response).
@@ -1858,7 +1877,7 @@ mod app {
             // Validate address is in CCM range
             let addr = ptr as usize;
             defmt::assert!(
-                addr >= 0x1000_0000 && addr < 0x1001_0000,
+                (0x1000_0000..0x1001_0000).contains(&addr),
                 "TRACE_BUF not in CCM RAM: {:#010x}",
                 addr
             );
@@ -2166,7 +2185,7 @@ mod app {
         let now = Mono::now();
         if tick_deadline
             .checked_duration_since(now)
-            .map_or(true, |d| d.to_micros() < budget_us)
+            .is_none_or(|d| d.to_micros() < budget_us)
         {
             buf.tick_no_sample(true); // budget drop
             return;
@@ -2462,7 +2481,7 @@ mod app {
             // no further commands arrive but the TMC4671 remains energized.
             if SHUTDOWN_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
                 if !shutdown_handled {
-                    if let Some(_) = commission_engine.take() {}
+                    commission_engine.take();
                     foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
                     motor_enabled = false;
                     calibrated = false;
@@ -3252,15 +3271,18 @@ mod app {
                                 flux_filter_hz: FLUX_FILTER_HZ.load(Relaxed),
                             }
                         };
+                        let outer_params = crate::commission::OuterTuneParams {
+                            profile: foci_core::autotune::CommissionProfile::from_u8(profile),
+                            mode: foci_core::autotune::OperatingMode::from_u8(mode),
+                            inner_lambda_us,
+                            theta_e_us,
+                            current_ringing: current_ringing_count > 1,
+                            current_bandwidth_hz,
+                        };
                         commission_engine =
                             Some(crate::commission::CommissioningEngine::new_outer(
                                 oid,
-                                foci_core::autotune::CommissionProfile::from_u8(profile),
-                                foci_core::autotune::OperatingMode::from_u8(mode),
-                                inner_lambda_us,
-                                theta_e_us,
-                                current_ringing_count > 1,
-                                current_bandwidth_hz,
+                                outer_params,
                                 entry_snapshot,
                             ));
                         unsafe {
@@ -4136,7 +4158,7 @@ mod app {
                         }
                         // Step is now or immediately — fall through to execute
                     }
-                    Err(()) => {
+                    Err(_) => {
                         // >1ms past: shutdown
                         tim5.dier().modify(|w| w.set_ccie(0, false));
                         TIMER_ACTIVE.store(false, Relaxed);
@@ -4184,7 +4206,7 @@ mod app {
                                 // Immediate: loop to execute next step
                                 continue;
                             }
-                            Err(()) => {
+                            Err(_) => {
                                 tim5.dier().modify(|w| w.set_ccie(0, false));
                                 TIMER_ACTIVE.store(false, Relaxed);
                                 TMC_DISABLE_SIGNAL.signal(());
