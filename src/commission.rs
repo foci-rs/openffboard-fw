@@ -655,9 +655,10 @@ enum InnerPhase {
 // ---------------------------------------------------------------------------
 
 /// Default velocity cap in encoder counts per millisecond.
-/// 4 rev/s at 4096 counts/rev = 16384 counts/s = ~16 counts/ms.
+/// 4 rev/s at 4000 counts/rev = 16000 counts/s = 16 counts/ms.
 /// Raised from 8 (2 rev/s) because MechanicalId at 60% torque
 /// on low-inertia motors exceeds 8 counts/ms.
+///
 const VELOCITY_CAP_COUNTS_PER_MS: i32 = 16;
 
 /// Default position window: +/- encoder counts from start position.
@@ -716,8 +717,7 @@ const MECH_ID_VELOCITY_ONSET_THRESHOLD: i32 = 2;
 
 /// Minimum mechanical-ID signal before model-based gain synthesis is trusted.
 ///
-/// The safety envelope caps velocity at 8 counts/ms, so these thresholds stay
-/// below that cap while rejecting the observed 1-count acceleration and
+/// These thresholds reject the observed 1-count acceleration and
 /// 2-count/ms peak velocity case that produced saturated gains.
 const MECH_ID_MIN_ACCEL_COUNTS_PER_MS2: u32 = 2;
 const MECH_ID_MIN_PEAK_VELOCITY_COUNTS_PER_MS: u32 = 4;
@@ -1072,12 +1072,15 @@ struct OuterSafetyLimits {
     velocity_cap: i32,
     /// Maximum distance from start position in encoder counts.
     position_window: i32,
-    /// Starting encoder position for window enforcement.
-    start_position: i32,
+    /// Unwrapped signed position accumulated from wrap-aware deltas.
+    unwrapped_position: i32,
     /// Torque cap: the configured run_current limit.
     torque_cap: u16,
-    /// Previous encoder count for velocity estimation.
+    /// Previous raw encoder count for delta computation.
     prev_encoder_count: i32,
+    /// Encoder counts per revolution (PPR * 4). Used to normalize
+    /// wrap-around deltas when the ABN decoder counter rolls over.
+    counts_per_rev: i32,
 }
 
 impl OuterSafetyLimits {
@@ -1085,9 +1088,10 @@ impl OuterSafetyLimits {
         Self {
             velocity_cap: VELOCITY_CAP_COUNTS_PER_MS,
             position_window: POSITION_WINDOW_COUNTS,
-            start_position,
+            unwrapped_position: 0,
             torque_cap,
             prev_encoder_count: start_position,
+            counts_per_rev: 0, // Set by MechanicalId::Setup after reading ABN_DECODER_PPR
         }
     }
 }
@@ -3783,12 +3787,31 @@ impl CommissioningEngine {
         }
     }
 
+    /// Compute a wrap-aware encoder delta.
+    ///
+    /// The ABN decoder counter wraps at `counts_per_rev` (PPR * 4).
+    /// A raw subtraction across the wrap boundary produces a delta
+    /// near +/- counts_per_rev instead of the true small motion.
+    /// This normalizes the delta to `[-half, +half)`.
+    fn encoder_delta(current: i32, previous: i32, counts_per_rev: i32) -> i32 {
+        let half = counts_per_rev / 2;
+        let raw = current.wrapping_sub(previous);
+        if raw > half {
+            raw - counts_per_rev
+        } else if raw < -half {
+            raw + counts_per_rev
+        } else {
+            raw
+        }
+    }
+
     /// Per-tick safety envelope check for all outer phases.
     ///
-    /// Reads the current encoder position, estimates velocity from the
-    /// delta since the last tick, and checks:
+    /// Reads the current encoder position, computes a wrap-aware
+    /// velocity delta, and accumulates an unwrapped signed position.
+    /// Checks:
     /// - Velocity within cap
-    /// - Position within window from start
+    /// - Unwrapped position within window from start
     ///
     /// Returns `true` if a safety limit is violated.
     async fn check_outer_safety<B: CommissioningBackend>(
@@ -3804,9 +3827,14 @@ impl CommissioningEngine {
         let encoder_raw = backend.read_encoder_count().await;
         let encoder_count = encoder_raw as i32;
 
-        // Velocity estimate: delta encoder counts per 1ms tick.
-        let velocity = encoder_count.wrapping_sub(safety.prev_encoder_count);
+        // Wrap-aware velocity: delta encoder counts per 1ms tick.
+        let velocity = Self::encoder_delta(
+            encoder_count,
+            safety.prev_encoder_count,
+            safety.counts_per_rev,
+        );
         safety.prev_encoder_count = encoder_count;
+        safety.unwrapped_position += velocity;
 
         // Check velocity cap (absolute value).
         let abs_velocity = if velocity < 0 { -velocity } else { velocity };
@@ -3819,12 +3847,11 @@ impl CommissioningEngine {
             return true;
         }
 
-        // Check position window.
-        let position_delta = encoder_count.wrapping_sub(safety.start_position);
-        let abs_position = if position_delta < 0 {
-            -position_delta
+        // Check position window against unwrapped accumulator.
+        let abs_position = if safety.unwrapped_position < 0 {
+            -safety.unwrapped_position
         } else {
-            position_delta
+            safety.unwrapped_position
         };
         if abs_position > safety.position_window {
             defmt::warn!(
@@ -3996,7 +4023,6 @@ impl CommissioningEngine {
                 };
 
                 // Initialize safety limits with real values.
-                safety.start_position = start_position;
                 safety.prev_encoder_count = start_position;
                 safety.torque_cap = current_limit as u16;
 
@@ -4036,10 +4062,24 @@ impl CommissioningEngine {
                 // Prepare transient buffer for forward capture.
                 buf.reset(MECH_ID_SAMPLE_PERIOD_US as u16);
 
+                // Read encoder PPR for wrap-aware delta computation.
+                let ppr_raw = backend.read_register(ABN_DECODER_PPR).await.unwrap_or(4000);
+                let counts_per_rev = (ppr_raw as i32).max(4);
+                safety.counts_per_rev = counts_per_rev;
+
+                // Re-read encoder after mode switch to prevent a false
+                // velocity spike in the safety check. The transition from
+                // position mode to torque mode can cause the motor to
+                // drift, producing a large encoder delta on the next tick.
+                let post_switch_pos = backend.read_encoder_count().await as i32;
+                safety.prev_encoder_count = post_switch_pos;
+                safety.unwrapped_position = 0;
+                data.start_position = post_switch_pos;
+
                 defmt::info!(
                     "mech-id: attempt={}, start pos={}, torque_step={}, current_limit={}",
                     data.attempt,
-                    start_position,
+                    post_switch_pos,
                     torque_step,
                     current_limit
                 );
@@ -4084,7 +4124,7 @@ impl CommissioningEngine {
 
                     // Extract forward metrics from buffer before reset.
                     let (initial_accel, peak_velocity, delay_samples, travel) =
-                        Self::extract_mech_metrics(buf, data.start_position);
+                        Self::extract_mech_metrics(buf, data.start_position, safety.counts_per_rev);
                     data.forward_initial_accel = initial_accel;
                     data.forward_peak_velocity = peak_velocity;
                     data.forward_delay_samples = delay_samples;
@@ -4156,7 +4196,7 @@ impl CommissioningEngine {
                         data.start_position
                     };
                     let (initial_accel, peak_velocity, delay_samples, travel) =
-                        Self::extract_mech_metrics(buf, reverse_start);
+                        Self::extract_mech_metrics(buf, reverse_start, safety.counts_per_rev);
                     // Store as absolute values for symmetry comparison.
                     data.reverse_initial_accel = if initial_accel < 0 {
                         -initial_accel
@@ -4366,20 +4406,21 @@ impl CommissioningEngine {
     fn extract_mech_metrics(
         buf: &TransientBuffer,
         reference_position: i32,
+        counts_per_rev: i32,
     ) -> (i32, i32, u16, u32) {
         let samples = buf.samples();
         if samples.len() < 2 {
             return (0, 0, 0, 0);
         }
 
-        // Convert absolute encoder samples into per-sample velocity. Sample 0
-        // is measured relative to the caller's reference position because
-        // there is no previous captured sample yet.
+        // Convert absolute encoder samples into per-sample velocity using
+        // wrap-aware deltas. The ABN decoder wraps at counts_per_rev, so
+        // raw subtraction produces wrong results near the boundary.
         let velocity_at = |idx: usize| -> i32 {
             if idx == 0 {
-                (samples[0] as i32).wrapping_sub(reference_position)
+                Self::encoder_delta(samples[0] as i32, reference_position, counts_per_rev)
             } else {
-                (samples[idx] as i32).wrapping_sub(samples[idx - 1] as i32)
+                Self::encoder_delta(samples[idx] as i32, samples[idx - 1] as i32, counts_per_rev)
             }
         };
 
@@ -4387,16 +4428,18 @@ impl CommissioningEngine {
         let mut onset_idx: Option<usize> = None;
         let mut max_travel: u32 = 0;
 
+        // Accumulate unwrapped travel from wrap-aware deltas.
+        let mut unwrapped_travel: i32 = 0;
+
         // Find the first sample with real motion and track the signed peak
         // velocity. Mechanical ID runs against an unloaded motor, but current
         // buildup and static friction can leave a quiet prefix at the start of
         // the capture. Treating that prefix as the acceleration window caused
         // false zero-acceleration failures on hardware.
-        for (i, &sample) in samples.iter().enumerate() {
+        for (i, &_sample) in samples.iter().enumerate() {
             let velocity = velocity_at(i);
-            let travel = (sample as i32)
-                .wrapping_sub(reference_position)
-                .unsigned_abs();
+            unwrapped_travel += velocity;
+            let travel = unwrapped_travel.unsigned_abs();
             if travel > max_travel {
                 max_travel = travel;
             }

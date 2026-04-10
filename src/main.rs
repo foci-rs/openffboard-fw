@@ -340,24 +340,12 @@ mod app {
     /// Step count (incremented by P3 ISR, read by P1/P2 for stepper_get_position).
     static STEPPER_POSITION: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
 
-    /// Set by trsync-triggered stops (timeout, endstop trigger), cleared by
-    /// reset_step_clock. When true, queue_step discards moves. NOT set by
-    /// motor disable or queue drain — matches Klipper C stepper.c semantics.
-    /// (SF_NEED_RESET is NOT set by config_stepper — only by stepper_stop).
-    static STEPPER_NEED_RESET: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-
     /// Set by P1 after calibration, cleared on disable/fault.
     /// Gates timer arming and ISR execution.
     static MOTOR_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
     /// Set by fault EXTI, cleared by P1 fault handler after cleanup.
     static FAULT_ACTIVE: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-
-    /// True when TIM5 CC1 is armed. Used by reset_step_clock to detect
-    /// "called while active" (triggers shutdown).
-    static TIMER_ACTIVE: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
 
     /// STEP_WIDTH value computed by tmc_set_encoder_hw, written to TMC4671
@@ -382,12 +370,26 @@ mod app {
     static STEP_DIRECTION: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(true);
 
+    /// Read-only mirror of `stepper_stop[0].timer_active` for P1.
+    /// Written inside TriggerDomain lock via `set_timer_active()`,
+    /// read by P1 for advisory purposes (PID settle timing).
+    /// P1 must never enter TriggerDomain.
+    static STEP_TIMER_ACTIVE_MIRROR: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+
     /// Homing I-suppression state machine.
     /// 0=Idle, 1=SuppressPending, 2=Suppressing, 3=RestorePending
     static HOMING_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-    /// TrSync OID that triggered the current homing operation.
-    static HOMING_TRSYNC_OID: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    /// TrSync OID that fired the trigger. 0xFF = no trigger pending.
+    /// Written by TriggerDomain on first trigger, cleared by
+    /// trsync_trigger command cleanup or config_reset.
+    static HOMING_TRIGGERED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0xFF);
+
+    /// Indicates trsync_state reports are pending delivery.
+    /// Set by TIM5 CC2 ISR, cleared by report_task.
+    static REPORT_PENDING: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
 
     /// Position P gain for cross-priority access (Q8.8).
     static POSITION_P_VALUE: core::sync::atomic::AtomicU16 =
@@ -431,6 +433,200 @@ mod app {
     /// Only accessed from TIM5 CC1 ISR (P3).
     static mut ISR_STEPPER: klipper_mcu::stepper::HardwareStepper =
         klipper_mcu::stepper::HardwareStepper::new();
+
+    // ---- TriggerDomain: unified trsync/endstop/stepper-stop resource ----
+
+    /// Physical stepper indices that drive real motors via TIM5 CC1.
+    /// OpenFFBoard has one physical stepper (index 0).
+    const PHYSICAL_STEPPER_INDICES: &[usize] = &[0];
+
+    /// Unified resource owning all trsync, endstop, and stepper-stop state.
+    ///
+    /// Accessed via `with_trigger_domain()` which uses
+    /// `cortex_m::interrupt::free()` for an interrupt-disabled critical
+    /// section, equivalent to RTIC P3 ceiling. This is NOT an RTIC shared
+    /// resource — it is a `static mut` with manual locking.
+    struct TriggerDomain {
+        trsync: [klipper_mcu::trigger::TrSyncRuntime; klipper_mcu::state::NUM_TRSYNC],
+        trsync_by_oid: heapless::LinearMap<u8, usize, { klipper_mcu::state::NUM_TRSYNC }>,
+        stop_signals: [Option<klipper_mcu::trigger::StopSignal>; 8],
+        stepper_stop: [klipper_mcu::trigger::StepperStopRuntime; klipper_mcu::state::NUM_STEPPERS],
+        endstops: [klipper_mcu::endstop::EndstopRuntime; klipper_mcu::state::NUM_ENDSTOPS],
+        endstop_by_oid: heapless::LinearMap<u8, usize, { klipper_mcu::state::NUM_ENDSTOPS }>,
+        scheduler: klipper_mcu::scheduler::TriggerScheduler,
+    }
+
+    impl TriggerDomain {
+        const fn new() -> Self {
+            Self {
+                trsync: [const { klipper_mcu::trigger::TrSyncRuntime::new() };
+                    klipper_mcu::state::NUM_TRSYNC],
+                trsync_by_oid: heapless::LinearMap::new(),
+                stop_signals: [None; 8],
+                stepper_stop: [const { klipper_mcu::trigger::StepperStopRuntime::new() };
+                    klipper_mcu::state::NUM_STEPPERS],
+                endstops: [const { klipper_mcu::endstop::EndstopRuntime::new() };
+                    klipper_mcu::state::NUM_ENDSTOPS],
+                endstop_by_oid: heapless::LinearMap::new(),
+                scheduler: klipper_mcu::scheduler::TriggerScheduler::new(),
+            }
+        }
+
+        /// Set `timer_active` for a stepper, updating the P1 mirror
+        /// for physical steppers.
+        fn set_timer_active(&mut self, stepper_idx: usize, active: bool) {
+            self.stepper_stop[stepper_idx].timer_active = active;
+            // Mirror to P1-readable atomic for physical steppers
+            if stepper_idx == 0 {
+                STEP_TIMER_ACTIVE_MIRROR.store(active, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        /// Read `timer_active` for a stepper.
+        fn timer_active(&self, stepper_idx: usize) -> bool {
+            self.stepper_stop[stepper_idx].timer_active
+        }
+
+        /// Attempt to trigger a trsync, dispatching stop signals to all
+        /// linked steppers. Returns the trigger result.
+        ///
+        /// Must be called inside `with_trigger_domain()`.
+        fn trigger(
+            &mut self,
+            trsync_oid: u8,
+            reason: u8,
+            clock: u32,
+        ) -> klipper_mcu::trigger::TriggerResult {
+            let idx = match self.trsync_by_oid.get(&trsync_oid) {
+                Some(&idx) => idx,
+                None => {
+                    return klipper_mcu::trigger::TriggerResult::UnknownOid;
+                }
+            };
+            let result = self.trsync[idx].trigger(trsync_oid, reason, clock);
+            if matches!(result, klipper_mcu::trigger::TriggerResult::First { .. }) {
+                // Collect stepper indices from matching stop signals, then
+                // clear the slots. Two-pass avoids borrow conflict between
+                // stop_signals iteration and set_timer_active(&mut self).
+                let mut stopped_indices: heapless::Vec<usize, 8> = heapless::Vec::new();
+                for slot in self.stop_signals.iter_mut() {
+                    if let Some(signal) = slot {
+                        if signal.trsync_oid == trsync_oid {
+                            let _ = stopped_indices.push(signal.stepper_idx);
+                            *slot = None;
+                        }
+                    }
+                }
+                // Dispatch physical stops and update stepper state
+                for &stepper_idx in &stopped_indices {
+                    stop_physical_stepper_no_lock(stepper_idx);
+                    self.stepper_stop[stepper_idx].need_reset = true;
+                    self.stepper_stop[stepper_idx].blocked_by_trigger = true;
+                    self.stepper_stop[stepper_idx].blocked_by_trsync = Some(trsync_oid);
+                    self.set_timer_active(stepper_idx, false);
+                }
+                // Signal homing I-suppression only when a stop signal
+                // actually fired — prevents unrelated trsync triggers
+                // from advancing the suppression state machine.
+                if !stopped_indices.is_empty() {
+                    HOMING_TRIGGERED.store(trsync_oid, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            result
+        }
+
+        /// Reprogram TIM5 CC2 from the scheduler's earliest deadline.
+        ///
+        /// Called inside the TriggerDomain lock from both P2 command handlers
+        /// and the P3 ISR after processing events.
+        fn reprogram_cc2(&mut self) {
+            let tim5 = embassy_stm32::pac::TIM5;
+            if let Some(earliest) = self.scheduler.earliest_deadline() {
+                let now = tim5.cnt().read();
+                let delta = earliest.wrapping_sub(now) as i32;
+                let clamped = if delta <= TRIGGER_TIMER_MIN_LEAD_TICKS as i32 {
+                    now.wrapping_add(TRIGGER_TIMER_MIN_LEAD_TICKS)
+                } else {
+                    earliest
+                };
+                tim5.ccr(1).write_value(clamped);
+                tim5.sr().modify(|w| w.set_ccif(1, false));
+                tim5.dier().modify(|w| w.set_ccie(1, true));
+                // Ensure NVIC is unmasked (idempotent)
+                unsafe {
+                    cortex_m::peripheral::NVIC::unmask(embassy_stm32::pac::Interrupt::TIM5);
+                }
+                self.scheduler.set_cc2_active(true);
+            } else {
+                tim5.dier().modify(|w| w.set_ccie(1, false));
+                self.scheduler.set_cc2_active(false);
+            }
+        }
+    }
+
+    /// Minimum lead time for TIM5 CC2 arming (trigger scheduler).
+    /// 128 ticks at 84 MHz = ~1.5 us.
+    const TRIGGER_TIMER_MIN_LEAD_TICKS: u32 = 128;
+
+    /// TriggerDomain static. Initialized in RTIC `init`, accessed via
+    /// `with_trigger_domain()`.
+    static mut TRIGGER_DOMAIN: core::mem::MaybeUninit<TriggerDomain> =
+        core::mem::MaybeUninit::uninit();
+
+    /// Lock TriggerDomain with interrupt-disabled critical section.
+    ///
+    /// Equivalent to P3 ceiling since P3 is the highest application priority.
+    /// Callable from P2 command handlers and P3 ISR.
+    ///
+    /// Uses `addr_of_mut!` to avoid the `static_mut_refs` lint (matching the
+    /// `STEP_QUEUE` access pattern in the existing codebase).
+    #[inline]
+    fn with_trigger_domain<F, R>(f: F) -> R
+    where
+        F: FnOnce(&mut TriggerDomain) -> R,
+    {
+        cortex_m::interrupt::free(|_| {
+            // SAFETY: All access to TRIGGER_DOMAIN goes through this function.
+            // interrupt::free ensures exclusive access across all priorities.
+            // addr_of_mut! avoids creating a reference to the static mut.
+            unsafe { f(&mut *core::ptr::addr_of_mut!(TRIGGER_DOMAIN).cast::<TriggerDomain>()) }
+        })
+    }
+
+    /// Stop a physical stepper without locking TriggerDomain.
+    ///
+    /// Called from inside `with_trigger_domain()` during trigger dispatch.
+    /// Only acts on physical stepper indices (CC1 timer, GPIO, queue).
+    ///
+    /// Per spec: disable CC1, clear interval, reset ISR stepper engine,
+    /// drain queue, reset direction GPIO.
+    fn stop_physical_stepper_no_lock(stepper_idx: usize) {
+        use core::sync::atomic::Ordering::Relaxed;
+        if !PHYSICAL_STEPPER_INDICES.contains(&stepper_idx) {
+            return;
+        }
+        let tim5 = embassy_stm32::pac::TIM5;
+        // 1. Disable CC1 interrupt — quiesce P3 step timer
+        tim5.dier().modify(|w| w.set_ccie(0, false));
+        tim5.sr().modify(|w| w.set_ccif(0, false));
+        // 2. Clear step interval
+        STEP_INTERVAL.store(0, Relaxed);
+        PID_ERROR_SUMS_CLEAR.store(true, Relaxed);
+        // 3. Reset ISR stepper engine state (clear stale partial segment)
+        // SAFETY: P3 (timer ISR) is quiesced by CC1IE disable above.
+        unsafe {
+            (*core::ptr::addr_of_mut!(ISR_STEPPER)).reset();
+        }
+        // 4. Drain queue
+        // SAFETY: P3 (timer ISR) is quiesced — we are the sole accessor.
+        unsafe { while (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue().is_some() {} }
+        // 5. Reset direction GPIO (PA0) to known low state
+        let gpio_a = embassy_stm32::pac::GPIOA;
+        gpio_a
+            .odr()
+            .modify(|w| w.set_odr(0, embassy_stm32::pac::gpio::vals::Odr::LOW));
+        STEP_DIRECTION.store(true, Relaxed); // Forward = default
+    }
 
     static TMC_REQUEST_SENDER: Mutex<
         RefCell<Option<Sender<'static, TmcRequest, TMC_CHANNEL_SIZE>>>,
@@ -563,6 +759,7 @@ mod app {
     /// when hardware `reset` is not available (linux/PRU platforms).
     #[klipper_command(in_shutdown)]
     pub fn config_reset(context: &mut State) {
+        use core::sync::atomic::Ordering::Relaxed;
         if !context.mcu_state.is_shutdown() {
             if enter_shutdown(context) {
                 klipper_shutdown!("config_reset only available when shutdown", read_tim5());
@@ -570,27 +767,57 @@ mod app {
             return;
         }
         klipper_mcu::commands::lifecycle::config_reset(context);
+        // Full TriggerDomain reset
+        with_trigger_domain(|td| {
+            td.scheduler.clear();
+            let tim5 = embassy_stm32::pac::TIM5;
+            tim5.dier().modify(|w| w.set_ccie(1, false));
+            for ts in td.trsync.iter_mut() {
+                ts.reset();
+            }
+            for es in td.endstops.iter_mut() {
+                es.reset();
+            }
+            for sig in td.stop_signals.iter_mut() {
+                *sig = None;
+            }
+            td.trsync_by_oid.clear();
+            td.endstop_by_oid.clear();
+            // Stop physical steppers only
+            for &idx in PHYSICAL_STEPPER_INDICES {
+                stop_physical_stepper_no_lock(idx);
+                td.set_timer_active(idx, false);
+            }
+            // Reset all stepper stop state (physical + logical)
+            for ss in td.stepper_stop.iter_mut() {
+                *ss = klipper_mcu::trigger::StepperStopRuntime::new();
+            }
+        });
+        // Clear derived mailbox state outside critical section
+        REPORT_PENDING.store(false, Relaxed);
+        HOMING_TRIGGERED.store(0xFF, Relaxed);
+        HOMING_STATE.store(0, Relaxed);
         // Clear firmware-side endstop pin assignments
         for pin_id in &ENDSTOP_PIN_IDS {
-            pin_id.store(0xFF, core::sync::atomic::Ordering::Relaxed);
+            pin_id.store(0xFF, Relaxed);
         }
         // Reset board-local control and protocol state
-        CURRENT_LIMIT_REG.store(0, core::sync::atomic::Ordering::Relaxed);
-        VELOCITY_FILTER_HZ.store(0, core::sync::atomic::Ordering::Relaxed);
-        TORQUE_FILTER_HZ.store(0, core::sync::atomic::Ordering::Relaxed);
-        POSITION_FILTER_HZ.store(0, core::sync::atomic::Ordering::Relaxed);
-        FLUX_FILTER_HZ.store(0, core::sync::atomic::Ordering::Relaxed);
-        VELOCITY_FEEDFORWARD.store(false, core::sync::atomic::Ordering::Relaxed);
-        VELOCITY_LIMIT_CFG.store(500_000, core::sync::atomic::Ordering::Relaxed);
-        FEEDFORWARD_RESET.store(false, core::sync::atomic::Ordering::Relaxed);
-        PID_ERROR_SUMS_CLEAR.store(false, core::sync::atomic::Ordering::Relaxed);
-        ENCODER_REVERSED.store(false, core::sync::atomic::Ordering::Relaxed);
-        STEPPER_POSITION_TARGET.store(0, core::sync::atomic::Ordering::Relaxed);
-        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
-        STATS_SEND_TIME.store(0, core::sync::atomic::Ordering::Relaxed);
-        STATS_SEND_TIME_HIGH.store(0, core::sync::atomic::Ordering::Relaxed);
+        CURRENT_LIMIT_REG.store(0, Relaxed);
+        VELOCITY_FILTER_HZ.store(0, Relaxed);
+        TORQUE_FILTER_HZ.store(0, Relaxed);
+        POSITION_FILTER_HZ.store(0, Relaxed);
+        FLUX_FILTER_HZ.store(0, Relaxed);
+        VELOCITY_FEEDFORWARD.store(false, Relaxed);
+        VELOCITY_LIMIT_CFG.store(500_000, Relaxed);
+        FEEDFORWARD_RESET.store(false, Relaxed);
+        PID_ERROR_SUMS_CLEAR.store(false, Relaxed);
+        ENCODER_REVERSED.store(false, Relaxed);
+        STEPPER_POSITION_TARGET.store(0, Relaxed);
+        COMMISSION_IN_FLIGHT.store(false, Relaxed);
+        STATS_SEND_TIME.store(0, Relaxed);
+        STATS_SEND_TIME_HIGH.store(0, Relaxed);
         // Signal tmc_control to drain stale requests from the pre-reset epoch
-        TMC_QUEUE_FLUSH.store(true, core::sync::atomic::Ordering::Relaxed);
+        TMC_QUEUE_FLUSH.store(true, Relaxed);
     }
 
     #[klipper_command]
@@ -618,10 +845,53 @@ mod app {
     /// `klipper_shutdown!` only when this returns `true`, so each call
     /// site provides a unique static string reason.
     fn enter_shutdown(context: &mut State) -> bool {
+        use core::sync::atomic::Ordering::Relaxed;
         let entered = klipper_mcu::commands::lifecycle::enter_shutdown(context);
         if entered {
             TMC_DISABLE_SIGNAL.signal(());
-            SHUTDOWN_ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed);
+            SHUTDOWN_ACTIVE.store(true, Relaxed);
+            // Quiesce TriggerDomain: cancel timers, stop steppers
+            with_trigger_domain(|td| {
+                td.scheduler.clear();
+                let tim5 = embassy_stm32::pac::TIM5;
+                tim5.dier().modify(|w| w.set_ccie(1, false));
+                // Stop physical steppers
+                for &idx in PHYSICAL_STEPPER_INDICES {
+                    stop_physical_stepper_no_lock(idx);
+                    td.set_timer_active(idx, false);
+                }
+                // Clear transient stepper state
+                for ss in td.stepper_stop.iter_mut() {
+                    ss.need_reset = true;
+                    ss.blocked_by_trigger = false;
+                    ss.blocked_by_trsync = None;
+                }
+                // Clear transient trsync state (preserve OID maps).
+                // Trigger each trsync to clear can_trigger per spec,
+                // then cancel timers and pending reports.
+                for (trsync_idx, ts) in td.trsync.iter_mut().enumerate() {
+                    // Find OID for this index (if configured)
+                    let oid = td
+                        .trsync_by_oid
+                        .iter()
+                        .find(|(_, &idx)| idx == trsync_idx)
+                        .map(|(&oid, _)| oid)
+                        .unwrap_or(0);
+                    ts.trigger(oid, 0, 0); // Sets can_trigger=false
+                    ts.cancel_timers();
+                    ts.clear_pending_report();
+                }
+                // Clear stop signals and endstop homing
+                for sig in td.stop_signals.iter_mut() {
+                    *sig = None;
+                }
+                for es in td.endstops.iter_mut() {
+                    es.reset();
+                }
+            });
+            REPORT_PENDING.store(false, Relaxed);
+            HOMING_TRIGGERED.store(0xFF, Relaxed);
+            HOMING_STATE.store(0, Relaxed);
         }
         entered
     }
@@ -709,49 +979,52 @@ mod app {
     /// by the TIM5 CC1 ISR (P3) which toggles STEP/DIR GPIO pins.
     #[klipper_command]
     pub fn queue_step(context: &mut State, oid: u8, interval: u32, count: u16, add: i16) {
-        use core::sync::atomic::Ordering::Relaxed;
         use klipper_mcu::commands::stepper::{queue_step_hw, QueueStepResult};
 
-        let need_reset = STEPPER_NEED_RESET.load(Relaxed);
+        let m = klipper_mcu::stepper::StepMove::new(interval, count, add);
 
-        // Check queue state before pushing (need len for first-move detection)
-        // SAFETY: P2 is the sole producer. Queue len read is safe from P2.
-        let queue_was_empty = unsafe { (*core::ptr::addr_of_mut!(STEP_QUEUE)).is_empty() };
+        // Lock TriggerDomain across need_reset check, direction state,
+        // enqueue, and arm — all atomic per spec.
+        let result = with_trigger_domain(|td| {
+            let need_reset = td.stepper_stop[0].need_reset;
 
-        match queue_step_hw(need_reset, count, queue_was_empty) {
-            Ok(QueueStepResult::Discarded) => (),
-            Err(e) => {
-                defmt::error!("queue_step: oid={} {}", oid, e);
-                if enter_shutdown(context) {
-                    klipper_shutdown!("queue_step failed", read_tim5());
+            // SAFETY: P2 is the sole producer. Queue len read is safe from P2.
+            let queue_was_empty = unsafe { (*core::ptr::addr_of_mut!(STEP_QUEUE)).is_empty() };
+
+            match queue_step_hw(need_reset, count, queue_was_empty) {
+                Ok(QueueStepResult::Discarded) => Ok(()),
+                Err(e) => Err(e),
+                Ok(_result) => {
+                    // Prepare move with direction state inside the lock.
+                    // Must happen after need_reset check to avoid advancing
+                    // direction bookkeeping for discarded moves.
+                    // SAFETY: P2_STEPPER is only accessed from P2 command handlers.
+                    let m = unsafe { (*core::ptr::addr_of_mut!(P2_STEPPER)).prepare_move(m) };
+
+                    // Push to SPSC queue
+                    // SAFETY: P2 is the sole producer.
+                    let ok = unsafe { (*core::ptr::addr_of_mut!(STEP_QUEUE)).enqueue(m).is_ok() };
+                    if !ok {
+                        return Err(klipper_mcu::commands::CommandError::QueueFull);
+                    }
+
+                    // Arm timer if the motor is ready and not already active
+                    if !td.timer_active(0)
+                        && MOTOR_ARMED.load(core::sync::atomic::Ordering::Relaxed)
+                    {
+                        let now = read_tim5();
+                        arm_step_timer(now.wrapping_add(1));
+                        td.set_timer_active(0, true);
+                    }
+                    Ok(())
                 }
             }
-            Ok(result) => {
-                // Prepare move with direction state
-                // SAFETY: P2_STEPPER is only accessed from P2 command handlers.
-                let m = klipper_mcu::stepper::StepMove::new(interval, count, add);
-                let m = unsafe { (*core::ptr::addr_of_mut!(P2_STEPPER)).prepare_move(m) };
+        });
 
-                // Push to SPSC queue
-                // SAFETY: P2 is the sole producer.
-                let ok = unsafe { (*core::ptr::addr_of_mut!(STEP_QUEUE)).enqueue(m).is_ok() };
-                if !ok {
-                    defmt::error!("queue_step: queue full");
-                    if enter_shutdown(context) {
-                        klipper_shutdown!("queue_step: queue full", read_tim5());
-                    }
-                    return;
-                }
-
-                // Arm timer if the motor is ready. This normally happens
-                // on the first queued move, but also recovers if moves were
-                // queued while asynchronous calibration was still running.
-                if matches!(
-                    result,
-                    QueueStepResult::QueuedFirstMove | QueueStepResult::Queued
-                ) {
-                    arm_queued_steps_if_ready();
-                }
+        if let Err(e) = result {
+            defmt::error!("queue_step: oid={} {}", oid, e);
+            if enter_shutdown(context) {
+                klipper_shutdown!("queue_step failed", read_tim5());
             }
         }
     }
@@ -773,29 +1046,36 @@ mod app {
     /// Triggers shutdown if called while active (matches Klipper stepper.c).
     #[klipper_command]
     pub fn reset_step_clock(context: &mut State, _oid: u8, clock: u32) {
-        use core::sync::atomic::Ordering::Relaxed;
+        let result: Result<(), klipper_mcu::commands::CommandError> = with_trigger_domain(|td| {
+            klipper_mcu::commands::stepper::reset_step_clock_hw(td.stepper_stop[0].timer_active)?;
 
-        if let Err(e) =
-            klipper_mcu::commands::stepper::reset_step_clock_hw(TIMER_ACTIVE.load(Relaxed))
-        {
+            // Drain any stale items from a previous stop
+            // SAFETY: Timer is not active (checked above), P3 is quiesced.
+            unsafe { while (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue().is_some() {} }
+
+            // Set clock base on P2 stepper state
+            // SAFETY: P2_STEPPER is only accessed from P2 command handlers.
+            unsafe {
+                (*core::ptr::addr_of_mut!(P2_STEPPER)).reset_step_clock(clock);
+            }
+
+            // Only clear need_reset if not blocked by an active trigger.
+            // When blocked_by_trigger is set, in-flight drip commands must
+            // not re-enable stepping. The flag is cleared by the host's
+            // trsync_trigger command which arrives after the host has
+            // received the trsync_state notification.
+            if !td.stepper_stop[0].blocked_by_trigger {
+                td.stepper_stop[0].need_reset = false;
+            }
+            Ok(())
+        });
+
+        if let Err(e) = result {
             defmt::error!("reset_step_clock: {}", e);
             if enter_shutdown(context) {
                 klipper_shutdown!("Can't reset time when stepper active", read_tim5());
             }
-            return;
         }
-
-        // Drain any stale items from a previous stop
-        // SAFETY: Timer is not active (checked above), P3 is quiesced.
-        unsafe { while (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue().is_some() {} }
-
-        // Set clock base on P2 stepper state
-        // SAFETY: P2_STEPPER is only accessed from P2 command handlers.
-        unsafe {
-            (*core::ptr::addr_of_mut!(P2_STEPPER)).reset_step_clock(clock);
-        }
-
-        STEPPER_NEED_RESET.store(false, Relaxed);
     }
 
     /// Report the current position of a stepper.
@@ -821,29 +1101,59 @@ mod app {
     /// all linked steppers are stopped.
     #[klipper_command]
     pub fn stepper_stop_on_trigger(context: &mut State, oid: u8, trsync_oid: u8) {
-        if let Err(e) =
-            klipper_mcu::commands::stepper::stepper_stop_on_trigger(context, oid, trsync_oid)
-        {
+        // Resolve stepper OID to index via State (outside critical section)
+        let stepper_idx = match context.steppers_by_oid.get(&oid) {
+            Some(&idx) => idx,
+            None => {
+                defmt::error!("stepper_stop_on_trigger: unknown stepper oid={}", oid);
+                if enter_shutdown(context) {
+                    klipper_shutdown!("stepper_stop_on_trigger: unknown stepper", read_tim5());
+                }
+                return;
+            }
+        };
+
+        let result = with_trigger_domain(|td| {
+            // Validate trsync OID exists
+            if !td.trsync_by_oid.contains_key(&trsync_oid) {
+                return Err(());
+            }
+            // Reject if this stepper already has an active stop signal,
+            // matching Klipper C where each stepper has a single stop_signal
+            // slot and trsync_add_signal() shuts down if already active.
+            for signal in td.stop_signals.iter().flatten() {
+                if signal.stepper_idx == stepper_idx {
+                    return Err(());
+                }
+            }
+            // Find empty slot and insert
+            for slot in td.stop_signals.iter_mut() {
+                if slot.is_none() {
+                    *slot = Some(klipper_mcu::trigger::StopSignal {
+                        trsync_oid,
+                        stepper_idx,
+                    });
+                    return Ok(());
+                }
+            }
+            Err(()) // No free slots
+        });
+
+        if result.is_err() {
             defmt::error!(
-                "stepper_stop_on_trigger: oid={} trsync_oid={} {}",
+                "stepper_stop_on_trigger: oid={} trsync_oid={} failed",
                 oid,
                 trsync_oid,
-                e
             );
             if enter_shutdown(context) {
                 klipper_shutdown!("stepper_stop_on_trigger failed", read_tim5());
             }
         } else {
-            // Begin homing I-suppression: only update the TrSync OID if
-            // we successfully transition Idle -> SuppressPending. This
-            // prevents overwriting the OID of an active suppression cycle.
+            // Begin homing I-suppression: transition Idle -> SuppressPending.
+            // HOMING_TRIGGERED is NOT set here — it is set by
+            // TriggerDomain::trigger() when the endstop/expire fires.
             use core::sync::atomic::Ordering::Relaxed;
-            if HOMING_STATE
-                .compare_exchange(0, 1, Relaxed, Relaxed)
-                .is_ok()
-            {
-                HOMING_TRSYNC_OID.store(trsync_oid, Relaxed);
-            }
+            let _ = HOMING_STATE.compare_exchange(0, 1, Relaxed, Relaxed);
         }
     }
 
@@ -1009,8 +1319,19 @@ mod app {
     /// Allocates the next free TrSync slot and maps the Klipper OID to it.
     #[klipper_command]
     pub fn config_trsync(context: &mut State, oid: u8) {
-        if let Err(e) = klipper_mcu::commands::trsync::config_trsync(context, oid) {
-            defmt::error!("config_trsync: {}", e);
+        let result = with_trigger_domain(|td| {
+            if td.trsync_by_oid.contains_key(&oid) {
+                return Err(());
+            }
+            let idx = td.trsync_by_oid.len();
+            if idx >= klipper_mcu::state::NUM_TRSYNC {
+                return Err(());
+            }
+            td.trsync_by_oid.insert(oid, idx).map_err(|_| ())?;
+            Ok(())
+        });
+        if result.is_err() {
+            defmt::error!("config_trsync: oid={}", oid);
             if enter_shutdown(context) {
                 klipper_shutdown!("config_trsync failed", read_tim5());
             }
@@ -1022,7 +1343,7 @@ mod app {
     /// Arm a TrSync for synchronized triggering.
     ///
     /// Configures the reporting interval and timeout reason, then transitions
-    /// the TrSync to the Armed state.
+    /// the TrSync to the Armed state. Schedules the first report timer event.
     #[klipper_command]
     pub fn trsync_start(
         context: &mut State,
@@ -1031,14 +1352,49 @@ mod app {
         report_ticks: u32,
         expire_reason: u8,
     ) {
-        if let Err(e) = klipper_mcu::commands::trsync::trsync_start(
-            context,
-            oid,
-            report_clock,
-            report_ticks,
-            expire_reason,
-        ) {
-            defmt::error!("trsync_start: {}", e);
+        let result = with_trigger_domain(|td| {
+            let idx = match td.trsync_by_oid.get(&oid) {
+                Some(&idx) => idx,
+                None => return Err(()),
+            };
+            // Clear old stop signals for this trsync OID
+            for slot in td.stop_signals.iter_mut() {
+                if let Some(signal) = slot {
+                    if signal.trsync_oid == oid {
+                        *slot = None;
+                    }
+                }
+            }
+            // Clear blocked_by_trigger for steppers blocked by this trsync
+            for stepper in td.stepper_stop.iter_mut() {
+                if stepper.blocked_by_trsync == Some(oid) {
+                    stepper.blocked_by_trigger = false;
+                    stepper.blocked_by_trsync = None;
+                }
+            }
+            // Cancel any existing scheduler entries for this trsync
+            td.scheduler.cancel(|k| {
+                matches!(k,
+                    klipper_mcu::scheduler::SchedulerEventKind::TrSyncExpire(i)
+                    | klipper_mcu::scheduler::SchedulerEventKind::TrSyncReport(i)
+                    if *i == idx
+                )
+            });
+            // Arm the runtime
+            td.trsync[idx].arm(report_clock, report_ticks, expire_reason);
+            // Schedule first report timer if report_ticks > 0
+            if report_ticks > 0 {
+                td.scheduler
+                    .schedule(klipper_mcu::scheduler::SchedulerEvent {
+                        wake_clock: report_clock,
+                        kind: klipper_mcu::scheduler::SchedulerEventKind::TrSyncReport(idx),
+                    });
+            }
+            td.reprogram_cc2();
+            Ok(())
+        });
+        if result.is_err() {
+            defmt::error!("trsync_start: oid={}", oid);
             if enter_shutdown(context) {
                 klipper_shutdown!("trsync_start failed", read_tim5());
             }
@@ -1047,35 +1403,114 @@ mod app {
 
     /// Update the expiry deadline for a TrSync.
     ///
-    /// The TrSync will auto-trigger with the configured expire_reason if
-    /// the clock reaches this value before a manual trigger.
+    /// Schedules the expire timer event. The TrSync will auto-trigger with
+    /// the configured expire_reason if the clock reaches this value before
+    /// a manual trigger.
     #[klipper_command]
     pub fn trsync_set_timeout(context: &mut State, oid: u8, clock: u32) {
-        if let Err(e) = klipper_mcu::commands::trsync::trsync_set_timeout(context, oid, clock) {
-            defmt::error!("trsync_set_timeout: {}", e);
+        let result = with_trigger_domain(|td| {
+            let idx = match td.trsync_by_oid.get(&oid) {
+                Some(&idx) => idx,
+                None => return Err(()),
+            };
+            if td.trsync[idx].can_trigger() {
+                td.trsync[idx].set_timeout(clock);
+                // Cancel any existing expire event and schedule a new one
+                td.scheduler.cancel(|k| {
+                    matches!(k,
+                        klipper_mcu::scheduler::SchedulerEventKind::TrSyncExpire(i) if *i == idx
+                    )
+                });
+                td.scheduler
+                    .schedule(klipper_mcu::scheduler::SchedulerEvent {
+                        wake_clock: clock,
+                        kind: klipper_mcu::scheduler::SchedulerEventKind::TrSyncExpire(idx),
+                    });
+                td.reprogram_cc2();
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            defmt::error!("trsync_set_timeout: oid={}", oid);
             if enter_shutdown(context) {
                 klipper_shutdown!("trsync_set_timeout failed", read_tim5());
             }
         }
     }
 
-    /// Manually trigger a TrSync with the given reason code.
+    /// Manually trigger a TrSync and clean up.
     ///
-    /// If the trigger is accepted (TrSync was Armed), stops the hardware
-    /// stepper and sets STEPPER_NEED_RESET — matching the behavior of the
-    /// endstop trigger path (P2 ticker) and timeout path. The library
-    /// crate's `stop_linked_steppers` is a no-op; the board crate must
-    /// handle the hardware stop here.
+    /// Mirrors Klipper C's `command_trsync_trigger`: attempts to fire the
+    /// trigger (no-op if already triggered), then unconditionally stops
+    /// report/expire timers, clears blocked_by_trigger on steppers, and
+    /// sends one final `trsync_state` reply with `can_trigger=0`.
     #[klipper_command]
     pub fn trsync_trigger(context: &mut State, oid: u8, reason: u8) {
-        match klipper_mcu::commands::trsync::trsync_trigger(context, oid, reason) {
-            Ok(true) => {
-                stepper_stop();
-                STEPPER_NEED_RESET.store(true, core::sync::atomic::Ordering::Relaxed);
+        let trigger_reason = with_trigger_domain(|td| {
+            let idx = match td.trsync_by_oid.get(&oid) {
+                Some(&idx) => idx,
+                None => return Err(()),
+            };
+            // Attempt trigger via TriggerDomain::trigger() which dispatches
+            // stop signals if this is the first trigger (no-op if already triggered)
+            let _result = td.trigger(oid, reason, 0);
+            let trigger_reason = td.trsync[idx].trigger_reason();
+
+            // Cancel scheduler entries for this trsync
+            td.scheduler.cancel(|k| {
+                matches!(k,
+                    klipper_mcu::scheduler::SchedulerEventKind::TrSyncExpire(i)
+                    | klipper_mcu::scheduler::SchedulerEventKind::TrSyncReport(i)
+                    if *i == idx
+                )
+            });
+            // Clear pending report to prevent stale async delivery
+            td.trsync[idx].clear_pending_report();
+            td.trsync[idx].cancel_timers();
+
+            // Clear stop signals for this trsync OID
+            for slot in td.stop_signals.iter_mut() {
+                if let Some(signal) = slot {
+                    if signal.trsync_oid == oid {
+                        *slot = None;
+                    }
+                }
             }
-            Ok(false) => {}
-            Err(e) => {
-                defmt::error!("trsync_trigger: {}", e);
+
+            // Clear blocked_by_trigger for steppers blocked by this trsync
+            // (leaves need_reset true until reset_step_clock)
+            for stepper in td.stepper_stop.iter_mut() {
+                if stepper.blocked_by_trsync == Some(oid) {
+                    stepper.blocked_by_trigger = false;
+                    stepper.blocked_by_trsync = None;
+                }
+            }
+
+            td.reprogram_cc2();
+            Ok(trigger_reason)
+        });
+
+        match trigger_reason {
+            Ok(trigger_reason) => {
+                // Clear homing trigger sentinel and advance suppression
+                // state machine. If P1 is in state 2 (Suppressing), the
+                // host trsync_trigger cleanup must advance it to state 3
+                // (RestorePending) so I-suppression is released even if
+                // P1 hasn't polled HOMING_TRIGGERED yet.
+                use core::sync::atomic::Ordering::Relaxed;
+                HOMING_TRIGGERED.store(0xFF, Relaxed);
+                let _ = HOMING_STATE.compare_exchange(2, 3, Relaxed, Relaxed);
+                // Send final trsync_state reply (can_trigger=0, clock=0)
+                klipper_reply!(
+                    trsync_state,
+                    oid: u8 = oid,
+                    can_trigger: u8 = 0,
+                    trigger_reason: u8 = trigger_reason,
+                    clock: u32 = 0
+                );
+            }
+            Err(()) => {
+                defmt::error!("trsync_trigger: unknown oid={}", oid);
                 if enter_shutdown(context) {
                     klipper_shutdown!("trsync_trigger failed", read_tim5());
                 }
@@ -1090,14 +1525,27 @@ mod app {
     /// resistor for endstop switch reading.
     #[klipper_command]
     pub fn config_endstop(context: &mut State, oid: u8, pin: u8, pull_up: u8) {
-        let idx = context.endstop_by_oid.len();
-        if let Err(e) = klipper_mcu::commands::endstop::config_endstop(context, oid) {
-            defmt::error!("config_endstop: {}", e);
-            if enter_shutdown(context) {
-                klipper_shutdown!("config_endstop failed", read_tim5());
+        let result = with_trigger_domain(|td| {
+            if td.endstop_by_oid.contains_key(&oid) {
+                return Err(());
             }
-            return;
-        }
+            let idx = td.endstop_by_oid.len();
+            if idx >= klipper_mcu::state::NUM_ENDSTOPS {
+                return Err(());
+            }
+            td.endstop_by_oid.insert(oid, idx).map_err(|_| ())?;
+            Ok(idx)
+        });
+        let idx = match result {
+            Ok(idx) => idx,
+            Err(()) => {
+                defmt::error!("config_endstop: oid={}", oid);
+                if enter_shutdown(context) {
+                    klipper_shutdown!("config_endstop failed", read_tim5());
+                }
+                return;
+            }
+        };
 
         // Configure GPIO pin as input (only for real GPIO pins, not virtual)
         if pin < GPIO_MAX_PIN_VALUE {
@@ -1124,7 +1572,8 @@ mod app {
     /// Arm an endstop for homing.
     ///
     /// Configures sampling parameters and links to a TrSync for trigger
-    /// notification. Actual GPIO sampling runs in the tmc_control 1ms loop.
+    /// notification. Schedules the first endstop sample event via the
+    /// trigger scheduler (TIM5 CC2).
     #[klipper_command]
     #[allow(clippy::too_many_arguments)]
     pub fn endstop_home(
@@ -1138,18 +1587,47 @@ mod app {
         trsync_oid: u8,
         trigger_reason: u8,
     ) {
-        if let Err(e) = klipper_mcu::commands::endstop::endstop_home(
-            context,
-            oid,
-            clock,
-            sample_ticks,
-            sample_count,
-            rest_ticks,
-            pin_value != 0,
-            trsync_oid,
-            trigger_reason,
-        ) {
-            defmt::error!("endstop_home: {}", e);
+        let result = with_trigger_domain(|td| {
+            let idx = match td.endstop_by_oid.get(&oid) {
+                Some(&idx) => idx,
+                None => return Err(()),
+            };
+            // Zero sample_count is a disarm request — no trsync needed
+            if sample_count != 0 && !td.trsync_by_oid.contains_key(&trsync_oid) {
+                return Err(());
+            }
+            // Look up pin_id from config-time storage
+            let pin_id = ENDSTOP_PIN_IDS[idx].load(core::sync::atomic::Ordering::Relaxed);
+            // Cancel existing scheduler entry for this endstop
+            td.scheduler.cancel(|k| {
+                matches!(k,
+                    klipper_mcu::scheduler::SchedulerEventKind::EndstopSample(i) if *i == idx
+                )
+            });
+            // Configure the endstop runtime
+            td.endstops[idx].start_homing(
+                clock,
+                sample_ticks,
+                sample_count,
+                rest_ticks,
+                pin_value != 0,
+                trsync_oid,
+                trigger_reason,
+                pin_id,
+            );
+            // Schedule first sample event if homing
+            if sample_count > 0 {
+                td.scheduler
+                    .schedule(klipper_mcu::scheduler::SchedulerEvent {
+                        wake_clock: clock,
+                        kind: klipper_mcu::scheduler::SchedulerEventKind::EndstopSample(idx),
+                    });
+            }
+            td.reprogram_cc2();
+            Ok(())
+        });
+        if result.is_err() {
+            defmt::error!("endstop_home: oid={}", oid);
             if enter_shutdown(context) {
                 klipper_shutdown!("endstop_home failed", read_tim5());
             }
@@ -1161,37 +1639,38 @@ mod app {
     /// Returns homing status, next sample clock, and current pin value.
     #[klipper_command]
     pub fn endstop_query_state(context: &mut State, oid: u8) {
-        let (homing, next_clock) =
-            match klipper_mcu::commands::endstop::endstop_query_state(context, oid) {
-                Ok(result) => result,
-                Err(e) => {
-                    defmt::error!("endstop_query_state: {}", e);
-                    if enter_shutdown(context) {
-                        klipper_shutdown!("endstop_query_state failed", read_tim5());
-                    }
-                    return;
-                }
+        // Brief lock to copy state
+        let query = with_trigger_domain(|td| {
+            let idx = match td.endstop_by_oid.get(&oid) {
+                Some(&idx) => idx,
+                None => return Err(()),
             };
-        // Read the live GPIO pin state for the endstop
-        let pin_state = context
-            .endstop_by_oid
-            .get(&oid)
-            .map(|&idx| {
-                let pin_id = ENDSTOP_PIN_IDS[idx].load(core::sync::atomic::Ordering::Relaxed);
-                if pin_id != 0xFF {
+            let (homing, next_clock) = td.endstops[idx].query_state();
+            let pin_id = ENDSTOP_PIN_IDS[idx].load(core::sync::atomic::Ordering::Relaxed);
+            Ok((homing, next_clock, pin_id))
+        });
+        match query {
+            Ok((homing, next_clock, pin_id)) => {
+                let pin_state = if pin_id != 0xFF {
                     gpio_read_pin(pin_id)
                 } else {
                     false
+                };
+                klipper_reply!(
+                    endstop_state,
+                    oid: u8 = oid,
+                    homing: u8 = u8::from(homing),
+                    next_clock: u32 = next_clock,
+                    pin_value: u8 = u8::from(pin_state)
+                );
+            }
+            Err(()) => {
+                defmt::error!("endstop_query_state: unknown oid={}", oid);
+                if enter_shutdown(context) {
+                    klipper_shutdown!("endstop_query_state failed", read_tim5());
                 }
-            })
-            .unwrap_or(false);
-        klipper_reply!(
-            endstop_state,
-            oid: u8 = oid,
-            homing: u8 = u8::from(homing),
-            next_clock: u32 = next_clock,
-            pin_value: u8 = u8::from(pin_state)
-        );
+            }
+        }
     }
 
     /// SPI configuration stub (TMC4671 SPI is handled internally).
@@ -1894,6 +2373,14 @@ mod app {
             });
         }
 
+        // Initialize TriggerDomain
+        // SAFETY: init runs once before any task starts. No concurrent access.
+        unsafe {
+            core::ptr::addr_of_mut!(TRIGGER_DOMAIN)
+                .cast::<TriggerDomain>()
+                .write(TriggerDomain::new());
+        }
+
         // Spawn tasks
         tmc_control::spawn().ok();
         usb_task::spawn().ok();
@@ -2486,7 +2973,7 @@ mod app {
                     motor_enabled = false;
                     calibrated = false;
                     COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
-                    stepper_stop();
+                    stepper_stop_from_p1();
                     MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
                     shutdown_handled = true;
                 }
@@ -2522,7 +3009,7 @@ mod app {
                 TORQUE_FILTER_HZ.store(0, R);
                 // Reset hardware stepper state
                 MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
-                stepper_stop();
+                stepper_stop_from_p1();
                 STEPPER_POSITION.store(0, core::sync::atomic::Ordering::Relaxed);
                 FAULT_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
                 defmt::info!("TMC request queue flushed after config_reset");
@@ -2826,7 +3313,7 @@ mod app {
                             calibrated = false;
                             motor_enabled = false;
                             MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
-                            stepper_stop();
+                            stepper_stop_from_p1();
                             defmt::error!("Stage 2 safety fault ({}), motor disabled", fault);
                             fault.status_code()
                         } else {
@@ -2933,7 +3420,7 @@ mod app {
                         calibrated = true;
                         motor_enabled = true;
                         MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
-                        arm_queued_steps_if_ready();
+                        arm_check::spawn().ok();
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
                         defmt::info!("foci_calibrate complete: oid={}", oid);
                         klipper_reply!(
@@ -3011,7 +3498,7 @@ mod app {
                         calibrated = true;
                         motor_enabled = true;
                         MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
-                        arm_queued_steps_if_ready();
+                        arm_check::spawn().ok();
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
 
                         let status = match inner.status {
@@ -3085,13 +3572,13 @@ mod app {
 
                             // If queue already has moves (burst-drain scenario),
                             // arm timer to start processing them
-                            arm_queued_steps_if_ready();
+                            arm_check::spawn().ok();
 
                             defmt::info!("Motor enabled (calibrated, step/dir armed)");
                         } else {
                             // Disable: stop stepping, kill motor
                             MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
-                            stepper_stop();
+                            stepper_stop_from_p1();
 
                             motor_enabled = false;
                             calibrated = false;
@@ -3354,7 +3841,7 @@ mod app {
             if TMC_DISABLE_SIGNAL.try_take().is_some() {
                 // Stop hardware stepper immediately
                 MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
-                stepper_stop();
+                stepper_stop_from_p1();
                 FAULT_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
 
                 motor_enabled = false;
@@ -3436,9 +3923,10 @@ mod app {
             if PID_ERROR_SUMS_CLEAR.swap(false, core::sync::atomic::Ordering::Relaxed) {
                 pid_error_clear_countdown_ms = HOLD_SETTLE_DELAY_MS;
             }
+            let timer_active = STEP_TIMER_ACTIVE_MIRROR.load(core::sync::atomic::Ordering::Relaxed);
             if motor_enabled
                 && commission_engine.is_none()
-                && !TIMER_ACTIVE.load(core::sync::atomic::Ordering::Relaxed)
+                && !timer_active
                 && pid_error_clear_countdown_ms > 0
             {
                 pid_error_clear_countdown_ms -= 1;
@@ -3451,124 +3939,8 @@ mod app {
                 }
             }
 
-            // TrSync: check timeouts and send periodic status reports.
-            //
-            // Runs every 1ms tick. For each active TrSync:
-            // - check_timeout: auto-triggers if the expiry clock has passed
-            // - report_due: sends trsync_state to the host at the configured interval
-            //
-            // Split into two passes to satisfy the borrow checker: first collect
-            // OID-index pairs from the map, then process each TrSync using direct
-            // field access (split borrows on State's distinct fields).
-            {
-                use klipper_mcu::trsync::TrSyncState;
-                let now_clock = read_tim5();
-                ctx.shared.app_state.lock(|state| {
-                    // Collect OID-index pairs (max NUM_TRSYNC = 4)
-                    let mut pairs: [(u8, usize); klipper_mcu::state::NUM_TRSYNC] =
-                        [(0, 0); klipper_mcu::state::NUM_TRSYNC];
-                    let count = state.trsync_by_oid.len();
-                    for (i, (&oid, &idx)) in state.trsync_by_oid.iter().enumerate() {
-                        pairs[i] = (oid, idx);
-                    }
-
-                    for &(oid, idx) in &pairs[..count] {
-                        // Check timeout — if expired, stop hardware stepper
-                        if state.trsync[idx].check_timeout(now_clock) {
-                            stepper_stop();
-                            STEPPER_NEED_RESET.store(true, core::sync::atomic::Ordering::Relaxed);
-                        }
-
-                        // Send periodic status report if due
-                        if state.trsync[idx].report_due(now_clock) {
-                            let (can_trigger, trigger_reason) = match state.trsync[idx].state() {
-                                TrSyncState::Idle => (0u8, 0u8),
-                                TrSyncState::Armed => (1u8, 0u8),
-                                TrSyncState::Triggered(reason) => (0u8, reason),
-                            };
-                            klipper_reply!(
-                                trsync_state,
-                                oid: u8 = oid,
-                                can_trigger: u8 = can_trigger,
-                                trigger_reason: u8 = trigger_reason,
-                                clock: u32 = now_clock
-                            );
-                        }
-                    }
-                });
-            }
-
-            // Endstop: sample configured GPIO pins when homing is active.
-            //
-            // For each active endstop whose sample clock has been reached, read
-            // the GPIO pin state and feed it to the endstop state machine. If
-            // the endstop triggers, fire the linked TrSync and stop steppers.
-            {
-                use klipper_mcu::endstop::SampleResult;
-                let now_clock = read_tim5();
-                ctx.shared.app_state.lock(|state| {
-                    // Collect OID-index pairs (max NUM_ENDSTOPS = 4)
-                    let mut pairs: [(u8, usize); klipper_mcu::state::NUM_ENDSTOPS] =
-                        [(0, 0); klipper_mcu::state::NUM_ENDSTOPS];
-                    let count = state.endstop_by_oid.len();
-                    for (i, (&oid, &idx)) in state.endstop_by_oid.iter().enumerate() {
-                        pairs[i] = (oid, idx);
-                    }
-
-                    for &(oid, idx) in &pairs[..count] {
-                        if !state.endstops[idx].is_homing() {
-                            continue;
-                        }
-
-                        // Check if it is time for the next sample
-                        let next = state.endstops[idx].next_sample_clock();
-                        let elapsed = now_clock.wrapping_sub(next);
-                        if elapsed > 0x8000_0000 {
-                            // next_sample_clock is in the future; skip
-                            continue;
-                        }
-
-                        // Read GPIO pin state
-                        let pin_id =
-                            ENDSTOP_PIN_IDS[idx].load(core::sync::atomic::Ordering::Relaxed);
-                        let pin_state = if pin_id != 0xFF {
-                            gpio_read_pin(pin_id)
-                        } else {
-                            false
-                        };
-
-                        match state.endstops[idx].sample(pin_state, now_clock) {
-                            SampleResult::Triggered { reason, trsync_oid } => {
-                                // Fire TrSync trigger and stop linked steppers
-                                if let Some(&ts_idx) = state.trsync_by_oid.get(&trsync_oid) {
-                                    state.trsync[ts_idx].trigger(reason);
-                                    stepper_stop();
-                                    STEPPER_NEED_RESET
-                                        .store(true, core::sync::atomic::Ordering::Relaxed);
-                                } else {
-                                    defmt::error!(
-                                        "endstop trigger: unknown trsync_oid={}",
-                                        trsync_oid
-                                    );
-                                    if enter_shutdown(state) {
-                                        klipper_shutdown!(
-                                            "Endstop trigger: unknown trsync OID",
-                                            read_tim5()
-                                        );
-                                    }
-                                }
-                                defmt::info!(
-                                    "endstop oid={} triggered: reason={} trsync_oid={}",
-                                    oid,
-                                    reason,
-                                    trsync_oid
-                                );
-                            }
-                            SampleResult::Continue | SampleResult::NotHoming => {}
-                        }
-                    }
-                });
-            }
+            // TrSync and endstop polling have been replaced by the TIM5 CC2
+            // trigger scheduler. See step_timer_irq CC2 dispatch above.
 
             // Homing I-suppression state machine.
             //
@@ -3591,18 +3963,13 @@ mod app {
                         defmt::info!("homing: position I suppressed");
                     }
                     2 => {
-                        // Suppressing: check if the linked TrSync has resolved
-                        let trsync_oid = HOMING_TRSYNC_OID.load(Relaxed);
-                        let resolved = ctx.shared.app_state.lock(|state| {
-                            if let Some(&ts_idx) = state.trsync_by_oid.get(&trsync_oid) {
-                                state.trsync[ts_idx].state()
-                                    != klipper_mcu::trsync::TrSyncState::Armed
-                            } else {
-                                // TrSync OID invalid, abort suppression
-                                true
-                            }
-                        });
-                        if resolved {
+                        // Suppressing: check if a trigger has fired via the
+                        // HOMING_TRIGGERED sentinel (set by TriggerDomain on
+                        // first trigger, 0xFF = no trigger pending).
+                        // P1 never enters TriggerDomain per spec.
+                        // If host's trsync_trigger runs before P1 polls,
+                        // trsync_trigger advances HOMING_STATE 2→3 directly.
+                        if HOMING_TRIGGERED.load(Relaxed) != 0xFF {
                             HOMING_STATE.store(3, Relaxed);
                         }
                     }
@@ -4004,27 +4371,17 @@ mod app {
         }
     }
 
-    /// Stop hardware stepper: disable timer, set need_reset, drain queue.
+    /// Stop hardware stepper from P1: hardware-only, no TriggerDomain lock.
     ///
-    /// Safe to call from P1 or P2. P3 is quiesced by disabling TIM5 CC1.
-    /// Disarm the step timer, drain the queue, and clear interval.
-    /// Does NOT set STEPPER_NEED_RESET — callers that need it (trsync
-    /// stop) must set it explicitly. Klipper's stepcompress only sends
-    /// reset_step_clock after trsync-triggered stops, not after motor
-    /// disable/re-enable cycles.
-    fn stepper_stop() {
-        use core::sync::atomic::Ordering::Relaxed;
-        let tim5 = embassy_stm32::pac::TIM5;
-        // Disable CC1 interrupt — quiesce P3
-        tim5.dier().modify(|w| w.set_ccie(0, false));
-        // Clear any pending CC1 flag
-        tim5.sr().modify(|w| w.set_ccif(0, false));
-        TIMER_ACTIVE.store(false, Relaxed);
-        STEP_INTERVAL.store(0, Relaxed);
-        PID_ERROR_SUMS_CLEAR.store(true, Relaxed);
-        // Drain queue (safe: P3 is disabled by the CC1IE clear above)
-        // SAFETY: P3 (timer ISR) is quiesced — we are the sole accessor.
-        unsafe { while (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue().is_some() {} }
+    /// Performs physical quiesce (disable CC1, drain queue, reset ISR engine),
+    /// updates the P1-readable mirror atomic, then spawns `stop_check` to
+    /// update the authoritative `timer_active` inside TriggerDomain at P2.
+    ///
+    /// P1 must never enter TriggerDomain per spec.
+    fn stepper_stop_from_p1() {
+        stop_physical_stepper_no_lock(0);
+        STEP_TIMER_ACTIVE_MIRROR.store(false, core::sync::atomic::Ordering::Relaxed);
+        stop_check::spawn().ok();
     }
 
     /// Minimum lead time when arming TIM5 CC1 from thread context.
@@ -4037,9 +4394,9 @@ mod app {
     /// Arm the TIM5 CC1 step timer for a compare at `clock`.
     ///
     /// Ensures NVIC is unmasked, clamps too-close compares forward, then
-    /// enables CC1 interrupt.
+    /// enables CC1 interrupt. Does NOT update TriggerDomain's timer_active
+    /// — the caller must do that inside the critical section.
     fn arm_step_timer(clock: u32) {
-        use core::sync::atomic::Ordering::Relaxed;
         let tim5 = embassy_stm32::pac::TIM5;
         // Ensure NVIC is unmasked (idempotent after first call)
         unsafe { cortex_m::peripheral::NVIC::unmask(embassy_stm32::pac::Interrupt::TIM5) };
@@ -4053,30 +4410,39 @@ mod app {
         tim5.ccr(0).write_value(clock);
         tim5.sr().modify(|w| w.set_ccif(0, false)); // Clear pending CC1
         tim5.dier().modify(|w| w.set_ccie(0, true)); // Enable CC1 interrupt
-        TIMER_ACTIVE.store(true, Relaxed);
     }
 
-    /// Arm TIM5 CC1 when motion is ready and queued.
+    /// P2 software task: clear TriggerDomain timer_active after P1 stop.
     ///
-    /// This is used from both P2 command handling and P1 calibration/enable
-    /// completion. During asynchronous auto-calibration, Klipper can queue
-    /// moves before the TMC4671 is in closed-loop mode; once calibration
-    /// completes, this starts the ISR that drains those deferred moves.
-    fn arm_queued_steps_if_ready() {
-        use core::sync::atomic::Ordering::Relaxed;
+    /// Spawned by `stepper_stop_from_p1()`. P1 performs the physical
+    /// quiesce (CC1 disable, queue drain) immediately, then this task
+    /// updates the authoritative flag so `reset_step_clock` and
+    /// `arm_check` see the correct state.
+    #[task(priority = 2)]
+    async fn stop_check(_ctx: stop_check::Context) {
+        with_trigger_domain(|td| {
+            td.set_timer_active(0, false);
+        });
+    }
 
-        if !MOTOR_ARMED.load(Relaxed) || TIMER_ACTIVE.load(Relaxed) {
-            return;
-        }
+    /// P2 software task: arm TIM5 CC1 if motor is ready and queue has moves.
+    ///
+    /// Spawned by P1 after calibration/enable completion. P1 must never
+    /// enter TriggerDomain — this task crosses the boundary at P2.
+    #[task(priority = 2)]
+    async fn arm_check(_ctx: arm_check::Context) {
+        with_trigger_domain(|td| {
+            if !MOTOR_ARMED.load(core::sync::atomic::Ordering::Relaxed) || td.timer_active(0) {
+                return;
+            }
 
-        // SAFETY: This mirrors the existing queue inspection in SetEnable.
-        // P2 is the sole producer while the timer is inactive; this helper
-        // only needs a best-effort empty/nonempty check before arming P3.
-        let queue_has_moves = unsafe { !(*core::ptr::addr_of_mut!(STEP_QUEUE)).is_empty() };
-        if queue_has_moves {
-            let now = read_tim5();
-            arm_step_timer(now.wrapping_add(1));
-        }
+            // SAFETY: P2 is the sole producer while the timer is inactive.
+            let queue_has_moves = unsafe { !(*core::ptr::addr_of_mut!(STEP_QUEUE)).is_empty() };
+            if queue_has_moves {
+                arm_step_timer(read_tim5().wrapping_add(1));
+                td.set_timer_active(0, true);
+            }
+        });
     }
 
     /// TIM5 CC1 step timer interrupt.
@@ -4089,6 +4455,146 @@ mod app {
         use klipper_mcu::stepper::StepEventResult;
 
         let tim5 = embassy_stm32::pac::TIM5;
+
+        // --- CC2: trigger scheduler (process before CC1) ---
+        if tim5.sr().read().ccif(1) && tim5.dier().read().ccie(1) {
+            tim5.sr().modify(|w| w.set_ccif(1, false));
+            let mut need_report = false;
+            with_trigger_domain(|td| {
+                use klipper_mcu::scheduler::SchedulerEventKind;
+                let now = read_tim5();
+                let due_indices = td.scheduler.find_due(now);
+                // Collect (kind, wake_clock) pairs before mutating scheduler
+                let mut due_events: heapless::Vec<(SchedulerEventKind, u32), 12> =
+                    heapless::Vec::new();
+                for &slot_idx in &due_indices {
+                    if let Some(event) = td.scheduler.get(slot_idx) {
+                        let _ = due_events.push((event.kind, event.wake_clock));
+                    }
+                    td.scheduler.remove(slot_idx);
+                }
+
+                for &(kind, wake_clock) in &due_events {
+                    match kind {
+                        SchedulerEventKind::EndstopSample(endstop_idx) => {
+                            use klipper_mcu::endstop::{EndstopPhase, EndstopSampleResult};
+                            let pin_id = ENDSTOP_PIN_IDS[endstop_idx].load(Relaxed);
+                            let read_pin = || -> bool {
+                                if pin_id != 0xFF {
+                                    gpio_read_pin(pin_id)
+                                } else {
+                                    false
+                                }
+                            };
+
+                            let phase = td.endstops[endstop_idx].phase();
+                            let result = match phase {
+                                EndstopPhase::Scanning => {
+                                    td.endstops[endstop_idx].scan(read_pin(), wake_clock)
+                                }
+                                EndstopPhase::Oversampling => {
+                                    td.endstops[endstop_idx].oversample(read_pin(), wake_clock)
+                                }
+                            };
+
+                            match result {
+                                EndstopSampleResult::EnterOversamplingNow => {
+                                    // Second GPIO read (C double-read)
+                                    match td.endstops[endstop_idx]
+                                        .oversample(read_pin(), wake_clock)
+                                    {
+                                        EndstopSampleResult::Triggered { trsync_oid, reason } => {
+                                            td.trigger(trsync_oid, reason, now);
+                                            need_report = true;
+                                        }
+                                        EndstopSampleResult::Reschedule { next_clock } => {
+                                            td.scheduler.schedule(
+                                                klipper_mcu::scheduler::SchedulerEvent {
+                                                    wake_clock: next_clock,
+                                                    kind: SchedulerEventKind::EndstopSample(
+                                                        endstop_idx,
+                                                    ),
+                                                },
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                EndstopSampleResult::Triggered { trsync_oid, reason } => {
+                                    td.trigger(trsync_oid, reason, now);
+                                    need_report = true;
+                                }
+                                EndstopSampleResult::Reschedule { next_clock } => {
+                                    td.scheduler
+                                        .schedule(klipper_mcu::scheduler::SchedulerEvent {
+                                            wake_clock: next_clock,
+                                            kind: SchedulerEventKind::EndstopSample(endstop_idx),
+                                        });
+                                }
+                                EndstopSampleResult::Inactive => {}
+                            }
+                        }
+                        SchedulerEventKind::TrSyncExpire(trsync_idx) => {
+                            // The scheduler event already confirms the deadline
+                            // has passed. Call td.trigger() directly — do NOT call
+                            // check_timeout() which internally triggers the
+                            // TrSyncRuntime, causing td.trigger() to see
+                            // AlreadyTriggered and skip stop signal dispatch.
+                            let oid = td
+                                .trsync_by_oid
+                                .iter()
+                                .find(|(_, &idx)| idx == trsync_idx)
+                                .map(|(&oid, _)| oid);
+                            if let Some(oid) = oid {
+                                let expire_reason = td.trsync[trsync_idx].expire_reason();
+                                td.trigger(oid, expire_reason, now);
+                                need_report = true;
+                            }
+                        }
+                        SchedulerEventKind::TrSyncReport(trsync_idx) => {
+                            let oid = td
+                                .trsync_by_oid
+                                .iter()
+                                .find(|(_, &idx)| idx == trsync_idx)
+                                .map(|(&oid, _)| oid);
+                            if let Some(oid) = oid {
+                                if td.trsync[trsync_idx].can_trigger() {
+                                    td.trsync[trsync_idx].set_liveness_report(oid, now);
+                                    need_report = true;
+                                    // Advance report_clock by report_ticks (stable cadence)
+                                    let report_ticks = td.trsync[trsync_idx].report_ticks();
+                                    if report_ticks > 0 {
+                                        let next_report = td.trsync[trsync_idx]
+                                            .report_clock()
+                                            .wrapping_add(report_ticks);
+                                        td.trsync[trsync_idx].set_report_clock(next_report);
+                                        td.scheduler.schedule(
+                                            klipper_mcu::scheduler::SchedulerEvent {
+                                                wake_clock: next_report,
+                                                kind: SchedulerEventKind::TrSyncReport(trsync_idx),
+                                            },
+                                        );
+                                    }
+                                }
+                                // After trigger, no more liveness reports — don't reschedule
+                            }
+                        }
+                    }
+                }
+                td.reprogram_cc2();
+            });
+            if need_report {
+                REPORT_PENDING.store(true, Relaxed);
+                report_task::spawn().ok();
+            }
+        }
+
+        // --- CC1: step timer (existing logic) ---
+        // Skip CC1 if the flag is not set, or if CC2 trigger processing
+        // disabled CC1 (stepper stop) — prevents one extra step after trigger.
+        if !tim5.sr().read().ccif(0) || !tim5.dier().read().ccie(0) {
+            return;
+        }
         // Clear CC1 interrupt flag
         tim5.sr().modify(|w| w.set_ccif(0, false));
 
@@ -4116,11 +4622,6 @@ mod app {
                     Some(m) => {
                         let dir_changed = stepper.load_move(m);
                         STEP_INTERVAL.store(stepper.current_interval(), Relaxed);
-                        // Always drive DIR before a segment's first STEP edge.
-                        // The software stepper defaults to forward=true while
-                        // PA0 powers up low; only writing on direction changes
-                        // left the first forward segment and the following
-                        // reverse segment at the same hardware DIR level.
                         let dir_val = if stepper.dir_state() {
                             embassy_stm32::pac::gpio::vals::Odr::HIGH
                         } else {
@@ -4135,9 +4636,11 @@ mod app {
                     None => {
                         // Queue empty: disarm timer, go idle
                         tim5.dier().modify(|w| w.set_ccie(0, false));
-                        TIMER_ACTIVE.store(false, Relaxed);
                         STEP_INTERVAL.store(0, Relaxed);
                         PID_ERROR_SUMS_CLEAR.store(true, Relaxed);
+                        with_trigger_domain(|td| {
+                            td.set_timer_active(0, false);
+                        });
                         return;
                     }
                 }
@@ -4153,16 +4656,14 @@ mod app {
                         }
                         tim5.ccr(0).write_value(compare);
                         if !immediate {
-                            // Step is in the future — schedule and return
                             return;
                         }
-                        // Step is now or immediately — fall through to execute
                     }
                     Err(_) => {
-                        // >1ms past: shutdown
                         tim5.dier().modify(|w| w.set_ccie(0, false));
-                        TIMER_ACTIVE.store(false, Relaxed);
-                        // Signal shutdown via TMC_DISABLE_SIGNAL
+                        with_trigger_domain(|td| {
+                            td.set_timer_active(0, false);
+                        });
                         TMC_DISABLE_SIGNAL.signal(());
                         defmt::error!("Stepper too far in past");
                         return;
@@ -4170,27 +4671,23 @@ mod app {
                 }
             } else {
                 // Active segment: execute one step
-                // Toggle STEP GPIO (PB11) via BSRR (atomic set/reset)
                 {
                     use embassy_stm32::pac::gpio::vals::Idr;
                     let is_high = gpio_b.idr().read().idr(11) == Idr::HIGH;
                     gpio_b.bsrr().write(|w| {
                         if is_high {
-                            w.set_br(11, true); // Reset (low)
+                            w.set_br(11, true);
                         } else {
-                            w.set_bs(11, true); // Set (high)
+                            w.set_bs(11, true);
                         }
                     });
                 }
 
-                // Increment position
                 let dir = if stepper.dir_state() { 1i32 } else { -1i32 };
                 STEPPER_POSITION.fetch_add(dir, Relaxed);
 
-                // Advance scheduling
                 match stepper.step_event() {
                     StepEventResult::ScheduleNext { clock } => {
-                        // Update feedforward interval (read by tmc_control at 1 kHz)
                         STEP_INTERVAL.store(stepper.current_interval(), Relaxed);
                         let now = tim5.cnt().read();
                         match stepper.check_deadline(clock, now, CLOCK_FREQ) {
@@ -4201,14 +4698,15 @@ mod app {
                                 }
                                 tim5.ccr(0).write_value(compare);
                                 if !immediate {
-                                    return; // Future step: wait for next interrupt
+                                    return;
                                 }
-                                // Immediate: loop to execute next step
                                 continue;
                             }
                             Err(_) => {
                                 tim5.dier().modify(|w| w.set_ccie(0, false));
-                                TIMER_ACTIVE.store(false, Relaxed);
+                                with_trigger_domain(|td| {
+                                    td.set_timer_active(0, false);
+                                });
                                 TMC_DISABLE_SIGNAL.signal(());
                                 defmt::error!("Stepper too far in past");
                                 return;
@@ -4216,7 +4714,6 @@ mod app {
                         }
                     }
                     StepEventResult::NeedMove => {
-                        // Segment exhausted: loop to dequeue next
                         continue;
                     }
                 }
@@ -4286,9 +4783,44 @@ mod app {
                 if consumed == 0 {
                     break; // No progress — wait for more USB data
                 }
+                // Yield to let report_task run when a trigger report is pending.
+                // Both tasks are P2; yielding gives report_task a chance to
+                // send the trsync_state reply before we process more commands.
+                if REPORT_PENDING.load(core::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
             }
             // Final poll to flush any remaining TX
             klipper_usb::poll();
+        }
+    }
+
+    /// Send pending trsync_state reports outside the TriggerDomain lock.
+    ///
+    /// Spawned by the TIM5 CC2 ISR when any trsync has a pending report.
+    /// Drains all pending snapshots in one brief critical section, then
+    /// sends replies at P2 without holding the lock.
+    #[task(priority = 2)]
+    async fn report_task(_ctx: report_task::Context) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let mut snapshots: heapless::Vec<klipper_mcu::trigger::ReportSnapshot, 4> =
+            heapless::Vec::new();
+        with_trigger_domain(|td| {
+            for ts in td.trsync.iter_mut() {
+                if let Some(snap) = ts.take_report() {
+                    let _ = snapshots.push(snap);
+                }
+            }
+            REPORT_PENDING.store(false, Relaxed);
+        });
+        for snap in &snapshots {
+            klipper_reply!(
+                trsync_state,
+                oid: u8 = snap.oid,
+                can_trigger: u8 = snap.can_trigger,
+                trigger_reason: u8 = snap.trigger_reason,
+                clock: u32 = snap.clock
+            );
         }
     }
 
