@@ -1053,10 +1053,16 @@ mod app {
             // SAFETY: Timer is not active (checked above), P3 is quiesced.
             unsafe { while (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue().is_some() {} }
 
-            // Set clock base on P2 stepper state
-            // SAFETY: P2_STEPPER is only accessed from P2 command handlers.
+            // Set clock base on both stepper state halves.
+            // SAFETY: reset_step_clock_hw accepted only because the timer is
+            // inactive, so P3 is not using ISR_STEPPER. P2_STEPPER is only
+            // accessed from P2 command handlers.
             unsafe {
-                (*core::ptr::addr_of_mut!(P2_STEPPER)).reset_step_clock(clock);
+                klipper_mcu::commands::stepper::reset_stepper_clocks(
+                    &mut *core::ptr::addr_of_mut!(P2_STEPPER),
+                    &mut *core::ptr::addr_of_mut!(ISR_STEPPER),
+                    clock,
+                );
             }
 
             // Only clear need_reset if not blocked by an active trigger.
