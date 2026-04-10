@@ -343,10 +343,13 @@ const VALIDATION_STEP_PERCENT: u32 = 15;
 /// Settling time after applying or removing current step (microseconds).
 const VALIDATION_SETTLE_US: u64 = 50_000;
 
-/// Lambda multiplier for retry (150% = increase lambda by 50%).
-/// Applied as lambda_us = lambda_us * 3 / 2.
-const RETRY_LAMBDA_MULTIPLIER_NUM: u32 = 3;
-const RETRY_LAMBDA_MULTIPLIER_DEN: u32 = 2;
+/// PID output voltage limit used during current-loop validation.
+///
+/// ADC calibration leaves `PIDOUT_UQ_UD_LIMITS` at 1024 as a conservative
+/// safety cap, but the measured validation captures can hit that cap before
+/// reaching the current target. 2000 matches the bounded encoder-alignment
+/// limit and remains well below the operational closed-loop limit.
+const CURRENT_VALIDATE_PIDOUT_LIMIT: u32 = 2000;
 
 /// Capture direction for bidirectional validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
@@ -395,6 +398,10 @@ struct CurrentValidateData {
     forward_metrics: Option<CurrentValidation>,
     /// Reverse capture metrics (filled after reverse capture).
     reverse_metrics: Option<CurrentValidation>,
+    /// Forward tail average from the last capture window.
+    forward_tail_avg: u32,
+    /// Reverse tail average from the last capture window.
+    reverse_tail_avg: u32,
     /// Final commissioning status to report.
     final_status: CommissionStatus,
     /// PID-output saturation counter: samples where the current PID's
@@ -695,6 +702,12 @@ const MECH_ID_SYMMETRY_THRESHOLD_PCT: u32 = 30;
 /// Matches closed-loop entry so torque, velocity, and position tests are not
 /// constrained by the conservative safe-state ceiling.
 const OUTER_PIDOUT_LIMIT: u32 = 16000;
+
+/// Torque mode with MODE_PID_TYPE set for the TMC4671 advanced PI structure.
+///
+/// Current-loop SIMC writes the advanced flux/torque PI registers, so
+/// validation and mechanical ID must exercise that same controller path.
+const CURRENT_TORQUE_MODE: u32 = 0x8000_0001;
 
 /// Velocity mode with MODE_PID_TYPE set for the TMC4671 advanced PI structure.
 ///
@@ -2898,6 +2911,18 @@ impl CommissioningEngine {
         let config = backend.tmc_config();
         let gains = foci_core::autotune::simc_current_gains(&model, profile, config);
 
+        defmt::info!(
+            "simc: R={} L={} tau_e={}us theta_e={}us lambda={}us → P={} I={} bw={}Hz",
+            model.r_int,
+            model.l_int,
+            model.tau_e_us,
+            model.theta_e_us,
+            gains.lambda_us,
+            gains.flux_p,
+            gains.flux_i,
+            gains.effective_bandwidth_hz,
+        );
+
         // Compute step amplitude: 15% of run_current.
         let current_limit = backend.current_limit() & 0xFFFF;
         let step_amplitude = if current_limit > 0 {
@@ -2916,6 +2941,8 @@ impl CommissioningEngine {
                 step_amplitude,
                 forward_metrics: None,
                 reverse_metrics: None,
+                forward_tail_avg: 0,
+                reverse_tail_avg: 0,
                 final_status: CommissionStatus::Accepted,
                 saturation_count: 0,
                 pidout_limit: {
@@ -2943,7 +2970,7 @@ impl CommissioningEngine {
     async fn step_current_validate<B: CommissioningBackend>(
         phase: &mut InnerPhase,
         buf: &mut TransientBuffer,
-        profile: CommissionProfile,
+        _profile: CommissionProfile,
         sequence: InnerSequence,
         backend: &mut B,
     ) -> StepResult {
@@ -2969,13 +2996,21 @@ impl CommissioningEngine {
                         .write_register(PID_TORQUE_P_TORQUE_I, torque_reg)
                         .await
                         .is_err()
+                    || backend
+                        .write_register(PIDOUT_UQ_UD_LIMITS, CURRENT_VALIDATE_PIDOUT_LIMIT)
+                        .await
+                        .is_err()
+                    || Self::clear_current_integrators(backend).await.is_err()
                 {
                     return Self::fail_inner(phase, CommissionError::Spi);
                 }
+                data.pidout_limit = CURRENT_VALIDATE_PIDOUT_LIMIT;
 
                 // Clear any previous metrics for this attempt.
                 data.forward_metrics = None;
                 data.reverse_metrics = None;
+                data.forward_tail_avg = 0;
+                data.reverse_tail_avg = 0;
                 data.saturation_count = 0;
 
                 *validate_state = CurrentValidateState::StepSetup {
@@ -2986,15 +3021,20 @@ impl CommissioningEngine {
 
             CurrentValidateState::StepSetup { direction } => {
                 let dir = *direction;
-                // Switch to torque mode (MODE=1).
+                // Switch to torque mode using the same advanced PI
+                // controller structure as the tuned current loop.
                 if backend
-                    .write_register(MODE_RAMP_MODE_MOTION, 1)
+                    .write_register(MODE_RAMP_MODE_MOTION, CURRENT_TORQUE_MODE)
                     .await
                     .is_err()
                 {
                     return Self::fail_inner(phase, CommissionError::Spi);
                 }
                 backend.set_enable_pin(true);
+
+                if Self::clear_current_integrators(backend).await.is_err() {
+                    return Self::fail_inner(phase, CommissionError::Spi);
+                }
 
                 // Apply current step via PID_TORQUE_FLUX_TARGET.
                 // Torque target in [31:16], flux target in [15:0].
@@ -3060,18 +3100,40 @@ impl CommissioningEngine {
                         // sample-level saturation check.
                         let target = data.step_amplitude as u32;
                         let metrics = foci_core::autotune::extract_step_metrics(buf, target, 0);
+                        let tail_len = (buf.len() as usize).min(16);
+                        let tail = &buf.samples()[buf.len() as usize - tail_len..];
+                        let mut tail_sum = 0u32;
+                        for &sample in tail {
+                            tail_sum = tail_sum.saturating_add(sample);
+                        }
+                        let tail_avg = if tail_len > 0 {
+                            tail_sum / tail_len as u32
+                        } else {
+                            0
+                        };
 
                         match dir {
                             CaptureDirection::Forward => {
                                 data.forward_metrics = Some(metrics);
+                                data.forward_tail_avg = tail_avg;
                             }
                             CaptureDirection::Reverse => {
                                 data.reverse_metrics = Some(metrics);
+                                data.reverse_tail_avg = tail_avg;
                             }
                         }
 
-                        // Return to zero target.
-                        let _ = backend.write_register(PID_TORQUE_FLUX_TARGET, 0).await;
+                        // Return to zero target and clear accumulated current
+                        // error so the next capture starts from a defined
+                        // controller state.
+                        if backend
+                            .write_register(PID_TORQUE_FLUX_TARGET, 0)
+                            .await
+                            .is_err()
+                            || Self::clear_current_integrators(backend).await.is_err()
+                        {
+                            return Self::fail_inner(phase, CommissionError::Spi);
+                        }
                         let deadline = backend.elapsed_us().wrapping_add(VALIDATION_SETTLE_US);
                         *validate_state = CurrentValidateState::StepSettle {
                             direction: dir,
@@ -3087,7 +3149,8 @@ impl CommissioningEngine {
                             // PID_TORQUE_ACTUAL is in [31:16], PID_FLUX_ACTUAL in [15:0].
                             // We stepped the torque axis, so read the upper half.
                             let torque_actual = ((actual >> 16) & 0xFFFF) as i16;
-                            buf.push(torque_actual.unsigned_abs() as u32);
+                            let abs_torque = torque_actual.unsigned_abs() as u32;
+                            buf.push(abs_torque);
                         }
                         Err(_) => {
                             return Self::fail_inner(phase, CommissionError::Spi);
@@ -3148,10 +3211,28 @@ impl CommissioningEngine {
                 };
 
                 let total_samples = foci_core::autotune::TRANSIENT_LEN as u16 * 2;
+                let settle_reference_us = foci_core::autotune::current_settling_reference_us(
+                    &data.gains,
+                    backend.tmc_config(),
+                );
                 let result = foci_core::autotune::classify_current_validation(
                     &combined,
-                    data.model.tau_e_us,
+                    settle_reference_us,
                     total_samples,
+                );
+
+                defmt::info!(
+                    "current validate: overshoot={}‰ ringing={} settle={}us sym={}‰ sat={}/{} tau_e={}us settle_ref={}us → {:?} (attempt={})",
+                    combined.overshoot_pct,
+                    combined.ringing_count,
+                    combined.settling_time_us,
+                    combined.symmetry_pct,
+                    combined.saturation_samples,
+                    total_samples,
+                    data.model.tau_e_us,
+                    settle_reference_us,
+                    result,
+                    data.attempt,
                 );
 
                 match result {
@@ -3163,30 +3244,50 @@ impl CommissioningEngine {
                             CommissionStatus::Accepted
                         };
                     }
-                    ValidationResult::Marginal if data.attempt == 0 => {
-                        // Retry: increase lambda by 50%, recompute gains.
-                        data.attempt = 1;
-                        let new_lambda = data.gains.lambda_us * RETRY_LAMBDA_MULTIPLIER_NUM
-                            / RETRY_LAMBDA_MULTIPLIER_DEN;
-
-                        // Adjust theta_e_us so the SIMC formula for the
-                        // original profile yields the desired larger lambda.
-                        //   Conservative: lambda = 4*theta → theta = lambda/4
-                        //   Balanced:     lambda = 2*theta → theta = lambda/2
-                        //   Stiff:        lambda = max(theta, tau/4) → theta = lambda
-                        let mut retry_model = data.model;
-                        retry_model.theta_e_us = match profile {
-                            CommissionProfile::Conservative => new_lambda / 4,
-                            CommissionProfile::Balanced => new_lambda / 2,
-                            CommissionProfile::Stiff => new_lambda,
-                        };
-
-                        let config = backend.tmc_config();
-                        let retry_gains =
-                            foci_core::autotune::simc_current_gains(&retry_model, profile, config);
-                        data.gains = retry_gains;
-                        *validate_state = CurrentValidateState::WriteGains;
-                        return StepResult::Continue;
+                    retry_result
+                        if foci_core::autotune::should_retry_current_validation(
+                            retry_result,
+                            data.attempt,
+                        ) =>
+                    {
+                        // Retry: keep P damping and adjust I based on the
+                        // measured tail response.
+                        let target = data.step_amplitude as u32;
+                        let settle_band = (target * 5 / 100).max(1);
+                        let retry_gains = foci_core::autotune::current_validation_retry_gains(
+                            data.gains,
+                            target,
+                            settle_band,
+                            data.forward_tail_avg,
+                            data.reverse_tail_avg,
+                            combined.overshoot_pct,
+                        );
+                        if foci_core::autotune::should_accept_current_validation_without_retry(
+                            &combined,
+                            settle_reference_us,
+                            total_samples,
+                            data.gains,
+                            retry_gains,
+                        ) {
+                            defmt::info!(
+                                "current validate accept: marginal symmetry only, retry unchanged"
+                            );
+                            data.final_status = CommissionStatus::Accepted;
+                        } else {
+                            data.attempt = 1;
+                            defmt::info!(
+                                "current validate retry: previous={:?} lambda={}us → P={} I={} tails={}/{}",
+                                retry_result,
+                                retry_gains.lambda_us,
+                                retry_gains.flux_p,
+                                retry_gains.flux_i,
+                                data.forward_tail_avg,
+                                data.reverse_tail_avg,
+                            );
+                            data.gains = retry_gains;
+                            *validate_state = CurrentValidateState::WriteGains;
+                            return StepResult::Continue;
+                        }
                     }
                     ValidationResult::Marginal | ValidationResult::Fail => {
                         // Fall back to conservative defaults.
@@ -4030,8 +4131,8 @@ impl CommissioningEngine {
                 data.start_position = start_position;
                 data.torque_step = torque_step;
 
-                // Ensure we are in torque mode (MODE=1) with current-loop
-                // gains already written by inner commissioning.
+                // Ensure we are in torque mode with the same advanced PI
+                // controller structure used by the tuned current loop.
                 if backend
                     .write_register(PIDOUT_UQ_UD_LIMITS, OUTER_PIDOUT_LIMIT)
                     .await
@@ -4039,7 +4140,7 @@ impl CommissioningEngine {
                     || backend.write_register(PWM_SV_CHOP, 7).await.is_err()
                     || backend.write_register(PHI_E_SELECTION, 3).await.is_err()
                     || backend
-                        .write_register(MODE_RAMP_MODE_MOTION, 1)
+                        .write_register(MODE_RAMP_MODE_MOTION, CURRENT_TORQUE_MODE)
                         .await
                         .is_err()
                 {
@@ -5569,6 +5670,14 @@ impl CommissioningEngine {
             .write_register(sub.data, value)
             .await
             .map_err(|_| ())
+    }
+
+    /// Clear torque/flux PI error sums for current-loop captures.
+    async fn clear_current_integrators<B: CommissioningBackend>(backend: &mut B) -> Result<(), ()> {
+        use tmc4671::registers::{PID_ERROR_PID_FLUX_ERROR_SUM, PID_ERROR_PID_TORQUE_ERROR_SUM};
+
+        Self::write_sub_register_checked(backend, PID_ERROR_PID_TORQUE_ERROR_SUM, 0).await?;
+        Self::write_sub_register_checked(backend, PID_ERROR_PID_FLUX_ERROR_SUM, 0).await
     }
 
     /// Write velocity biquad filter coefficients.
