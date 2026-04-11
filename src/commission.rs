@@ -351,12 +351,7 @@ const VALIDATION_SETTLE_US: u64 = 50_000;
 /// limit and remains well below the operational closed-loop limit.
 const CURRENT_VALIDATE_PIDOUT_LIMIT: u32 = 2000;
 
-/// Capture direction for bidirectional validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
-enum CaptureDirection {
-    Forward,
-    Reverse,
-}
+use foci_core::autotune::CaptureDirection;
 
 /// Current-loop validation sub-state machine (Phase 7).
 #[derive(Debug, defmt::Format)]
@@ -398,10 +393,6 @@ struct CurrentValidateData {
     forward_metrics: Option<CurrentValidation>,
     /// Reverse capture metrics (filled after reverse capture).
     reverse_metrics: Option<CurrentValidation>,
-    /// Forward tail average from the last capture window.
-    forward_tail_avg: u32,
-    /// Reverse tail average from the last capture window.
-    reverse_tail_avg: u32,
     /// Final commissioning status to report.
     final_status: CommissionStatus,
     /// PID-output saturation counter: samples where the current PID's
@@ -2941,8 +2932,6 @@ impl CommissioningEngine {
                 step_amplitude,
                 forward_metrics: None,
                 reverse_metrics: None,
-                forward_tail_avg: 0,
-                reverse_tail_avg: 0,
                 final_status: CommissionStatus::Accepted,
                 saturation_count: 0,
                 pidout_limit: {
@@ -3009,8 +2998,6 @@ impl CommissioningEngine {
                 // Clear any previous metrics for this attempt.
                 data.forward_metrics = None;
                 data.reverse_metrics = None;
-                data.forward_tail_avg = 0;
-                data.reverse_tail_avg = 0;
                 data.saturation_count = 0;
 
                 *validate_state = CurrentValidateState::StepSetup {
@@ -3100,26 +3087,13 @@ impl CommissioningEngine {
                         // sample-level saturation check.
                         let target = data.step_amplitude as u32;
                         let metrics = foci_core::autotune::extract_step_metrics(buf, target, 0);
-                        let tail_len = (buf.len() as usize).min(16);
-                        let tail = &buf.samples()[buf.len() as usize - tail_len..];
-                        let mut tail_sum = 0u32;
-                        for &sample in tail {
-                            tail_sum = tail_sum.saturating_add(sample);
-                        }
-                        let tail_avg = if tail_len > 0 {
-                            tail_sum / tail_len as u32
-                        } else {
-                            0
-                        };
 
                         match dir {
                             CaptureDirection::Forward => {
                                 data.forward_metrics = Some(metrics);
-                                data.forward_tail_avg = tail_avg;
                             }
                             CaptureDirection::Reverse => {
                                 data.reverse_metrics = Some(metrics);
-                                data.reverse_tail_avg = tail_avg;
                             }
                         }
 
@@ -3148,9 +3122,13 @@ impl CommissioningEngine {
                         Ok(actual) => {
                             // PID_TORQUE_ACTUAL is in [31:16], PID_FLUX_ACTUAL in [15:0].
                             // We stepped the torque axis, so read the upper half.
+                            // Normalize by direction so both captures produce
+                            // positive values when the motor responds correctly.
+                            // Wrong-sign current clamps to zero.
                             let torque_actual = ((actual >> 16) & 0xFFFF) as i16;
-                            let abs_torque = torque_actual.unsigned_abs() as u32;
-                            buf.push(abs_torque);
+                            let sample =
+                                foci_core::autotune::normalize_capture_sample(torque_actual, dir);
+                            buf.push(sample);
                         }
                         Err(_) => {
                             return Self::fail_inner(phase, CommissionError::Spi);
@@ -3191,13 +3169,19 @@ impl CommissioningEngine {
                     }
                 };
 
-                // Compute symmetry from forward and reverse rise times.
-                let symmetry = foci_core::autotune::compute_symmetry_pct(
-                    forward.rise_time_us,
-                    reverse.rise_time_us,
+                // Compute symmetry from forward and reverse tail levels
+                // (steady-state current magnitude).
+                let symmetry = foci_core::autotune::compute_tail_symmetry_pct(
+                    forward.tail_level,
+                    reverse.tail_level,
                 );
 
-                // Use the forward metrics with symmetry filled in for classification.
+                // Use worst-case tail_level (lower = further from target).
+                let worst_tail = forward.tail_level.min(reverse.tail_level);
+                let target = data.step_amplitude as u32;
+                let target_error =
+                    foci_core::autotune::compute_target_error_pct(worst_tail, target);
+
                 let combined = CurrentValidation {
                     symmetry_pct: symmetry,
                     // Use worst-case of forward and reverse for other metrics.
@@ -3208,6 +3192,8 @@ impl CommissioningEngine {
                     // helper's current-level saturation.
                     saturation_samples: data.saturation_count,
                     rise_time_us: forward.rise_time_us,
+                    tail_level: worst_tail,
+                    target_error_pct: target_error,
                 };
 
                 let total_samples = foci_core::autotune::TRANSIENT_LEN as u16 * 2;
@@ -3222,11 +3208,12 @@ impl CommissioningEngine {
                 );
 
                 defmt::info!(
-                    "current validate: overshoot={}‰ ringing={} settle={}us sym={}‰ sat={}/{} tau_e={}us settle_ref={}us → {:?} (attempt={})",
+                    "current validate: overshoot={}‰ ringing={} settle={}us sym={}‰ target_err={}‰ sat={}/{} tau_e={}us settle_ref={}us → {:?} (attempt={})",
                     combined.overshoot_pct,
                     combined.ringing_count,
                     combined.settling_time_us,
                     combined.symmetry_pct,
+                    combined.target_error_pct,
                     combined.saturation_samples,
                     total_samples,
                     data.model.tau_e_us,
@@ -3258,8 +3245,8 @@ impl CommissioningEngine {
                             data.gains,
                             target,
                             settle_band,
-                            data.forward_tail_avg,
-                            data.reverse_tail_avg,
+                            forward.tail_level,
+                            reverse.tail_level,
                             combined.overshoot_pct,
                         );
                         if foci_core::autotune::should_accept_current_validation_without_retry(
@@ -3281,8 +3268,8 @@ impl CommissioningEngine {
                                 retry_gains.lambda_us,
                                 retry_gains.flux_p,
                                 retry_gains.flux_i,
-                                data.forward_tail_avg,
-                                data.reverse_tail_avg,
+                                forward.tail_level,
+                                reverse.tail_level,
                             );
                             data.gains = retry_gains;
                             *validate_state = CurrentValidateState::WriteGains;
