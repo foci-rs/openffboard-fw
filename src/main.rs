@@ -626,6 +626,18 @@ mod app {
             .odr()
             .modify(|w| w.set_odr(0, embassy_stm32::pac::gpio::vals::Odr::LOW));
         STEP_DIRECTION.store(true, Relaxed); // Forward = default
+                                             // 6. Reset STEP GPIO (PB11) to LOW.
+                                             //
+                                             // Full-mode scheduling relies on the ISR toggling from a known
+                                             // starting state: the first event of each segment must drive STEP
+                                             // LOW → HIGH (the rising edge the TMC4671 counts). If the previous
+                                             // segment ended mid-pulse (shutdown or stop between step and unstep
+                                             // events) the pin could still be HIGH, which would flip the parity
+                                             // for the next segment and lose the first motor step.
+        let gpio_b = embassy_stm32::pac::GPIOB;
+        gpio_b
+            .odr()
+            .modify(|w| w.set_odr(11, embassy_stm32::pac::gpio::vals::Odr::LOW));
     }
 
     static TMC_REQUEST_SENDER: Mutex<
@@ -668,6 +680,30 @@ mod app {
     #[klipper_constant]
     const MCU: &str = "stm32f407xx";
 
+    // STEPPER_STEP_BOTH_EDGE=1 matches the value Klipper C declares
+    // unconditionally in `src/stepper.c`, which suppresses Klipper's
+    // "MCU has deprecated code" startup warning. Reporting anything
+    // else (0 or absent) fires the warning permanently with no user-
+    // facing way to silence it.
+    //
+    // Safety does NOT depend on this value:
+    //   - The only driver module that binds to this firmware is
+    //     `klipper-foci`, which never calls
+    //     `setup_default_pulse_duration(..., step_both_edge=True)`, so
+    //     `_req_step_both_edge` stays False and Klipper never activates
+    //     toggle-mode stepping for FOCI steppers.
+    //   - The firmware's step ISR only implements `stepper_event_full`
+    //     semantics: it always doubles `count` internally and always
+    //     emits a STEP rising edge followed by a falling edge. Klipper
+    //     queue_step counts are motor-step counts in both Klipper modes,
+    //     so the TMC4671 sees the right number of rising edges even if
+    //     a future driver module were to request toggle mode.
+    //   - The TMC4671 itself only counts rising edges on STEP
+    //     (datasheet §4.2.4), so any accidental toggle-mode generation
+    //     by the firmware would be caught as a test failure immediately.
+    //
+    // The constant is therefore a protocol-parity advertisement, not a
+    // capability gate.
     #[klipper_constant]
     const STEPPER_STEP_BOTH_EDGE: u32 = 1;
 
@@ -4676,7 +4712,15 @@ mod app {
                     }
                 }
             } else {
-                // Active segment: execute one step
+                // Active segment: execute one timer event (step or unstep).
+                //
+                // Full-mode scheduling (STEPPER_STEP_BOTH_EDGE=0): each motor
+                // step is a pair of events. Event 1 drives STEP HIGH (step
+                // phase, TMC4671 sees a rising edge and advances its counter);
+                // event 2 drives STEP LOW (unstep phase, no-op for the
+                // TMC4671). STEPPER_POSITION only advances on the step phase
+                // so the firmware counter matches the TMC4671's view of
+                // position. Matches Klipper C `stepper_event_full`.
                 {
                     use embassy_stm32::pac::gpio::vals::Idr;
                     let is_high = gpio_b.idr().read().idr(11) == Idr::HIGH;
@@ -4689,17 +4733,38 @@ mod app {
                     });
                 }
 
-                let dir = if stepper.dir_state() { 1i32 } else { -1i32 };
-                STEPPER_POSITION.fetch_add(dir, Relaxed);
-
                 match stepper.step_event() {
-                    StepEventResult::ScheduleNext { clock } => {
+                    StepEventResult::ScheduleNext { clock, phase } => {
+                        // Rising edge (LOW → HIGH) → TMC4671 advances, so the
+                        // firmware counter advances too. Falling edge (HIGH →
+                        // LOW) is the second half of the pulse and does not
+                        // change the driver's position.
+                        use klipper_mcu::stepper::StepPhase;
+                        let is_step = matches!(phase, StepPhase::Step);
+                        if is_step {
+                            let dir = if stepper.dir_state() { 1i32 } else { -1i32 };
+                            STEPPER_POSITION.fetch_add(dir, Relaxed);
+                        }
                         STEP_INTERVAL.store(stepper.current_interval(), Relaxed);
                         let now = tim5.cnt().read();
                         match stepper.check_deadline(clock, now, CLOCK_FREQ) {
                             Ok(compare) => {
                                 let immediate = compare != clock;
-                                if immediate {
+                                // Only rebase the cadence anchor when the
+                                // scheduled event IS the next rising edge
+                                // (Unstep phase returns `next_step_clock`).
+                                // For Step phase `clock` is the pulse-close
+                                // time, only STEP_PULSE_TICKS past the
+                                // rising edge — it is almost always in the
+                                // past by the time we read TIM5 here, so
+                                // rebasing would drag every subsequent
+                                // rising edge forward by the pulse-close
+                                // latency and stretch the step interval.
+                                // Leaving the anchor untouched lets the
+                                // following Unstep event schedule the next
+                                // rising edge at `original_step_clock +
+                                // interval` as intended.
+                                if immediate && !is_step {
                                     stepper.rebase_next_step_clock(compare);
                                 }
                                 tim5.ccr(0).write_value(compare);
@@ -4720,6 +4785,9 @@ mod app {
                         }
                     }
                     StepEventResult::NeedMove => {
+                        // Final unstep of the segment: the GPIO toggle above
+                        // already drove STEP LOW, leaving the pin in the
+                        // quiescent state before we dequeue the next move.
                         continue;
                     }
                 }
