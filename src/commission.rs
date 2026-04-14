@@ -2483,7 +2483,7 @@ impl CommissioningEngine {
         phase: &mut InnerPhase,
         buf: &mut TransientBuffer,
         sequence: InnerSequence,
-        _selftest_results: &mut foci_core::selftest::SelftestResults,
+        selftest_results: &mut foci_core::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
         use tmc4671::registers::*;
@@ -2956,6 +2956,20 @@ impl CommissioningEngine {
 
                 match sequence {
                     InnerSequence::Selftest => {
+                        selftest_results.set(
+                            7,
+                            foci_core::selftest::SelftestStageValue {
+                                status: 0,
+                                value: r_mohm,
+                            },
+                        );
+                        selftest_results.set(
+                            8,
+                            foci_core::selftest::SelftestStageValue {
+                                status: 0,
+                                value: l_uh as u32,
+                            },
+                        );
                         // Full safe-state restore matching restore_safe_state().
                         backend.set_enable_pin(false);
                         let _ = backend.write_register(MODE_RAMP_MODE_MOTION, 0).await;
