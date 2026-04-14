@@ -1252,6 +1252,9 @@ pub struct CommissioningEngine {
     oid: u8,
     engine_mode: EngineMode,
     buf: TransientBuffer,
+    /// Per-stage results collected during a selftest run. Populated only
+    /// when `sequence == InnerSequence::Selftest`; unused otherwise.
+    selftest_results: foci_core::selftest::SelftestResults,
 }
 
 impl CommissioningEngine {
@@ -1270,6 +1273,7 @@ impl CommissioningEngine {
                 adc_cal: None,
             },
             buf: TransientBuffer::new(),
+            selftest_results: foci_core::selftest::SelftestResults::default(),
         }
     }
 
@@ -1288,6 +1292,7 @@ impl CommissioningEngine {
                 adc_cal: None,
             },
             buf: TransientBuffer::new(),
+            selftest_results: foci_core::selftest::SelftestResults::default(),
         }
     }
 
@@ -1306,6 +1311,7 @@ impl CommissioningEngine {
                 adc_cal: None,
             },
             buf: TransientBuffer::new(),
+            selftest_results: foci_core::selftest::SelftestResults::default(),
         }
     }
 
@@ -1344,6 +1350,7 @@ impl CommissioningEngine {
                 entry_snapshot,
             },
             buf: TransientBuffer::new(),
+            selftest_results: foci_core::selftest::SelftestResults::default(),
         }
     }
 
@@ -1369,6 +1376,16 @@ impl CommissioningEngine {
             EngineMode::Outer { entry_snapshot, .. } => Some(*entry_snapshot),
             _ => None,
         }
+    }
+
+    /// Consume the engine's collected selftest results.
+    ///
+    /// Caller should only invoke this when the most recent `step()`
+    /// returned `StepResult::SelftestDone`.
+    // Called from main.rs in task 10; allow until then.
+    #[expect(dead_code)]
+    pub fn take_selftest_results(&mut self) -> foci_core::selftest::SelftestResults {
+        core::mem::take(&mut self.selftest_results)
     }
 
     /// Restore outer gains from an entry snapshot after Stage 2 soft failure.
