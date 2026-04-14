@@ -1766,6 +1766,9 @@ impl CommissioningEngine {
                 if !(ADC_OFFSET_MIN..=ADC_OFFSET_MAX).contains(&offset_i0)
                     || !(ADC_OFFSET_MIN..=ADC_OFFSET_MAX).contains(&offset_i1)
                 {
+                    if matches!(sequence, InnerSequence::Selftest) {
+                        selftest_results.set(1, foci_core::selftest::SelftestStageValue::fail(0));
+                    }
                     return Self::fail_inner(phase, CommissionError::AdcFault);
                 }
 
@@ -1927,6 +1930,11 @@ impl CommissioningEngine {
 
                         // Validate coil presence.
                         if obs.expected.unsigned_abs() <= MOTOR_CURRENT_THRESHOLD {
+                            if matches!(sequence, InnerSequence::Selftest) {
+                                let stage = if is_coil_b { 3 } else { 2 };
+                                selftest_results
+                                    .set(stage, foci_core::selftest::SelftestStageValue::fail(0));
+                            }
                             return Self::fail_inner(phase, CommissionError::CoilFault);
                         }
 
@@ -2227,11 +2235,12 @@ impl CommissioningEngine {
                 // baseline because the rotor is still held at the displaced
                 // sweep angle; EncoderAlign::Setup will drive back to PHI=0.
                 if matches!(sequence, InnerSequence::Selftest) {
+                    // Raw encoder delta magnitude; direction captured in stage 6.
                     selftest_results.set(
                         5,
                         foci_core::selftest::SelftestStageValue {
                             status: 0,
-                            value: delta as u32,
+                            value: delta.unsigned_abs(),
                         },
                     );
                     // Stage 6: encoder direction (0=forward, 1=reversed).
