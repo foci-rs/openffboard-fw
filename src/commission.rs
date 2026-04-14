@@ -1518,6 +1518,7 @@ impl CommissioningEngine {
             return self.abort(CommissionError::Shutdown);
         }
 
+        let selftest_results = &mut self.selftest_results;
         match &mut self.engine_mode {
             EngineMode::Inner {
                 ref mut phase,
@@ -1525,7 +1526,16 @@ impl CommissioningEngine {
                 sequence,
                 adc_cal,
             } => {
-                Self::step_inner(phase, &mut self.buf, *profile, *sequence, adc_cal, backend).await
+                Self::step_inner(
+                    phase,
+                    &mut self.buf,
+                    *profile,
+                    *sequence,
+                    adc_cal,
+                    selftest_results,
+                    backend,
+                )
+                .await
             }
             EngineMode::Outer {
                 ref mut phase,
@@ -1573,26 +1583,29 @@ impl CommissioningEngine {
         profile: CommissionProfile,
         sequence: InnerSequence,
         adc_cal: &mut Option<AdcCalResult>,
+        selftest_results: &mut foci_core::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
         match phase {
             InnerPhase::AdcCalibrate(_) => {
-                Self::step_adc_calibrate(phase, sequence, adc_cal, backend).await
+                Self::step_adc_calibrate(phase, sequence, adc_cal, selftest_results, backend).await
             }
-            InnerPhase::CoilCheck { .. } => Self::step_coil_check(phase, backend).await,
+            InnerPhase::CoilCheck { .. } => {
+                Self::step_coil_check(phase, sequence, selftest_results, backend).await
+            }
             InnerPhase::PhaseWiringCheck { coil_a, coil_b } => {
                 let a = *coil_a;
                 let b = *coil_b;
-                Self::step_phase_wiring(phase, a, b)
+                Self::step_phase_wiring(phase, sequence, selftest_results, a, b)
             }
             InnerPhase::EncoderCheck { .. } => {
-                Self::step_encoder_check(phase, sequence, backend).await
+                Self::step_encoder_check(phase, sequence, selftest_results, backend).await
             }
             InnerPhase::EncoderAlign { .. } => {
-                Self::step_encoder_align(phase, sequence, adc_cal, backend).await
+                Self::step_encoder_align(phase, sequence, adc_cal, selftest_results, backend).await
             }
             InnerPhase::ElectricalId { .. } => {
-                Self::step_elec_id(phase, buf, sequence, backend).await
+                Self::step_elec_id(phase, buf, sequence, selftest_results, backend).await
             }
             InnerPhase::CurrentTune { .. } => {
                 Self::step_current_tune(phase, profile, backend).await
@@ -1620,6 +1633,7 @@ impl CommissioningEngine {
         phase: &mut InnerPhase,
         sequence: InnerSequence,
         adc_cal: &mut Option<AdcCalResult>,
+        _selftest_results: &mut foci_core::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
         use tmc4671::registers::*;
@@ -1811,6 +1825,8 @@ impl CommissioningEngine {
     /// check.
     async fn step_coil_check<B: CommissioningBackend>(
         phase: &mut InnerPhase,
+        _sequence: InnerSequence,
+        _selftest_results: &mut foci_core::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
         use tmc4671::registers::*;
@@ -1956,6 +1972,8 @@ impl CommissioningEngine {
     /// the other channel. If reversed, the motor phases are swapped.
     fn step_phase_wiring(
         phase: &mut InnerPhase,
+        _sequence: InnerSequence,
+        _selftest_results: &mut foci_core::selftest::SelftestResults,
         coil_a: CoilObservation,
         coil_b: CoilObservation,
     ) -> StepResult {
@@ -2085,6 +2103,7 @@ impl CommissioningEngine {
     async fn step_encoder_check<B: CommissioningBackend>(
         phase: &mut InnerPhase,
         sequence: InnerSequence,
+        _selftest_results: &mut foci_core::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
         use tmc4671::registers::*;
@@ -2197,6 +2216,7 @@ impl CommissioningEngine {
         phase: &mut InnerPhase,
         sequence: InnerSequence,
         adc_cal: &mut Option<AdcCalResult>,
+        _selftest_results: &mut foci_core::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
         use tmc4671::registers::*;
@@ -2403,6 +2423,7 @@ impl CommissioningEngine {
         phase: &mut InnerPhase,
         buf: &mut TransientBuffer,
         sequence: InnerSequence,
+        _selftest_results: &mut foci_core::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
         use tmc4671::registers::*;
