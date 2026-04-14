@@ -2234,6 +2234,16 @@ impl CommissioningEngine {
                             value: delta as u32,
                         },
                     );
+                    // Stage 6: encoder direction (0=forward, 1=reversed).
+                    // Reversed when the encoder count decreases as PHI_E increases.
+                    let reversed = delta < 0;
+                    selftest_results.set(
+                        6,
+                        foci_core::selftest::SelftestStageValue {
+                            status: 0,
+                            value: if reversed { 1 } else { 0 },
+                        },
+                    );
                 }
 
                 // Direction detected. Transition to EncoderAlign, which
