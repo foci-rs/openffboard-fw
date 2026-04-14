@@ -2142,7 +2142,7 @@ impl CommissioningEngine {
     async fn step_encoder_check<B: CommissioningBackend>(
         phase: &mut InnerPhase,
         sequence: InnerSequence,
-        _selftest_results: &mut foci_core::selftest::SelftestResults,
+        selftest_results: &mut foci_core::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
         use tmc4671::registers::*;
@@ -2216,6 +2216,9 @@ impl CommissioningEngine {
                         *count_start,
                         count_end
                     );
+                    if matches!(sequence, InnerSequence::Selftest) {
+                        selftest_results.set(5, foci_core::selftest::SelftestStageValue::fail(0));
+                    }
                     return Self::fail_inner(phase, CommissionError::EncoderFault);
                 }
 
@@ -2223,7 +2226,15 @@ impl CommissioningEngine {
                 // EncoderAlign. Use the final sweep count as the alignment
                 // baseline because the rotor is still held at the displaced
                 // sweep angle; EncoderAlign::Setup will drive back to PHI=0.
-                let _ = sequence; // used for routing in other phases
+                if matches!(sequence, InnerSequence::Selftest) {
+                    selftest_results.set(
+                        5,
+                        foci_core::selftest::SelftestStageValue {
+                            status: 0,
+                            value: delta as u32,
+                        },
+                    );
+                }
 
                 // Direction detected. Transition to EncoderAlign, which
                 // locks PHI_E_SELECTION to ABN at a known D-axis zero before
