@@ -1832,8 +1832,8 @@ impl CommissioningEngine {
     /// check.
     async fn step_coil_check<B: CommissioningBackend>(
         phase: &mut InnerPhase,
-        _sequence: InnerSequence,
-        _selftest_results: &mut foci_core::selftest::SelftestResults,
+        sequence: InnerSequence,
+        selftest_results: &mut foci_core::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
         use tmc4671::registers::*;
@@ -1938,8 +1938,24 @@ impl CommissioningEngine {
 
                         // Store observation.
                         if !is_coil_b {
+                            if matches!(sequence, InnerSequence::Selftest) {
+                                selftest_results.set(
+                                    2,
+                                    foci_core::selftest::SelftestStageValue::coil_current(
+                                        obs.expected,
+                                    ),
+                                );
+                            }
                             *coil_a_obs = Some(obs);
                         } else {
+                            if matches!(sequence, InnerSequence::Selftest) {
+                                selftest_results.set(
+                                    3,
+                                    foci_core::selftest::SelftestStageValue::coil_current(
+                                        obs.expected,
+                                    ),
+                                );
+                            }
                             // Both coils tested. Transition to PhaseWiringCheck.
                             let a = coil_a_obs.unwrap_or(CoilObservation {
                                 expected: 0,
