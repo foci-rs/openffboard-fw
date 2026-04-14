@@ -1995,17 +1995,33 @@ impl CommissioningEngine {
     /// the other channel. If reversed, the motor phases are swapped.
     fn step_phase_wiring(
         phase: &mut InnerPhase,
-        _sequence: InnerSequence,
-        _selftest_results: &mut foci_core::selftest::SelftestResults,
+        sequence: InnerSequence,
+        selftest_results: &mut foci_core::selftest::SelftestResults,
         coil_a: CoilObservation,
         coil_b: CoilObservation,
     ) -> StepResult {
         // Phase wiring check: expected channel must dominate.
         if coil_a.other.unsigned_abs() >= coil_a.expected.unsigned_abs() {
+            if matches!(sequence, InnerSequence::Selftest) {
+                selftest_results.set(4, foci_core::selftest::SelftestStageValue::fail(0));
+            }
             return Self::fail_inner(phase, CommissionError::PhaseFault);
         }
         if coil_b.other.unsigned_abs() >= coil_b.expected.unsigned_abs() {
+            if matches!(sequence, InnerSequence::Selftest) {
+                selftest_results.set(4, foci_core::selftest::SelftestStageValue::fail(0));
+            }
             return Self::fail_inner(phase, CommissionError::PhaseFault);
+        }
+
+        if matches!(sequence, InnerSequence::Selftest) {
+            selftest_results.set(
+                4,
+                foci_core::selftest::SelftestStageValue {
+                    status: 0,
+                    value: 0,
+                },
+            );
         }
 
         // Transition to encoder check.
