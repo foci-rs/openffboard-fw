@@ -1633,7 +1633,7 @@ impl CommissioningEngine {
         phase: &mut InnerPhase,
         sequence: InnerSequence,
         adc_cal: &mut Option<AdcCalResult>,
-        _selftest_results: &mut foci_core::selftest::SelftestResults,
+        selftest_results: &mut foci_core::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
         use tmc4671::registers::*;
@@ -1767,6 +1767,13 @@ impl CommissioningEngine {
                     || !(ADC_OFFSET_MIN..=ADC_OFFSET_MAX).contains(&offset_i1)
                 {
                     return Self::fail_inner(phase, CommissionError::AdcFault);
+                }
+
+                if matches!(sequence, InnerSequence::Selftest) {
+                    selftest_results.set(
+                        1,
+                        foci_core::selftest::SelftestStageValue::adc_offsets(offset_i0, offset_i1),
+                    );
                 }
 
                 // Program calibrated offsets.
