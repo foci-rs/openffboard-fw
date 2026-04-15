@@ -3476,13 +3476,24 @@ mod app {
                     }
                     crate::commission::StepResult::SelftestDone => {
                         let oid = engine.oid();
+                        let results = engine.take_selftest_results();
                         commission_engine = None;
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
                         // Engine already restored safe state internally.
+                        // Emit one result message per populated stage, then the
+                        // terminal done message.
+                        for (stage, stage_value) in results.iter() {
+                            klipper_reply!(
+                                foci_selftest_result,
+                                oid: u8 = oid,
+                                stage: u8 = stage,
+                                status: u8 = stage_value.status,
+                                value: u32 = stage_value.value
+                            );
+                        }
                         klipper_reply!(
-                            foci_commission_phase,
+                            foci_selftest_done,
                             oid: u8 = oid,
-                            phase: u8 = 0,
                             status: u8 = 0
                         );
                     }

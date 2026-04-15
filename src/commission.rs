@@ -1382,8 +1382,6 @@ impl CommissioningEngine {
     ///
     /// Caller should only invoke this when the most recent `step()`
     /// returned `StepResult::SelftestDone`.
-    // Called from main.rs in task 10; allow until then.
-    #[expect(dead_code)]
     pub fn take_selftest_results(&mut self) -> foci_core::selftest::SelftestResults {
         core::mem::take(&mut self.selftest_results)
     }
