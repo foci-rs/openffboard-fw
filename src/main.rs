@@ -1858,9 +1858,8 @@ mod app {
         if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
             defmt::warn!("foci_selftest rejected: commission in flight");
             klipper_reply!(
-                foci_commission_phase,
+                foci_selftest_done,
                 oid: u8 = oid,
-                phase: u8 = 0,
                 status: u8 =
                     foci_core::autotune::CommissionError::AlreadyRunning.status_code()
             );
@@ -1869,9 +1868,8 @@ mod app {
         if !tmc_send(foci_core::tmc::tmc_selftest(oid)) {
             COMMISSION_IN_FLIGHT.store(false, Relaxed);
             klipper_reply!(
-                foci_commission_phase,
+                foci_selftest_done,
                 oid: u8 = oid,
-                phase: u8 = 0,
                 status: u8 =
                     foci_core::autotune::CommissionError::QueueFull.status_code()
             );
@@ -3101,6 +3099,8 @@ mod app {
                         unsafe { trace_buf().stop() };
                         let oid = engine.oid();
                         let is_calibrate = engine.is_calibrate();
+                        let is_selftest = engine.is_selftest();
+                        let selftest_results = engine.take_selftest_results();
                         defmt::error!("InnerFailed: calibrate={} error={}", is_calibrate, error,);
                         commission_engine = None;
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
@@ -3117,6 +3117,23 @@ mod app {
                                 adc_i0: u16 = 0,
                                 adc_i1: u16 = 0,
                                 encoder_count: u32 = 0
+                            );
+                        } else if is_selftest {
+                            // Emit any collected stage results, then the
+                            // terminal done with the error code.
+                            for (stage, v) in selftest_results.iter() {
+                                klipper_reply!(
+                                    foci_selftest_result,
+                                    oid: u8 = oid,
+                                    stage: u8 = stage,
+                                    status: u8 = v.status,
+                                    value: u32 = v.value
+                                );
+                            }
+                            klipper_reply!(
+                                foci_selftest_done,
+                                oid: u8 = oid,
+                                status: u8 = error.status_code()
                             );
                         } else {
                             klipper_reply!(
@@ -3837,9 +3854,8 @@ mod app {
                             COMMISSION_IN_FLIGHT
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             klipper_reply!(
-                                foci_commission_phase,
+                                foci_selftest_done,
                                 oid: u8 = oid,
-                                phase: u8 = 0,
                                 status: u8 =
                                     foci_core::autotune::CommissionError::MotorEnabled
                                         .status_code()

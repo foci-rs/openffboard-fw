@@ -1370,6 +1370,17 @@ impl CommissioningEngine {
         )
     }
 
+    /// Whether this engine was launched by `foci_selftest`.
+    pub fn is_selftest(&self) -> bool {
+        matches!(
+            self.engine_mode,
+            EngineMode::Inner {
+                sequence: InnerSequence::Selftest,
+                ..
+            }
+        )
+    }
+
     /// Return the entry snapshot for the outer engine, if active.
     pub fn entry_snapshot(&self) -> Option<EntrySnapshot> {
         match &self.engine_mode {
