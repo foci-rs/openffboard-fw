@@ -14,7 +14,7 @@ use foci_core::autotune::{
     TransientBuffer, ValidationResult, VelocityGains, VelocityValidation,
 };
 use foci_core::config::TmcConfig;
-use tmc4671::registers::Register;
+use foci_tmc4671::registers::Register;
 
 /// Hardware abstraction for commissioning measurements.
 ///
@@ -1406,7 +1406,7 @@ impl CommissioningEngine {
         snapshot: &EntrySnapshot,
         backend: &mut B,
     ) -> Result<(), CommissionError> {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         // 1. Zero torque, velocity targets, and velocity offset.
         backend
@@ -1645,7 +1645,7 @@ impl CommissioningEngine {
         selftest_results: &mut foci_core::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         let cal_state = match phase {
             InnerPhase::AdcCalibrate(cal_state) => cal_state,
@@ -1848,7 +1848,7 @@ impl CommissioningEngine {
         selftest_results: &mut foci_core::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         // Extract mutable fields from phase.
         let (state, coil_a_obs) = match phase {
@@ -2063,7 +2063,7 @@ impl CommissioningEngine {
         backend: &mut B,
         phi_e: u32,
     ) -> Result<(), CommissionError> {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         let current_limit = backend.current_limit() & 0xFFFF;
         if current_limit == 0 {
@@ -2134,7 +2134,7 @@ impl CommissioningEngine {
     async fn stop_encoder_current_drive<B: CommissioningBackend>(
         backend: &mut B,
     ) -> Result<(), CommissionError> {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         backend
             .write_register(PID_TORQUE_FLUX_TARGET, 0)
@@ -2162,7 +2162,7 @@ impl CommissioningEngine {
         selftest_results: &mut foci_core::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         let state = match phase {
             InnerPhase::EncoderCheck { state } => state,
@@ -2297,7 +2297,7 @@ impl CommissioningEngine {
         _selftest_results: &mut foci_core::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         let state = match phase {
             InnerPhase::EncoderAlign { state } => state,
@@ -2504,7 +2504,7 @@ impl CommissioningEngine {
         selftest_results: &mut foci_core::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         let (elec_id_state, data) = match phase {
             InnerPhase::ElectricalId { state, data } => (state, data),
@@ -2995,7 +2995,7 @@ impl CommissioningEngine {
                         let _ = backend.write_register(UQ_UD_EXT, 0).await;
                         let _ = backend.write_register(PWM_SV_CHOP, 0).await;
                         let _ = backend
-                            .write_register(tmc4671::registers::PID_VELOCITY_OFFSET, 0)
+                            .write_register(foci_tmc4671::registers::PID_VELOCITY_OFFSET, 0)
                             .await;
                         StepResult::SelftestDone
                     }
@@ -3067,7 +3067,7 @@ impl CommissioningEngine {
                 pidout_limit: {
                     // Read PIDOUT_UQ_UD_LIMITS for saturation detection.
                     backend
-                        .read_register(tmc4671::registers::PIDOUT_UQ_UD_LIMITS)
+                        .read_register(foci_tmc4671::registers::PIDOUT_UQ_UD_LIMITS)
                         .await
                         .unwrap_or(0)
                         & 0xFFFF
@@ -3093,7 +3093,7 @@ impl CommissioningEngine {
         sequence: InnerSequence,
         backend: &mut B,
     ) -> StepResult {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         let (validate_state, data) = match phase {
             InnerPhase::CurrentValidate { state, data } => (state, data),
@@ -3268,7 +3268,7 @@ impl CommissioningEngine {
                     // FOC voltage output (FOC_UQ_UD_LIMITED) and count when
                     // it's near the PIDOUT_UQ_UD_LIMITS voltage ceiling.
                     if data.pidout_limit > 0 {
-                        let sub = tmc4671::registers::INTERIM_FOC_UQ_UD_LIMITED;
+                        let sub = foci_tmc4671::registers::INTERIM_FOC_UQ_UD_LIMITED;
                         let _ = backend.write_register(sub.addr, sub.sub_addr as u32).await;
                         if let Ok(foc_limited) = backend.read_register(sub.data).await {
                             // FOC_UQ_UD_LIMITED packs UQ in [31:16], UD in [15:0].
@@ -3523,7 +3523,7 @@ impl CommissioningEngine {
         adc_cal: &mut Option<AdcCalResult>,
         backend: &mut B,
     ) -> StepResult {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         let (
             cle_state,
@@ -3951,10 +3951,10 @@ impl CommissioningEngine {
         {
             // Zero excitation immediately on any safety violation.
             let _ = backend
-                .write_register(tmc4671::registers::PID_TORQUE_FLUX_TARGET, 0)
+                .write_register(foci_tmc4671::registers::PID_TORQUE_FLUX_TARGET, 0)
                 .await;
             let _ = backend
-                .write_register(tmc4671::registers::MODE_RAMP_MODE_MOTION, 0)
+                .write_register(foci_tmc4671::registers::MODE_RAMP_MODE_MOTION, 0)
                 .await;
             let err = Self::safety_error_for_phase(phase);
             return Self::fail_outer(phase, err);
@@ -4215,7 +4215,7 @@ impl CommissioningEngine {
         buf: &mut TransientBuffer,
         backend: &mut B,
     ) -> StepResult {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         let (state, data, safety) = match phase {
             OuterPhase::MechanicalId {
@@ -4848,7 +4848,7 @@ impl CommissioningEngine {
         current_bandwidth_hz: u32,
         backend: &mut B,
     ) -> StepResult {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         let (state, data, safety) = match phase {
             OuterPhase::VelocityValidate {
@@ -4943,7 +4943,7 @@ impl CommissioningEngine {
                 // PID's torque output (INTERIM_PIDOUT_TARGET_TORQUE) and
                 // count when it's at or near the configured torque limit.
                 if data.torque_limit > 0 {
-                    let sub = tmc4671::registers::INTERIM_PIDOUT_TARGET_TORQUE;
+                    let sub = foci_tmc4671::registers::INTERIM_PIDOUT_TARGET_TORQUE;
                     let _ = backend.write_register(sub.addr, sub.sub_addr as u32).await;
                     if let Ok(pidout) = backend.read_register(sub.data).await {
                         let commanded_torque = (pidout & 0xFFFF) as i16;
@@ -5031,7 +5031,7 @@ impl CommissioningEngine {
 
                 // Detect velocity-controller saturation from PID output.
                 if data.torque_limit > 0 {
-                    let sub = tmc4671::registers::INTERIM_PIDOUT_TARGET_TORQUE;
+                    let sub = foci_tmc4671::registers::INTERIM_PIDOUT_TARGET_TORQUE;
                     let _ = backend.write_register(sub.addr, sub.sub_addr as u32).await;
                     if let Ok(pidout) = backend.read_register(sub.data).await {
                         let commanded_torque = (pidout & 0xFFFF) as i16;
@@ -5413,7 +5413,7 @@ impl CommissioningEngine {
         mode: OperatingMode,
         backend: &mut B,
     ) -> StepResult {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         let (state, data, safety) = match phase {
             OuterPhase::PositionTune {
@@ -5717,25 +5717,29 @@ impl CommissioningEngine {
         if let Some(cutoff_hz) = filter_config.velocity_filter_hz {
             Self::write_biquad_velocity(backend, cutoff_hz as u16, pwm_maxcnt).await;
         } else {
-            Self::write_sub_register(backend, tmc4671::registers::CONFIG_BIQUAD_V_ENABLE, 0).await;
+            Self::write_sub_register(backend, foci_tmc4671::registers::CONFIG_BIQUAD_V_ENABLE, 0)
+                .await;
         }
 
         if let Some(cutoff_hz) = filter_config.position_filter_hz {
             Self::write_biquad_position(backend, cutoff_hz as u16, pwm_maxcnt).await;
         } else {
-            Self::write_sub_register(backend, tmc4671::registers::CONFIG_BIQUAD_X_ENABLE, 0).await;
+            Self::write_sub_register(backend, foci_tmc4671::registers::CONFIG_BIQUAD_X_ENABLE, 0)
+                .await;
         }
 
         if let Some(cutoff_hz) = filter_config.flux_filter_hz {
             Self::write_biquad_flux(backend, cutoff_hz as u16, pwm_maxcnt).await;
         } else {
-            Self::write_sub_register(backend, tmc4671::registers::CONFIG_BIQUAD_F_ENABLE, 0).await;
+            Self::write_sub_register(backend, foci_tmc4671::registers::CONFIG_BIQUAD_F_ENABLE, 0)
+                .await;
         }
 
         if let Some(cutoff_hz) = filter_config.torque_filter_hz {
             Self::write_biquad_torque(backend, cutoff_hz as u16, pwm_maxcnt).await;
         } else {
-            Self::write_sub_register(backend, tmc4671::registers::CONFIG_BIQUAD_T_ENABLE, 0).await;
+            Self::write_sub_register(backend, foci_tmc4671::registers::CONFIG_BIQUAD_T_ENABLE, 0)
+                .await;
         }
 
         defmt::info!(
@@ -5766,7 +5770,7 @@ impl CommissioningEngine {
     /// TMC4671 sub-registers use address register 0x4D and data register 0x4E.
     async fn write_sub_register<B: CommissioningBackend>(
         backend: &mut B,
-        sub: tmc4671::registers::SubRegister,
+        sub: foci_tmc4671::registers::SubRegister,
         value: u32,
     ) {
         let _ = backend.write_register(sub.addr, sub.sub_addr as u32).await;
@@ -5776,7 +5780,7 @@ impl CommissioningEngine {
     /// Write a sub-register, returning `Err(())` if either SPI transfer fails.
     async fn write_sub_register_checked<B: CommissioningBackend>(
         backend: &mut B,
-        sub: tmc4671::registers::SubRegister,
+        sub: foci_tmc4671::registers::SubRegister,
         value: u32,
     ) -> Result<(), ()> {
         backend
@@ -5791,7 +5795,9 @@ impl CommissioningEngine {
 
     /// Clear torque/flux PI error sums for current-loop captures.
     async fn clear_current_integrators<B: CommissioningBackend>(backend: &mut B) -> Result<(), ()> {
-        use tmc4671::registers::{PID_ERROR_PID_FLUX_ERROR_SUM, PID_ERROR_PID_TORQUE_ERROR_SUM};
+        use foci_tmc4671::registers::{
+            PID_ERROR_PID_FLUX_ERROR_SUM, PID_ERROR_PID_TORQUE_ERROR_SUM,
+        };
 
         Self::write_sub_register_checked(backend, PID_ERROR_PID_TORQUE_ERROR_SUM, 0).await?;
         Self::write_sub_register_checked(backend, PID_ERROR_PID_FLUX_ERROR_SUM, 0).await
@@ -5803,7 +5809,7 @@ impl CommissioningEngine {
         cutoff_hz: u16,
         pwm_maxcnt: u16,
     ) {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
         if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(cutoff_hz, pwm_maxcnt) {
             Self::write_sub_register(backend, CONFIG_BIQUAD_V_A_1, coeffs.a_1 as u32).await;
             Self::write_sub_register(backend, CONFIG_BIQUAD_V_A_2, coeffs.a_2 as u32).await;
@@ -5821,7 +5827,7 @@ impl CommissioningEngine {
         cutoff_hz: u16,
         pwm_maxcnt: u16,
     ) {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
         if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(cutoff_hz, pwm_maxcnt) {
             Self::write_sub_register(backend, CONFIG_BIQUAD_X_A_1, coeffs.a_1 as u32).await;
             Self::write_sub_register(backend, CONFIG_BIQUAD_X_A_2, coeffs.a_2 as u32).await;
@@ -5839,7 +5845,7 @@ impl CommissioningEngine {
         cutoff_hz: u16,
         pwm_maxcnt: u16,
     ) {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
         if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(cutoff_hz, pwm_maxcnt) {
             Self::write_sub_register(backend, CONFIG_BIQUAD_F_A_1, coeffs.a_1 as u32).await;
             Self::write_sub_register(backend, CONFIG_BIQUAD_F_A_2, coeffs.a_2 as u32).await;
@@ -5857,7 +5863,7 @@ impl CommissioningEngine {
         cutoff_hz: u16,
         pwm_maxcnt: u16,
     ) {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
         if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(cutoff_hz, pwm_maxcnt) {
             Self::write_sub_register(backend, CONFIG_BIQUAD_T_A_1, coeffs.a_1 as u32).await;
             Self::write_sub_register(backend, CONFIG_BIQUAD_T_A_2, coeffs.a_2 as u32).await;

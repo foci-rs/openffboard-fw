@@ -33,7 +33,7 @@ critical-section = "1.2"
 anchor.workspace = true
 
 # Project crates
-tmc4671 = { path = "../tmc4671" }
+foci-tmc4671 = { path = "../foci-tmc4671" }
 klipper-mcu = { path = "../klipper-mcu" }
 klipper-usb = { path = "../klipper-usb" }
 foci-core = { path = "../foci-core", features = ["defmt"] }

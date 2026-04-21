@@ -28,10 +28,10 @@ mod app {
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use embassy_sync::signal::Signal;
     use embedded_hal_bus::spi::ExclusiveDevice;
+    use foci_tmc4671::spi::Tmc4671Spi;
     use klipper_mcu::state::State;
     use rtic_monotonics::stm32::prelude::*;
     use rtic_sync::channel::{Receiver, Sender};
-    use tmc4671::spi::Tmc4671Spi;
 
     bind_interrupts!(struct Irqs {
         DMA2_STREAM2 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH2>;
@@ -151,7 +151,7 @@ mod app {
     }
 
     impl<'a> crate::commission::CommissioningBackend for OpenFFBoardBackend<'a> {
-        type Error = tmc4671::spi::SpiError<
+        type Error = foci_tmc4671::spi::SpiError<
             embedded_hal_bus::spi::DeviceError<
                 embassy_stm32::spi::Error,
                 core::convert::Infallible,
@@ -160,14 +160,14 @@ mod app {
 
         async fn read_register(
             &mut self,
-            reg: tmc4671::registers::Register,
+            reg: foci_tmc4671::registers::Register,
         ) -> Result<u32, Self::Error> {
             self.tmc.read_register(reg).await
         }
 
         async fn write_register(
             &mut self,
-            reg: tmc4671::registers::Register,
+            reg: foci_tmc4671::registers::Register,
             val: u32,
         ) -> Result<(), Self::Error> {
             self.tmc.write_register(reg, val).await
@@ -183,7 +183,7 @@ mod app {
 
         async fn read_encoder_count(&mut self) -> u32 {
             self.tmc
-                .read_register(tmc4671::registers::ABN_DECODER_COUNT)
+                .read_register(foci_tmc4671::registers::ABN_DECODER_COUNT)
                 .await
                 .unwrap_or(0)
         }
@@ -2463,14 +2463,14 @@ mod app {
         match req {
             #[cfg(feature = "dev")]
             TmcRequest::Write { addr, value } => {
-                let reg = tmc4671::registers::Register::new(addr);
+                let reg = foci_tmc4671::registers::Register::new(addr);
                 if tmc.write_register(reg, value).await.is_err() {
                     defmt::error!("TMC4671 SPI write failed: addr={:#04x}", addr);
                 }
             }
             #[cfg(feature = "dev")]
             TmcRequest::Read { oid, addr } => {
-                let reg = tmc4671::registers::Register::new(addr);
+                let reg = foci_tmc4671::registers::Register::new(addr);
                 match tmc.read_register(reg).await {
                     Ok(value) => {
                         klipper_reply!(
@@ -2486,7 +2486,7 @@ mod app {
                 }
             }
             TmcRequest::SetCurrent { run_ma } => {
-                use tmc4671::registers::*;
+                use foci_tmc4671::registers::*;
                 // User configures RMS current (Klipper convention). The TMC4671
                 // PID limits operate on peak amplitude in the d-q frame
                 // (datasheet eq. 19/21: I_phase = I_D * sin(phi_e)).
@@ -2510,7 +2510,7 @@ mod app {
                 );
             }
             TmcRequest::SetEncoder { ppr } => {
-                use tmc4671::registers::*;
+                use foci_tmc4671::registers::*;
                 if ppr == 0 {
                     defmt::error!("Invalid encoder PPR: 0");
                     return Err(());
@@ -2528,7 +2528,7 @@ mod app {
                 defmt::info!("TMC4671 encoder: {} PPR, step_width={}", ppr, step_width);
             }
             TmcRequest::SetEncoderDir { invert } => {
-                use tmc4671::registers::*;
+                use foci_tmc4671::registers::*;
                 let mode = if invert { 1u32 << 12 } else { 0 };
                 if tmc.write_register(ABN_DECODER_MODE, mode).await.is_err() {
                     defmt::error!("TMC4671 SPI write failed: ABN_DECODER_MODE");
@@ -2552,7 +2552,7 @@ mod app {
                     // Yield between SPI reads to let USB task drain TX buffer
                     Mono::delay(1.millis()).await;
 
-                    let reg = tmc4671::registers::Register::new(addr);
+                    let reg = foci_tmc4671::registers::Register::new(addr);
                     let value = match tmc.read_register(reg).await {
                         Ok(v) => v,
                         Err(_) => {
@@ -2693,7 +2693,7 @@ mod app {
         tmc: &mut Tmc4671Spi<TmcSpiDevice>,
         tick_deadline: <Mono as rtic_monotonics::Monotonic>::Instant,
     ) {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         let buf = unsafe { trace_buf() };
         if !buf.is_capturing() {
@@ -2873,7 +2873,7 @@ mod app {
 
         // Verify TMC4671 chip identity — shutdown if SPI fails or wrong chip
         match tmc
-            .read_sub_register(tmc4671::registers::CHIPINFO_SI_TYPE)
+            .read_sub_register(foci_tmc4671::registers::CHIPINFO_SI_TYPE)
             .await
         {
             Ok(chip_id) => {
@@ -2941,7 +2941,7 @@ mod app {
         // bulk capacitors to absorb typical regen events. PE10 remains
         // held LOW at boot (line ~1650) to keep the Layer 2 brake FET off.
         {
-            use tmc4671::registers::*;
+            use foci_tmc4671::registers::*;
             let _ = tmc.write_register(ADC_VM_LIMITS, 0xFFFF_FFFF).await;
         }
 
@@ -2949,7 +2949,7 @@ mod app {
         // output pin (PE8 EXTI). Only PLL lock loss and ADC current clipping
         // warrant immediate hardware interrupt — other flags are polled.
         {
-            use tmc4671::registers::*;
+            use foci_tmc4671::registers::*;
             const STATUS_NOT_PLL_LOCKED: u32 = 1 << 19;
             const STATUS_ADC_I_CLIPPED: u32 = 1 << 26;
             let mask = STATUS_NOT_PLL_LOCKED | STATUS_ADC_I_CLIPPED;
@@ -3173,7 +3173,7 @@ mod app {
                         // the tuned gains, operational limits, filters,
                         // and re-enter position mode before declaring done.
                         let restore = async {
-                            use tmc4671::registers::*;
+                            use foci_tmc4671::registers::*;
 
                             // Tuned velocity + position gains.
                             let velocity_reg =
@@ -3331,11 +3331,11 @@ mod app {
                                     // Stability check with cooperative delay.
                                     Mono::delay(10.millis()).await;
                                     let pos1 = tmc
-                                        .read_register(tmc4671::registers::PID_POSITION_ACTUAL)
+                                        .read_register(foci_tmc4671::registers::PID_POSITION_ACTUAL)
                                         .await;
                                     Mono::delay(10.millis()).await;
                                     let pos2 = tmc
-                                        .read_register(tmc4671::registers::PID_POSITION_ACTUAL)
+                                        .read_register(foci_tmc4671::registers::PID_POSITION_ACTUAL)
                                         .await;
                                     match (pos1, pos2) {
                                         (Ok(p1), Ok(p2)) => {
@@ -3372,7 +3372,7 @@ mod app {
                             // Safety fault: hard disable, clear all state.
                             // Report the actual restore failure to the host.
                             let _ = tmc
-                                .write_register(tmc4671::registers::MODE_RAMP_MODE_MOTION, 0)
+                                .write_register(foci_tmc4671::registers::MODE_RAMP_MODE_MOTION, 0)
                                 .await;
                             foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
                             calibrated = false;
@@ -3416,7 +3416,7 @@ mod app {
                         // tmc_enter_closedloop didn't have one either).
                         let gain_restore = async {
                             use core::sync::atomic::Ordering::Relaxed;
-                            use tmc4671::registers::*;
+                            use foci_tmc4671::registers::*;
 
                             // Current-loop gains from prior commissioning.
                             if let Some(gains) = stored_gains {
@@ -3532,7 +3532,7 @@ mod app {
                             CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
                         let _ = tmc
                             .write_register(
-                                tmc4671::registers::PID_TORQUE_FLUX_LIMITS,
+                                foci_tmc4671::registers::PID_TORQUE_FLUX_LIMITS,
                                 current_limit,
                             )
                             .await;
@@ -3924,7 +3924,7 @@ mod app {
                 enable_pin.set_low();
                 // Read STATUS_FLAGS to identify the fault cause.
                 let flags = tmc
-                    .read_register(tmc4671::registers::STATUS_FLAGS)
+                    .read_register(foci_tmc4671::registers::STATUS_FLAGS)
                     .await
                     .unwrap_or(0);
                 defmt::error!("TMC4671 emergency disable: STATUS={:#010x}", flags);
@@ -3979,12 +3979,12 @@ mod app {
                 };
 
                 let _ = tmc
-                    .write_register(tmc4671::registers::PID_VELOCITY_OFFSET, offset as u32)
+                    .write_register(foci_tmc4671::registers::PID_VELOCITY_OFFSET, offset as u32)
                     .await;
             } else if feedforward_was_active {
                 // Feedforward just deactivated — clear stale offset
                 let _ = tmc
-                    .write_register(tmc4671::registers::PID_VELOCITY_OFFSET, 0)
+                    .write_register(foci_tmc4671::registers::PID_VELOCITY_OFFSET, 0)
                     .await;
             }
             feedforward_was_active = ff_active;
@@ -4032,7 +4032,7 @@ mod app {
                         let pos_p = POSITION_P_VALUE.load(Relaxed);
                         let reg = (pos_p as u32) << 16; // P in upper half, I=0
                         let _ = tmc
-                            .write_register(tmc4671::registers::PID_POSITION_P_POSITION_I, reg)
+                            .write_register(foci_tmc4671::registers::PID_POSITION_P_POSITION_I, reg)
                             .await;
                         HOMING_STATE.store(2, Relaxed);
                         defmt::info!("homing: position I suppressed");
@@ -4054,12 +4054,12 @@ mod app {
                         let pos_i = POSITION_I_VALUE.load(Relaxed);
                         let reg = ((pos_p as u32) << 16) | pos_i as u32;
                         let _ = tmc
-                            .write_register(tmc4671::registers::PID_POSITION_P_POSITION_I, reg)
+                            .write_register(foci_tmc4671::registers::PID_POSITION_P_POSITION_I, reg)
                             .await;
                         // Clear position error integrator
                         let _ = tmc
                             .write_sub_register(
-                                tmc4671::registers::PID_ERROR_PID_POSITION_ERROR_SUM,
+                                foci_tmc4671::registers::PID_ERROR_PID_POSITION_ERROR_SUM,
                                 0,
                             )
                             .await;
@@ -4075,7 +4075,10 @@ mod app {
             status_poll_counter += 1;
             if status_poll_counter >= 1000 {
                 status_poll_counter = 0;
-                if let Ok(flags) = tmc.read_register(tmc4671::registers::STATUS_FLAGS).await {
+                if let Ok(flags) = tmc
+                    .read_register(foci_tmc4671::registers::STATUS_FLAGS)
+                    .await
+                {
                     // Warning flags: PID output limits (position, velocity, current)
                     const PID_LIMIT_MASK: u32 = 0x0000_FFFF; // bits 0-15
                     const PWM_LIMIT_MASK: u32 = (1 << 24) | (1 << 25); // pwm_min, pwm_max
@@ -4099,7 +4102,7 @@ mod app {
     /// Uses whatever voltage/mode settings were configured by tmc_init.
     #[cfg(feature = "dev")]
     async fn do_test_spin(tmc: &mut Tmc4671Spi<TmcSpiDevice>, revolutions: u8) {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         let total_steps = revolutions as u32 * 50 * 256; // 256 microsteps per e-cycle
         defmt::info!(
@@ -4138,7 +4141,7 @@ mod app {
         tmc: &mut Tmc4671Spi<TmcSpiDevice>,
         enable_pin: &mut Output<'static>,
     ) {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         // --- ADC calibration (inlined from former tmc_adc_calibrate) ---
 
@@ -4293,7 +4296,7 @@ mod app {
     /// boundaries removes stale integral state without changing configured
     /// gains or the active position target.
     async fn clear_pid_error_sums(tmc: &mut Tmc4671Spi<TmcSpiDevice>) -> Result<(), ()> {
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         tmc.write_sub_register(PID_ERROR_PID_TORQUE_ERROR_SUM, 0)
             .await
@@ -4314,7 +4317,7 @@ mod app {
         tmc: &mut Tmc4671Spi<TmcSpiDevice>,
     ) -> Result<(), ()> {
         use core::sync::atomic::Ordering::Relaxed;
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         let target = tmc
             .read_register(PID_POSITION_TARGET)
@@ -4349,7 +4352,7 @@ mod app {
     /// Hz atomics). Best-effort: warns on failure, does not abort.
     async fn apply_stored_filters(tmc: &mut Tmc4671Spi<TmcSpiDevice>) {
         use core::sync::atomic::Ordering::Relaxed;
-        use tmc4671::registers::*;
+        use foci_tmc4671::registers::*;
 
         let pwm_maxcnt = TMC_CONFIG.pwm_maxcnt;
 
