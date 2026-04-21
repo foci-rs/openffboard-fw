@@ -11,8 +11,6 @@ pub mod pac {
     pub use embassy_stm32::pac::*;
 }
 
-mod commission;
-
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [UART4, UART5, USART3])]
 mod app {
     use core::cell::RefCell;
@@ -143,14 +141,14 @@ mod app {
     /// CommissioningBackend implementation for OpenFFBoard.
     ///
     /// Wraps the TMC4671 SPI driver, enable pin, and timer so the
-    /// board-agnostic [`crate::commission::CommissioningEngine`] can
+    /// board-agnostic [`foci_firmware::commission::CommissioningEngine`] can
     /// perform register I/O, pin control, and timing.
     struct OpenFFBoardBackend<'a> {
         tmc: &'a mut Tmc4671Spi<TmcSpiDevice>,
         enable_pin: &'a mut Output<'static>,
     }
 
-    impl<'a> crate::commission::CommissioningBackend for OpenFFBoardBackend<'a> {
+    impl<'a> foci_firmware::commission::CommissioningBackend for OpenFFBoardBackend<'a> {
         type Error = foci_tmc4671::spi::SpiError<
             embedded_hal_bus::spi::DeviceError<
                 embassy_stm32::spi::Error,
@@ -2993,7 +2991,7 @@ mod app {
         // Stored position/velocity PID gains from host.
         // Active commissioning engine. Set when a Commission/Tune
         // request arrives, cleared when the engine finishes or fails.
-        let mut commission_engine: Option<crate::commission::CommissioningEngine> = None;
+        let mut commission_engine: Option<foci_firmware::commission::CommissioningEngine> = None;
 
         // Whether the shutdown safe-state has already been applied this
         // shutdown cycle. Reset when shutdown clears.
@@ -3077,14 +3075,14 @@ mod app {
                 let mut backend = OpenFFBoardBackend { tmc, enable_pin };
                 let result = engine.step(&mut backend).await;
                 match result {
-                    crate::commission::StepResult::Continue => {
+                    foci_firmware::commission::StepResult::Continue => {
                         // Trace capture runs here — the main-loop trace call
                         // is unreachable due to 'continue'.
                         trace_sample_tick(tmc, engine_tick_deadline).await;
                         Mono::delay(1.millis()).await;
                         continue;
                     }
-                    crate::commission::StepResult::PhaseChanged(phase_id) => {
+                    foci_firmware::commission::StepResult::PhaseChanged(phase_id) => {
                         let oid = engine.oid();
                         // Start fast trace on ClosedLoopEntry for Stage 1
                         // (Commission only, not Calibrate — spec excludes
@@ -3107,7 +3105,7 @@ mod app {
                         Mono::delay(1.millis()).await;
                         continue;
                     }
-                    crate::commission::StepResult::InnerFailed(error) => {
+                    foci_firmware::commission::StepResult::InnerFailed(error) => {
                         unsafe { trace_buf().stop() };
                         let oid = engine.oid();
                         let is_calibrate = engine.is_calibrate();
@@ -3156,7 +3154,7 @@ mod app {
                             );
                         }
                     }
-                    crate::commission::StepResult::OuterDone(outer) => {
+                    foci_firmware::commission::StepResult::OuterDone(outer) => {
                         unsafe { trace_buf().stop() };
                         let oid = engine.oid();
                         commission_engine = None;
@@ -3306,7 +3304,7 @@ mod app {
                             synth_position_i: u16 = outer.synth_position_i
                         );
                     }
-                    crate::commission::StepResult::OuterFailed(error) => {
+                    foci_firmware::commission::StepResult::OuterFailed(error) => {
                         unsafe { trace_buf().stop() };
                         let oid = engine.oid();
                         let snapshot = engine.entry_snapshot();
@@ -3327,7 +3325,7 @@ mod app {
                             Some(error)
                         } else if let Some(snapshot) = snapshot {
                             let mut restore_backend = OpenFFBoardBackend { tmc, enable_pin };
-                            match crate::commission::CommissioningEngine::restore_entry_gains(
+                            match foci_firmware::commission::CommissioningEngine::restore_entry_gains(
                                 &snapshot,
                                 &mut restore_backend,
                             )
@@ -3405,7 +3403,7 @@ mod app {
                             status: u8 = reply_status
                         );
                     }
-                    crate::commission::StepResult::CalibrateDone(cal_result) => {
+                    foci_firmware::commission::StepResult::CalibrateDone(cal_result) => {
                         let oid = engine.oid();
                         commission_engine = None;
 
@@ -3503,7 +3501,7 @@ mod app {
                             encoder_count: u32 = cal_result.encoder_count
                         );
                     }
-                    crate::commission::StepResult::SelftestDone => {
+                    foci_firmware::commission::StepResult::SelftestDone => {
                         let oid = engine.oid();
                         let results = engine.take_selftest_results();
                         commission_engine = None;
@@ -3526,7 +3524,7 @@ mod app {
                             status: u8 = 0
                         );
                     }
-                    crate::commission::StepResult::CommissionDone(commission_result) => {
+                    foci_firmware::commission::StepResult::CommissionDone(commission_result) => {
                         unsafe { trace_buf().stop() };
                         let oid = engine.oid();
                         commission_engine = None;
@@ -3636,8 +3634,11 @@ mod app {
                                 // TODO: hardcoded OID 0 — correct for single-motor
                                 // OpenFFBoard but needs OID routing for multi-motor boards.
                                 defmt::info!("Auto-calibrating on enable");
-                                commission_engine =
-                                    Some(crate::commission::CommissioningEngine::new_calibrate(0));
+                                commission_engine = Some(
+                                    foci_firmware::commission::CommissioningEngine::new_calibrate(
+                                        0,
+                                    ),
+                                );
                                 // Don't set motor_enabled/MOTOR_ARMED yet --
                                 // the CalibrateDone handler does that after
                                 // encoder alignment + closed-loop entry.
@@ -3690,8 +3691,9 @@ mod app {
                         // Engine tick will drive ADC cal; CalibrateDone handler
                         // performs encoder alignment and closed-loop entry.
                         calibrated = false;
-                        commission_engine =
-                            Some(crate::commission::CommissioningEngine::new_calibrate(oid));
+                        commission_engine = Some(
+                            foci_firmware::commission::CommissioningEngine::new_calibrate(oid),
+                        );
                     }
                     #[cfg(feature = "dev")]
                     TmcRequest::Init => {
@@ -3775,11 +3777,12 @@ mod app {
                             continue;
                         }
                         calibrated = false;
-                        commission_engine =
-                            Some(crate::commission::CommissioningEngine::new_commission(
+                        commission_engine = Some(
+                            foci_firmware::commission::CommissioningEngine::new_commission(
                                 oid,
                                 foci_firmware::autotune::CommissionProfile::from_u8(profile),
-                            ));
+                            ),
+                        );
                         // Trace start deferred to ClosedLoopEntry phase transition
                         // (see PhaseChanged handler). Spec scopes Stage 1 trace to
                         // ClosedLoopEntry only — starting here would add SPI reads
@@ -3827,7 +3830,7 @@ mod app {
                         }
                         let entry_snapshot = {
                             use core::sync::atomic::Ordering::Relaxed;
-                            crate::commission::EntrySnapshot {
+                            foci_firmware::commission::EntrySnapshot {
                                 velocity_p: VELOCITY_P_VALUE.load(Relaxed),
                                 velocity_i: VELOCITY_I_VALUE.load(Relaxed),
                                 position_p: POSITION_P_VALUE.load(Relaxed),
@@ -3840,7 +3843,7 @@ mod app {
                                 flux_filter_hz: FLUX_FILTER_HZ.load(Relaxed),
                             }
                         };
-                        let outer_params = crate::commission::OuterTuneParams {
+                        let outer_params = foci_firmware::commission::OuterTuneParams {
                             profile: foci_firmware::autotune::CommissionProfile::from_u8(profile),
                             mode: foci_firmware::autotune::OperatingMode::from_u8(mode),
                             inner_lambda_us,
@@ -3849,7 +3852,7 @@ mod app {
                             current_bandwidth_hz,
                         };
                         commission_engine =
-                            Some(crate::commission::CommissioningEngine::new_outer(
+                            Some(foci_firmware::commission::CommissioningEngine::new_outer(
                                 oid,
                                 outer_params,
                                 entry_snapshot,
@@ -3877,7 +3880,7 @@ mod app {
                         // Engine tick drives selftest phases; SelftestDone
                         // handler sends the completion signal.
                         commission_engine =
-                            Some(crate::commission::CommissioningEngine::new_selftest(oid));
+                            Some(foci_firmware::commission::CommissioningEngine::new_selftest(oid));
                     }
                     req @ TmcRequest::SetEncoder { .. } => {
                         if handle_tmc_request(req, tmc).await.is_err() {
