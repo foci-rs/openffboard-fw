@@ -3325,7 +3325,7 @@ mod app {
                             Some(error)
                         } else if let Some(snapshot) = snapshot {
                             let mut restore_backend = OpenFFBoardBackend { tmc, enable_pin };
-                            match foci_firmware::commission::CommissioningEngine::restore_entry_gains(
+                            match foci_firmware::commissioning::inner::restore_entry_gains(
                                 &snapshot,
                                 &mut restore_backend,
                             )
