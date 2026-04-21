@@ -15,6 +15,7 @@ mod app_types;
 mod board_init;
 mod interrupts;
 mod transport;
+mod usb_task;
 
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [UART4, UART5, USART3])]
 mod app {
@@ -225,8 +226,6 @@ mod app {
             VELOCITY_LIMIT_CFG.load(core::sync::atomic::Ordering::Relaxed)
         }
     }
-
-    use crate::transport::USB_WAKE;
 
     /// 64-bit uptime tracking. Updated by the stats task every 5 seconds.
     /// `stats_send_time` is the CYCCNT value at last stats send.
@@ -4695,40 +4694,7 @@ mod app {
     #[task(priority = 2, shared = [app_state])]
     async fn usb_task(mut ctx: usb_task::Context) {
         loop {
-            USB_WAKE.wait().await;
-
-            // Process pending USB events. Poll reads new bulk OUT data
-            // and drains bulk IN. Loop while making progress — break if
-            // the protocol can't consume any bytes (incomplete frame).
-            while foci_usb_stm32::poll() {
-                let data = foci_usb_stm32::rx_data();
-                if data.is_empty() {
-                    break;
-                }
-                let len = data.len().min(128);
-                let mut local_buf = [0u8; 128];
-                local_buf[..len].copy_from_slice(&data[..len]);
-
-                // Feed to protocol — only consume what transport processed.
-                // Partial frames at the end must stay in the RX buffer.
-                let mut input = SliceInputBuffer::new(&local_buf[..len]);
-                ctx.shared.app_state.lock(|state| {
-                    crate::KLIPPER_TRANSPORT.receive(&mut input, state);
-                });
-                let consumed = len - input.available();
-                foci_usb_stm32::rx_consume(consumed);
-                if consumed == 0 {
-                    break; // No progress — wait for more USB data
-                }
-                // Yield to let report_task run when a trigger report is pending.
-                // Both tasks are P2; yielding gives report_task a chance to
-                // send the trsync_state reply before we process more commands.
-                if REPORT_PENDING.load(core::sync::atomic::Ordering::Relaxed) {
-                    break;
-                }
-            }
-            // Final poll to flush any remaining TX
-            foci_usb_stm32::poll();
+            crate::usb_task::pump(|f| ctx.shared.app_state.lock(f), &REPORT_PENDING).await;
         }
     }
 
