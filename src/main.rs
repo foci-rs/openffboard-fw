@@ -6,9 +6,9 @@ use panic_probe as _;
 
 // PAC shim for RTIC + embassy-stm32
 pub mod pac {
+    pub use embassy_stm32::Peripherals;
     pub use embassy_stm32::pac::Interrupt as interrupt;
     pub use embassy_stm32::pac::*;
-    pub use embassy_stm32::Peripherals;
 }
 
 mod commission;
@@ -411,7 +411,7 @@ mod app {
     /// SAFETY: Only accessed from tmc_control (P1) after init. MaybeUninit
     /// because CCM RAM has no default initialization; init() writes a valid
     /// TraceBuffer via ptr::write before any read.
-    #[link_section = ".ccmram"]
+    #[unsafe(link_section = ".ccmram")]
     static mut TRACE_BUF: core::mem::MaybeUninit<foci_core::trace::TraceBuffer> =
         core::mem::MaybeUninit::uninit();
 
@@ -510,11 +510,11 @@ mod app {
                 // stop_signals iteration and set_timer_active(&mut self).
                 let mut stopped_indices: heapless::Vec<usize, 8> = heapless::Vec::new();
                 for slot in self.stop_signals.iter_mut() {
-                    if let Some(signal) = slot {
-                        if signal.trsync_oid == trsync_oid {
-                            let _ = stopped_indices.push(signal.stepper_idx);
-                            *slot = None;
-                        }
+                    if let Some(signal) = slot
+                        && signal.trsync_oid == trsync_oid
+                    {
+                        let _ = stopped_indices.push(signal.stepper_idx);
+                        *slot = None;
                     }
                 }
                 // Dispatch physical stops and update stepper state
@@ -626,14 +626,14 @@ mod app {
             .odr()
             .modify(|w| w.set_odr(0, embassy_stm32::pac::gpio::vals::Odr::LOW));
         STEP_DIRECTION.store(true, Relaxed); // Forward = default
-                                             // 6. Reset STEP GPIO (PB11) to LOW.
-                                             //
-                                             // Full-mode scheduling relies on the ISR toggling from a known
-                                             // starting state: the first event of each segment must drive STEP
-                                             // LOW → HIGH (the rising edge the TMC4671 counts). If the previous
-                                             // segment ended mid-pulse (shutdown or stop between step and unstep
-                                             // events) the pin could still be HIGH, which would flip the parity
-                                             // for the next segment and lose the first motor step.
+        // 6. Reset STEP GPIO (PB11) to LOW.
+        //
+        // Full-mode scheduling relies on the ISR toggling from a known
+        // starting state: the first event of each segment must drive STEP
+        // LOW → HIGH (the rising edge the TMC4671 counts). If the previous
+        // segment ended mid-pulse (shutdown or stop between step and unstep
+        // events) the pin could still be HIGH, which would flip the parity
+        // for the next segment and lose the first motor step.
         let gpio_b = embassy_stm32::pac::GPIOB;
         gpio_b
             .odr()
@@ -653,7 +653,8 @@ mod app {
     unsafe fn trace_buf() -> &'static mut foci_core::trace::TraceBuffer {
         // Use addr_of_mut! to avoid creating a reference to the mutable static
         // (Rust 2024 edition compatibility). MaybeUninit<T> has the same layout as T.
-        &mut *core::ptr::addr_of_mut!(TRACE_BUF).cast::<foci_core::trace::TraceBuffer>()
+        // SAFETY: caller upholds the P1-only + post-init contract of `trace_buf`.
+        unsafe { &mut *core::ptr::addr_of_mut!(TRACE_BUF).cast::<foci_core::trace::TraceBuffer>() }
     }
 
     pub struct BufferTransportOutput;
@@ -910,7 +911,7 @@ mod app {
                     let oid = td
                         .trsync_by_oid
                         .iter()
-                        .find(|(_, &idx)| idx == trsync_idx)
+                        .find(|&(_, &idx)| idx == trsync_idx)
                         .map(|(&oid, _)| oid)
                         .unwrap_or(0);
                     ts.trigger(oid, 0, 0); // Sets can_trigger=false
@@ -1015,7 +1016,7 @@ mod app {
     /// by the TIM5 CC1 ISR (P3) which toggles STEP/DIR GPIO pins.
     #[klipper_command]
     pub fn queue_step(context: &mut State, oid: u8, interval: u32, count: u16, add: i16) {
-        use klipper_mcu::commands::stepper::{queue_step_hw, QueueStepResult};
+        use klipper_mcu::commands::stepper::{QueueStepResult, queue_step_hw};
 
         let m = klipper_mcu::stepper::StepMove::new(interval, count, add);
 
@@ -1401,10 +1402,10 @@ mod app {
             };
             // Clear old stop signals for this trsync OID
             for slot in td.stop_signals.iter_mut() {
-                if let Some(signal) = slot {
-                    if signal.trsync_oid == oid {
-                        *slot = None;
-                    }
+                if let Some(signal) = slot
+                    && signal.trsync_oid == oid
+                {
+                    *slot = None;
                 }
             }
             // Clear blocked_by_trigger for steppers blocked by this trsync
@@ -1512,10 +1513,10 @@ mod app {
 
             // Clear stop signals for this trsync OID
             for slot in td.stop_signals.iter_mut() {
-                if let Some(signal) = slot {
-                    if signal.trsync_oid == oid {
-                        *slot = None;
-                    }
+                if let Some(signal) = slot
+                    && signal.trsync_oid == oid
+                {
+                    *slot = None;
                 }
             }
 
@@ -1949,10 +1950,10 @@ mod app {
         }
     }
 
-    /// Fetch a trace sample by offset. gen must match current generation.
+    /// Fetch a trace sample by offset. generation must match current generation.
     #[klipper_command]
-    pub fn foci_trace_fetch(_context: &mut State, oid: u8, offset: u16, gen: u8) {
-        if !tmc_send(foci_core::tmc::tmc_trace_fetch(oid, offset, gen)) {
+    pub fn foci_trace_fetch(_context: &mut State, oid: u8, offset: u16, generation: u8) {
+        if !tmc_send(foci_core::tmc::tmc_trace_fetch(oid, offset, generation)) {
             defmt::warn!("trace_fetch: TMC channel full");
         }
     }
@@ -2618,7 +2619,7 @@ mod app {
                     foci_trace_info_result,
                     oid: u8 = oid,
                     state: u8 = info.state,
-                    gen: u8 = info.generation,
+                    generation: u8 = info.generation,
                     preset: u8 = info.preset,
                     count: u16 = info.count,
                     phase: u8 = info.phase_id,
@@ -2626,9 +2627,13 @@ mod app {
                     dropped: u16 = info.dropped
                 );
             }
-            TmcRequest::TraceFetch { oid, offset, gen } => {
+            TmcRequest::TraceFetch {
+                oid,
+                offset,
+                generation,
+            } => {
                 let buf = unsafe { trace_buf() };
-                match buf.fetch(oid, offset, gen) {
+                match buf.fetch(oid, offset, generation) {
                     foci_core::trace::FetchResult::Ok(ring_idx) => {
                         let data = if buf.preset() == foci_core::trace::PRESET_FULL {
                             buf.sample_bytes_full(ring_idx)
@@ -3001,7 +3006,7 @@ mod app {
         // Position is read from STEPPER_POSITION_TARGET atomic (updated
         // by usb_receive at P2) — no shared resource lock needed.
         loop {
-            use embassy_futures::select::{select, Either};
+            use embassy_futures::select::{Either, select};
 
             // On shutdown, perform one-shot motor safe-state then idle until
             // shutdown clears. This catches USB disconnect / host crash where
@@ -4349,94 +4354,94 @@ mod app {
 
         // Velocity biquad.
         let filter_hz = VELOCITY_FILTER_HZ.load(Relaxed);
-        if filter_hz > 0 {
-            if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt) {
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_V_A_1, coeffs.a_1 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_V_A_2, coeffs.a_2 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_V_B_0, coeffs.b_0 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_V_B_1, coeffs.b_1 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_V_B_2, coeffs.b_2 as u32)
-                    .await;
-                let _ = tmc.write_sub_register(CONFIG_BIQUAD_V_ENABLE, 1).await;
-            }
+        if filter_hz > 0
+            && let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt)
+        {
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_V_A_1, coeffs.a_1 as u32)
+                .await;
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_V_A_2, coeffs.a_2 as u32)
+                .await;
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_V_B_0, coeffs.b_0 as u32)
+                .await;
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_V_B_1, coeffs.b_1 as u32)
+                .await;
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_V_B_2, coeffs.b_2 as u32)
+                .await;
+            let _ = tmc.write_sub_register(CONFIG_BIQUAD_V_ENABLE, 1).await;
         }
 
         // Torque biquad.
         let filter_hz = TORQUE_FILTER_HZ.load(Relaxed);
-        if filter_hz > 0 {
-            if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt) {
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_T_A_1, coeffs.a_1 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_T_A_2, coeffs.a_2 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_T_B_0, coeffs.b_0 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_T_B_1, coeffs.b_1 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_T_B_2, coeffs.b_2 as u32)
-                    .await;
-                let _ = tmc.write_sub_register(CONFIG_BIQUAD_T_ENABLE, 1).await;
-            }
+        if filter_hz > 0
+            && let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt)
+        {
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_T_A_1, coeffs.a_1 as u32)
+                .await;
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_T_A_2, coeffs.a_2 as u32)
+                .await;
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_T_B_0, coeffs.b_0 as u32)
+                .await;
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_T_B_1, coeffs.b_1 as u32)
+                .await;
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_T_B_2, coeffs.b_2 as u32)
+                .await;
+            let _ = tmc.write_sub_register(CONFIG_BIQUAD_T_ENABLE, 1).await;
         }
 
         // Position biquad.
         let filter_hz = POSITION_FILTER_HZ.load(Relaxed);
-        if filter_hz > 0 {
-            if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt) {
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_X_A_1, coeffs.a_1 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_X_A_2, coeffs.a_2 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_X_B_0, coeffs.b_0 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_X_B_1, coeffs.b_1 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_X_B_2, coeffs.b_2 as u32)
-                    .await;
-                let _ = tmc.write_sub_register(CONFIG_BIQUAD_X_ENABLE, 1).await;
-            }
+        if filter_hz > 0
+            && let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt)
+        {
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_X_A_1, coeffs.a_1 as u32)
+                .await;
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_X_A_2, coeffs.a_2 as u32)
+                .await;
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_X_B_0, coeffs.b_0 as u32)
+                .await;
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_X_B_1, coeffs.b_1 as u32)
+                .await;
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_X_B_2, coeffs.b_2 as u32)
+                .await;
+            let _ = tmc.write_sub_register(CONFIG_BIQUAD_X_ENABLE, 1).await;
         }
 
         // Flux biquad.
         let filter_hz = FLUX_FILTER_HZ.load(Relaxed);
-        if filter_hz > 0 {
-            if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt) {
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_F_A_1, coeffs.a_1 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_F_A_2, coeffs.a_2 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_F_B_0, coeffs.b_0 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_F_B_1, coeffs.b_1 as u32)
-                    .await;
-                let _ = tmc
-                    .write_sub_register(CONFIG_BIQUAD_F_B_2, coeffs.b_2 as u32)
-                    .await;
-                let _ = tmc.write_sub_register(CONFIG_BIQUAD_F_ENABLE, 1).await;
-            }
+        if filter_hz > 0
+            && let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt)
+        {
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_F_A_1, coeffs.a_1 as u32)
+                .await;
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_F_A_2, coeffs.a_2 as u32)
+                .await;
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_F_B_0, coeffs.b_0 as u32)
+                .await;
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_F_B_1, coeffs.b_1 as u32)
+                .await;
+            let _ = tmc
+                .write_sub_register(CONFIG_BIQUAD_F_B_2, coeffs.b_2 as u32)
+                .await;
+            let _ = tmc.write_sub_register(CONFIG_BIQUAD_F_ENABLE, 1).await;
         }
     }
 
@@ -4612,7 +4617,7 @@ mod app {
                             let oid = td
                                 .trsync_by_oid
                                 .iter()
-                                .find(|(_, &idx)| idx == trsync_idx)
+                                .find(|&(_, &idx)| idx == trsync_idx)
                                 .map(|(&oid, _)| oid);
                             if let Some(oid) = oid {
                                 let expire_reason = td.trsync[trsync_idx].expire_reason();
@@ -4624,26 +4629,25 @@ mod app {
                             let oid = td
                                 .trsync_by_oid
                                 .iter()
-                                .find(|(_, &idx)| idx == trsync_idx)
+                                .find(|&(_, &idx)| idx == trsync_idx)
                                 .map(|(&oid, _)| oid);
-                            if let Some(oid) = oid {
-                                if td.trsync[trsync_idx].can_trigger() {
-                                    td.trsync[trsync_idx].set_liveness_report(oid, now);
-                                    need_report = true;
-                                    // Advance report_clock by report_ticks (stable cadence)
-                                    let report_ticks = td.trsync[trsync_idx].report_ticks();
-                                    if report_ticks > 0 {
-                                        let next_report = td.trsync[trsync_idx]
-                                            .report_clock()
-                                            .wrapping_add(report_ticks);
-                                        td.trsync[trsync_idx].set_report_clock(next_report);
-                                        td.scheduler.schedule(
-                                            klipper_mcu::scheduler::SchedulerEvent {
-                                                wake_clock: next_report,
-                                                kind: SchedulerEventKind::TrSyncReport(trsync_idx),
-                                            },
-                                        );
-                                    }
+                            if let Some(oid) = oid
+                                && td.trsync[trsync_idx].can_trigger()
+                            {
+                                td.trsync[trsync_idx].set_liveness_report(oid, now);
+                                need_report = true;
+                                // Advance report_clock by report_ticks (stable cadence)
+                                let report_ticks = td.trsync[trsync_idx].report_ticks();
+                                if report_ticks > 0 {
+                                    let next_report = td.trsync[trsync_idx]
+                                        .report_clock()
+                                        .wrapping_add(report_ticks);
+                                    td.trsync[trsync_idx].set_report_clock(next_report);
+                                    td.scheduler
+                                        .schedule(klipper_mcu::scheduler::SchedulerEvent {
+                                            wake_clock: next_report,
+                                            kind: SchedulerEventKind::TrSyncReport(trsync_idx),
+                                        });
                                 }
                                 // After trigger, no more liveness reports — don't reschedule
                             }

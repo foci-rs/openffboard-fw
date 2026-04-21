@@ -1530,7 +1530,7 @@ impl CommissioningEngine {
         let selftest_results = &mut self.selftest_results;
         match &mut self.engine_mode {
             EngineMode::Inner {
-                ref mut phase,
+                phase,
                 profile,
                 sequence,
                 adc_cal,
@@ -1547,7 +1547,7 @@ impl CommissioningEngine {
                 .await
             }
             EngineMode::Outer {
-                ref mut phase,
+                phase,
                 profile,
                 mode,
                 inner_lambda_us,
@@ -1859,7 +1859,7 @@ impl CommissioningEngine {
         let is_coil_b = matches!(state, CoilCheckState::CoilB(_));
 
         match state {
-            CoilCheckState::CoilA(ref mut coil_test) | CoilCheckState::CoilB(ref mut coil_test) => {
+            CoilCheckState::CoilA(coil_test) | CoilCheckState::CoilB(coil_test) => {
                 match coil_test {
                     CoilTestState::Setup { phase: coil_phase } => {
                         let p = *coil_phase;
@@ -3946,18 +3946,18 @@ impl CommissioningEngine {
         backend: &mut B,
     ) -> StepResult {
         // Run per-tick safety envelope for all active phases.
-        if let Some(safety) = Self::outer_safety_mut(phase) {
-            if Self::check_outer_safety(safety, backend).await {
-                // Zero excitation immediately on any safety violation.
-                let _ = backend
-                    .write_register(tmc4671::registers::PID_TORQUE_FLUX_TARGET, 0)
-                    .await;
-                let _ = backend
-                    .write_register(tmc4671::registers::MODE_RAMP_MODE_MOTION, 0)
-                    .await;
-                let err = Self::safety_error_for_phase(phase);
-                return Self::fail_outer(phase, err);
-            }
+        if let Some(safety) = Self::outer_safety_mut(phase)
+            && Self::check_outer_safety(safety, backend).await
+        {
+            // Zero excitation immediately on any safety violation.
+            let _ = backend
+                .write_register(tmc4671::registers::PID_TORQUE_FLUX_TARGET, 0)
+                .await;
+            let _ = backend
+                .write_register(tmc4671::registers::MODE_RAMP_MODE_MOTION, 0)
+                .await;
+            let err = Self::safety_error_for_phase(phase);
+            return Self::fail_outer(phase, err);
         }
 
         match phase {
