@@ -13,6 +13,7 @@ pub mod pac {
 
 mod app_types;
 mod board_init;
+mod heartbeat;
 mod interrupts;
 mod transport;
 mod usb_task;
@@ -4705,26 +4706,18 @@ mod app {
     /// sends replies at P2 without holding the lock.
     #[task(priority = 2)]
     async fn report_task(_ctx: report_task::Context) {
-        use core::sync::atomic::Ordering::Relaxed;
-        let mut snapshots: heapless::Vec<foci_klipper::trigger::ReportSnapshot, 4> =
-            heapless::Vec::new();
-        with_trigger_domain(|td| {
-            for ts in td.trsync.iter_mut() {
-                if let Some(snap) = ts.take_report() {
-                    let _ = snapshots.push(snap);
-                }
-            }
-            REPORT_PENDING.store(false, Relaxed);
-        });
-        for snap in &snapshots {
-            klipper_reply!(
-                trsync_state,
-                oid: u8 = snap.oid,
-                can_trigger: u8 = snap.can_trigger,
-                trigger_reason: u8 = snap.trigger_reason,
-                clock: u32 = snap.clock
-            );
-        }
+        crate::heartbeat::emit_trigger_reports(
+            |snaps| {
+                with_trigger_domain(|td| {
+                    for ts in td.trsync.iter_mut() {
+                        if let Some(snap) = ts.take_report() {
+                            let _ = snaps.push(snap);
+                        }
+                    }
+                });
+            },
+            &REPORT_PENDING,
+        );
     }
 
     /// Periodic stats heartbeat sent to Klipper.
@@ -4734,42 +4727,16 @@ mod app {
     /// CPU usage metrics. Also kicks the IWDG watchdog.
     #[task(priority = 1, local = [wdg])]
     async fn stats(ctx: stats::Context) {
-        let mut count: u32 = 0;
-        let mut sum: u32 = 0;
-        let mut sumsq: u32 = 0;
-        let mut last_clock = read_tim5();
-
+        let mut accumulator = crate::heartbeat::StatsAccumulator::new(read_tim5());
         loop {
             Mono::delay(5000.millis()).await;
-
-            let now = read_tim5();
-            let elapsed = now.wrapping_sub(last_clock);
-            last_clock = now;
-
-            // Track one "iteration" per stats period with elapsed ticks
-            count += 1;
-            sum += elapsed;
-            let diff_scaled = elapsed / STATS_SUMSQ_BASE;
-            sumsq = sumsq.saturating_add(diff_scaled.saturating_mul(elapsed));
-
-            // Track 32-bit clock wraps for get_uptime high word.
-            // Store time before incrementing high to avoid a race with
-            // get_uptime (P2) preempting between the two updates.
-            {
-                use core::sync::atomic::Ordering::Relaxed;
-                let prev = STATS_SEND_TIME.swap(now, Relaxed);
-                if now < prev {
-                    STATS_SEND_TIME_HIGH.fetch_add(1, Relaxed);
-                }
-            }
-
-            defmt::info!("stats tick");
-            klipper_output!("stats count=%u sum=%u sumsq=%u", count, sum, sumsq);
-            ctx.local.wdg.pet();
-
-            count = 0;
-            sum = 0;
-            sumsq = 0;
+            crate::heartbeat::stats_tick(
+                &mut accumulator,
+                read_tim5(),
+                &STATS_SEND_TIME,
+                &STATS_SEND_TIME_HIGH,
+                ctx.local.wdg,
+            );
         }
     }
 
@@ -4777,7 +4744,7 @@ mod app {
     #[task(priority = 1, local = [led])]
     async fn blink(ctx: blink::Context) {
         loop {
-            ctx.local.led.toggle();
+            crate::heartbeat::toggle_led(ctx.local.led);
             Mono::delay(500.millis()).await;
         }
     }
