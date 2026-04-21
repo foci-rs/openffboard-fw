@@ -15,6 +15,7 @@ mod app_types;
 mod board_init;
 mod heartbeat;
 mod interrupts;
+mod platform_impl;
 mod transport;
 mod usb_task;
 
