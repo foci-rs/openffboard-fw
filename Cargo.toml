@@ -35,7 +35,7 @@ anchor.workspace = true
 # Project crates
 foci-tmc4671 = { path = "../foci-tmc4671" }
 foci-klipper = { path = "../foci-klipper" }
-klipper-usb = { path = "../klipper-usb" }
+foci-usb-stm32 = { path = "../foci-usb-stm32" }
 foci-core = { path = "../foci-core", features = ["defmt"] }
 
 # Logging

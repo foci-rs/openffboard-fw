@@ -667,7 +667,7 @@ mod app {
             let mut scratch = ScratchOutput::new();
             f(&mut scratch);
             let output = scratch.result();
-            klipper_usb::tx_write(output);
+            foci_usb_stm32::tx_write(output);
             // Wake usb_task to drain TX buffer. Critical for data
             // generated outside usb_task (stats output from P1).
             USB_WAKE.signal(());
@@ -2364,7 +2364,7 @@ mod app {
         // SAFETY: Called exactly once, before any other klipper-usb function.
         // base_addr is the USB_OTG_FS peripheral base on STM32F407.
         unsafe {
-            klipper_usb::usb_init(&klipper_usb::UsbConfig {
+            foci_usb_stm32::usb_init(&foci_usb_stm32::UsbConfig {
                 base_addr: 0x5000_0000,
                 irq_num: 67,
                 trdt: 6,
@@ -4839,7 +4839,7 @@ mod app {
     /// immediately. The handler only masks and signals — no FIFO access.
     #[task(binds = OTG_FS, priority = 3)]
     fn otg_fs_irq(_ctx: otg_fs_irq::Context) {
-        klipper_usb::irq_handler();
+        foci_usb_stm32::irq_handler();
         USB_WAKE.signal(());
     }
 
@@ -4875,8 +4875,8 @@ mod app {
             // Process pending USB events. Poll reads new bulk OUT data
             // and drains bulk IN. Loop while making progress — break if
             // the protocol can't consume any bytes (incomplete frame).
-            while klipper_usb::poll() {
-                let data = klipper_usb::rx_data();
+            while foci_usb_stm32::poll() {
+                let data = foci_usb_stm32::rx_data();
                 if data.is_empty() {
                     break;
                 }
@@ -4891,7 +4891,7 @@ mod app {
                     crate::KLIPPER_TRANSPORT.receive(&mut input, state);
                 });
                 let consumed = len - input.available();
-                klipper_usb::rx_consume(consumed);
+                foci_usb_stm32::rx_consume(consumed);
                 if consumed == 0 {
                     break; // No progress — wait for more USB data
                 }
@@ -4903,7 +4903,7 @@ mod app {
                 }
             }
             // Final poll to flush any remaining TX
-            klipper_usb::poll();
+            foci_usb_stm32::poll();
         }
     }
 
