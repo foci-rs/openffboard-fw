@@ -96,36 +96,6 @@ mod app {
         bandwidth_hz: 150.0,
     };
 
-    /// Errors that can occur during the TMC4671 calibration sequence.
-    #[derive(Debug, defmt::Format)]
-    enum CalibrationError {
-        /// SPI communication or register verification failed.
-        SpiError,
-        /// Motor already enabled (calibration not needed).
-        AlreadyEnabled,
-        /// Internal firmware error (queue full, channel not initialized, etc.).
-        InternalError,
-        /// Required configuration (e.g., `tmc_set_encoder`) has not been
-        /// issued by the host before calibration. Most commonly this means
-        /// STEP_WIDTH has not been computed, so the TMC4671 hardware step
-        /// input would not advance the position target — the motor would
-        /// calibrate successfully but silently not respond to step pulses.
-        ConfigFault,
-    }
-
-    impl CalibrationError {
-        /// Map to a numeric status code for `foci_calibrate_result`.
-        fn status_code(&self) -> u8 {
-            match self {
-                Self::SpiError => 1,
-                // Code 4 was PidFault (removed with tmc_enter_closedloop).
-                Self::AlreadyEnabled => 5,
-                Self::InternalError => 6,
-                Self::ConfigFault => 7,
-            }
-        }
-    }
-
     /// CommissioningBackend implementation for OpenFFBoard.
     ///
     /// Wraps the TMC4671 SPI driver, enable pin, and timer so the
@@ -1869,7 +1839,7 @@ mod app {
             klipper_reply!(
                 foci_calibrate_result,
                 oid: u8 = oid,
-                status: u8 = CalibrationError::ConfigFault.status_code(),
+                status: u8 = foci_firmware::calibration::CalibrationError::ConfigFault.status_code(),
                 adc_i0: u16 = 0,
                 adc_i1: u16 = 0,
                 encoder_count: u32 = 0
@@ -1881,7 +1851,7 @@ mod app {
             klipper_reply!(
                 foci_calibrate_result,
                 oid: u8 = oid,
-                status: u8 = CalibrationError::InternalError.status_code(),
+                status: u8 = foci_firmware::calibration::CalibrationError::InternalError.status_code(),
                 adc_i0: u16 = 0,
                 adc_i1: u16 = 0,
                 encoder_count: u32 = 0
@@ -1893,7 +1863,7 @@ mod app {
             klipper_reply!(
                 foci_calibrate_result,
                 oid: u8 = oid,
-                status: u8 = CalibrationError::InternalError.status_code(),
+                status: u8 = foci_firmware::calibration::CalibrationError::InternalError.status_code(),
                 adc_i0: u16 = 0,
                 adc_i1: u16 = 0,
                 encoder_count: u32 = 0
@@ -3299,7 +3269,7 @@ mod app {
                             klipper_reply!(
                                 foci_calibrate_result,
                                 oid: u8 = oid,
-                                status: u8 = CalibrationError::SpiError.status_code(),
+                                status: u8 = foci_firmware::calibration::CalibrationError::SpiError.status_code(),
                                 adc_i0: u16 = 0,
                                 adc_i1: u16 = 0,
                                 encoder_count: u32 = 0
@@ -3509,7 +3479,7 @@ mod app {
                             klipper_reply!(
                                 foci_calibrate_result,
                                 oid: u8 = oid,
-                                status: u8 = CalibrationError::AlreadyEnabled.status_code(),
+                                status: u8 = foci_firmware::calibration::CalibrationError::AlreadyEnabled.status_code(),
                                 adc_i0: u16 = 0,
                                 adc_i1: u16 = 0,
                                 encoder_count: u32 = 0
