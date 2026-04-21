@@ -28,8 +28,8 @@ mod app {
     use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
     use embassy_sync::signal::Signal;
     use embedded_hal_bus::spi::ExclusiveDevice;
+    use foci_klipper::state::State;
     use foci_tmc4671::spi::Tmc4671Spi;
-    use klipper_mcu::state::State;
     use rtic_monotonics::stm32::prelude::*;
     use rtic_sync::channel::{Receiver, Sender};
 
@@ -421,18 +421,18 @@ mod app {
     /// SAFETY: Access protocol enforced by RTIC priorities:
     /// - Timer active: P2 enqueues only (Producer), P3 dequeues only (Consumer)
     /// - Timer disabled: P1/P2 may drain (Consumer side safe, P3 quiesced)
-    static mut STEP_QUEUE: heapless::spsc::Queue<klipper_mcu::stepper::StepMove, 1024> =
+    static mut STEP_QUEUE: heapless::spsc::Queue<foci_klipper::stepper::StepMove, 1024> =
         heapless::spsc::Queue::new();
 
     /// P2-local HardwareStepper state (direction tracking, prepare_move).
     /// Only accessed from usb_task (P2) command handlers.
-    static mut P2_STEPPER: klipper_mcu::stepper::HardwareStepper =
-        klipper_mcu::stepper::HardwareStepper::new();
+    static mut P2_STEPPER: foci_klipper::stepper::HardwareStepper =
+        foci_klipper::stepper::HardwareStepper::new();
 
     /// P3-local HardwareStepper state (active segment, step execution).
     /// Only accessed from TIM5 CC1 ISR (P3).
-    static mut ISR_STEPPER: klipper_mcu::stepper::HardwareStepper =
-        klipper_mcu::stepper::HardwareStepper::new();
+    static mut ISR_STEPPER: foci_klipper::stepper::HardwareStepper =
+        foci_klipper::stepper::HardwareStepper::new();
 
     // ---- TriggerDomain: unified trsync/endstop/stepper-stop resource ----
 
@@ -447,28 +447,29 @@ mod app {
     /// section, equivalent to RTIC P3 ceiling. This is NOT an RTIC shared
     /// resource — it is a `static mut` with manual locking.
     struct TriggerDomain {
-        trsync: [klipper_mcu::trigger::TrSyncRuntime; klipper_mcu::state::NUM_TRSYNC],
-        trsync_by_oid: heapless::LinearMap<u8, usize, { klipper_mcu::state::NUM_TRSYNC }>,
-        stop_signals: [Option<klipper_mcu::trigger::StopSignal>; 8],
-        stepper_stop: [klipper_mcu::trigger::StepperStopRuntime; klipper_mcu::state::NUM_STEPPERS],
-        endstops: [klipper_mcu::endstop::EndstopRuntime; klipper_mcu::state::NUM_ENDSTOPS],
-        endstop_by_oid: heapless::LinearMap<u8, usize, { klipper_mcu::state::NUM_ENDSTOPS }>,
-        scheduler: klipper_mcu::scheduler::TriggerScheduler,
+        trsync: [foci_klipper::trigger::TrSyncRuntime; foci_klipper::state::NUM_TRSYNC],
+        trsync_by_oid: heapless::LinearMap<u8, usize, { foci_klipper::state::NUM_TRSYNC }>,
+        stop_signals: [Option<foci_klipper::trigger::StopSignal>; 8],
+        stepper_stop:
+            [foci_klipper::trigger::StepperStopRuntime; foci_klipper::state::NUM_STEPPERS],
+        endstops: [foci_klipper::endstop::EndstopRuntime; foci_klipper::state::NUM_ENDSTOPS],
+        endstop_by_oid: heapless::LinearMap<u8, usize, { foci_klipper::state::NUM_ENDSTOPS }>,
+        scheduler: foci_klipper::scheduler::TriggerScheduler,
     }
 
     impl TriggerDomain {
         const fn new() -> Self {
             Self {
-                trsync: [const { klipper_mcu::trigger::TrSyncRuntime::new() };
-                    klipper_mcu::state::NUM_TRSYNC],
+                trsync: [const { foci_klipper::trigger::TrSyncRuntime::new() };
+                    foci_klipper::state::NUM_TRSYNC],
                 trsync_by_oid: heapless::LinearMap::new(),
                 stop_signals: [None; 8],
-                stepper_stop: [const { klipper_mcu::trigger::StepperStopRuntime::new() };
-                    klipper_mcu::state::NUM_STEPPERS],
-                endstops: [const { klipper_mcu::endstop::EndstopRuntime::new() };
-                    klipper_mcu::state::NUM_ENDSTOPS],
+                stepper_stop: [const { foci_klipper::trigger::StepperStopRuntime::new() };
+                    foci_klipper::state::NUM_STEPPERS],
+                endstops: [const { foci_klipper::endstop::EndstopRuntime::new() };
+                    foci_klipper::state::NUM_ENDSTOPS],
                 endstop_by_oid: heapless::LinearMap::new(),
-                scheduler: klipper_mcu::scheduler::TriggerScheduler::new(),
+                scheduler: foci_klipper::scheduler::TriggerScheduler::new(),
             }
         }
 
@@ -496,15 +497,15 @@ mod app {
             trsync_oid: u8,
             reason: u8,
             clock: u32,
-        ) -> klipper_mcu::trigger::TriggerResult {
+        ) -> foci_klipper::trigger::TriggerResult {
             let idx = match self.trsync_by_oid.get(&trsync_oid) {
                 Some(&idx) => idx,
                 None => {
-                    return klipper_mcu::trigger::TriggerResult::UnknownOid;
+                    return foci_klipper::trigger::TriggerResult::UnknownOid;
                 }
             };
             let result = self.trsync[idx].trigger(trsync_oid, reason, clock);
-            if matches!(result, klipper_mcu::trigger::TriggerResult::First { .. }) {
+            if matches!(result, foci_klipper::trigger::TriggerResult::First { .. }) {
                 // Collect stepper indices from matching stop signals, then
                 // clear the slots. Two-pass avoids borrow conflict between
                 // stop_signals iteration and set_timer_active(&mut self).
@@ -765,7 +766,7 @@ mod app {
     #[klipper_command(in_shutdown)]
     pub fn get_config(context: &mut State) {
         let (is_config, crc, is_shutdown, move_count) =
-            klipper_mcu::commands::lifecycle::get_config(context);
+            foci_klipper::commands::lifecycle::get_config(context);
         klipper_reply!(
             config,
             is_config: bool = is_config,
@@ -781,7 +782,7 @@ mod app {
     /// when not in shutdown, triggers a shutdown instead.
     #[klipper_command(in_shutdown)]
     pub fn clear_shutdown(context: &mut State) {
-        if klipper_mcu::commands::lifecycle::clear_shutdown(context).is_err()
+        if foci_klipper::commands::lifecycle::clear_shutdown(context).is_err()
             && enter_shutdown(context)
         {
             klipper_shutdown!("Shutdown cleared when not shutdown", read_tim5());
@@ -803,7 +804,7 @@ mod app {
             }
             return;
         }
-        klipper_mcu::commands::lifecycle::config_reset(context);
+        foci_klipper::commands::lifecycle::config_reset(context);
         // Full TriggerDomain reset
         with_trigger_domain(|td| {
             td.scheduler.clear();
@@ -827,7 +828,7 @@ mod app {
             }
             // Reset all stepper stop state (physical + logical)
             for ss in td.stepper_stop.iter_mut() {
-                *ss = klipper_mcu::trigger::StepperStopRuntime::new();
+                *ss = foci_klipper::trigger::StepperStopRuntime::new();
             }
         });
         // Clear derived mailbox state outside critical section
@@ -859,13 +860,13 @@ mod app {
 
     #[klipper_command]
     pub fn finalize_config(context: &mut State, crc: u32) {
-        klipper_mcu::commands::lifecycle::finalize_config(context, crc);
+        foci_klipper::commands::lifecycle::finalize_config(context, crc);
         defmt::info!("Config finalized, CRC: {:#010x}", crc);
     }
 
     #[klipper_command]
     pub fn allocate_oids(_count: u8) {
-        klipper_mcu::commands::lifecycle::allocate_oids(_count);
+        foci_klipper::commands::lifecycle::allocate_oids(_count);
     }
 
     #[klipper_command(in_shutdown)]
@@ -883,7 +884,7 @@ mod app {
     /// site provides a unique static string reason.
     fn enter_shutdown(context: &mut State) -> bool {
         use core::sync::atomic::Ordering::Relaxed;
-        let entered = klipper_mcu::commands::lifecycle::enter_shutdown(context);
+        let entered = foci_klipper::commands::lifecycle::enter_shutdown(context);
         if entered {
             TMC_DISABLE_SIGNAL.signal(());
             SHUTDOWN_ACTIVE.store(true, Relaxed);
@@ -1000,7 +1001,7 @@ mod app {
         _invert_step: u8,
         _step_pulse_ticks: u32,
     ) {
-        if let Err(e) = klipper_mcu::commands::stepper::config_stepper(context, oid) {
+        if let Err(e) = foci_klipper::commands::stepper::config_stepper(context, oid) {
             defmt::error!("config_stepper: {}", e);
             if enter_shutdown(context) {
                 klipper_shutdown!("config_stepper failed", read_tim5());
@@ -1016,9 +1017,9 @@ mod app {
     /// by the TIM5 CC1 ISR (P3) which toggles STEP/DIR GPIO pins.
     #[klipper_command]
     pub fn queue_step(context: &mut State, oid: u8, interval: u32, count: u16, add: i16) {
-        use klipper_mcu::commands::stepper::{QueueStepResult, queue_step_hw};
+        use foci_klipper::commands::stepper::{QueueStepResult, queue_step_hw};
 
-        let m = klipper_mcu::stepper::StepMove::new(interval, count, add);
+        let m = foci_klipper::stepper::StepMove::new(interval, count, add);
 
         // Lock TriggerDomain across need_reset check, direction state,
         // enqueue, and arm — all atomic per spec.
@@ -1042,7 +1043,7 @@ mod app {
                     // SAFETY: P2 is the sole producer.
                     let ok = unsafe { (*core::ptr::addr_of_mut!(STEP_QUEUE)).enqueue(m).is_ok() };
                     if !ok {
-                        return Err(klipper_mcu::commands::CommandError::QueueFull);
+                        return Err(foci_klipper::commands::CommandError::QueueFull);
                     }
 
                     // Arm timer if the motor is ready and not already active
@@ -1083,8 +1084,8 @@ mod app {
     /// Triggers shutdown if called while active (matches Klipper stepper.c).
     #[klipper_command]
     pub fn reset_step_clock(context: &mut State, _oid: u8, clock: u32) {
-        let result: Result<(), klipper_mcu::commands::CommandError> = with_trigger_domain(|td| {
-            klipper_mcu::commands::stepper::reset_step_clock_hw(td.stepper_stop[0].timer_active)?;
+        let result: Result<(), foci_klipper::commands::CommandError> = with_trigger_domain(|td| {
+            foci_klipper::commands::stepper::reset_step_clock_hw(td.stepper_stop[0].timer_active)?;
 
             // Drain any stale items from a previous stop
             // SAFETY: Timer is not active (checked above), P3 is quiesced.
@@ -1095,7 +1096,7 @@ mod app {
             // inactive, so P3 is not using ISR_STEPPER. P2_STEPPER is only
             // accessed from P2 command handlers.
             unsafe {
-                klipper_mcu::commands::stepper::reset_stepper_clocks(
+                foci_klipper::commands::stepper::reset_stepper_clocks(
                     &mut *core::ptr::addr_of_mut!(P2_STEPPER),
                     &mut *core::ptr::addr_of_mut!(ISR_STEPPER),
                     clock,
@@ -1172,7 +1173,7 @@ mod app {
             // Find empty slot and insert
             for slot in td.stop_signals.iter_mut() {
                 if slot.is_none() {
-                    *slot = Some(klipper_mcu::trigger::StopSignal {
+                    *slot = Some(foci_klipper::trigger::StopSignal {
                         trsync_oid,
                         stepper_idx,
                     });
@@ -1215,7 +1216,7 @@ mod app {
         _default_value: u8,
         _max_duration: u32,
     ) {
-        if let Err(e) = klipper_mcu::commands::digital_out::config_digital_out(context, oid) {
+        if let Err(e) = foci_klipper::commands::digital_out::config_digital_out(context, oid) {
             defmt::error!("config_digital_out: {}", e);
             if enter_shutdown(context) {
                 klipper_shutdown!("config_digital_out failed", read_tim5());
@@ -1234,7 +1235,7 @@ mod app {
     #[klipper_command]
     pub fn queue_digital_out(context: &mut State, oid: u8, clock: u32, on_ticks: u32) {
         let _ = clock;
-        match klipper_mcu::commands::digital_out::queue_digital_out(context, oid, on_ticks) {
+        match foci_klipper::commands::digital_out::queue_digital_out(context, oid, on_ticks) {
             Ok(enabled) => {
                 if !tmc_send(TmcRequest::SetEnable(enabled)) && enter_shutdown(context) {
                     klipper_shutdown!("Motor enable/disable lost (queue full)", read_tim5());
@@ -1252,7 +1253,7 @@ mod app {
     /// Immediately update a digital output value.
     #[klipper_command]
     pub fn update_digital_out(context: &mut State, oid: u8, value: u8) {
-        match klipper_mcu::commands::digital_out::update_digital_out(context, oid, value) {
+        match foci_klipper::commands::digital_out::update_digital_out(context, oid, value) {
             Ok(enabled) => {
                 if !tmc_send(TmcRequest::SetEnable(enabled)) && enter_shutdown(context) {
                     klipper_shutdown!("Motor enable/disable lost (queue full)", read_tim5());
@@ -1278,7 +1279,7 @@ mod app {
 
     /// Per-endstop pin identifier (enum value from `config_endstop`).
     /// `0xFF` means no pin configured.
-    static ENDSTOP_PIN_IDS: [core::sync::atomic::AtomicU8; klipper_mcu::state::NUM_ENDSTOPS] = [
+    static ENDSTOP_PIN_IDS: [core::sync::atomic::AtomicU8; foci_klipper::state::NUM_ENDSTOPS] = [
         core::sync::atomic::AtomicU8::new(0xFF),
         core::sync::atomic::AtomicU8::new(0xFF),
         core::sync::atomic::AtomicU8::new(0xFF),
@@ -1367,7 +1368,7 @@ mod app {
                 return Err(());
             }
             let idx = td.trsync_by_oid.len();
-            if idx >= klipper_mcu::state::NUM_TRSYNC {
+            if idx >= foci_klipper::state::NUM_TRSYNC {
                 return Err(());
             }
             td.trsync_by_oid.insert(oid, idx).map_err(|_| ())?;
@@ -1418,8 +1419,8 @@ mod app {
             // Cancel any existing scheduler entries for this trsync
             td.scheduler.cancel(|k| {
                 matches!(k,
-                    klipper_mcu::scheduler::SchedulerEventKind::TrSyncExpire(i)
-                    | klipper_mcu::scheduler::SchedulerEventKind::TrSyncReport(i)
+                    foci_klipper::scheduler::SchedulerEventKind::TrSyncExpire(i)
+                    | foci_klipper::scheduler::SchedulerEventKind::TrSyncReport(i)
                     if *i == idx
                 )
             });
@@ -1428,9 +1429,9 @@ mod app {
             // Schedule first report timer if report_ticks > 0
             if report_ticks > 0 {
                 td.scheduler
-                    .schedule(klipper_mcu::scheduler::SchedulerEvent {
+                    .schedule(foci_klipper::scheduler::SchedulerEvent {
                         wake_clock: report_clock,
-                        kind: klipper_mcu::scheduler::SchedulerEventKind::TrSyncReport(idx),
+                        kind: foci_klipper::scheduler::SchedulerEventKind::TrSyncReport(idx),
                     });
             }
             td.reprogram_cc2();
@@ -1461,13 +1462,13 @@ mod app {
                 // Cancel any existing expire event and schedule a new one
                 td.scheduler.cancel(|k| {
                     matches!(k,
-                        klipper_mcu::scheduler::SchedulerEventKind::TrSyncExpire(i) if *i == idx
+                        foci_klipper::scheduler::SchedulerEventKind::TrSyncExpire(i) if *i == idx
                     )
                 });
                 td.scheduler
-                    .schedule(klipper_mcu::scheduler::SchedulerEvent {
+                    .schedule(foci_klipper::scheduler::SchedulerEvent {
                         wake_clock: clock,
-                        kind: klipper_mcu::scheduler::SchedulerEventKind::TrSyncExpire(idx),
+                        kind: foci_klipper::scheduler::SchedulerEventKind::TrSyncExpire(idx),
                     });
                 td.reprogram_cc2();
             }
@@ -1502,8 +1503,8 @@ mod app {
             // Cancel scheduler entries for this trsync
             td.scheduler.cancel(|k| {
                 matches!(k,
-                    klipper_mcu::scheduler::SchedulerEventKind::TrSyncExpire(i)
-                    | klipper_mcu::scheduler::SchedulerEventKind::TrSyncReport(i)
+                    foci_klipper::scheduler::SchedulerEventKind::TrSyncExpire(i)
+                    | foci_klipper::scheduler::SchedulerEventKind::TrSyncReport(i)
                     if *i == idx
                 )
             });
@@ -1573,7 +1574,7 @@ mod app {
                 return Err(());
             }
             let idx = td.endstop_by_oid.len();
-            if idx >= klipper_mcu::state::NUM_ENDSTOPS {
+            if idx >= foci_klipper::state::NUM_ENDSTOPS {
                 return Err(());
             }
             td.endstop_by_oid.insert(oid, idx).map_err(|_| ())?;
@@ -1644,7 +1645,7 @@ mod app {
             // Cancel existing scheduler entry for this endstop
             td.scheduler.cancel(|k| {
                 matches!(k,
-                    klipper_mcu::scheduler::SchedulerEventKind::EndstopSample(i) if *i == idx
+                    foci_klipper::scheduler::SchedulerEventKind::EndstopSample(i) if *i == idx
                 )
             });
             // Configure the endstop runtime
@@ -1661,9 +1662,9 @@ mod app {
             // Schedule first sample event if homing
             if sample_count > 0 {
                 td.scheduler
-                    .schedule(klipper_mcu::scheduler::SchedulerEvent {
+                    .schedule(foci_klipper::scheduler::SchedulerEvent {
                         wake_clock: clock,
-                        kind: klipper_mcu::scheduler::SchedulerEventKind::EndstopSample(idx),
+                        kind: foci_klipper::scheduler::SchedulerEventKind::EndstopSample(idx),
                     });
             }
             td.reprogram_cc2();
@@ -1719,31 +1720,31 @@ mod app {
     /// SPI configuration stub (TMC4671 SPI is handled internally).
     #[klipper_command]
     pub fn config_spi(_oid: u8, _pin: u32, _cs_active_high: u8) {
-        klipper_mcu::commands::spi::config_spi(_oid, _pin, _cs_active_high);
+        foci_klipper::commands::spi::config_spi(_oid, _pin, _cs_active_high);
     }
 
     /// SPI configuration without chip-select stub.
     #[klipper_command]
     pub fn config_spi_without_cs(_oid: u8) {
-        klipper_mcu::commands::spi::config_spi_without_cs(_oid);
+        foci_klipper::commands::spi::config_spi_without_cs(_oid);
     }
 
     /// SPI bus assignment stub.
     #[klipper_command]
     pub fn spi_set_bus(_oid: u8, _spi_bus: u32, _mode: u32, _rate: u32) {
-        klipper_mcu::commands::spi::spi_set_bus(_oid, _spi_bus, _mode, _rate);
+        foci_klipper::commands::spi::spi_set_bus(_oid, _spi_bus, _mode, _rate);
     }
 
     /// SPI shutdown message configuration stub.
     #[klipper_command]
     pub fn config_spi_shutdown(_oid: u8, _spi_oid: u8, _shutdown_msg: &[u8]) {
-        klipper_mcu::commands::spi::config_spi_shutdown(_oid, _spi_oid, _shutdown_msg);
+        foci_klipper::commands::spi::config_spi_shutdown(_oid, _spi_oid, _shutdown_msg);
     }
 
     /// SPI send stub (data is accepted but not forwarded).
     #[klipper_command]
     pub fn spi_send(_oid: u8, _data: &[u8]) {
-        klipper_mcu::commands::spi::spi_send(_oid, _data);
+        foci_klipper::commands::spi::spi_send(_oid, _data);
     }
 
     // ---- TMC4671 register access commands ----
@@ -4530,7 +4531,7 @@ mod app {
     #[task(binds = TIM5, priority = 3)]
     fn step_timer_irq(_ctx: step_timer_irq::Context) {
         use core::sync::atomic::Ordering::Relaxed;
-        use klipper_mcu::stepper::StepEventResult;
+        use foci_klipper::stepper::StepEventResult;
 
         let tim5 = embassy_stm32::pac::TIM5;
 
@@ -4539,7 +4540,7 @@ mod app {
             tim5.sr().modify(|w| w.set_ccif(1, false));
             let mut need_report = false;
             with_trigger_domain(|td| {
-                use klipper_mcu::scheduler::SchedulerEventKind;
+                use foci_klipper::scheduler::SchedulerEventKind;
                 let now = read_tim5();
                 let due_indices = td.scheduler.find_due(now);
                 // Collect (kind, wake_clock) pairs before mutating scheduler
@@ -4555,7 +4556,7 @@ mod app {
                 for &(kind, wake_clock) in &due_events {
                     match kind {
                         SchedulerEventKind::EndstopSample(endstop_idx) => {
-                            use klipper_mcu::endstop::{EndstopPhase, EndstopSampleResult};
+                            use foci_klipper::endstop::{EndstopPhase, EndstopSampleResult};
                             let pin_id = ENDSTOP_PIN_IDS[endstop_idx].load(Relaxed);
                             let read_pin = || -> bool {
                                 if pin_id != 0xFF {
@@ -4587,7 +4588,7 @@ mod app {
                                         }
                                         EndstopSampleResult::Reschedule { next_clock } => {
                                             td.scheduler.schedule(
-                                                klipper_mcu::scheduler::SchedulerEvent {
+                                                foci_klipper::scheduler::SchedulerEvent {
                                                     wake_clock: next_clock,
                                                     kind: SchedulerEventKind::EndstopSample(
                                                         endstop_idx,
@@ -4603,11 +4604,12 @@ mod app {
                                     need_report = true;
                                 }
                                 EndstopSampleResult::Reschedule { next_clock } => {
-                                    td.scheduler
-                                        .schedule(klipper_mcu::scheduler::SchedulerEvent {
+                                    td.scheduler.schedule(
+                                        foci_klipper::scheduler::SchedulerEvent {
                                             wake_clock: next_clock,
                                             kind: SchedulerEventKind::EndstopSample(endstop_idx),
-                                        });
+                                        },
+                                    );
                                 }
                                 EndstopSampleResult::Inactive => {}
                             }
@@ -4647,11 +4649,12 @@ mod app {
                                         .report_clock()
                                         .wrapping_add(report_ticks);
                                     td.trsync[trsync_idx].set_report_clock(next_report);
-                                    td.scheduler
-                                        .schedule(klipper_mcu::scheduler::SchedulerEvent {
+                                    td.scheduler.schedule(
+                                        foci_klipper::scheduler::SchedulerEvent {
                                             wake_clock: next_report,
                                             kind: SchedulerEventKind::TrSyncReport(trsync_idx),
-                                        });
+                                        },
+                                    );
                                 }
                                 // After trigger, no more liveness reports — don't reschedule
                             }
@@ -4774,7 +4777,7 @@ mod app {
                         // firmware counter advances too. Falling edge (HIGH →
                         // LOW) is the second half of the pulse and does not
                         // change the driver's position.
-                        use klipper_mcu::stepper::StepPhase;
+                        use foci_klipper::stepper::StepPhase;
                         let is_step = matches!(phase, StepPhase::Step);
                         if is_step {
                             let dir = if stepper.dir_state() { 1i32 } else { -1i32 };
@@ -4912,7 +4915,7 @@ mod app {
     #[task(priority = 2)]
     async fn report_task(_ctx: report_task::Context) {
         use core::sync::atomic::Ordering::Relaxed;
-        let mut snapshots: heapless::Vec<klipper_mcu::trigger::ReportSnapshot, 4> =
+        let mut snapshots: heapless::Vec<foci_klipper::trigger::ReportSnapshot, 4> =
             heapless::Vec::new();
         with_trigger_domain(|td| {
             for ts in td.trsync.iter_mut() {
@@ -5090,5 +5093,5 @@ klipper_enumeration!(
 
 klipper_config_generate!(
     transport = crate::app::TRANSPORT_OUTPUT: crate::app::BufferTransportOutput,
-    context = &'ctx mut klipper_mcu::state::State,
+    context = &'ctx mut foci_klipper::state::State,
 );
