@@ -12,6 +12,7 @@ pub mod pac {
 }
 
 mod app_types;
+mod board_init;
 
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [UART4, UART5, USART3])]
 mod app {
@@ -2145,24 +2146,6 @@ mod app {
         wdg: IndependentWatchdog<'static, peripherals::IWDG>,
     }
 
-    /// Read the STM32 96-bit unique device ID and format as a hex string.
-    ///
-    /// The UID is at 0x1FFF_7A10 on STM32F4. Returns a 24-character hex string.
-    /// Reads the 12 raw bytes sequentially (matching Klipper/Katapult convention)
-    /// and outputs high nibble first for each byte.
-    fn read_stm32_uid(buf: &mut [u8; 24]) -> &str {
-        const UID_BASE: *const u8 = 0x1FFF_7A10 as *const u8;
-        let hex = b"0123456789ABCDEF";
-        for i in 0..12 {
-            // SAFETY: UID registers are always readable at this address on STM32F4
-            let b = unsafe { core::ptr::read_volatile(UID_BASE.add(i)) };
-            buf[i * 2] = hex[(b >> 4) as usize];
-            buf[i * 2 + 1] = hex[(b & 0x0F) as usize];
-        }
-        // SAFETY: buf contains only ASCII hex characters
-        unsafe { core::str::from_utf8_unchecked(buf) }
-    }
-
     #[init(local = [
         tmc_channel: rtic_sync::channel::Channel<TmcRequest, TMC_CHANNEL_SIZE> =
             rtic_sync::channel::Channel::new(),
@@ -2171,90 +2154,11 @@ mod app {
     fn init(ctx: init::Context) -> (Shared, Local) {
         defmt::info!("FOCI OpenFFBoard starting");
 
-        // Configure clock tree: HSE 8 MHz -> PLL -> 168 MHz SYSCLK, 48 MHz USB
-        let mut config = embassy_stm32::Config::default();
-        {
-            use embassy_stm32::rcc::*;
-            config.rcc.hse = Some(Hse {
-                freq: embassy_stm32::time::Hertz(8_000_000),
-                mode: HseMode::Oscillator,
-            });
-            config.rcc.pll_src = PllSource::HSE;
-            config.rcc.pll = Some(Pll {
-                prediv: PllPreDiv::DIV4,
-                mul: PllMul::MUL168,
-                divp: Some(PllPDiv::DIV2),
-                divq: Some(PllQDiv::DIV7),
-                divr: None,
-            });
-            config.rcc.ahb_pre = AHBPrescaler::DIV1;
-            config.rcc.apb1_pre = APBPrescaler::DIV4;
-            config.rcc.apb2_pre = APBPrescaler::DIV2;
-            config.rcc.sys = Sysclk::PLL1_P;
-            config.rcc.mux.clk48sel = embassy_stm32::pac::rcc::vals::Clk48sel::PLL1_Q;
-        }
-        let p = embassy_stm32::init(config);
-
+        let p = embassy_stm32::init(crate::board_init::rcc_config());
         defmt::info!("SYSCLK: 168 MHz, USB: 48 MHz");
 
-        // TIM5: free-running 32-bit counter at 84 MHz (APB1 timer clock).
-        // Sole Klipper clock source and step timer base.
-        {
-            let rcc = embassy_stm32::pac::RCC;
-            rcc.apb1enr().modify(|w| w.set_tim5en(true));
-            // Two cycles for clock to stabilize
-            cortex_m::asm::delay(2);
-            let tim5 = embassy_stm32::pac::TIM5;
-            tim5.psc().write_value(0); // No prescaler: 84 MHz
-            tim5.arr().write_value(0xFFFF_FFFF); // Full 32-bit range
-            tim5.egr().write(|w| w.set_ug(true)); // Force update to load PSC/ARR
-            tim5.cr1().modify(|w| w.set_cen(true)); // Start counting
-        }
-
-        // TIM5 CC1: configure for step timer interrupts (not armed yet).
-        // CC1 interrupt is enabled when the first queue_step arms the timer.
-        // NVIC unmask is also deferred to first arm — unmasking here would
-        // fire the ISR from the UIF flag set by EGR.UG above.
-        {
-            let tim5 = embassy_stm32::pac::TIM5;
-            tim5.dier().write_value(Default::default()); // All interrupts off
-            tim5.sr().write_value(Default::default()); // Clear all pending flags
-        }
-
-        // PB11: STEP GPIO (push-pull output, low initial)
-        // PA0: DIR GPIO (push-pull output, low initial)
-        {
-            use embassy_stm32::pac::gpio::vals;
-            // Enable GPIOB and GPIOA clocks
-            let rcc = embassy_stm32::pac::RCC;
-            rcc.ahb1enr().modify(|w| w.set_gpioaen(true));
-            rcc.ahb1enr().modify(|w| w.set_gpioben(true));
-
-            // PB11: push-pull output, very high speed
-            let gpio_b = embassy_stm32::pac::GPIOB;
-            gpio_b
-                .moder()
-                .modify(|w| w.set_moder(11, vals::Moder::OUTPUT));
-            gpio_b
-                .otyper()
-                .modify(|w| w.set_ot(11, vals::Ot::PUSH_PULL));
-            gpio_b
-                .ospeedr()
-                .modify(|w| w.set_ospeedr(11, vals::Ospeedr::VERY_HIGH_SPEED));
-            gpio_b.odr().modify(|w| w.set_odr(11, vals::Odr::LOW));
-
-            // PA0: push-pull output, very high speed
-            let gpio_a = embassy_stm32::pac::GPIOA;
-            gpio_a
-                .moder()
-                .modify(|w| w.set_moder(0, vals::Moder::OUTPUT));
-            gpio_a.otyper().modify(|w| w.set_ot(0, vals::Ot::PUSH_PULL));
-            gpio_a
-                .ospeedr()
-                .modify(|w| w.set_ospeedr(0, vals::Ospeedr::VERY_HIGH_SPEED));
-            gpio_a.odr().modify(|w| w.set_odr(0, vals::Odr::LOW));
-        }
-
+        crate::board_init::init_tim5_clock();
+        crate::board_init::init_stepdir_gpio();
         defmt::info!("TIM5 enabled for Klipper clock @ 84 MHz, STEP/DIR GPIO configured");
 
         // TIM2 clock: 84 MHz (APB1 timer clock, same bus as TIM5). At the
@@ -2269,23 +2173,8 @@ mod app {
         // PE7: TMC4671 ENABLE pin (active high, start disabled)
         let tmc_enable = Output::new(p.PE7, Level::Low, Speed::Low);
 
-        // PE10: Brake chopper control (active-high assumed).
-        // Drive LOW immediately to prevent the brake resistor from firing
-        // while the STM32 is booting. On STM32 reset, GPIO defaults to
-        // analog/high-impedance which the brake FET may interpret as ON.
-        {
-            let _brake_pin = Output::new(p.PE10, Level::Low, Speed::Low);
-            core::mem::forget(_brake_pin); // Keep pin configured, don't drop
-        }
-
-        // PE8: TMC4671 STATUS pin (input, active high).
-        // Pin mode configured here; EXTI interrupt enabled later in
-        // tmc_control after STATUS_MASK is written to the TMC4671.
-        {
-            use embassy_stm32::gpio::{Input, Pull};
-            let _status_pin = Input::new(p.PE8, Pull::Down);
-            core::mem::forget(_status_pin);
-        }
+        crate::board_init::init_brake_pin(p.PE10);
+        crate::board_init::init_tmc_status_pin(p.PE8);
 
         // IWDG: 10-second timeout, kicked by the stats task every 5 seconds.
         let mut wdg = IndependentWatchdog::new(p.IWDG, 10_000_000);
@@ -2323,27 +2212,10 @@ mod app {
 
         defmt::info!("SPI1 configured: 8 MHz, Mode 3, DMA");
 
-        // USB OTG FS: configure D+/D- GPIO pins (PA11=D-, PA12=D+)
-        // Alternate function 10 for USB OTG FS on STM32F4
-        {
-            use embassy_stm32::gpio::{AfType, Flex, Pull};
-            let mut dm = Flex::new(p.PA11);
-            dm.set_as_af_unchecked(10, AfType::input(Pull::None));
-            let mut dp = Flex::new(p.PA12);
-            dp.set_as_af_unchecked(10, AfType::input(Pull::None));
-            // Pins must stay configured — don't drop the Flex handles
-            core::mem::forget(dm);
-            core::mem::forget(dp);
-        }
+        crate::board_init::init_usb_pins(p.PA11, p.PA12);
+        crate::board_init::enable_usb_clock();
 
-        // Enable USB OTG FS peripheral clock
-        embassy_stm32::pac::RCC
-            .ahb2enr()
-            .modify(|w| w.set_usb_otg_fsen(true));
-        // Brief delay for clock to stabilize
-        cortex_m::asm::delay(100);
-
-        let uid = read_stm32_uid(ctx.local.uid_str);
+        let uid = crate::board_init::read_stm32_uid(ctx.local.uid_str);
 
         // SAFETY: Called exactly once, before any other klipper-usb function.
         // base_addr is the USB_OTG_FS peripheral base on STM32F407.
@@ -2362,19 +2234,7 @@ mod app {
             });
         }
 
-        // Enable DWT CYCCNT for first-sample SPI timing measurement.
-        // CYCCNT is disabled on reset; requires DEMCR.TRCENA + DWT.CYCCNTENA.
-        {
-            let dcb = unsafe { &*cortex_m::peripheral::DCB::PTR };
-            unsafe {
-                dcb.demcr.modify(|v| v | (1 << 24)); // TRCENA
-            }
-            let dwt = unsafe { &*cortex_m::peripheral::DWT::PTR };
-            unsafe {
-                dwt.cyccnt.write(0);
-                dwt.ctrl.modify(|v| v | 1); // CYCCNTENA
-            }
-        }
+        crate::board_init::enable_dwt_cyccnt();
 
         // Initialize trace buffer in CCM RAM
         unsafe {
