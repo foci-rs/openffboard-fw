@@ -11,15 +11,15 @@ pub mod pac {
     pub use embassy_stm32::pac::*;
 }
 
+mod app_types;
+
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [UART4, UART5, USART3])]
 mod app {
     use core::cell::RefCell;
 
     use anchor::*;
-    // CycleDelay uses cortex_m::asm::delay() (CPU busy-wait, no DWT needed)
     use critical_section::Mutex;
     use embassy_stm32::gpio::{Level, Output, Speed};
-    use embassy_stm32::mode::Async as AsyncMode;
     use embassy_stm32::spi::Spi;
     use embassy_stm32::wdg::IndependentWatchdog;
     use embassy_stm32::{bind_interrupts, peripherals};
@@ -30,6 +30,8 @@ mod app {
     use foci_tmc4671::spi::Tmc4671Spi;
     use rtic_monotonics::stm32::prelude::*;
     use rtic_sync::channel::{Receiver, Sender};
+
+    use crate::app_types::{CycleDelay, TmcSpiDevice};
 
     bind_interrupts!(struct Irqs {
         DMA2_STREAM2 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH2>;
@@ -47,26 +49,6 @@ mod app {
     // The rtic-monotonics crate handles the hardware timer overflow
     // automatically via an extended u64 counter in a TimerQueueBackend.
     stm32_tim2_monotonic!(Mono, 1_000_000);
-
-    /// SPI bus type for TMC4671 communication.
-    type Spi1Bus = Spi<'static, AsyncMode, embassy_stm32::spi::mode::Master>;
-
-    /// Sub-microsecond busy-wait delay for SPI read pauses.
-    ///
-    /// The TMC4671-LA requires a 500ns pause after the address byte for
-    /// SPI reads above 2 MHz (datasheet Table 2, tSCKpause). At 168 MHz,
-    /// 500ns = 84 CPU cycles — too short for async yield.
-    struct CycleDelay;
-
-    impl embedded_hal_async::delay::DelayNs for CycleDelay {
-        async fn delay_ns(&mut self, ns: u32) {
-            let cycles = (ns as u64 * 168 / 1000) as u32;
-            cortex_m::asm::delay(cycles);
-        }
-    }
-
-    /// TMC4671 SPI device with exclusive bus access and software CS.
-    type TmcSpiDevice = ExclusiveDevice<Spi1Bus, Output<'static>, CycleDelay>;
 
     use foci_firmware::tmc::TmcRequest;
 
@@ -5001,103 +4983,6 @@ mod app {
 }
 
 use anchor::klipper_config_generate;
-use anchor::klipper_enumeration;
-
-// Pin enumerations at crate root (outside mod app) so anchor_codegen
-// can discover them. TMC4671 handles all pins internally — these exist
-// only for Klipper config pin name resolution.
-klipper_enumeration!(
-    #[allow(non_camel_case_types)]
-    #[klipper_enumeration(name = "pin")]
-    enum Pins {
-        PA0,
-        PA1,
-        PA2,
-        PA3,
-        PA4,
-        PA5,
-        PA6,
-        PA7,
-        PA8,
-        PA9,
-        PA10,
-        PA11,
-        PA12,
-        PA13,
-        PA14,
-        PA15,
-        PB0,
-        PB1,
-        PB2,
-        PB3,
-        PB4,
-        PB5,
-        PB6,
-        PB7,
-        PB8,
-        PB9,
-        PB10,
-        PB11,
-        PB12,
-        PB13,
-        PB14,
-        PB15,
-        PC0,
-        PC1,
-        PC2,
-        PC3,
-        PC4,
-        PC5,
-        PC6,
-        PC7,
-        PC8,
-        PC9,
-        PC10,
-        PC11,
-        PC12,
-        PC13,
-        PC14,
-        PC15,
-        PD0,
-        PD1,
-        PD2,
-        PD3,
-        PD4,
-        PD5,
-        PD6,
-        PD7,
-        PD8,
-        PD9,
-        PD10,
-        PD11,
-        PD12,
-        PD13,
-        PD14,
-        PD15,
-        PE0,
-        PE1,
-        PE2,
-        PE3,
-        PE4,
-        PE5,
-        PE6,
-        PE7,
-        PE8,
-        PE9,
-        PE10,
-        PE11,
-        PE12,
-        PE13,
-        PE14,
-        PE15,
-        // Virtual pins for FOCI stepper control.
-        // STEP/DIR are handled internally (no GPIO toggle).
-        // ENA maps to the TMC4671 enable pin (PE7 on OpenFFBoard).
-        STEP0,
-        DIR0,
-        ENA0,
-    }
-);
 
 klipper_config_generate!(
     transport = crate::app::TRANSPORT_OUTPUT: crate::app::BufferTransportOutput,
