@@ -33,10 +33,10 @@ critical-section = "1.2"
 anchor.workspace = true
 
 # Project crates
-foci-tmc4671 = { path = "../foci-tmc4671" }
-foci-klipper = { path = "../foci-klipper" }
-foci-usb-stm32 = { path = "../foci-usb-stm32" }
-foci-core = { path = "../foci-core", features = ["defmt"] }
+foci-tmc4671 = { path = "../shared/foci-tmc4671" }
+foci-klipper = { path = "../shared/foci-klipper" }
+foci-usb-stm32 = { path = "../shared/foci-usb-stm32" }
+foci-core = { path = "../shared/foci-core", features = ["defmt"] }
 
 # Logging
 defmt.workspace = true
