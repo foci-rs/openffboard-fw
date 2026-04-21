@@ -8,12 +8,12 @@
 //! (electrical ID, current tune, validation) are filled by the
 //! electrical-ID and current-tune plans.
 
-use foci_core::autotune::{
+use foci_firmware::autotune::{
     ClosedLoopEntryState, CommissionError, CommissionProfile, CommissionStatus, CurrentGains,
     CurrentValidation, ElectricalModel, InnerSequence, MechanicalModel, OperatingMode, PhaseId,
     TransientBuffer, ValidationResult, VelocityGains, VelocityValidation,
 };
-use foci_core::config::TmcConfig;
+use foci_firmware::config::TmcConfig;
 use foci_tmc4671::registers::Register;
 
 /// Hardware abstraction for commissioning measurements.
@@ -351,7 +351,7 @@ const VALIDATION_SETTLE_US: u64 = 50_000;
 /// limit and remains well below the operational closed-loop limit.
 const CURRENT_VALIDATE_PIDOUT_LIMIT: u32 = 2000;
 
-use foci_core::autotune::CaptureDirection;
+use foci_firmware::autotune::CaptureDirection;
 
 /// Current-loop validation sub-state machine (Phase 7).
 #[derive(Debug, defmt::Format)]
@@ -1135,7 +1135,7 @@ enum OuterPhase {
         /// Accepted velocity gains.
         velocity_gains: VelocityGains,
         /// Accepted position gains.
-        position_gains: foci_core::autotune::PositionGains,
+        position_gains: foci_firmware::autotune::PositionGains,
         /// Whether position oscillation was detected early (at minimum P).
         position_oscillation_early: bool,
         /// Whether velocity chatter was detected.
@@ -1154,8 +1154,8 @@ enum OuterPhase {
     /// Phase 13: Assemble and transmit results.
     Commit {
         velocity_gains: VelocityGains,
-        position_gains: foci_core::autotune::PositionGains,
-        filter_config: foci_core::autotune::FilterConfig,
+        position_gains: foci_firmware::autotune::PositionGains,
+        filter_config: foci_firmware::autotune::FilterConfig,
         /// Identified effective inertia from mechanical ID (internal units).
         j_eff: u32,
         /// Identified effective damping from mechanical ID (internal units).
@@ -1254,7 +1254,7 @@ pub struct CommissioningEngine {
     buf: TransientBuffer,
     /// Per-stage results collected during a selftest run. Populated only
     /// when `sequence == InnerSequence::Selftest`; unused otherwise.
-    selftest_results: foci_core::selftest::SelftestResults,
+    selftest_results: foci_firmware::selftest::SelftestResults,
 }
 
 impl CommissioningEngine {
@@ -1273,7 +1273,7 @@ impl CommissioningEngine {
                 adc_cal: None,
             },
             buf: TransientBuffer::new(),
-            selftest_results: foci_core::selftest::SelftestResults::default(),
+            selftest_results: foci_firmware::selftest::SelftestResults::default(),
         }
     }
 
@@ -1292,7 +1292,7 @@ impl CommissioningEngine {
                 adc_cal: None,
             },
             buf: TransientBuffer::new(),
-            selftest_results: foci_core::selftest::SelftestResults::default(),
+            selftest_results: foci_firmware::selftest::SelftestResults::default(),
         }
     }
 
@@ -1311,7 +1311,7 @@ impl CommissioningEngine {
                 adc_cal: None,
             },
             buf: TransientBuffer::new(),
-            selftest_results: foci_core::selftest::SelftestResults::default(),
+            selftest_results: foci_firmware::selftest::SelftestResults::default(),
         }
     }
 
@@ -1350,7 +1350,7 @@ impl CommissioningEngine {
                 entry_snapshot,
             },
             buf: TransientBuffer::new(),
-            selftest_results: foci_core::selftest::SelftestResults::default(),
+            selftest_results: foci_firmware::selftest::SelftestResults::default(),
         }
     }
 
@@ -1393,7 +1393,7 @@ impl CommissioningEngine {
     ///
     /// Caller should only invoke this when the most recent `step()`
     /// returned `StepResult::SelftestDone`.
-    pub fn take_selftest_results(&mut self) -> foci_core::selftest::SelftestResults {
+    pub fn take_selftest_results(&mut self) -> foci_firmware::selftest::SelftestResults {
         core::mem::take(&mut self.selftest_results)
     }
 
@@ -1592,7 +1592,7 @@ impl CommissioningEngine {
         profile: CommissionProfile,
         sequence: InnerSequence,
         adc_cal: &mut Option<AdcCalResult>,
-        selftest_results: &mut foci_core::selftest::SelftestResults,
+        selftest_results: &mut foci_firmware::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
         match phase {
@@ -1642,7 +1642,7 @@ impl CommissioningEngine {
         phase: &mut InnerPhase,
         sequence: InnerSequence,
         adc_cal: &mut Option<AdcCalResult>,
-        selftest_results: &mut foci_core::selftest::SelftestResults,
+        selftest_results: &mut foci_firmware::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
         use foci_tmc4671::registers::*;
@@ -1776,7 +1776,8 @@ impl CommissioningEngine {
                     || !(ADC_OFFSET_MIN..=ADC_OFFSET_MAX).contains(&offset_i1)
                 {
                     if matches!(sequence, InnerSequence::Selftest) {
-                        selftest_results.set(1, foci_core::selftest::SelftestStageValue::fail(0));
+                        selftest_results
+                            .set(1, foci_firmware::selftest::SelftestStageValue::fail(0));
                     }
                     return Self::fail_inner(phase, CommissionError::AdcFault);
                 }
@@ -1784,7 +1785,9 @@ impl CommissioningEngine {
                 if matches!(sequence, InnerSequence::Selftest) {
                     selftest_results.set(
                         1,
-                        foci_core::selftest::SelftestStageValue::adc_offsets(offset_i0, offset_i1),
+                        foci_firmware::selftest::SelftestStageValue::adc_offsets(
+                            offset_i0, offset_i1,
+                        ),
                     );
                 }
 
@@ -1845,7 +1848,7 @@ impl CommissioningEngine {
     async fn step_coil_check<B: CommissioningBackend>(
         phase: &mut InnerPhase,
         sequence: InnerSequence,
-        selftest_results: &mut foci_core::selftest::SelftestResults,
+        selftest_results: &mut foci_firmware::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
         use foci_tmc4671::registers::*;
@@ -1941,8 +1944,10 @@ impl CommissioningEngine {
                         if obs.expected.unsigned_abs() <= MOTOR_CURRENT_THRESHOLD {
                             if matches!(sequence, InnerSequence::Selftest) {
                                 let stage = if is_coil_b { 3 } else { 2 };
-                                selftest_results
-                                    .set(stage, foci_core::selftest::SelftestStageValue::fail(0));
+                                selftest_results.set(
+                                    stage,
+                                    foci_firmware::selftest::SelftestStageValue::fail(0),
+                                );
                             }
                             return Self::fail_inner(phase, CommissionError::CoilFault);
                         }
@@ -1958,7 +1963,7 @@ impl CommissioningEngine {
                             if matches!(sequence, InnerSequence::Selftest) {
                                 selftest_results.set(
                                     2,
-                                    foci_core::selftest::SelftestStageValue::coil_current(
+                                    foci_firmware::selftest::SelftestStageValue::coil_current(
                                         obs.expected,
                                     ),
                                 );
@@ -1968,7 +1973,7 @@ impl CommissioningEngine {
                             if matches!(sequence, InnerSequence::Selftest) {
                                 selftest_results.set(
                                     3,
-                                    foci_core::selftest::SelftestStageValue::coil_current(
+                                    foci_firmware::selftest::SelftestStageValue::coil_current(
                                         obs.expected,
                                     ),
                                 );
@@ -2013,20 +2018,20 @@ impl CommissioningEngine {
     fn step_phase_wiring(
         phase: &mut InnerPhase,
         sequence: InnerSequence,
-        selftest_results: &mut foci_core::selftest::SelftestResults,
+        selftest_results: &mut foci_firmware::selftest::SelftestResults,
         coil_a: CoilObservation,
         coil_b: CoilObservation,
     ) -> StepResult {
         // Phase wiring check: expected channel must dominate.
         if coil_a.other.unsigned_abs() >= coil_a.expected.unsigned_abs() {
             if matches!(sequence, InnerSequence::Selftest) {
-                selftest_results.set(4, foci_core::selftest::SelftestStageValue::fail(0));
+                selftest_results.set(4, foci_firmware::selftest::SelftestStageValue::fail(0));
             }
             return Self::fail_inner(phase, CommissionError::PhaseFault);
         }
         if coil_b.other.unsigned_abs() >= coil_b.expected.unsigned_abs() {
             if matches!(sequence, InnerSequence::Selftest) {
-                selftest_results.set(4, foci_core::selftest::SelftestStageValue::fail(0));
+                selftest_results.set(4, foci_firmware::selftest::SelftestStageValue::fail(0));
             }
             return Self::fail_inner(phase, CommissionError::PhaseFault);
         }
@@ -2034,7 +2039,7 @@ impl CommissioningEngine {
         if matches!(sequence, InnerSequence::Selftest) {
             selftest_results.set(
                 4,
-                foci_core::selftest::SelftestStageValue {
+                foci_firmware::selftest::SelftestStageValue {
                     status: 0,
                     value: 0,
                 },
@@ -2073,7 +2078,7 @@ impl CommissioningEngine {
         let target = (current_limit / 2)
             .clamp(ENCODER_MOVE_CURRENT_MIN, ENCODER_MOVE_CURRENT_MAX)
             .min(current_limit) as i16;
-        let defaults = foci_core::pid::DEFAULT_INNER_GAINS;
+        let defaults = foci_firmware::pid::DEFAULT_INNER_GAINS;
         let flux_reg = (defaults.flux_p as u32) << 16 | defaults.flux_i as u32;
         let torque_reg = (defaults.torque_p as u32) << 16 | defaults.torque_i as u32;
         let target_reg: u32 = PidTorqueFluxTarget::new()
@@ -2159,7 +2164,7 @@ impl CommissioningEngine {
     async fn step_encoder_check<B: CommissioningBackend>(
         phase: &mut InnerPhase,
         sequence: InnerSequence,
-        selftest_results: &mut foci_core::selftest::SelftestResults,
+        selftest_results: &mut foci_firmware::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
         use foci_tmc4671::registers::*;
@@ -2234,7 +2239,8 @@ impl CommissioningEngine {
                         count_end
                     );
                     if matches!(sequence, InnerSequence::Selftest) {
-                        selftest_results.set(5, foci_core::selftest::SelftestStageValue::fail(0));
+                        selftest_results
+                            .set(5, foci_firmware::selftest::SelftestStageValue::fail(0));
                     }
                     return Self::fail_inner(phase, CommissionError::EncoderFault);
                 }
@@ -2247,7 +2253,7 @@ impl CommissioningEngine {
                     // Raw encoder delta magnitude; direction captured in stage 6.
                     selftest_results.set(
                         5,
-                        foci_core::selftest::SelftestStageValue {
+                        foci_firmware::selftest::SelftestStageValue {
                             status: 0,
                             value: delta.unsigned_abs(),
                         },
@@ -2257,7 +2263,7 @@ impl CommissioningEngine {
                     let reversed = delta < 0;
                     selftest_results.set(
                         6,
-                        foci_core::selftest::SelftestStageValue {
+                        foci_firmware::selftest::SelftestStageValue {
                             status: 0,
                             value: if reversed { 1 } else { 0 },
                         },
@@ -2294,7 +2300,7 @@ impl CommissioningEngine {
         phase: &mut InnerPhase,
         sequence: InnerSequence,
         adc_cal: &mut Option<AdcCalResult>,
-        _selftest_results: &mut foci_core::selftest::SelftestResults,
+        _selftest_results: &mut foci_firmware::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
         use foci_tmc4671::registers::*;
@@ -2453,7 +2459,7 @@ impl CommissioningEngine {
                         // main.rs will overwrite current-loop gains with
                         // stored_gains (from prior commissioning) and
                         // re-apply filters from atomics.
-                        let defaults = foci_core::pid::DEFAULT_INNER_GAINS;
+                        let defaults = foci_firmware::pid::DEFAULT_INNER_GAINS;
                         let vel_limit = backend.operational_velocity_limit();
                         *phase = InnerPhase::ClosedLoopEntry {
                             state: ClosedLoopEntryState::WriteGains,
@@ -2501,7 +2507,7 @@ impl CommissioningEngine {
         phase: &mut InnerPhase,
         buf: &mut TransientBuffer,
         sequence: InnerSequence,
-        selftest_results: &mut foci_core::selftest::SelftestResults,
+        selftest_results: &mut foci_firmware::selftest::SelftestResults,
         backend: &mut B,
     ) -> StepResult {
         use foci_tmc4671::registers::*;
@@ -2976,14 +2982,14 @@ impl CommissioningEngine {
                     InnerSequence::Selftest => {
                         selftest_results.set(
                             7,
-                            foci_core::selftest::SelftestStageValue {
+                            foci_firmware::selftest::SelftestStageValue {
                                 status: 0,
                                 value: r_mohm,
                             },
                         );
                         selftest_results.set(
                             8,
-                            foci_core::selftest::SelftestStageValue {
+                            foci_firmware::selftest::SelftestStageValue {
                                 status: 0,
                                 value: l_uh as u32,
                             },
@@ -3030,7 +3036,7 @@ impl CommissioningEngine {
         };
 
         let config = backend.tmc_config();
-        let gains = foci_core::autotune::simc_current_gains(&model, profile, config);
+        let gains = foci_firmware::autotune::simc_current_gains(&model, profile, config);
 
         defmt::info!(
             "simc: R={} L={} tau_e={}us theta_e={}us lambda={}us → P={} I={} bw={}Hz",
@@ -3216,7 +3222,7 @@ impl CommissioningEngine {
                         // not from measured current, so disable the helper's
                         // sample-level saturation check.
                         let target = data.step_amplitude as u32;
-                        let metrics = foci_core::autotune::extract_step_metrics(buf, target, 0);
+                        let metrics = foci_firmware::autotune::extract_step_metrics(buf, target, 0);
 
                         match dir {
                             CaptureDirection::Forward => {
@@ -3256,8 +3262,10 @@ impl CommissioningEngine {
                             // positive values when the motor responds correctly.
                             // Wrong-sign current clamps to zero.
                             let torque_actual = ((actual >> 16) & 0xFFFF) as i16;
-                            let sample =
-                                foci_core::autotune::normalize_capture_sample(torque_actual, dir);
+                            let sample = foci_firmware::autotune::normalize_capture_sample(
+                                torque_actual,
+                                dir,
+                            );
                             buf.push(sample);
                         }
                         Err(_) => {
@@ -3301,7 +3309,7 @@ impl CommissioningEngine {
 
                 // Compute symmetry from forward and reverse tail levels
                 // (steady-state current magnitude).
-                let symmetry = foci_core::autotune::compute_tail_symmetry_pct(
+                let symmetry = foci_firmware::autotune::compute_tail_symmetry_pct(
                     forward.tail_level,
                     reverse.tail_level,
                 );
@@ -3310,7 +3318,7 @@ impl CommissioningEngine {
                 let worst_tail = forward.tail_level.min(reverse.tail_level);
                 let target = data.step_amplitude as u32;
                 let target_error =
-                    foci_core::autotune::compute_target_error_pct(worst_tail, target);
+                    foci_firmware::autotune::compute_target_error_pct(worst_tail, target);
 
                 let combined = CurrentValidation {
                     symmetry_pct: symmetry,
@@ -3326,12 +3334,12 @@ impl CommissioningEngine {
                     target_error_pct: target_error,
                 };
 
-                let total_samples = foci_core::autotune::TRANSIENT_LEN as u16 * 2;
-                let settle_reference_us = foci_core::autotune::current_settling_reference_us(
+                let total_samples = foci_firmware::autotune::TRANSIENT_LEN as u16 * 2;
+                let settle_reference_us = foci_firmware::autotune::current_settling_reference_us(
                     &data.gains,
                     backend.tmc_config(),
                 );
-                let result = foci_core::autotune::classify_current_validation(
+                let result = foci_firmware::autotune::classify_current_validation(
                     &combined,
                     settle_reference_us,
                     total_samples,
@@ -3362,7 +3370,7 @@ impl CommissioningEngine {
                         };
                     }
                     retry_result
-                        if foci_core::autotune::should_retry_current_validation(
+                        if foci_firmware::autotune::should_retry_current_validation(
                             retry_result,
                             data.attempt,
                         ) =>
@@ -3371,7 +3379,7 @@ impl CommissioningEngine {
                         // measured tail response.
                         let target = data.step_amplitude as u32;
                         let settle_band = (target * 5 / 100).max(1);
-                        let retry_gains = foci_core::autotune::current_validation_retry_gains(
+                        let retry_gains = foci_firmware::autotune::current_validation_retry_gains(
                             data.gains,
                             target,
                             settle_band,
@@ -3379,7 +3387,7 @@ impl CommissioningEngine {
                             reverse.tail_level,
                             combined.overshoot_pct,
                         );
-                        if foci_core::autotune::should_accept_current_validation_without_retry(
+                        if foci_firmware::autotune::should_accept_current_validation_without_retry(
                             &combined,
                             settle_reference_us,
                             total_samples,
@@ -3409,10 +3417,10 @@ impl CommissioningEngine {
                     ValidationResult::Marginal | ValidationResult::Fail => {
                         // Fall back to conservative defaults.
                         data.gains = CurrentGains {
-                            flux_p: foci_core::pid::DEFAULT_INNER_GAINS.flux_p,
-                            flux_i: foci_core::pid::DEFAULT_INNER_GAINS.flux_i,
-                            torque_p: foci_core::pid::DEFAULT_INNER_GAINS.torque_p,
-                            torque_i: foci_core::pid::DEFAULT_INNER_GAINS.torque_i,
+                            flux_p: foci_firmware::pid::DEFAULT_INNER_GAINS.flux_p,
+                            flux_i: foci_firmware::pid::DEFAULT_INNER_GAINS.flux_i,
+                            torque_p: foci_firmware::pid::DEFAULT_INNER_GAINS.torque_p,
+                            torque_i: foci_firmware::pid::DEFAULT_INNER_GAINS.torque_i,
                             effective_bandwidth_hz: 0,
                             lambda_us: 0,
                         };
@@ -4749,7 +4757,7 @@ impl CommissioningEngine {
             )
         } else {
             let config = backend.tmc_config();
-            let gains = match foci_core::autotune::simc_velocity_gains(
+            let gains = match foci_firmware::autotune::simc_velocity_gains(
                 &model,
                 profile,
                 mode,
@@ -4959,7 +4967,7 @@ impl CommissioningEngine {
                     let _ = backend.write_register(PID_VELOCITY_TARGET, 0).await;
 
                     // Extract forward metrics.
-                    let metrics = foci_core::autotune::extract_velocity_metrics(
+                    let metrics = foci_firmware::autotune::extract_velocity_metrics(
                         buf,
                         data.step_target,
                         0, // Saturation counted from velocity PID output, not velocity samples.
@@ -5045,7 +5053,7 @@ impl CommissioningEngine {
                 if buf.is_full() {
                     let _ = backend.write_register(PID_VELOCITY_TARGET, 0).await;
 
-                    let metrics = foci_core::autotune::extract_velocity_metrics(
+                    let metrics = foci_firmware::autotune::extract_velocity_metrics(
                         buf,
                         data.step_target,
                         0, // Saturation counted from velocity PID output, not velocity samples.
@@ -5138,8 +5146,10 @@ impl CommissioningEngine {
                     symmetry_pct: 0,
                 });
 
-                let symmetry =
-                    foci_core::autotune::compute_symmetry_pct(fwd.rise_time_ms, rev.rise_time_ms);
+                let symmetry = foci_firmware::autotune::compute_symmetry_pct(
+                    fwd.rise_time_ms,
+                    rev.rise_time_ms,
+                );
 
                 // Merge: take the worst of forward/reverse for each metric.
                 let merged = VelocityValidation {
@@ -5156,10 +5166,10 @@ impl CommissioningEngine {
                 } else {
                     data.model.tau_mech_ms.max(1)
                 };
-                let result = foci_core::autotune::classify_velocity_validation(
+                let result = foci_firmware::autotune::classify_velocity_validation(
                     &merged,
                     validation_tau_ms,
-                    foci_core::autotune::TRANSIENT_LEN as u16 * 2, // Total samples across both captures.
+                    foci_firmware::autotune::TRANSIENT_LEN as u16 * 2, // Total samples across both captures.
                 );
 
                 defmt::info!(
@@ -5263,7 +5273,7 @@ impl CommissioningEngine {
                             / VEL_RETRY_LAMBDA_MUL_DEN;
                         retry_model.theta_mech_us = new_theta;
 
-                        match foci_core::autotune::simc_velocity_gains(
+                        match foci_firmware::autotune::simc_velocity_gains(
                             &retry_model,
                             profile,
                             mode,
@@ -5516,7 +5526,8 @@ impl CommissioningEngine {
             PositionTuneState::Analyze => {
                 // Check for oscillation in the captured response.
                 let target_abs = data.step_target_counts;
-                let oscillation = foci_core::autotune::detect_position_oscillation(buf, target_abs);
+                let oscillation =
+                    foci_firmware::autotune::detect_position_oscillation(buf, target_abs);
 
                 defmt::info!(
                     "pos tune: P={}, oscillation={}",
@@ -5616,7 +5627,7 @@ impl CommissioningEngine {
                 defmt::info!("pos tune: final P={}, I={}", final_p, final_i);
 
                 let carried_safety = *safety;
-                let position_gains = foci_core::autotune::PositionGains {
+                let position_gains = foci_firmware::autotune::PositionGains {
                     position_p: final_p,
                     position_i: final_i,
                 };
@@ -5701,7 +5712,7 @@ impl CommissioningEngine {
         // Estimate position bandwidth as velocity_bw / 4.
         let position_bandwidth_hz = velocity_gains.effective_bandwidth_hz / 4;
 
-        let filter_config = foci_core::autotune::recommend_filters(
+        let filter_config = foci_firmware::autotune::recommend_filters(
             velocity_chatter,
             velocity_gains.effective_bandwidth_hz,
             position_oscillation_early,
@@ -5810,7 +5821,7 @@ impl CommissioningEngine {
         pwm_maxcnt: u16,
     ) {
         use foci_tmc4671::registers::*;
-        if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(cutoff_hz, pwm_maxcnt) {
+        if let Some(coeffs) = foci_firmware::biquad::butterworth_lowpass(cutoff_hz, pwm_maxcnt) {
             Self::write_sub_register(backend, CONFIG_BIQUAD_V_A_1, coeffs.a_1 as u32).await;
             Self::write_sub_register(backend, CONFIG_BIQUAD_V_A_2, coeffs.a_2 as u32).await;
             Self::write_sub_register(backend, CONFIG_BIQUAD_V_B_0, coeffs.b_0 as u32).await;
@@ -5828,7 +5839,7 @@ impl CommissioningEngine {
         pwm_maxcnt: u16,
     ) {
         use foci_tmc4671::registers::*;
-        if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(cutoff_hz, pwm_maxcnt) {
+        if let Some(coeffs) = foci_firmware::biquad::butterworth_lowpass(cutoff_hz, pwm_maxcnt) {
             Self::write_sub_register(backend, CONFIG_BIQUAD_X_A_1, coeffs.a_1 as u32).await;
             Self::write_sub_register(backend, CONFIG_BIQUAD_X_A_2, coeffs.a_2 as u32).await;
             Self::write_sub_register(backend, CONFIG_BIQUAD_X_B_0, coeffs.b_0 as u32).await;
@@ -5846,7 +5857,7 @@ impl CommissioningEngine {
         pwm_maxcnt: u16,
     ) {
         use foci_tmc4671::registers::*;
-        if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(cutoff_hz, pwm_maxcnt) {
+        if let Some(coeffs) = foci_firmware::biquad::butterworth_lowpass(cutoff_hz, pwm_maxcnt) {
             Self::write_sub_register(backend, CONFIG_BIQUAD_F_A_1, coeffs.a_1 as u32).await;
             Self::write_sub_register(backend, CONFIG_BIQUAD_F_A_2, coeffs.a_2 as u32).await;
             Self::write_sub_register(backend, CONFIG_BIQUAD_F_B_0, coeffs.b_0 as u32).await;
@@ -5864,7 +5875,7 @@ impl CommissioningEngine {
         pwm_maxcnt: u16,
     ) {
         use foci_tmc4671::registers::*;
-        if let Some(coeffs) = foci_core::biquad::butterworth_lowpass(cutoff_hz, pwm_maxcnt) {
+        if let Some(coeffs) = foci_firmware::biquad::butterworth_lowpass(cutoff_hz, pwm_maxcnt) {
             Self::write_sub_register(backend, CONFIG_BIQUAD_T_A_1, coeffs.a_1 as u32).await;
             Self::write_sub_register(backend, CONFIG_BIQUAD_T_A_2, coeffs.a_2 as u32).await;
             Self::write_sub_register(backend, CONFIG_BIQUAD_T_B_0, coeffs.b_0 as u32).await;

@@ -70,7 +70,7 @@ mod app {
     /// TMC4671 SPI device with exclusive bus access and software CS.
     type TmcSpiDevice = ExclusiveDevice<Spi1Bus, Output<'static>, CycleDelay>;
 
-    use foci_core::tmc::TmcRequest;
+    use foci_firmware::tmc::TmcRequest;
 
     const TMC_CHANNEL_SIZE: usize = 8;
 
@@ -99,7 +99,7 @@ mod app {
     /// The optimal bandwidth increased from 50 Hz to 150 Hz after fixing
     /// the PWM frequency formula (datasheet: 25 kHz, not 6.25 kHz) and
     /// improving L measurement accuracy via 8 MHz SPI.
-    const TMC_CONFIG: foci_core::config::TmcConfig = foci_core::config::TmcConfig {
+    const TMC_CONFIG: foci_firmware::config::TmcConfig = foci_firmware::config::TmcConfig {
         pwm_maxcnt: 3999,
         tmc_clock_hz: 25_000_000,
         bbm_h: 10,
@@ -228,7 +228,7 @@ mod app {
             TMC_CONFIG.excitation_voltage
         }
 
-        fn tmc_config(&self) -> &foci_core::config::TmcConfig {
+        fn tmc_config(&self) -> &foci_firmware::config::TmcConfig {
             &TMC_CONFIG
         }
 
@@ -412,7 +412,7 @@ mod app {
     /// because CCM RAM has no default initialization; init() writes a valid
     /// TraceBuffer via ptr::write before any read.
     #[unsafe(link_section = ".ccmram")]
-    static mut TRACE_BUF: core::mem::MaybeUninit<foci_core::trace::TraceBuffer> =
+    static mut TRACE_BUF: core::mem::MaybeUninit<foci_firmware::trace::TraceBuffer> =
         core::mem::MaybeUninit::uninit();
 
     /// Lock-free move queue for hardware step/dir.
@@ -651,11 +651,13 @@ mod app {
     ///
     /// Must only be called from tmc_control (P1) after init has completed.
     #[inline]
-    unsafe fn trace_buf() -> &'static mut foci_core::trace::TraceBuffer {
+    unsafe fn trace_buf() -> &'static mut foci_firmware::trace::TraceBuffer {
         // Use addr_of_mut! to avoid creating a reference to the mutable static
         // (Rust 2024 edition compatibility). MaybeUninit<T> has the same layout as T.
         // SAFETY: caller upholds the P1-only + post-init contract of `trace_buf`.
-        unsafe { &mut *core::ptr::addr_of_mut!(TRACE_BUF).cast::<foci_core::trace::TraceBuffer>() }
+        unsafe {
+            &mut *core::ptr::addr_of_mut!(TRACE_BUF).cast::<foci_firmware::trace::TraceBuffer>()
+        }
     }
 
     pub struct BufferTransportOutput;
@@ -1771,21 +1773,21 @@ mod app {
     #[cfg(feature = "dev")]
     #[klipper_command]
     pub fn tmc_init(_context: &mut State, _oid: u8) {
-        tmc_send(foci_core::tmc::tmc_init());
+        tmc_send(foci_firmware::tmc::tmc_init());
     }
 
     /// Test motor rotation by sweeping PHI_E_EXT through N revolutions.
     #[cfg(feature = "dev")]
     #[klipper_command]
     pub fn tmc_test_spin(_context: &mut State, _oid: u8, revolutions: u8) {
-        tmc_send(foci_core::tmc::tmc_test_spin(revolutions));
+        tmc_send(foci_firmware::tmc::tmc_test_spin(revolutions));
     }
 
     /// Write a TMC4671 register via SPI.
     #[cfg(feature = "dev")]
     #[klipper_command]
     pub fn tmc_write_register(_context: &mut State, _oid: u8, addr: u8, value: u32) {
-        tmc_send(foci_core::tmc::tmc_write_register(addr, value));
+        tmc_send(foci_firmware::tmc::tmc_write_register(addr, value));
     }
 
     /// Read a TMC4671 register via SPI.
@@ -1794,7 +1796,7 @@ mod app {
     #[cfg(feature = "dev")]
     #[klipper_command]
     pub fn tmc_read_register(_context: &mut State, oid: u8, addr: u8) {
-        if !tmc_send(foci_core::tmc::tmc_read_register(oid, addr)) {
+        if !tmc_send(foci_firmware::tmc::tmc_read_register(oid, addr)) {
             defmt::warn!("tmc_read_register dropped: addr={:#04x}", addr);
             // No reply — let the Python query_command timeout naturally.
         }
@@ -1805,7 +1807,7 @@ mod app {
     /// current scaling factor.
     #[klipper_command]
     pub fn tmc_set_current(context: &mut State, _oid: u8, run_ma: u32) {
-        if !tmc_send(foci_core::tmc::tmc_set_current(run_ma)) && enter_shutdown(context) {
+        if !tmc_send(foci_firmware::tmc::tmc_set_current(run_ma)) && enter_shutdown(context) {
             klipper_shutdown!("tmc_set_current lost (queue full)", read_tim5());
         }
     }
@@ -1826,7 +1828,7 @@ mod app {
             return;
         }
         // Use _hw variant: returns step_width for TMC4671 STEP_WIDTH register
-        let (req, step_width) = foci_core::tmc::tmc_set_encoder_hw(ppr, 50);
+        let (req, step_width) = foci_firmware::tmc::tmc_set_encoder_hw(ppr, 50);
         STEP_WIDTH_VALUE.store(step_width, core::sync::atomic::Ordering::Relaxed);
         defmt::info!("channel={} ppr={} step_width={}", channel, ppr, step_width);
         if !tmc_send(req) && enter_shutdown(context) {
@@ -1845,7 +1847,9 @@ mod app {
             }
             return;
         }
-        if !tmc_send(foci_core::tmc::tmc_set_encoder_dir(invert != 0)) && enter_shutdown(context) {
+        if !tmc_send(foci_firmware::tmc::tmc_set_encoder_dir(invert != 0))
+            && enter_shutdown(context)
+        {
             klipper_shutdown!("tmc_set_encoder_dir lost (queue full)", read_tim5());
         }
     }
@@ -1863,17 +1867,17 @@ mod app {
                 foci_selftest_done,
                 oid: u8 = oid,
                 status: u8 =
-                    foci_core::autotune::CommissionError::AlreadyRunning.status_code()
+                    foci_firmware::autotune::CommissionError::AlreadyRunning.status_code()
             );
             return;
         }
-        if !tmc_send(foci_core::tmc::tmc_selftest(oid)) {
+        if !tmc_send(foci_firmware::tmc::tmc_selftest(oid)) {
             COMMISSION_IN_FLIGHT.store(false, Relaxed);
             klipper_reply!(
                 foci_selftest_done,
                 oid: u8 = oid,
                 status: u8 =
-                    foci_core::autotune::CommissionError::QueueFull.status_code()
+                    foci_firmware::autotune::CommissionError::QueueFull.status_code()
             );
         }
     }
@@ -1917,7 +1921,7 @@ mod app {
             );
             return;
         }
-        if !tmc_send(foci_core::tmc::tmc_calibrate(oid)) {
+        if !tmc_send(foci_firmware::tmc::tmc_calibrate(oid)) {
             COMMISSION_IN_FLIGHT.store(false, Relaxed);
             klipper_reply!(
                 foci_calibrate_result,
@@ -1936,7 +1940,7 @@ mod app {
     /// FOCI:DUMP protocol lines. Replaces Python-side register reads.
     #[klipper_command]
     pub fn foci_dump_registers(_context: &mut State, oid: u8) {
-        if !tmc_send(foci_core::tmc::tmc_dump_registers(oid)) {
+        if !tmc_send(foci_firmware::tmc::tmc_dump_registers(oid)) {
             defmt::warn!("foci_dump_registers dropped");
             // No reply — let the Python wait loop timeout with an
             // explicit "register dump timed out" error.
@@ -1946,7 +1950,7 @@ mod app {
     /// Query trace buffer metadata.
     #[klipper_command]
     pub fn foci_trace_info(_context: &mut State, oid: u8) {
-        if !tmc_send(foci_core::tmc::tmc_trace_info(oid)) {
+        if !tmc_send(foci_firmware::tmc::tmc_trace_info(oid)) {
             defmt::warn!("trace_info: TMC channel full");
         }
     }
@@ -1954,7 +1958,7 @@ mod app {
     /// Fetch a trace sample by offset. generation must match current generation.
     #[klipper_command]
     pub fn foci_trace_fetch(_context: &mut State, oid: u8, offset: u16, generation: u8) {
-        if !tmc_send(foci_core::tmc::tmc_trace_fetch(oid, offset, generation)) {
+        if !tmc_send(foci_firmware::tmc::tmc_trace_fetch(oid, offset, generation)) {
             defmt::warn!("trace_fetch: TMC channel full");
         }
     }
@@ -1969,7 +1973,7 @@ mod app {
         torque_p: u16,
         torque_i: u16,
     ) {
-        if !tmc_send(foci_core::tmc::tmc_set_pid_gains(
+        if !tmc_send(foci_firmware::tmc::tmc_set_pid_gains(
             flux_p, flux_i, torque_p, torque_i,
         )) && enter_shutdown(context)
         {
@@ -2015,7 +2019,7 @@ mod app {
         velocity_p: u16,
         velocity_i: u16,
     ) {
-        if !tmc_send(foci_core::tmc::tmc_set_position_gains(
+        if !tmc_send(foci_firmware::tmc::tmc_set_position_gains(
             position_p, position_i, velocity_p, velocity_i,
         )) && enter_shutdown(context)
         {
@@ -2048,17 +2052,17 @@ mod app {
                 foci_commission_phase,
                 oid: u8 = oid,
                 phase: u8 = 0,
-                status: u8 = foci_core::autotune::CommissionError::AlreadyRunning.status_code()
+                status: u8 = foci_firmware::autotune::CommissionError::AlreadyRunning.status_code()
             );
             return;
         }
-        if !tmc_send(foci_core::tmc::tmc_commission(oid, profile)) {
+        if !tmc_send(foci_firmware::tmc::tmc_commission(oid, profile)) {
             COMMISSION_IN_FLIGHT.store(false, Relaxed);
             klipper_reply!(
                 foci_commission_phase,
                 oid: u8 = oid,
                 phase: u8 = 0,
-                status: u8 = foci_core::autotune::CommissionError::QueueFull.status_code()
+                status: u8 = foci_firmware::autotune::CommissionError::QueueFull.status_code()
             );
         }
     }
@@ -2093,11 +2097,11 @@ mod app {
                 foci_commission_phase,
                 oid: u8 = oid,
                 phase: u8 = 0,
-                status: u8 = foci_core::autotune::CommissionError::AlreadyRunning.status_code()
+                status: u8 = foci_firmware::autotune::CommissionError::AlreadyRunning.status_code()
             );
             return;
         }
-        if !tmc_send(foci_core::tmc::tmc_tune(
+        if !tmc_send(foci_firmware::tmc::tmc_tune(
             oid,
             profile,
             mode,
@@ -2111,7 +2115,7 @@ mod app {
                 foci_commission_phase,
                 oid: u8 = oid,
                 phase: u8 = 0,
-                status: u8 = foci_core::autotune::CommissionError::QueueFull.status_code()
+                status: u8 = foci_firmware::autotune::CommissionError::QueueFull.status_code()
             );
         }
     }
@@ -2395,7 +2399,8 @@ mod app {
         // Initialize trace buffer in CCM RAM
         unsafe {
             // Use addr_of_mut! to avoid creating a reference to the mutable static
-            let ptr = core::ptr::addr_of_mut!(TRACE_BUF).cast::<foci_core::trace::TraceBuffer>();
+            let ptr =
+                core::ptr::addr_of_mut!(TRACE_BUF).cast::<foci_firmware::trace::TraceBuffer>();
             // Validate address is in CCM range
             let addr = ptr as usize;
             defmt::assert!(
@@ -2406,10 +2411,10 @@ mod app {
             defmt::info!(
                 "trace: buffer at {:#010x}, size {} bytes",
                 addr,
-                core::mem::size_of::<foci_core::trace::TraceBuffer>()
+                core::mem::size_of::<foci_firmware::trace::TraceBuffer>()
             );
             core::ptr::write(ptr, {
-                let mut buf = core::mem::zeroed::<foci_core::trace::TraceBuffer>();
+                let mut buf = core::mem::zeroed::<foci_firmware::trace::TraceBuffer>();
                 // reset() sets magic and all fields to valid initial state
                 buf.reset();
                 buf
@@ -2549,7 +2554,7 @@ mod app {
                 defmt::warn!("handle_tmc_request: SelfTest handled by main loop");
             }
             TmcRequest::DumpRegisters { oid } => {
-                for &addr in foci_core::dump::DUMP_REGISTERS {
+                for &addr in foci_firmware::dump::DUMP_REGISTERS {
                     // Yield between SPI reads to let USB task drain TX buffer
                     Mono::delay(1.millis()).await;
 
@@ -2569,7 +2574,7 @@ mod app {
                     );
                 }
                 // Sub-registers (INTERIM, PID_ERROR) use synthetic addrs 0x80+
-                for &(synthetic_addr, sub_reg) in foci_core::dump::DUMP_SUB_REGISTERS {
+                for &(synthetic_addr, sub_reg) in foci_firmware::dump::DUMP_SUB_REGISTERS {
                     Mono::delay(1.millis()).await;
 
                     let value = match tmc.read_sub_register(sub_reg).await {
@@ -2636,8 +2641,8 @@ mod app {
             } => {
                 let buf = unsafe { trace_buf() };
                 match buf.fetch(oid, offset, generation) {
-                    foci_core::trace::FetchResult::Ok(ring_idx) => {
-                        let data = if buf.preset() == foci_core::trace::PRESET_FULL {
+                    foci_firmware::trace::FetchResult::Ok(ring_idx) => {
+                        let data = if buf.preset() == foci_firmware::trace::PRESET_FULL {
                             buf.sample_bytes_full(ring_idx)
                         } else {
                             buf.sample_bytes_fast(ring_idx)
@@ -2650,7 +2655,7 @@ mod app {
                             data: &[u8] = data
                         );
                     }
-                    foci_core::trace::FetchResult::Busy => {
+                    foci_firmware::trace::FetchResult::Busy => {
                         klipper_reply!(
                             foci_trace_data,
                             oid: u8 = oid,
@@ -2659,7 +2664,7 @@ mod app {
                             data: &[u8] = &[]
                         );
                     }
-                    foci_core::trace::FetchResult::Invalid => {
+                    foci_firmware::trace::FetchResult::Invalid => {
                         klipper_reply!(
                             foci_trace_data,
                             oid: u8 = oid,
@@ -2705,13 +2710,13 @@ mod app {
         let engine_tick = buf.engine_tick();
 
         // Full preset decimation: skip odd ticks (500 Hz effective)
-        if preset == foci_core::trace::PRESET_FULL && engine_tick % 2 != 0 {
+        if preset == foci_firmware::trace::PRESET_FULL && engine_tick % 2 != 0 {
             buf.tick_no_sample(false); // intentional decimation, not a drop
             return;
         }
 
         // Pre-read deadline check
-        let budget_us = if preset == foci_core::trace::PRESET_FULL {
+        let budget_us = if preset == foci_firmware::trace::PRESET_FULL {
             TRACE_SPI_BUDGET_FULL_US
         } else {
             TRACE_SPI_BUDGET_FAST_US
@@ -2755,7 +2760,7 @@ mod app {
         let velocity_actual =
             read_or_drop!(tmc.read_sub_register(INTERIM_PIDOUT_TARGET_VELOCITY)) as i32;
 
-        if preset == foci_core::trace::PRESET_FULL {
+        if preset == foci_firmware::trace::PRESET_FULL {
             // Read additional full-preset registers
             let torque_flux_target = read_or_drop!(tmc.read_register(PID_TORQUE_FLUX_TARGET));
             let velocity_offset = read_or_drop!(tmc.read_register(PID_VELOCITY_OFFSET)) as i32;
@@ -2793,8 +2798,8 @@ mod app {
                 return;
             }
 
-            buf.push_full(foci_core::trace::TraceSampleFull {
-                fast: foci_core::trace::TraceSampleFast {
+            buf.push_full(foci_firmware::trace::TraceSampleFull {
+                fast: foci_firmware::trace::TraceSampleFast {
                     engine_tick: 0, // set by push
                     phase_id: 0,    // set by push
                     flags: 0,       // set by push
@@ -2838,7 +2843,7 @@ mod app {
                 return;
             }
 
-            buf.push_fast(foci_core::trace::TraceSampleFast {
+            buf.push_fast(foci_firmware::trace::TraceSampleFast {
                 engine_tick: 0,
                 phase_id: 0,
                 flags: 0,
@@ -2983,7 +2988,7 @@ mod app {
 
         // Stored PID gains from host (explicit or R/L-derived).
         // None = use defaults during calibration.
-        let mut stored_gains: Option<foci_core::pid::InnerLoopGains> = None;
+        let mut stored_gains: Option<foci_firmware::pid::InnerLoopGains> = None;
 
         // Stored position/velocity PID gains from host.
         // Active commissioning engine. Set when a Commission/Tune
@@ -3016,7 +3021,7 @@ mod app {
             if SHUTDOWN_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
                 if !shutdown_handled {
                     commission_engine.take();
-                    foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                    foci_firmware::selftest::restore_safe_state(tmc, enable_pin).await;
                     motor_enabled = false;
                     calibrated = false;
                     COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
@@ -3039,7 +3044,7 @@ mod app {
                 // hardware state (zero targets, disable outputs) so the motor
                 // is not left energized in whatever mode the engine last set.
                 if commission_engine.take().is_some() {
-                    foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                    foci_firmware::selftest::restore_safe_state(tmc, enable_pin).await;
                 }
                 COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
                 // Clear commissioned outer configuration so the next closed-
@@ -3084,12 +3089,12 @@ mod app {
                         // Start fast trace on ClosedLoopEntry for Stage 1
                         // (Commission only, not Calibrate — spec excludes
                         // Calibrate-on-enable and foci_calibrate CLE paths).
-                        if phase_id == foci_core::autotune::PhaseId::ClosedLoopEntry
+                        if phase_id == foci_firmware::autotune::PhaseId::ClosedLoopEntry
                             && !engine.is_calibrate()
                             && !unsafe { trace_buf() }.is_capturing()
                         {
                             unsafe {
-                                trace_buf().start(oid, foci_core::trace::PRESET_FAST);
+                                trace_buf().start(oid, foci_firmware::trace::PRESET_FAST);
                             }
                         }
                         unsafe { trace_buf().set_phase(phase_id.to_u8()) };
@@ -3111,7 +3116,7 @@ mod app {
                         defmt::error!("InnerFailed: calibrate={} error={}", is_calibrate, error,);
                         commission_engine = None;
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
-                        foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                        foci_firmware::selftest::restore_safe_state(tmc, enable_pin).await;
                         if is_calibrate {
                             // Send raw CommissionError status code — the
                             // old CalibrationError mapping was lossy (4
@@ -3221,14 +3226,14 @@ mod app {
                         };
                         if restore.await.is_err() {
                             defmt::error!("OuterDone: position-mode restore SPI failed");
-                            foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                            foci_firmware::selftest::restore_safe_state(tmc, enable_pin).await;
                             COMMISSION_IN_FLIGHT.store(false, R);
                             motor_enabled = false;
                             calibrated = false;
                             klipper_reply!(
                                 foci_tune_result,
                                 oid: u8 = oid,
-                                status: u8 = foci_core::autotune::CommissionError::Spi
+                                status: u8 = foci_firmware::autotune::CommissionError::Spi
                                     .status_code(),
                                 velocity_p: u16 = 0,
                                 velocity_i: u16 = 0,
@@ -3267,10 +3272,10 @@ mod app {
                         COMMISSION_IN_FLIGHT.store(false, R);
 
                         let status = match outer.status {
-                            foci_core::autotune::CommissionStatus::Accepted => 0u8,
-                            foci_core::autotune::CommissionStatus::AcceptedWithWarnings => 1,
-                            foci_core::autotune::CommissionStatus::InnerOnly => 2,
-                            foci_core::autotune::CommissionStatus::Failed(e) => e.status_code(),
+                            foci_firmware::autotune::CommissionStatus::Accepted => 0u8,
+                            foci_firmware::autotune::CommissionStatus::AcceptedWithWarnings => 1,
+                            foci_firmware::autotune::CommissionStatus::InnerOnly => 2,
+                            foci_firmware::autotune::CommissionStatus::Failed(e) => e.status_code(),
                         };
                         klipper_reply!(
                             foci_tune_result,
@@ -3314,7 +3319,7 @@ mod app {
                         // SafetyEnvelopeViolation are safety faults that
                         // must hard-disable immediately. All other errors
                         // are soft failures eligible for entry-gain restore.
-                        use foci_core::autotune::CommissionError as CE;
+                        use foci_firmware::autotune::CommissionError as CE;
                         let is_safety_fault =
                             matches!(error, CE::Spi | CE::Shutdown | CE::SafetyEnvelopeViolation);
 
@@ -3375,7 +3380,7 @@ mod app {
                             let _ = tmc
                                 .write_register(foci_tmc4671::registers::MODE_RAMP_MODE_MOTION, 0)
                                 .await;
-                            foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                            foci_firmware::selftest::restore_safe_state(tmc, enable_pin).await;
                             calibrated = false;
                             motor_enabled = false;
                             MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
@@ -3462,7 +3467,7 @@ mod app {
                         };
                         if gain_restore.await.is_err() {
                             defmt::error!("CalibrateDone: saved gain restore SPI failed");
-                            foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                            foci_firmware::selftest::restore_safe_state(tmc, enable_pin).await;
                             COMMISSION_IN_FLIGHT
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             klipper_reply!(
@@ -3540,7 +3545,7 @@ mod app {
 
                         // Persist inner gains so future calibrate uses them.
                         let inner = &commission_result.inner;
-                        stored_gains = Some(foci_core::pid::InnerLoopGains {
+                        stored_gains = Some(foci_firmware::pid::InnerLoopGains {
                             flux_p: inner.flux_p,
                             flux_i: inner.flux_i,
                             torque_p: inner.torque_p,
@@ -3579,10 +3584,10 @@ mod app {
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
 
                         let status = match inner.status {
-                            foci_core::autotune::CommissionStatus::Accepted => 0u8,
-                            foci_core::autotune::CommissionStatus::AcceptedWithWarnings => 1,
-                            foci_core::autotune::CommissionStatus::InnerOnly => 2,
-                            foci_core::autotune::CommissionStatus::Failed(e) => e.status_code(),
+                            foci_firmware::autotune::CommissionStatus::Accepted => 0u8,
+                            foci_firmware::autotune::CommissionStatus::AcceptedWithWarnings => 1,
+                            foci_firmware::autotune::CommissionStatus::InnerOnly => 2,
+                            foci_firmware::autotune::CommissionStatus::Failed(e) => e.status_code(),
                         };
                         defmt::info!("foci_commission complete: oid={} status={}", oid, status);
                         klipper_reply!(
@@ -3659,7 +3664,7 @@ mod app {
 
                             motor_enabled = false;
                             calibrated = false;
-                            foci_core::selftest::restore_safe_state(tmc, enable_pin).await;
+                            foci_firmware::selftest::restore_safe_state(tmc, enable_pin).await;
 
                             // Zero position counter
                             STEPPER_POSITION.store(0, core::sync::atomic::Ordering::Relaxed);
@@ -3703,7 +3708,7 @@ mod app {
                         torque_p,
                         torque_i,
                     } => {
-                        stored_gains = Some(foci_core::pid::InnerLoopGains {
+                        stored_gains = Some(foci_firmware::pid::InnerLoopGains {
                             flux_p,
                             flux_i,
                             torque_p,
@@ -3749,7 +3754,7 @@ mod app {
                                 oid: u8 = oid,
                                 phase: u8 = 0,
                                 status: u8 =
-                                    foci_core::autotune::CommissionError::MotorEnabled
+                                    foci_firmware::autotune::CommissionError::MotorEnabled
                                         .status_code()
                             );
                             continue;
@@ -3764,7 +3769,7 @@ mod app {
                                 oid: u8 = oid,
                                 phase: u8 = 0,
                                 status: u8 =
-                                    foci_core::autotune::CommissionError::NoCurrent
+                                    foci_firmware::autotune::CommissionError::NoCurrent
                                         .status_code()
                             );
                             continue;
@@ -3773,7 +3778,7 @@ mod app {
                         commission_engine =
                             Some(crate::commission::CommissioningEngine::new_commission(
                                 oid,
-                                foci_core::autotune::CommissionProfile::from_u8(profile),
+                                foci_firmware::autotune::CommissionProfile::from_u8(profile),
                             ));
                         // Trace start deferred to ClosedLoopEntry phase transition
                         // (see PhaseChanged handler). Spec scopes Stage 1 trace to
@@ -3800,7 +3805,7 @@ mod app {
                                 oid: u8 = oid,
                                 phase: u8 = 0,
                                 status: u8 =
-                                    foci_core::autotune::CommissionError::EncoderNotAligned
+                                    foci_firmware::autotune::CommissionError::EncoderNotAligned
                                         .status_code()
                             );
                             continue;
@@ -3815,7 +3820,7 @@ mod app {
                                 oid: u8 = oid,
                                 phase: u8 = 0,
                                 status: u8 =
-                                    foci_core::autotune::CommissionError::NoCurrent
+                                    foci_firmware::autotune::CommissionError::NoCurrent
                                         .status_code()
                             );
                             continue;
@@ -3836,8 +3841,8 @@ mod app {
                             }
                         };
                         let outer_params = crate::commission::OuterTuneParams {
-                            profile: foci_core::autotune::CommissionProfile::from_u8(profile),
-                            mode: foci_core::autotune::OperatingMode::from_u8(mode),
+                            profile: foci_firmware::autotune::CommissionProfile::from_u8(profile),
+                            mode: foci_firmware::autotune::OperatingMode::from_u8(mode),
                             inner_lambda_us,
                             theta_e_us,
                             current_ringing: current_ringing_count > 1,
@@ -3850,9 +3855,9 @@ mod app {
                                 entry_snapshot,
                             ));
                         unsafe {
-                            trace_buf().start(oid, foci_core::trace::PRESET_FULL);
+                            trace_buf().start(oid, foci_firmware::trace::PRESET_FULL);
                             trace_buf()
-                                .set_phase(foci_core::autotune::PhaseId::MechanicalId.to_u8());
+                                .set_phase(foci_firmware::autotune::PhaseId::MechanicalId.to_u8());
                         }
                     }
                     TmcRequest::SelfTest { oid } => {
@@ -3864,7 +3869,7 @@ mod app {
                                 foci_selftest_done,
                                 oid: u8 = oid,
                                 status: u8 =
-                                    foci_core::autotune::CommissionError::MotorEnabled
+                                    foci_firmware::autotune::CommissionError::MotorEnabled
                                         .status_code()
                             );
                             continue;
@@ -3883,7 +3888,7 @@ mod app {
                             });
                         }
                         // Compute feedforward scale factor from step_width and PWM config
-                        velocity_scale = foci_core::tmc::compute_velocity_scale_factor(
+                        velocity_scale = foci_firmware::tmc::compute_velocity_scale_factor(
                             STEP_WIDTH_VALUE
                                 .load(core::sync::atomic::Ordering::Relaxed)
                                 .unsigned_abs(),
@@ -3976,7 +3981,7 @@ mod app {
                 } else {
                     let interval = STEP_INTERVAL.load(core::sync::atomic::Ordering::Relaxed);
                     let forward = STEP_DIRECTION.load(core::sync::atomic::Ordering::Relaxed);
-                    foci_core::tmc::compute_velocity_offset(velocity_scale, interval, forward)
+                    foci_firmware::tmc::compute_velocity_offset(velocity_scale, interval, forward)
                 };
 
                 let _ = tmc
@@ -4360,7 +4365,7 @@ mod app {
         // Velocity biquad.
         let filter_hz = VELOCITY_FILTER_HZ.load(Relaxed);
         if filter_hz > 0
-            && let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt)
+            && let Some(coeffs) = foci_firmware::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt)
         {
             let _ = tmc
                 .write_sub_register(CONFIG_BIQUAD_V_A_1, coeffs.a_1 as u32)
@@ -4383,7 +4388,7 @@ mod app {
         // Torque biquad.
         let filter_hz = TORQUE_FILTER_HZ.load(Relaxed);
         if filter_hz > 0
-            && let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt)
+            && let Some(coeffs) = foci_firmware::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt)
         {
             let _ = tmc
                 .write_sub_register(CONFIG_BIQUAD_T_A_1, coeffs.a_1 as u32)
@@ -4406,7 +4411,7 @@ mod app {
         // Position biquad.
         let filter_hz = POSITION_FILTER_HZ.load(Relaxed);
         if filter_hz > 0
-            && let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt)
+            && let Some(coeffs) = foci_firmware::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt)
         {
             let _ = tmc
                 .write_sub_register(CONFIG_BIQUAD_X_A_1, coeffs.a_1 as u32)
@@ -4429,7 +4434,7 @@ mod app {
         // Flux biquad.
         let filter_hz = FLUX_FILTER_HZ.load(Relaxed);
         if filter_hz > 0
-            && let Some(coeffs) = foci_core::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt)
+            && let Some(coeffs) = foci_firmware::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt)
         {
             let _ = tmc
                 .write_sub_register(CONFIG_BIQUAD_F_A_1, coeffs.a_1 as u32)

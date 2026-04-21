@@ -36,7 +36,7 @@ anchor.workspace = true
 foci-tmc4671 = { path = "../../shared/foci-tmc4671" }
 foci-klipper = { path = "../../shared/foci-klipper" }
 foci-usb-stm32 = { path = "../../shared/foci-usb-stm32" }
-foci-core = { package = "foci-firmware", path = "../../shared/foci-firmware", features = ["defmt"] }
+foci-firmware = { path = "../../shared/foci-firmware", features = ["defmt"] }
 
 # Logging
 defmt.workspace = true
@@ -47,7 +47,7 @@ panic-probe = { version = "1.0", features = ["print-defmt"] }
 heapless.workspace = true
 
 [features]
-dev = ["foci-core/dev"]
+dev = ["foci-firmware/dev"]
 
 [build-dependencies]
 anchor_codegen.workspace = true
