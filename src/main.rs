@@ -13,6 +13,7 @@ pub mod pac {
 
 mod app_types;
 mod board_init;
+mod interrupts;
 mod transport;
 
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [UART4, UART5, USART3])]
@@ -4673,8 +4674,7 @@ mod app {
     /// immediately. The handler only masks and signals — no FIFO access.
     #[task(binds = OTG_FS, priority = 3)]
     fn otg_fs_irq(_ctx: otg_fs_irq::Context) {
-        foci_usb_stm32::irq_handler();
-        USB_WAKE.signal(());
+        crate::interrupts::otg_fs_irq();
     }
 
     /// TMC4671 STATUS pin interrupt (PE8, EXTI line 8).
@@ -4684,16 +4684,7 @@ mod app {
     /// STATUS_FLAGS on next tick to log the cause.
     #[task(binds = EXTI9_5, priority = 3)]
     fn tmc_status_irq(_ctx: tmc_status_irq::Context) {
-        let exti = embassy_stm32::pac::EXTI;
-        exti.pr(0).write(|w| w.set_line(8, true));
-
-        // Immediately quiesce step generation (same P3, atomic)
-        FAULT_ACTIVE.store(true, core::sync::atomic::Ordering::Relaxed);
-        let tim5 = embassy_stm32::pac::TIM5;
-        tim5.dier().modify(|w| w.set_ccie(0, false));
-
-        TMC_DISABLE_SIGNAL.signal(());
-        defmt::warn!("TMC4671 STATUS interrupt: fault detected, step timer disabled");
+        crate::interrupts::tmc_status_irq(&FAULT_ACTIVE, &TMC_DISABLE_SIGNAL);
     }
 
     /// Single USB task replacing usb_pump, usb_receive, usb_send, usb_control.
