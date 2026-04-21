@@ -2326,7 +2326,8 @@ mod app {
 
         // PA4: TMC4671 chip select (active low)
         let spi_cs = Output::new(p.PA4, Level::High, Speed::VeryHigh);
-        let spi_dev = ExclusiveDevice::new(spi1, spi_cs, CycleDelay).unwrap();
+        let spi_dev = ExclusiveDevice::new(spi1, spi_cs, CycleDelay)
+            .expect("ExclusiveDevice::new is infallible");
         let tmc = Tmc4671Spi::new(spi_dev);
 
         // TMC register request channel
