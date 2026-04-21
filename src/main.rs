@@ -13,6 +13,7 @@ pub mod pac {
 
 mod app_types;
 mod board_init;
+mod transport;
 
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [UART4, UART5, USART3])]
 mod app {
@@ -224,8 +225,7 @@ mod app {
         }
     }
 
-    /// USB wake signal. The OTG_FS ISR signals this to wake usb_task.
-    static USB_WAKE: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+    use crate::transport::USB_WAKE;
 
     /// 64-bit uptime tracking. Updated by the stats task every 5 seconds.
     /// `stats_send_time` is the CYCCNT value at last stats send.
@@ -638,22 +638,6 @@ mod app {
         // SAFETY: caller upholds the P1-only + post-init contract of `trace_buf`.
         unsafe {
             &mut *core::ptr::addr_of_mut!(TRACE_BUF).cast::<foci_firmware::trace::TraceBuffer>()
-        }
-    }
-
-    pub struct BufferTransportOutput;
-    pub const TRANSPORT_OUTPUT: BufferTransportOutput = BufferTransportOutput;
-
-    impl TransportOutput for BufferTransportOutput {
-        type Output = ScratchOutput;
-        fn output(&self, f: impl FnOnce(&mut Self::Output)) {
-            let mut scratch = ScratchOutput::new();
-            f(&mut scratch);
-            let output = scratch.result();
-            foci_usb_stm32::tx_write(output);
-            // Wake usb_task to drain TX buffer. Critical for data
-            // generated outside usb_task (stats output from P1).
-            USB_WAKE.signal(());
         }
     }
 
@@ -4845,6 +4829,6 @@ mod app {
 use anchor::klipper_config_generate;
 
 klipper_config_generate!(
-    transport = crate::app::TRANSPORT_OUTPUT: crate::app::BufferTransportOutput,
+    transport = crate::transport::TRANSPORT_OUTPUT: crate::transport::BufferTransportOutput,
     context = &'ctx mut foci_klipper::state::State,
 );
