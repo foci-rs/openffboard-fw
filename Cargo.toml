@@ -36,7 +36,7 @@ anchor.workspace = true
 foci-tmc4671 = { path = "../../shared/foci-tmc4671" }
 foci-klipper = { path = "../../shared/foci-klipper" }
 foci-usb-stm32 = { path = "../../shared/foci-usb-stm32" }
-foci-firmware = { path = "../../shared/foci-firmware", features = ["defmt"] }
+foci-firmware = { path = "../../shared/foci-firmware" }
 
 # Logging
 defmt.workspace = true
