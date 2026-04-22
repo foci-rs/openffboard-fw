@@ -13,6 +13,7 @@ pub mod pac {
 
 mod app_types;
 mod board_init;
+mod firmware_ctx;
 mod heartbeat;
 mod interrupts;
 mod platform_impl;
