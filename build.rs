@@ -3,15 +3,6 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() {
-    // Anchor protocol codegen
-    anchor_codegen::ConfigBuilder::new()
-        .entry("src/main.rs")
-        .set_version(env!("CARGO_PKG_VERSION"))
-        .set_build_versions("")
-        .set_app("foci")
-        .set_license("MIT OR Apache-2.0")
-        .build();
-
     // Copy the appropriate memory layout to OUT_DIR.
     // Default: Katapult bootloader offset (0x08008000).
     // With --features dev-flash: direct flash at 0x08000000 for probe-rs.

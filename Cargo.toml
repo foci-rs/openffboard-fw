@@ -30,8 +30,9 @@ cortex-m-rt = "0.7"
 critical-section = "1.2"
 
 # Klipper protocol
-anchor.workspace = true
 ankyra.workspace = true
+ankyra-macros.workspace = true
+ankyra-assemble.workspace = true
 
 # Project crates
 foci-tmc4671 = { path = "../../shared/foci-tmc4671" }
@@ -49,6 +50,3 @@ heapless.workspace = true
 
 [features]
 dev = ["foci-firmware/dev"]
-
-[build-dependencies]
-anchor_codegen.workspace = true
