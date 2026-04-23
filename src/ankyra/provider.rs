@@ -122,6 +122,20 @@ ankyra::ankyra_provider! {
     enumerations: [
         crate::ankyra::enumerations::Pins,
     ],
+    constants: [
+        crate::ankyra::constants::CLOCK_FREQ,
+        crate::ankyra::constants::MCU,
+        crate::ankyra::constants::RECEIVE_WINDOW,
+        crate::ankyra::constants::RESERVE_PINS_DRV,
+        crate::ankyra::constants::RESERVE_PINS_LED,
+        crate::ankyra::constants::RESERVE_PINS_SPI,
+        crate::ankyra::constants::RESERVE_PINS_STEP,
+        crate::ankyra::constants::RESERVE_PINS_SWD,
+        crate::ankyra::constants::RESERVE_PINS_TMC,
+        crate::ankyra::constants::RESERVE_PINS_USB,
+        crate::ankyra::constants::STATS_SUMSQ_BASE,
+        crate::ankyra::constants::STEPPER_STEP_BOTH_EDGE,
+    ],
 }
 
 #[cfg(not(feature = "dev"))]
@@ -213,5 +227,19 @@ ankyra::ankyra_provider! {
     ],
     enumerations: [
         crate::ankyra::enumerations::Pins,
+    ],
+    constants: [
+        crate::ankyra::constants::CLOCK_FREQ,
+        crate::ankyra::constants::MCU,
+        crate::ankyra::constants::RECEIVE_WINDOW,
+        crate::ankyra::constants::RESERVE_PINS_DRV,
+        crate::ankyra::constants::RESERVE_PINS_LED,
+        crate::ankyra::constants::RESERVE_PINS_SPI,
+        crate::ankyra::constants::RESERVE_PINS_STEP,
+        crate::ankyra::constants::RESERVE_PINS_SWD,
+        crate::ankyra::constants::RESERVE_PINS_TMC,
+        crate::ankyra::constants::RESERVE_PINS_USB,
+        crate::ankyra::constants::STATS_SUMSQ_BASE,
+        crate::ankyra::constants::STEPPER_STEP_BOTH_EDGE,
     ],
 }

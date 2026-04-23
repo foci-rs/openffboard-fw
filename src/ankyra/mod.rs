@@ -7,6 +7,7 @@
 //! `ankyra_config!` invocation stays at the crate root (`main.rs`)
 //! because ankyra requires it there.
 
+pub mod constants;
 pub mod enumerations;
 pub mod handlers;
 pub mod outputs;
