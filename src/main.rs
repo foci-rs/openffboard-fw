@@ -26,36 +26,27 @@ mod usb_task;
 
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [UART4, UART5, USART3])]
 mod app {
-    use core::cell::RefCell;
-
     use ::ankyra::klipper_constant;
-    use critical_section::Mutex;
     use embassy_stm32::gpio::{Level, Output, Speed};
     use embassy_stm32::spi::Spi;
     use embassy_stm32::wdg::IndependentWatchdog;
     use embassy_stm32::{bind_interrupts, peripherals};
-    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-    use embassy_sync::signal::Signal;
     use embedded_hal_bus::spi::ExclusiveDevice;
     use foci_klipper::state::State;
     use foci_tmc4671::spi::Tmc4671Spi;
     use rtic_monotonics::stm32::prelude::*;
-    use rtic_sync::channel::{Receiver, Sender};
+    use rtic_sync::channel::Receiver;
 
     use crate::app_types::{CycleDelay, TmcSpiDevice};
     use crate::helpers::lifecycle::*;
     use crate::helpers::stepper::*;
-    use crate::helpers::tmc::*;
     use crate::helpers::trsync::*;
     use crate::state::lifecycle::*;
     use crate::state::stepper::*;
     use crate::state::tmc::*;
     use crate::state::trace::*;
     use crate::state::trsync::*;
-    use crate::trigger_domain::{
-        PHYSICAL_STEPPER_INDICES, TRIGGER_DOMAIN, TriggerDomain, stop_physical_stepper_no_lock,
-        with_trigger_domain,
-    };
+    use crate::trigger_domain::{TRIGGER_DOMAIN, TriggerDomain, with_trigger_domain};
 
     bind_interrupts!(struct Irqs {
         DMA2_STREAM2 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH2>;
@@ -80,9 +71,6 @@ mod app {
     const TRACE_SPI_BUDGET_FAST_US: u64 = 300;
     /// SPI budget for full trace preset (us). Estimated ~450us from fast ratio.
     const TRACE_SPI_BUDGET_FULL_US: u64 = 550;
-
-    /// Number of TMC4671 motor channels on OpenFFBoard (single-motor board).
-    const TMC_MOTOR_COUNT: u8 = 1;
 
     /// Current scaling for OpenFFBoard: milliamps per ADC least significant bit.
     /// Derived from sense resistor value and ADC configuration.
@@ -241,10 +229,18 @@ mod app {
     }
 
     // ---- Klipper constants ----
+    //
+    // `#[klipper_constant]` registers each value into the Klipper data
+    // dictionary via generated carrier macros. Several constants below
+    // (MCU, STEPPER_STEP_BOTH_EDGE, RECEIVE_WINDOW, STATS_SUMSQ_BASE,
+    // RESERVE_PINS_*) are only consumed over the wire and are never
+    // referenced from Rust — the `#[allow(dead_code)]` suppresses the
+    // unused-const lint without masking genuinely dead code elsewhere.
 
     #[klipper_constant]
     const CLOCK_FREQ: u32 = 84_000_000;
 
+    #[allow(dead_code)]
     #[klipper_constant]
     const MCU: &str = "stm32f407xx";
 
@@ -272,12 +268,15 @@ mod app {
     //
     // The constant is therefore a protocol-parity advertisement, not a
     // capability gate.
+    #[allow(dead_code)]
     #[klipper_constant]
     const STEPPER_STEP_BOTH_EDGE: u32 = 1;
 
+    #[allow(dead_code)]
     #[klipper_constant]
     const RECEIVE_WINDOW: u32 = 192;
 
+    #[allow(dead_code)]
     #[klipper_constant]
     const STATS_SUMSQ_BASE: u32 = 256;
 
@@ -285,25 +284,32 @@ mod app {
     // Tells the Klipper host which pins are firmware-owned and must not be
     // assigned to user-facing config sections (steppers, heaters, fans, etc.).
 
+    #[allow(dead_code)]
     #[klipper_constant]
     const RESERVE_PINS_USB: &str = "PA9,PA11,PA12";
 
+    #[allow(dead_code)]
     #[klipper_constant]
     const RESERVE_PINS_SPI: &str = "PA4,PA5,PA6,PA7";
 
+    #[allow(dead_code)]
     #[klipper_constant]
     const RESERVE_PINS_TMC: &str = "PE7,PE8,PE10,PE12";
 
+    #[allow(dead_code)]
     #[klipper_constant]
     const RESERVE_PINS_LED: &str = "PD7,PE0,PE1";
 
+    #[allow(dead_code)]
     #[klipper_constant]
     const RESERVE_PINS_SWD: &str = "PA13,PA14";
 
+    #[allow(dead_code)]
     #[klipper_constant]
     const RESERVE_PINS_DRV: &str = "PB0,PB1,PC4,PC5";
 
     /// STEP (PB11) and DIR (PA0) GPIO pins for TMC4671 hardware step/dir.
+    #[allow(dead_code)]
     #[klipper_constant]
     const RESERVE_PINS_STEP: &str = "PA0,PB11";
 

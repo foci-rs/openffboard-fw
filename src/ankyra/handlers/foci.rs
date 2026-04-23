@@ -148,6 +148,11 @@ pub fn foci_commission(_ctx: &mut FirmwareCtx<'_>, oid: u8, profile: u8) {
 }
 
 /// Start Stage 2 installed tuning (mechanical ID + velocity/position/filters).
+///
+/// The parameter list is dictated by the Klipper wire protocol — collapsing
+/// it into a struct would break the host command format, so the clippy lint
+/// is suppressed at the handler level.
+#[allow(clippy::too_many_arguments)]
 #[klipper_command]
 pub fn foci_tune(
     _ctx: &mut FirmwareCtx<'_>,
