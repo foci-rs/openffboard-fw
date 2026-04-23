@@ -307,38 +307,6 @@ mod app {
     #[klipper_constant]
     const RESERVE_PINS_STEP: &str = "PA0,PB11";
 
-    // ---- TrSync and Endstop commands ----
-
-    /// SPI configuration stub (TMC4671 SPI is handled internally).
-    #[klipper_command]
-    pub fn config_spi(_oid: u8, _pin: u32, _cs_active_high: u8) {
-        foci_klipper::commands::spi::config_spi(_oid, _pin, _cs_active_high);
-    }
-
-    /// SPI configuration without chip-select stub.
-    #[klipper_command]
-    pub fn config_spi_without_cs(_oid: u8) {
-        foci_klipper::commands::spi::config_spi_without_cs(_oid);
-    }
-
-    /// SPI bus assignment stub.
-    #[klipper_command]
-    pub fn spi_set_bus(_oid: u8, _spi_bus: u32, _mode: u32, _rate: u32) {
-        foci_klipper::commands::spi::spi_set_bus(_oid, _spi_bus, _mode, _rate);
-    }
-
-    /// SPI shutdown message configuration stub.
-    #[klipper_command]
-    pub fn config_spi_shutdown(_oid: u8, _spi_oid: u8, _shutdown_msg: &[u8]) {
-        foci_klipper::commands::spi::config_spi_shutdown(_oid, _spi_oid, _shutdown_msg);
-    }
-
-    /// SPI send stub (data is accepted but not forwarded).
-    #[klipper_command]
-    pub fn spi_send(_oid: u8, _data: &[u8]) {
-        foci_klipper::commands::spi::spi_send(_oid, _data);
-    }
-
     // ---- TMC4671 register access commands ----
 
     /// Trigger TMC4671 initialization sequence.
@@ -659,13 +627,6 @@ mod app {
             current_ringing,
             current_bw,
         });
-    }
-
-    /// SPI transfer stub (returns empty response).
-    #[klipper_command]
-    pub fn spi_transfer(_oid: u8, _data: &[u8]) {
-        let empty: &[u8] = &[];
-        klipper_reply!(spi_transfer_response, oid: u8 = _oid, response: &[u8] = empty);
     }
 
     // ---- RTIC resources ----
