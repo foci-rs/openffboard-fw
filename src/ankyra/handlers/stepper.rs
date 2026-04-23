@@ -11,10 +11,11 @@ use ankyra::prelude::klipper_command;
 use crate::firmware_ctx::FirmwareCtx;
 use crate::helpers::lifecycle::{enter_shutdown, read_tim5};
 use crate::helpers::stepper::arm_step_timer;
-use crate::state::stepper::{ISR_STEPPER, P2_STEPPER, STEP_QUEUE, STEPPER_POSITION};
-use crate::state::tmc::MOTOR_ARMED;
-use crate::state::trsync::HOMING_STATE;
+use crate::state::stepper::{ISR_STEPPER, P2_STEPPER, STEP_QUEUE};
 use crate::trigger_domain::with_trigger_domain;
+use foci_firmware::state::stepper::STEPPER_POSITION;
+use foci_firmware::state::tmc::MOTOR_ARMED;
+use foci_firmware::state::trsync::HOMING_STATE;
 
 /// Register a stepper motor object.
 ///

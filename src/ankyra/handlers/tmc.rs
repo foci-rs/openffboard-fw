@@ -14,7 +14,7 @@ use ankyra::prelude::klipper_command;
 use crate::firmware_ctx::FirmwareCtx;
 use crate::helpers::lifecycle::{enter_shutdown, read_tim5};
 use crate::helpers::tmc::tmc_send;
-use crate::state::tmc::{
+use foci_firmware::state::tmc::{
     FLUX_FILTER_HZ, POSITION_FILTER_HZ, STEP_WIDTH_VALUE, TORQUE_FILTER_HZ, VELOCITY_FEEDFORWARD,
     VELOCITY_FILTER_HZ, VELOCITY_LIMIT_CFG,
 };

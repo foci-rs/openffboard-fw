@@ -1,12 +1,9 @@
 //! Board-level static state, decomposed by subsystem.
 //!
-//! Each submodule holds the `pub(crate) static` atomics and simple
-//! statics for its subsystem. Task 8b populates these from `mod app`
-//! in main.rs. Future boards may eventually share these via a common
-//! crate.
+//! Each submodule holds only the board-local statics (RTIC channel senders,
+//! hardware-capacity queues, HardwareStepper handles). Cross-priority
+//! atomics and the TMC disable signal have moved to `foci_firmware::state::*`.
 
-pub mod lifecycle;
 pub mod stepper;
 pub mod tmc;
 pub mod trace;
-pub mod trsync;

@@ -11,17 +11,19 @@ use ankyra::prelude::klipper_command;
 
 use crate::firmware_ctx::FirmwareCtx;
 use crate::helpers::lifecycle::{KATAPULT_BYPASS, enter_shutdown, katapult_reset, read_tim5};
-use crate::state::lifecycle::{SHUTDOWN_ACTIVE, STATS_SEND_TIME, STATS_SEND_TIME_HIGH};
-use crate::state::stepper::STEPPER_POSITION_TARGET;
-use crate::state::tmc::{
+use crate::trigger_domain::{
+    PHYSICAL_STEPPER_INDICES, stop_physical_stepper_no_lock, with_trigger_domain,
+};
+use foci_firmware::state::lifecycle::{
+    REPORT_PENDING, SHUTDOWN_ACTIVE, STATS_SEND_TIME, STATS_SEND_TIME_HIGH,
+};
+use foci_firmware::state::stepper::STEPPER_POSITION_TARGET;
+use foci_firmware::state::tmc::{
     COMMISSION_IN_FLIGHT, CURRENT_LIMIT_REG, ENCODER_REVERSED, FEEDFORWARD_RESET, FLUX_FILTER_HZ,
     PID_ERROR_SUMS_CLEAR, POSITION_FILTER_HZ, TMC_QUEUE_FLUSH, TORQUE_FILTER_HZ,
     VELOCITY_FEEDFORWARD, VELOCITY_FILTER_HZ, VELOCITY_LIMIT_CFG,
 };
-use crate::state::trsync::{ENDSTOP_PIN_IDS, HOMING_STATE, HOMING_TRIGGERED, REPORT_PENDING};
-use crate::trigger_domain::{
-    PHYSICAL_STEPPER_INDICES, stop_physical_stepper_no_lock, with_trigger_domain,
-};
+use foci_firmware::state::trsync::{ENDSTOP_PIN_IDS, HOMING_STATE, HOMING_TRIGGERED};
 
 #[klipper_command(in_shutdown)]
 pub fn get_clock(_ctx: &mut FirmwareCtx<'_>) {

@@ -41,12 +41,14 @@ mod app {
     use crate::helpers::lifecycle::*;
     use crate::helpers::stepper::*;
     use crate::helpers::trsync::*;
-    use crate::state::lifecycle::*;
     use crate::state::stepper::*;
     use crate::state::tmc::*;
     use crate::state::trace::*;
-    use crate::state::trsync::*;
     use crate::trigger_domain::{TRIGGER_DOMAIN, TriggerDomain, with_trigger_domain};
+    use foci_firmware::state::lifecycle::*;
+    use foci_firmware::state::stepper::*;
+    use foci_firmware::state::tmc::*;
+    use foci_firmware::state::trsync::*;
 
     bind_interrupts!(struct Irqs {
         DMA2_STREAM2 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH2>;

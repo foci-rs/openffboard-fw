@@ -2,8 +2,8 @@
 //! Promoted from `mod app` in `main.rs` by Task 8c so handlers and the
 //! step-timer ISR share a single implementation.
 
-use crate::state::stepper::STEP_TIMER_ACTIVE_MIRROR;
 use crate::trigger_domain::stop_physical_stepper_no_lock;
+use foci_firmware::state::stepper::STEP_TIMER_ACTIVE_MIRROR;
 
 /// Minimum lead time when arming TIM5 CC1 from thread context.
 ///

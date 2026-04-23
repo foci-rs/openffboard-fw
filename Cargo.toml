@@ -20,7 +20,7 @@ embassy-stm32 = { version = "0.6", features = [
 ] }
 embassy-time = "0.5"
 embassy-futures = "0.1"
-embassy-sync = "0.6"
+embassy-sync.workspace = true
 embedded-hal-async = { workspace = true }
 embedded-hal-bus = { version = "0.3", features = ["async"] }
 

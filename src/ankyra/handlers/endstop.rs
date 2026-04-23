@@ -10,8 +10,8 @@ use ankyra::prelude::klipper_command;
 use crate::firmware_ctx::FirmwareCtx;
 use crate::helpers::lifecycle::{enter_shutdown, read_tim5};
 use crate::helpers::trsync::{GPIO_MAX_PIN_VALUE, gpio_configure_input, gpio_read_pin};
-use crate::state::trsync::ENDSTOP_PIN_IDS;
 use crate::trigger_domain::with_trigger_domain;
+use foci_firmware::state::trsync::ENDSTOP_PIN_IDS;
 
 /// Register an endstop object.
 ///

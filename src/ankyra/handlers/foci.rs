@@ -13,7 +13,7 @@ use ankyra::prelude::klipper_command;
 
 use crate::firmware_ctx::FirmwareCtx;
 use crate::helpers::tmc::{FociTuneParams, foci_tune_inner, tmc_send};
-use crate::state::tmc::{COMMISSION_IN_FLIGHT, STEP_WIDTH_VALUE};
+use foci_firmware::state::tmc::{COMMISSION_IN_FLIGHT, STEP_WIDTH_VALUE};
 
 /// Trigger TMC4671 self-test diagnostic via the commissioning engine.
 ///

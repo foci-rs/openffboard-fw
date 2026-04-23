@@ -7,12 +7,12 @@ use core::sync::atomic::Ordering::Relaxed;
 
 use foci_klipper::state::State;
 
-use crate::state::lifecycle::SHUTDOWN_ACTIVE;
-use crate::state::tmc::TMC_DISABLE_SIGNAL;
-use crate::state::trsync::{HOMING_STATE, HOMING_TRIGGERED, REPORT_PENDING};
 use crate::trigger_domain::{
     PHYSICAL_STEPPER_INDICES, stop_physical_stepper_no_lock, with_trigger_domain,
 };
+use foci_firmware::state::lifecycle::{REPORT_PENDING, SHUTDOWN_ACTIVE};
+use foci_firmware::state::tmc::TMC_DISABLE_SIGNAL;
+use foci_firmware::state::trsync::{HOMING_STATE, HOMING_TRIGGERED};
 
 /// Katapult bootloader vector table base (from Klipper `armcm_reset.c`).
 pub(crate) const KATAPULT_BOOT_ADDRESS: u32 = 0x0800_0000;

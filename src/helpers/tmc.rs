@@ -5,7 +5,8 @@
 
 use foci_firmware::tmc::TmcRequest;
 
-use crate::state::tmc::{COMMISSION_IN_FLIGHT, TMC_REQUEST_SENDER};
+use crate::state::tmc::TMC_REQUEST_SENDER;
+use foci_firmware::state::tmc::COMMISSION_IN_FLIGHT;
 
 /// Parameters for `foci_tune` grouped into a struct to satisfy
 /// clippy's `too_many_arguments` lint. The `#[klipper_command]`

@@ -9,8 +9,8 @@ use ankyra::prelude::klipper_command;
 
 use crate::firmware_ctx::FirmwareCtx;
 use crate::helpers::lifecycle::{enter_shutdown, read_tim5};
-use crate::state::trsync::{HOMING_STATE, HOMING_TRIGGERED};
 use crate::trigger_domain::with_trigger_domain;
+use foci_firmware::state::trsync::{HOMING_STATE, HOMING_TRIGGERED};
 
 /// Register a TrSync (trigger synchronization) object.
 ///

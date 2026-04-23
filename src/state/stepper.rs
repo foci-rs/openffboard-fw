@@ -1,36 +1,6 @@
-//! Stepper-subsystem state (queue, position, direction latches, step
-//! clock). Task 8b populates this from `mod app` in main.rs.
-
-/// Stepper position target, updated by usb_receive (P2) after each
-/// protocol dispatch, read by tmc_control (P1) for SPI writes.
-/// Lockfree: AtomicI32 avoids priority ceiling lock that would
-/// block P2 protocol tasks.
-pub(crate) static STEPPER_POSITION_TARGET: core::sync::atomic::AtomicI32 =
-    core::sync::atomic::AtomicI32::new(0);
-
-/// Step count (incremented by P3 ISR, read by P1/P2 for stepper_get_position).
-pub(crate) static STEPPER_POSITION: core::sync::atomic::AtomicI32 =
-    core::sync::atomic::AtomicI32::new(0);
-
-/// Current step interval in TIM5 clock ticks, written by P3 after
-/// every step event. Written to 0 when the step queue drains (both
-/// the ISR empty-queue branch and stepper_stop). Read by tmc_control
-/// at 1 kHz for velocity feedforward computation.
-pub(crate) static STEP_INTERVAL: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-
-/// Current step direction, written by P3 when direction changes.
-/// true = forward, false = reverse. Read by tmc_control for
-/// feedforward sign.
-pub(crate) static STEP_DIRECTION: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(true);
-
-/// Read-only mirror of `stepper_stop[0].timer_active` for P1.
-/// Written inside TriggerDomain lock via `set_timer_active()`,
-/// read by P1 for advisory purposes (PID settle timing).
-/// P1 must never enter TriggerDomain.
-pub(crate) static STEP_TIMER_ACTIVE_MIRROR: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+//! Stepper-subsystem board-local state (queue, hardware stepper handles).
+//! The cross-priority atomics (position, interval, direction, timer mirror)
+//! have moved to `foci_firmware::state::stepper`.
 
 /// Lock-free move queue for hardware step/dir.
 /// P2 enqueues, P3 dequeues. When timer is disabled, P1/P2 may drain.

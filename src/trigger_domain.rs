@@ -7,11 +7,10 @@
 //! the subsystem `state/*` modules makes the coordination surface
 //! inspectable independently of RTIC's macro expansion.
 
-use crate::state::stepper::{
-    ISR_STEPPER, STEP_DIRECTION, STEP_INTERVAL, STEP_QUEUE, STEP_TIMER_ACTIVE_MIRROR,
-};
-use crate::state::tmc::PID_ERROR_SUMS_CLEAR;
-use crate::state::trsync::HOMING_TRIGGERED;
+use crate::state::stepper::{ISR_STEPPER, STEP_QUEUE};
+use foci_firmware::state::stepper::{STEP_DIRECTION, STEP_INTERVAL, STEP_TIMER_ACTIVE_MIRROR};
+use foci_firmware::state::tmc::PID_ERROR_SUMS_CLEAR;
+use foci_firmware::state::trsync::HOMING_TRIGGERED;
 
 // ---- TriggerDomain: unified trsync/endstop/stepper-stop resource ----
 
