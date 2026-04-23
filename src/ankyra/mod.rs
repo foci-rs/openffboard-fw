@@ -10,4 +10,5 @@
 pub mod enumerations;
 pub mod handlers;
 pub mod outputs;
+pub mod provider;
 pub mod replies;
