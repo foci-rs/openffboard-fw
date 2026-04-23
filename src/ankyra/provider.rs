@@ -125,7 +125,7 @@ ankyra::ankyra_provider! {
     constants: [
         crate::ankyra::constants::CLOCK_FREQ,
         crate::ankyra::constants::MCU,
-        crate::ankyra::constants::RECEIVE_WINDOW,
+        crate::ankyra::firmware_constants::RECEIVE_WINDOW,
         crate::ankyra::constants::RESERVE_PINS_DRV,
         crate::ankyra::constants::RESERVE_PINS_LED,
         crate::ankyra::constants::RESERVE_PINS_SPI,
@@ -133,8 +133,8 @@ ankyra::ankyra_provider! {
         crate::ankyra::constants::RESERVE_PINS_SWD,
         crate::ankyra::constants::RESERVE_PINS_TMC,
         crate::ankyra::constants::RESERVE_PINS_USB,
-        crate::ankyra::constants::STATS_SUMSQ_BASE,
-        crate::ankyra::constants::STEPPER_STEP_BOTH_EDGE,
+        crate::ankyra::firmware_constants::STATS_SUMSQ_BASE,
+        crate::ankyra::firmware_constants::STEPPER_STEP_BOTH_EDGE,
     ],
 }
 
@@ -231,7 +231,7 @@ ankyra::ankyra_provider! {
     constants: [
         crate::ankyra::constants::CLOCK_FREQ,
         crate::ankyra::constants::MCU,
-        crate::ankyra::constants::RECEIVE_WINDOW,
+        crate::ankyra::firmware_constants::RECEIVE_WINDOW,
         crate::ankyra::constants::RESERVE_PINS_DRV,
         crate::ankyra::constants::RESERVE_PINS_LED,
         crate::ankyra::constants::RESERVE_PINS_SPI,
@@ -239,7 +239,7 @@ ankyra::ankyra_provider! {
         crate::ankyra::constants::RESERVE_PINS_SWD,
         crate::ankyra::constants::RESERVE_PINS_TMC,
         crate::ankyra::constants::RESERVE_PINS_USB,
-        crate::ankyra::constants::STATS_SUMSQ_BASE,
-        crate::ankyra::constants::STEPPER_STEP_BOTH_EDGE,
+        crate::ankyra::firmware_constants::STATS_SUMSQ_BASE,
+        crate::ankyra::firmware_constants::STEPPER_STEP_BOTH_EDGE,
     ],
 }

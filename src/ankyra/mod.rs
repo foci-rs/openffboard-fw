@@ -22,3 +22,9 @@ pub mod replies {
 pub mod outputs {
     pub use foci_firmware::ankyra::outputs::*;
 }
+// Re-export foci-firmware firmware-wide constants for ankyra_provider! compatibility.
+// Board-specific constants (CLOCK_FREQ, MCU, RESERVE_PINS_*) are defined in the local
+// constants module.
+pub mod firmware_constants {
+    pub use foci_firmware::ankyra::constants::*;
+}

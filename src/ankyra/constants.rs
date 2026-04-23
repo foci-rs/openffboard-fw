@@ -19,42 +19,6 @@ pub const CLOCK_FREQ: u32 = 84_000_000;
 #[klipper_constant]
 pub const MCU: &str = "stm32f407xx";
 
-// STEPPER_STEP_BOTH_EDGE=1 matches the value Klipper C declares
-// unconditionally in `src/stepper.c`, which suppresses Klipper's
-// "MCU has deprecated code" startup warning. Reporting anything
-// else (0 or absent) fires the warning permanently with no user-
-// facing way to silence it.
-//
-// Safety does NOT depend on this value:
-//   - The only driver module that binds to this firmware is
-//     `klipper-foci`, which never calls
-//     `setup_default_pulse_duration(..., step_both_edge=True)`, so
-//     `_req_step_both_edge` stays False and Klipper never activates
-//     toggle-mode stepping for FOCI steppers.
-//   - The firmware's step ISR only implements `stepper_event_full`
-//     semantics: it always doubles `count` internally and always
-//     emits a STEP rising edge followed by a falling edge. Klipper
-//     queue_step counts are motor-step counts in both Klipper modes,
-//     so the TMC4671 sees the right number of rising edges even if
-//     a future driver module were to request toggle mode.
-//   - The TMC4671 itself only counts rising edges on STEP
-//     (datasheet §4.2.4), so any accidental toggle-mode generation
-//     by the firmware would be caught as a test failure immediately.
-//
-// The constant is therefore a protocol-parity advertisement, not a
-// capability gate.
-#[allow(dead_code)]
-#[klipper_constant]
-pub const STEPPER_STEP_BOTH_EDGE: u32 = 1;
-
-#[allow(dead_code)]
-#[klipper_constant]
-pub const RECEIVE_WINDOW: u32 = 192;
-
-#[allow(dead_code)]
-#[klipper_constant]
-pub const STATS_SUMSQ_BASE: u32 = 256;
-
 // ---- Reserved pin constants ----
 // Tells the Klipper host which pins are firmware-owned and must not be
 // assigned to user-facing config sections (steppers, heaters, fans, etc.).
