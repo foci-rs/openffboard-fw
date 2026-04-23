@@ -11,6 +11,7 @@ pub mod pac {
     pub use embassy_stm32::pac::*;
 }
 
+mod ankyra;
 mod app_types;
 mod board_init;
 mod firmware_ctx;

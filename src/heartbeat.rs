@@ -3,7 +3,8 @@
 //! declared in `main.rs`; the task shells handle only RTIC plumbing
 //! (Mono, local-resource binding) and delegate all work here.
 
-use anchor::{klipper_output, klipper_reply};
+use crate::ankyra::outputs::stats;
+use crate::ankyra::replies::trsync_state;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use embassy_stm32::gpio::Output;
 use embassy_stm32::peripherals;
@@ -72,11 +73,11 @@ pub fn stats_tick(
     }
 
     defmt::info!("stats tick");
-    klipper_output!(
-        "stats count=%u sum=%u sumsq=%u",
-        accumulator.count,
-        accumulator.sum,
-        accumulator.sumsq
+    ::ankyra::klipper_output!(
+        stats,
+        count: u32 = accumulator.count,
+        sum: u32 = accumulator.sum,
+        sumsq: u32 = accumulator.sumsq,
     );
     wdg.pet();
 
@@ -100,12 +101,12 @@ where
     drain_snapshots(&mut snapshots);
     report_pending.store(false, Relaxed);
     for snap in &snapshots {
-        klipper_reply!(
+        ::ankyra::klipper_reply!(
             trsync_state,
             oid: u8 = snap.oid,
             can_trigger: u8 = snap.can_trigger,
             trigger_reason: u8 = snap.trigger_reason,
-            clock: u32 = snap.clock
+            clock: u32 = snap.clock,
         );
     }
 }
