@@ -1,10 +1,10 @@
-//! Board-level type aliases and the Klipper pin enumeration.
+//! Board-level type aliases and shared helper types.
 //!
 //! Items that are naturally `mod app`-scoped but do not need to live
 //! next to the RTIC task graph are collected here so `main.rs` stays
-//! focused on the RTIC wiring.
+//! focused on the RTIC wiring. The `Pins` wire enumeration moved to
+//! `crate::ankyra::enumerations` during the ankyra migration (Task 8a).
 
-use anchor::klipper_enumeration;
 use embassy_stm32::gpio::Output;
 use embassy_stm32::mode::Async as AsyncMode;
 use embassy_stm32::spi::Spi;
@@ -29,24 +29,3 @@ impl embedded_hal_async::delay::DelayNs for CycleDelay {
 
 /// TMC4671 SPI device with exclusive bus access and software CS.
 pub type TmcSpiDevice = ExclusiveDevice<Spi1Bus, Output<'static>, CycleDelay>;
-
-// Pin enumerations at crate root (outside `mod app`) so anchor_codegen
-// can discover them. TMC4671 handles all pins internally — these exist
-// only for Klipper config pin name resolution.
-klipper_enumeration!(
-    #[allow(non_camel_case_types)]
-    #[klipper_enumeration(name = "pin")]
-    pub enum Pins {
-        Range(PA, 0, 16),
-        Range(PB, 0, 16),
-        Range(PC, 0, 16),
-        Range(PD, 0, 16),
-        Range(PE, 0, 16),
-        // Virtual pins for FOCI stepper control.
-        // STEP/DIR are handled internally (no GPIO toggle).
-        // ENA maps to the TMC4671 enable pin (PE7 on OpenFFBoard).
-        STEP0,
-        DIR0,
-        ENA0,
-    }
-);

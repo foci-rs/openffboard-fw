@@ -16,8 +16,10 @@ mod app_types;
 mod board_init;
 mod firmware_ctx;
 mod heartbeat;
+mod helpers;
 mod interrupts;
 mod platform_impl;
+mod state;
 mod transport;
 mod usb_task;
 
