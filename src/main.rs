@@ -42,6 +42,11 @@ mod app {
     use rtic_sync::channel::{Receiver, Sender};
 
     use crate::app_types::{CycleDelay, TmcSpiDevice};
+    use crate::state::lifecycle::*;
+    use crate::state::stepper::*;
+    use crate::state::tmc::*;
+    use crate::state::trace::*;
+    use crate::state::trsync::*;
 
     bind_interrupts!(struct Irqs {
         DMA2_STREAM2 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH2>;
@@ -61,8 +66,6 @@ mod app {
     stm32_tim2_monotonic!(Mono, 1_000_000);
 
     use foci_firmware::tmc::TmcRequest;
-
-    const TMC_CHANNEL_SIZE: usize = 8;
 
     /// SPI budget for fast trace preset (us). DWT measured ~227us on hardware.
     const TRACE_SPI_BUDGET_FAST_US: u64 = 300;
@@ -203,193 +206,11 @@ mod app {
         }
     }
 
-    /// 64-bit uptime tracking. Updated by the stats task every 5 seconds.
-    /// `stats_send_time` is the CYCCNT value at last stats send.
-    /// `stats_send_time_high` counts 32-bit CYCCNT wraps (~25.5s at 168MHz).
-    static STATS_SEND_TIME: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    static STATS_SEND_TIME_HIGH: core::sync::atomic::AtomicU32 =
-        core::sync::atomic::AtomicU32::new(0);
-
-    /// Emergency motor disable signal. Set by enter_shutdown(), consumed
-    /// by tmc_control. Uses a Signal so tmc_control wakes immediately
-    /// even if blocked on an empty channel.
-    static TMC_DISABLE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-
-    /// Stepper position target, updated by usb_receive (P2) after each
-    /// protocol dispatch, read by tmc_control (P1) for SPI writes.
-    /// Lockfree: AtomicI32 avoids priority ceiling lock that would
-    /// block P2 protocol tasks.
-    static STEPPER_POSITION_TARGET: core::sync::atomic::AtomicI32 =
-        core::sync::atomic::AtomicI32::new(0);
-
-    /// Current limit for PID_TORQUE_FLUX_LIMITS (0x5E).
-    /// Datasheet: single u16 field at bits[15:0]; upper 16 bits ignored by hardware.
-    /// Set by tmc_set_current, re-applied during calibration to ensure
-    /// the limit is correct regardless of TMC4671 register state.
-    static CURRENT_LIMIT_REG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
-    /// Velocity biquad filter cutoff frequency in Hz (set by tmc_set_velocity_filter).
-    /// 0 = disabled, 10..=1000 = enabled. Applied during closed-loop entry.
-    static VELOCITY_FILTER_HZ: core::sync::atomic::AtomicU16 =
-        core::sync::atomic::AtomicU16::new(0);
-
-    /// Torque biquad filter cutoff frequency in Hz (set by tmc_set_torque_filter).
-    /// 0 = disabled, 10..=1000 = enabled. Applied during closed-loop entry.
-    static TORQUE_FILTER_HZ: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
-
-    /// Position target biquad filter cutoff frequency in Hz (set by tmc_set_position_filter).
-    /// 0 = disabled, 10..=1000 = enabled. Applied during closed-loop entry.
-    static POSITION_FILTER_HZ: core::sync::atomic::AtomicU16 =
-        core::sync::atomic::AtomicU16::new(0);
-
-    /// Flux biquad filter cutoff frequency in Hz (set by tmc_set_flux_filter).
-    /// 0 = disabled, 10..=1000 = enabled. Applied during closed-loop entry.
-    static FLUX_FILTER_HZ: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
-
-    /// Velocity feedforward enable flag (set by tmc_set_velocity_feedforward).
-    /// When true, the 1ms tick loop computes velocity from the step
-    /// interval and writes PID_VELOCITY_OFFSET.
-    static VELOCITY_FEEDFORWARD: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-
-    /// Signal the tick loop to zero feedforward for one tick after a
-    /// direction change. Avoids a sign-flip transient in
-    /// PID_VELOCITY_OFFSET. Set by handle_tmc_request when encoder
-    /// direction changes, consumed by tmc_control on next iteration.
-    static FEEDFORWARD_RESET: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-
-    /// Signal the tick loop to clear TMC4671 PID error sums after motion.
-    /// The step ISR cannot use SPI, so it sets this flag when the hardware
-    /// step queue drains and P1 performs the register writes on the next tick.
-    static PID_ERROR_SUMS_CLEAR: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-
-    /// Configurable PID velocity limit (caps position PID output).
-    /// Prevents integrator-driven velocity runaway when position I > 0.
-    /// Override via tmc_set_velocity_limit command from host config.
-    /// Written to PID_VELOCITY_LIMIT (0x60) during closedloop entry.
-    static VELOCITY_LIMIT_CFG: core::sync::atomic::AtomicU32 =
-        core::sync::atomic::AtomicU32::new(500_000);
-
-    /// Whether the encoder direction is reversed (set by tmc_set_encoder_dir).
-    /// When true, position targets are negated before writing to the TMC4671.
-    static ENCODER_REVERSED: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-
-    /// Guard for single-in-flight commissioning. Set at command ingress (P2),
-    /// cleared after commissioning completes or fails (P1).
-    static COMMISSION_IN_FLIGHT: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-
-    /// Shutdown active flag. Set by enter_shutdown(), cleared by clear_shutdown().
-    /// Checked by tmc_control to perform one-shot motor safe-state on first tick.
-    static SHUTDOWN_ACTIVE: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-
-    /// Signal tmc_control to drain all pending requests. Set by config_reset
-    /// (P2), cleared by tmc_control (P1) after draining.
-    static TMC_QUEUE_FLUSH: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-
-    // --- Hardware step/dir state ---
-
-    /// Step count (incremented by P3 ISR, read by P1/P2 for stepper_get_position).
-    static STEPPER_POSITION: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
-
-    /// Set by P1 after calibration, cleared on disable/fault.
-    /// Gates timer arming and ISR execution.
-    static MOTOR_ARMED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
-    /// Set by fault EXTI, cleared by P1 fault handler after cleanup.
-    static FAULT_ACTIVE: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-
-    /// STEP_WIDTH value computed by tmc_set_encoder_hw, written to TMC4671
-    /// register 0x78 during closedloop entry.
-    static STEP_WIDTH_VALUE: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(0);
-
     /// Acceptable residual following error after a completed move, in ABN
     /// encoder counts. Within this window the controller is fighting encoder
     /// quantization and belt/motor compliance more than useful position error.
     const HOLD_SETTLE_DEADBAND_COUNTS: u32 = 4;
     const HOLD_SETTLE_DELAY_MS: u8 = 100;
-
-    /// Current step interval in TIM5 clock ticks, written by P3 after
-    /// every step event. Written to 0 when the step queue drains (both
-    /// the ISR empty-queue branch and stepper_stop). Read by tmc_control
-    /// at 1 kHz for velocity feedforward computation.
-    static STEP_INTERVAL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-
-    /// Current step direction, written by P3 when direction changes.
-    /// true = forward, false = reverse. Read by tmc_control for
-    /// feedforward sign.
-    static STEP_DIRECTION: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(true);
-
-    /// Read-only mirror of `stepper_stop[0].timer_active` for P1.
-    /// Written inside TriggerDomain lock via `set_timer_active()`,
-    /// read by P1 for advisory purposes (PID settle timing).
-    /// P1 must never enter TriggerDomain.
-    static STEP_TIMER_ACTIVE_MIRROR: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-
-    /// Homing I-suppression state machine.
-    /// 0=Idle, 1=SuppressPending, 2=Suppressing, 3=RestorePending
-    static HOMING_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
-
-    /// TrSync OID that fired the trigger. 0xFF = no trigger pending.
-    /// Written by TriggerDomain on first trigger, cleared by
-    /// trsync_trigger command cleanup or config_reset.
-    static HOMING_TRIGGERED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0xFF);
-
-    /// Indicates trsync_state reports are pending delivery.
-    /// Set by TIM5 CC2 ISR, cleared by report_task.
-    static REPORT_PENDING: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-
-    /// Position P gain for cross-priority access (Q8.8).
-    static POSITION_P_VALUE: core::sync::atomic::AtomicU16 =
-        core::sync::atomic::AtomicU16::new(640);
-
-    /// Position I gain for cross-priority access (Q8.8).
-    static POSITION_I_VALUE: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
-
-    /// Velocity P gain for cross-priority access (Q8.8).
-    /// Default 1152 = 4.5 in Q8.8 (conservative).
-    static VELOCITY_P_VALUE: core::sync::atomic::AtomicU16 =
-        core::sync::atomic::AtomicU16::new(1152);
-
-    /// Velocity I gain for cross-priority access (Q8.8).
-    static VELOCITY_I_VALUE: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
-
-    /// Trace capture buffer in CCM RAM. Initialized via `reset()` in init.
-    ///
-    /// SAFETY: Only accessed from tmc_control (P1) after init. MaybeUninit
-    /// because CCM RAM has no default initialization; init() writes a valid
-    /// TraceBuffer via ptr::write before any read.
-    #[unsafe(link_section = ".ccmram")]
-    static mut TRACE_BUF: core::mem::MaybeUninit<foci_firmware::trace::TraceBuffer> =
-        core::mem::MaybeUninit::uninit();
-
-    /// Lock-free move queue for hardware step/dir.
-    /// P2 enqueues, P3 dequeues. When timer is disabled, P1/P2 may drain.
-    ///
-    /// SAFETY: Access protocol enforced by RTIC priorities:
-    /// - Timer active: P2 enqueues only (Producer), P3 dequeues only (Consumer)
-    /// - Timer disabled: P1/P2 may drain (Consumer side safe, P3 quiesced)
-    static mut STEP_QUEUE: heapless::spsc::Queue<foci_klipper::stepper::StepMove, 1024> =
-        heapless::spsc::Queue::new();
-
-    /// P2-local HardwareStepper state (direction tracking, prepare_move).
-    /// Only accessed from usb_task (P2) command handlers.
-    static mut P2_STEPPER: foci_klipper::stepper::HardwareStepper =
-        foci_klipper::stepper::HardwareStepper::new();
-
-    /// P3-local HardwareStepper state (active segment, step execution).
-    /// Only accessed from TIM5 CC1 ISR (P3).
-    static mut ISR_STEPPER: foci_klipper::stepper::HardwareStepper =
-        foci_klipper::stepper::HardwareStepper::new();
 
     // ---- TriggerDomain: unified trsync/endstop/stepper-stop resource ----
 
@@ -597,10 +418,6 @@ mod app {
             .odr()
             .modify(|w| w.set_odr(11, embassy_stm32::pac::gpio::vals::Odr::LOW));
     }
-
-    static TMC_REQUEST_SENDER: Mutex<
-        RefCell<Option<Sender<'static, TmcRequest, TMC_CHANNEL_SIZE>>>,
-    > = Mutex::new(RefCell::new(None));
 
     /// Get a mutable reference to the trace buffer.
     ///
@@ -1219,15 +1036,6 @@ mod app {
     /// Pin enum value representing the first non-GPIO virtual pin.
     /// Pin enum: PA0=0..PA15=15, PB0=16..PB15=31, ..., PE0=64..PE15=79.
     const GPIO_MAX_PIN_VALUE: u8 = GPIO_NUM_PORTS * 16;
-
-    /// Per-endstop pin identifier (enum value from `config_endstop`).
-    /// `0xFF` means no pin configured.
-    static ENDSTOP_PIN_IDS: [core::sync::atomic::AtomicU8; foci_klipper::state::NUM_ENDSTOPS] = [
-        core::sync::atomic::AtomicU8::new(0xFF),
-        core::sync::atomic::AtomicU8::new(0xFF),
-        core::sync::atomic::AtomicU8::new(0xFF),
-        core::sync::atomic::AtomicU8::new(0xFF),
-    ];
 
     /// Get the PAC GPIO port for the given port index (0=A, 1=B, ..., 4=E).
     ///
