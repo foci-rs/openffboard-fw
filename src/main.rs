@@ -43,6 +43,10 @@ mod app {
     use rtic_sync::channel::{Receiver, Sender};
 
     use crate::app_types::{CycleDelay, TmcSpiDevice};
+    use crate::helpers::lifecycle::*;
+    use crate::helpers::stepper::*;
+    use crate::helpers::tmc::*;
+    use crate::helpers::trsync::*;
     use crate::state::lifecycle::*;
     use crate::state::stepper::*;
     use crate::state::tmc::*;
@@ -305,11 +309,6 @@ mod app {
 
     // ---- Klipper command handlers ----
 
-    /// Read the TIM5 counter (Klipper clock at 84 MHz).
-    fn read_tim5() -> u32 {
-        embassy_stm32::pac::TIM5.cnt().read()
-    }
-
     #[klipper_command(in_shutdown)]
     pub fn get_clock(_context: &mut State) {
         let clock = read_tim5();
@@ -438,64 +437,6 @@ mod app {
         }
     }
 
-    /// Transition to shutdown state: disable motor, notify host.
-    ///
-    /// Returns `true` if this call actually entered shutdown (first call).
-    /// Returns `false` if already in shutdown. The caller should send
-    /// `klipper_shutdown!` only when this returns `true`, so each call
-    /// site provides a unique static string reason.
-    fn enter_shutdown(context: &mut State) -> bool {
-        use core::sync::atomic::Ordering::Relaxed;
-        let entered = foci_klipper::commands::lifecycle::enter_shutdown(context);
-        if entered {
-            TMC_DISABLE_SIGNAL.signal(());
-            SHUTDOWN_ACTIVE.store(true, Relaxed);
-            // Quiesce TriggerDomain: cancel timers, stop steppers
-            with_trigger_domain(|td| {
-                td.scheduler.clear();
-                let tim5 = embassy_stm32::pac::TIM5;
-                tim5.dier().modify(|w| w.set_ccie(1, false));
-                // Stop physical steppers
-                for &idx in PHYSICAL_STEPPER_INDICES {
-                    stop_physical_stepper_no_lock(idx);
-                    td.set_timer_active(idx, false);
-                }
-                // Clear transient stepper state
-                for ss in td.stepper_stop.iter_mut() {
-                    ss.need_reset = true;
-                    ss.blocked_by_trigger = false;
-                    ss.blocked_by_trsync = None;
-                }
-                // Clear transient trsync state (preserve OID maps).
-                // Trigger each trsync to clear can_trigger per spec,
-                // then cancel timers and pending reports.
-                for (trsync_idx, ts) in td.trsync.iter_mut().enumerate() {
-                    // Find OID for this index (if configured)
-                    let oid = td
-                        .trsync_by_oid
-                        .iter()
-                        .find(|&(_, &idx)| idx == trsync_idx)
-                        .map(|(&oid, _)| oid)
-                        .unwrap_or(0);
-                    ts.trigger(oid, 0, 0); // Sets can_trigger=false
-                    ts.cancel_timers();
-                    ts.clear_pending_report();
-                }
-                // Clear stop signals and endstop homing
-                for sig in td.stop_signals.iter_mut() {
-                    *sig = None;
-                }
-                for es in td.endstops.iter_mut() {
-                    es.reset();
-                }
-            });
-            REPORT_PENDING.store(false, Relaxed);
-            HOMING_TRIGGERED.store(0xFF, Relaxed);
-            HOMING_STATE.store(0, Relaxed);
-        }
-        entered
-    }
-
     /// Reset the MCU. Matches Klipper's `command_reset` (armcm_reset.c).
     ///
     /// Writes `CANBOOT_BYPASS` to Katapult's request signature so the
@@ -508,45 +449,6 @@ mod app {
 
     #[klipper_command(in_shutdown)]
     pub fn debug_nop() {}
-
-    // Katapult bootloader constants (from Klipper armcm_reset.c).
-    const KATAPULT_BOOT_ADDRESS: u32 = 0x0800_0000;
-    const KATAPULT_SIGNATURE: u64 = 0x2174_6f6f_426e_6143; // "CanBoot!"
-    #[allow(dead_code)] // Used by klipper-usb's check_reboot() path
-    const KATAPULT_REQUEST: u64 = 0x5984_E3FA_6CA1_589B; // stay in bootloader
-    const KATAPULT_BYPASS: u64 = 0x7b06_ec45_a9a8_243d; // skip bootloader
-
-    /// Write a Katapult request signature and perform a system reset.
-    ///
-    /// `KATAPULT_REQUEST`: stay in bootloader (for reflashing via 1200-baud DTR).
-    /// `KATAPULT_BYPASS`: skip bootloader, boot application (for FIRMWARE_RESTART).
-    ///
-    /// Matches Klipper's `canboot_reset()` in armcm_reset.c. Verifies the
-    /// bootloader signature before writing, no-ops if no bootloader is present.
-    fn katapult_reset(req_signature: u64) {
-        // SAFETY: The bootloader vector table at KATAPULT_BOOT_ADDRESS is
-        // always readable. We verify the Katapult signature before writing.
-        unsafe {
-            let bl_vectors = KATAPULT_BOOT_ADDRESS as *const u32;
-            let reset_handler = core::ptr::read_volatile(bl_vectors.add(1));
-            let boot_sig_addr = (reset_handler - 9) as *const u64;
-            let req_sig_addr = core::ptr::read_volatile(bl_vectors) as *mut u64;
-
-            // Verify alignment and signature
-            if !(boot_sig_addr as usize).is_multiple_of(8)
-                || core::ptr::read_volatile(boot_sig_addr) != KATAPULT_SIGNATURE
-                || !(req_sig_addr as usize).is_multiple_of(8)
-            {
-                // No valid bootloader — just reset
-                cortex_m::peripheral::SCB::sys_reset();
-            }
-
-            cortex_m::interrupt::disable();
-            core::ptr::write_volatile(req_sig_addr, req_signature);
-        }
-
-        cortex_m::peripheral::SCB::sys_reset();
-    }
 
     // ---- Stepper commands ----
 
@@ -828,85 +730,6 @@ mod app {
                 }
             }
         }
-    }
-
-    // ---- GPIO infrastructure for endstop pin reading ----
-
-    /// Number of GPIO ports (A..E) on the STM32F407.
-    const GPIO_NUM_PORTS: u8 = 5;
-
-    /// Pin enum value representing the first non-GPIO virtual pin.
-    /// Pin enum: PA0=0..PA15=15, PB0=16..PB15=31, ..., PE0=64..PE15=79.
-    const GPIO_MAX_PIN_VALUE: u8 = GPIO_NUM_PORTS * 16;
-
-    /// Get the PAC GPIO port for the given port index (0=A, 1=B, ..., 4=E).
-    ///
-    /// Returns `None` for out-of-range port indices.
-    fn gpio_port(port: u8) -> Option<embassy_stm32::pac::gpio::Gpio> {
-        match port {
-            0 => Some(embassy_stm32::pac::GPIOA),
-            1 => Some(embassy_stm32::pac::GPIOB),
-            2 => Some(embassy_stm32::pac::GPIOC),
-            3 => Some(embassy_stm32::pac::GPIOD),
-            4 => Some(embassy_stm32::pac::GPIOE),
-            _ => None,
-        }
-    }
-
-    /// Configure a GPIO pin as input with optional pull-up.
-    ///
-    /// Enables the GPIO port clock, sets the pin to input mode, and configures
-    /// the pull-up/pull-down resistor. Uses raw PAC register access to avoid
-    /// the type-erasure problem with embassy-stm32 `Input` pins.
-    ///
-    /// `pin_value` is the pin enum value (PA0=0, PB0=16, etc.).
-    fn gpio_configure_input(pin_value: u8, pull_up: bool) {
-        let port_idx = pin_value / 16;
-        let pin_idx = (pin_value % 16) as usize;
-
-        // Enable GPIO port clock on AHB1
-        let rcc = embassy_stm32::pac::RCC;
-        rcc.ahb1enr().modify(|w| match port_idx {
-            0 => w.set_gpioaen(true),
-            1 => w.set_gpioben(true),
-            2 => w.set_gpiocen(true),
-            3 => w.set_gpioden(true),
-            4 => w.set_gpioeen(true),
-            _ => {}
-        });
-        // Brief delay for clock to stabilize
-        cortex_m::asm::delay(2);
-
-        if let Some(gpio) = gpio_port(port_idx) {
-            use embassy_stm32::pac::gpio::vals;
-            // Set pin as input
-            gpio.moder()
-                .modify(|w| w.set_moder(pin_idx, vals::Moder::INPUT));
-            // Configure pull-up or floating
-            let pull = if pull_up {
-                vals::Pupdr::PULL_UP
-            } else {
-                vals::Pupdr::FLOATING
-            };
-            gpio.pupdr().modify(|w| w.set_pupdr(pin_idx, pull));
-        }
-    }
-
-    /// Read the current state of a GPIO pin.
-    ///
-    /// `pin_value` is the pin enum value (PA0=0, PB0=16, etc.).
-    /// Returns `false` if the pin value is out of range.
-    fn gpio_read_pin(pin_value: u8) -> bool {
-        if pin_value >= GPIO_MAX_PIN_VALUE {
-            return false;
-        }
-        let port_idx = pin_value / 16;
-        let pin_idx = (pin_value % 16) as usize;
-
-        gpio_port(port_idx).is_some_and(|gpio| {
-            use embassy_stm32::pac::gpio::vals;
-            gpio.idr().read().idr(pin_idx) == vals::Idr::HIGH
-        })
     }
 
     // ---- TrSync and Endstop commands ----
@@ -1302,24 +1125,6 @@ mod app {
 
     // ---- TMC4671 register access commands ----
 
-    /// Send a request to the tmc_control task.
-    ///
-    /// Returns `true` if the request was enqueued, `false` if the channel
-    /// was full or not yet initialized. Callers with async reply contracts
-    /// must send a failure reply to the host when this returns `false`.
-    fn tmc_send(req: TmcRequest) -> bool {
-        critical_section::with(|cs| {
-            if let Some(sender) = TMC_REQUEST_SENDER.borrow(cs).borrow_mut().as_mut() {
-                if sender.try_send(req).is_err() {
-                    defmt::warn!("TMC request channel full, command dropped");
-                    return false;
-                }
-                return true;
-            }
-            false
-        })
-    }
-
     /// Trigger TMC4671 initialization sequence.
     #[cfg(feature = "dev")]
     #[klipper_command]
@@ -1608,59 +1413,6 @@ mod app {
             return;
         }
         if !tmc_send(foci_firmware::tmc::tmc_commission(oid, profile)) {
-            COMMISSION_IN_FLIGHT.store(false, Relaxed);
-            klipper_reply!(
-                foci_commission_phase,
-                oid: u8 = oid,
-                phase: u8 = 0,
-                status: u8 = foci_firmware::autotune::CommissionError::QueueFull.status_code()
-            );
-        }
-    }
-
-    /// Parameters for `foci_tune` grouped into a struct to satisfy
-    /// clippy's `too_many_arguments` lint. The `#[klipper_command]`
-    /// handler signature is protocol-bound and cannot be changed.
-    struct FociTuneParams {
-        oid: u8,
-        profile: u8,
-        mode: u8,
-        inner_lambda: u32,
-        theta_e: u32,
-        current_ringing: u8,
-        current_bw: u32,
-    }
-
-    /// Inner implementation of `foci_tune`.
-    fn foci_tune_inner(params: FociTuneParams) {
-        use core::sync::atomic::Ordering::Relaxed;
-        let FociTuneParams {
-            oid,
-            profile,
-            mode,
-            inner_lambda,
-            theta_e,
-            current_ringing,
-            current_bw,
-        } = params;
-        if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
-            klipper_reply!(
-                foci_commission_phase,
-                oid: u8 = oid,
-                phase: u8 = 0,
-                status: u8 = foci_firmware::autotune::CommissionError::AlreadyRunning.status_code()
-            );
-            return;
-        }
-        if !tmc_send(foci_firmware::tmc::tmc_tune(
-            oid,
-            profile,
-            mode,
-            inner_lambda,
-            theta_e,
-            current_ringing,
-            current_bw,
-        )) {
             COMMISSION_IN_FLIGHT.store(false, Relaxed);
             klipper_reply!(
                 foci_commission_phase,
@@ -3868,47 +3620,6 @@ mod app {
                 .await;
             let _ = tmc.write_sub_register(CONFIG_BIQUAD_F_ENABLE, 1).await;
         }
-    }
-
-    /// Stop hardware stepper from P1: hardware-only, no TriggerDomain lock.
-    ///
-    /// Performs physical quiesce (disable CC1, drain queue, reset ISR engine),
-    /// updates the P1-readable mirror atomic, then spawns `stop_check` to
-    /// update the authoritative `timer_active` inside TriggerDomain at P2.
-    ///
-    /// P1 must never enter TriggerDomain per spec.
-    fn stepper_stop_from_p1() {
-        stop_physical_stepper_no_lock(0);
-        STEP_TIMER_ACTIVE_MIRROR.store(false, core::sync::atomic::Ordering::Relaxed);
-        stop_check::spawn().ok();
-    }
-
-    /// Minimum lead time when arming TIM5 CC1 from thread context.
-    ///
-    /// If CC1 is programmed too close to the live CNT value, the compare can
-    /// be missed before CC1IE is fully armed. TIM5 is free-running 32-bit at
-    /// 84 MHz, so a missed match would not reoccur until wrap (~51 s later).
-    const STEP_TIMER_ARM_MIN_LEAD_TICKS: u32 = 128;
-
-    /// Arm the TIM5 CC1 step timer for a compare at `clock`.
-    ///
-    /// Ensures NVIC is unmasked, clamps too-close compares forward, then
-    /// enables CC1 interrupt. Does NOT update TriggerDomain's timer_active
-    /// — the caller must do that inside the critical section.
-    fn arm_step_timer(clock: u32) {
-        let tim5 = embassy_stm32::pac::TIM5;
-        // Ensure NVIC is unmasked (idempotent after first call)
-        unsafe { cortex_m::peripheral::NVIC::unmask(embassy_stm32::pac::Interrupt::TIM5) };
-        let now = tim5.cnt().read();
-        let min_clock = now.wrapping_add(STEP_TIMER_ARM_MIN_LEAD_TICKS);
-        let clock = if (clock as i32).wrapping_sub(min_clock as i32) < 0 {
-            min_clock
-        } else {
-            clock
-        };
-        tim5.ccr(0).write_value(clock);
-        tim5.sr().modify(|w| w.set_ccif(0, false)); // Clear pending CC1
-        tim5.dier().modify(|w| w.set_ccie(0, true)); // Enable CC1 interrupt
     }
 
     /// P2 software task: clear TriggerDomain timer_active after P1 stop.
