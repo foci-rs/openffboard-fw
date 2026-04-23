@@ -28,7 +28,7 @@ use foci_firmware::state::trsync::{ENDSTOP_PIN_IDS, HOMING_STATE, HOMING_TRIGGER
 #[klipper_command(in_shutdown)]
 pub fn get_clock(_ctx: &mut FirmwareCtx<'_>) {
     let clock = read_tim5();
-    ::ankyra::klipper_reply!(crate::ankyra::replies::Clock, clock: u32 = clock);
+    ::ankyra::klipper_reply!(foci_firmware::ankyra::replies::Clock, clock: u32 = clock);
 }
 
 #[klipper_command(in_shutdown)]
@@ -37,7 +37,7 @@ pub fn get_uptime(_ctx: &mut FirmwareCtx<'_>) {
     let cur = read_tim5();
     let high = STATS_SEND_TIME_HIGH.load(Relaxed) + u32::from(cur < STATS_SEND_TIME.load(Relaxed));
     ::ankyra::klipper_reply!(
-        crate::ankyra::replies::Uptime,
+        foci_firmware::ankyra::replies::Uptime,
         high: u32 = high,
         clock: u32 = cur,
     );
@@ -48,7 +48,7 @@ pub fn get_config(ctx: &mut FirmwareCtx<'_>) {
     let (is_config, crc, is_shutdown, move_count) =
         foci_klipper::commands::lifecycle::get_config(ctx.state);
     ::ankyra::klipper_reply!(
-        crate::ankyra::replies::Config,
+        foci_firmware::ankyra::replies::Config,
         is_config: bool = is_config,
         crc: u32 = crc,
         is_shutdown: bool = is_shutdown,

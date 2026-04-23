@@ -154,7 +154,7 @@ pub fn reset_step_clock(ctx: &mut FirmwareCtx<'_>, _oid: u8, clock: u32) {
 pub fn stepper_get_position(_ctx: &mut FirmwareCtx<'_>, oid: u8) {
     let pos = STEPPER_POSITION.load(core::sync::atomic::Ordering::Relaxed);
     ::ankyra::klipper_reply!(
-        crate::ankyra::replies::StepperPosition,
+        foci_firmware::ankyra::replies::StepperPosition,
         oid: u8 = oid,
         pos: i32 = pos
     );
@@ -168,7 +168,7 @@ pub fn stepper_get_position(_ctx: &mut FirmwareCtx<'_>, oid: u8) {
 pub fn stepper_get_commanded_position(_ctx: &mut FirmwareCtx<'_>, oid: u8) {
     let pos = STEPPER_POSITION.load(core::sync::atomic::Ordering::Relaxed);
     ::ankyra::klipper_reply!(
-        crate::ankyra::replies::StepperPosition,
+        foci_firmware::ankyra::replies::StepperPosition,
         oid: u8 = oid,
         pos: i32 = pos
     );

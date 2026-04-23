@@ -54,7 +54,7 @@ pub(crate) fn foci_tune_inner(params: FociTuneParams) {
     if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
         ::ankyra::klipper_reply_from!(
             &mut crate::_ankyra_config::Sender,
-            crate::ankyra::replies::FociCommissionPhase,
+            foci_firmware::ankyra::replies::FociCommissionPhase,
             oid: u8 = oid,
             phase: u8 = 0,
             status: u8 = foci_firmware::autotune::CommissionError::AlreadyRunning.status_code(),
@@ -73,7 +73,7 @@ pub(crate) fn foci_tune_inner(params: FociTuneParams) {
         COMMISSION_IN_FLIGHT.store(false, Relaxed);
         ::ankyra::klipper_reply_from!(
             &mut crate::_ankyra_config::Sender,
-            crate::ankyra::replies::FociCommissionPhase,
+            foci_firmware::ankyra::replies::FociCommissionPhase,
             oid: u8 = oid,
             phase: u8 = 0,
             status: u8 = foci_firmware::autotune::CommissionError::QueueFull.status_code(),

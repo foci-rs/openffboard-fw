@@ -152,7 +152,7 @@ pub fn endstop_query_state(ctx: &mut FirmwareCtx<'_>, oid: u8) {
                 false
             };
             ::ankyra::klipper_reply!(
-                crate::ankyra::replies::EndstopState,
+                foci_firmware::ankyra::replies::EndstopState,
                 oid: u8 = oid,
                 homing: u8 = u8::from(homing),
                 next_clock: u32 = next_clock,

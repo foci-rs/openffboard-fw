@@ -48,7 +48,7 @@ pub fn spi_send(_ctx: &mut FirmwareCtx<'_>, oid: u8, data: &[u8]) {
 pub fn spi_transfer(_ctx: &mut FirmwareCtx<'_>, oid: u8, _data: &[u8]) {
     let empty: &[u8] = &[];
     ::ankyra::klipper_reply!(
-        crate::ankyra::replies::SpiTransferResponse::<'static>,
+        foci_firmware::ankyra::replies::SpiTransferResponse::<'static>,
         oid: u8 = oid,
         response: &[u8] = empty
     );

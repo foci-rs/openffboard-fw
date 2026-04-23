@@ -200,7 +200,7 @@ pub fn trsync_trigger(ctx: &mut FirmwareCtx<'_>, oid: u8, reason: u8) {
             let _ = HOMING_STATE.compare_exchange(2, 3, Relaxed, Relaxed);
             // Send final trsync_state reply (can_trigger=0, clock=0)
             ::ankyra::klipper_reply!(
-                crate::ankyra::replies::TrsyncState,
+                foci_firmware::ankyra::replies::TrsyncState,
                 oid: u8 = oid,
                 can_trigger: u8 = 0,
                 trigger_reason: u8 = trigger_reason,

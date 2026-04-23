@@ -430,7 +430,7 @@ mod app {
                     Ok(value) => {
                         ::ankyra::klipper_reply_from!(
                             &mut crate::_ankyra_config::Sender,
-                            crate::ankyra::replies::TmcRegisterValue,
+                            foci_firmware::ankyra::replies::TmcRegisterValue,
                             oid: u8 = oid,
                             addr: u8 = addr,
                             value: u32 = value,
@@ -518,7 +518,7 @@ mod app {
                     };
                     ::ankyra::klipper_reply_from!(
                         &mut crate::_ankyra_config::Sender,
-                        crate::ankyra::replies::FociDumpValue,
+                        foci_firmware::ankyra::replies::FociDumpValue,
                         oid: u8 = oid,
                         addr: u8 = addr,
                         value: u32 = value,
@@ -540,7 +540,7 @@ mod app {
                     };
                     ::ankyra::klipper_reply_from!(
                         &mut crate::_ankyra_config::Sender,
-                        crate::ankyra::replies::FociDumpValue,
+                        foci_firmware::ankyra::replies::FociDumpValue,
                         oid: u8 = oid,
                         addr: u8 = synthetic_addr,
                         value: u32 = value,
@@ -549,7 +549,7 @@ mod app {
                 Mono::delay(1.millis()).await;
                 ::ankyra::klipper_reply_from!(
                     &mut crate::_ankyra_config::Sender,
-                    crate::ankyra::replies::FociDumpDone,
+                    foci_firmware::ankyra::replies::FociDumpDone,
                     oid: u8 = oid,
                 );
             }
@@ -580,7 +580,7 @@ mod app {
                 let info = unsafe { trace_buf() }.info(oid);
                 ::ankyra::klipper_reply_from!(
                     &mut crate::_ankyra_config::Sender,
-                    crate::ankyra::replies::FociTraceInfoResult,
+                    foci_firmware::ankyra::replies::FociTraceInfoResult,
                     oid: u8 = oid,
                     state: u8 = info.state,
                     generation: u8 = info.generation,
@@ -606,7 +606,7 @@ mod app {
                         };
                         ::ankyra::klipper_reply_from!(
                             &mut crate::_ankyra_config::Sender,
-                            crate::ankyra::replies::FociTraceData,
+                            foci_firmware::ankyra::replies::FociTraceData,
                             oid: u8 = oid,
                             offset: u16 = offset,
                             status: u8 = 0,
@@ -616,7 +616,7 @@ mod app {
                     foci_firmware::trace::FetchResult::Busy => {
                         ::ankyra::klipper_reply_from!(
                             &mut crate::_ankyra_config::Sender,
-                            crate::ankyra::replies::FociTraceData,
+                            foci_firmware::ankyra::replies::FociTraceData,
                             oid: u8 = oid,
                             offset: u16 = offset,
                             status: u8 = 1,
@@ -626,7 +626,7 @@ mod app {
                     foci_firmware::trace::FetchResult::Invalid => {
                         ::ankyra::klipper_reply_from!(
                             &mut crate::_ankyra_config::Sender,
-                            crate::ankyra::replies::FociTraceData,
+                            foci_firmware::ankyra::replies::FociTraceData,
                             oid: u8 = oid,
                             offset: u16 = offset,
                             status: u8 = 2,
@@ -1068,7 +1068,7 @@ mod app {
                         unsafe { trace_buf().set_phase(phase_id.to_u8()) };
                         ::ankyra::klipper_reply_from!(
                             &mut crate::_ankyra_config::Sender,
-                            crate::ankyra::replies::FociCommissionPhase,
+                            foci_firmware::ankyra::replies::FociCommissionPhase,
                             oid: u8 = oid,
                             phase: u8 = phase_id.to_u8(),
                             status: u8 = 0,
@@ -1093,7 +1093,7 @@ mod app {
                             // the full CommissionError code range (1-17).
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
-                                crate::ankyra::replies::FociCalibrateResult,
+                                foci_firmware::ankyra::replies::FociCalibrateResult,
                                 oid: u8 = oid,
                                 status: u8 = error.status_code(),
                                 adc_i0: u16 = 0,
@@ -1106,7 +1106,7 @@ mod app {
                             for (stage, v) in selftest_results.iter() {
                                 ::ankyra::klipper_reply_from!(
                                     &mut crate::_ankyra_config::Sender,
-                                    crate::ankyra::replies::FociSelftestResult,
+                                    foci_firmware::ankyra::replies::FociSelftestResult,
                                     oid: u8 = oid,
                                     stage: u8 = stage,
                                     status: u8 = v.status,
@@ -1115,14 +1115,14 @@ mod app {
                             }
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
-                                crate::ankyra::replies::FociSelftestDone,
+                                foci_firmware::ankyra::replies::FociSelftestDone,
                                 oid: u8 = oid,
                                 status: u8 = error.status_code(),
                             );
                         } else {
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
-                                crate::ankyra::replies::FociCommissionPhase,
+                                foci_firmware::ankyra::replies::FociCommissionPhase,
                                 oid: u8 = oid,
                                 phase: u8 = 0,
                                 status: u8 = error.status_code(),
@@ -1205,7 +1205,7 @@ mod app {
                             calibrated = false;
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
-                                crate::ankyra::replies::FociTuneResult,
+                                foci_firmware::ankyra::replies::FociTuneResult,
                                 oid: u8 = oid,
                                 status: u8 = foci_firmware::autotune::CommissionError::Spi
                                     .status_code(),
@@ -1253,7 +1253,7 @@ mod app {
                         };
                         ::ankyra::klipper_reply_from!(
                             &mut crate::_ankyra_config::Sender,
-                            crate::ankyra::replies::FociTuneResult,
+                            foci_firmware::ankyra::replies::FociTuneResult,
                             oid: u8 = oid,
                             status: u8 = status,
                             velocity_p: u16 = outer.velocity_p,
@@ -1375,7 +1375,7 @@ mod app {
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
                         ::ankyra::klipper_reply_from!(
                             &mut crate::_ankyra_config::Sender,
-                            crate::ankyra::replies::FociCommissionPhase,
+                            foci_firmware::ankyra::replies::FociCommissionPhase,
                             oid: u8 = oid,
                             phase: u8 = 0,
                             status: u8 = reply_status,
@@ -1448,7 +1448,7 @@ mod app {
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
-                                crate::ankyra::replies::FociCalibrateResult,
+                                foci_firmware::ankyra::replies::FociCalibrateResult,
                                 oid: u8 = oid,
                                 status: u8 = foci_firmware::calibration::CalibrationError::SpiError.status_code(),
                                 adc_i0: u16 = 0,
@@ -1473,7 +1473,7 @@ mod app {
                         defmt::info!("foci_calibrate complete: oid={}", oid);
                         ::ankyra::klipper_reply_from!(
                             &mut crate::_ankyra_config::Sender,
-                            crate::ankyra::replies::FociCalibrateResult,
+                            foci_firmware::ankyra::replies::FociCalibrateResult,
                             oid: u8 = oid,
                             status: u8 = 0,
                             adc_i0: u16 = cal_result.adc_i0,
@@ -1492,7 +1492,7 @@ mod app {
                         for (stage, stage_value) in results.iter() {
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
-                                crate::ankyra::replies::FociSelftestResult,
+                                foci_firmware::ankyra::replies::FociSelftestResult,
                                 oid: u8 = oid,
                                 stage: u8 = stage,
                                 status: u8 = stage_value.status,
@@ -1501,7 +1501,7 @@ mod app {
                         }
                         ::ankyra::klipper_reply_from!(
                             &mut crate::_ankyra_config::Sender,
-                            crate::ankyra::replies::FociSelftestDone,
+                            foci_firmware::ankyra::replies::FociSelftestDone,
                             oid: u8 = oid,
                             status: u8 = 0,
                         );
@@ -1572,7 +1572,7 @@ mod app {
                         defmt::info!("foci_commission complete: oid={} status={}", oid, status);
                         ::ankyra::klipper_reply_from!(
                             &mut crate::_ankyra_config::Sender,
-                            crate::ankyra::replies::FociCommissionResult,
+                            foci_firmware::ankyra::replies::FociCommissionResult,
                             oid: u8 = oid,
                             status: u8 = status,
                             r_mohm: u32 = inner.r_mohm,
@@ -1663,7 +1663,7 @@ mod app {
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
-                                crate::ankyra::replies::FociCalibrateResult,
+                                foci_firmware::ankyra::replies::FociCalibrateResult,
                                 oid: u8 = oid,
                                 status: u8 = foci_firmware::calibration::CalibrationError::AlreadyEnabled.status_code(),
                                 adc_i0: u16 = 0,
@@ -1737,7 +1737,7 @@ mod app {
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
-                                crate::ankyra::replies::FociCommissionPhase,
+                                foci_firmware::ankyra::replies::FociCommissionPhase,
                                 oid: u8 = oid,
                                 phase: u8 = 0,
                                 status: u8 =
@@ -1753,7 +1753,7 @@ mod app {
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
-                                crate::ankyra::replies::FociCommissionPhase,
+                                foci_firmware::ankyra::replies::FociCommissionPhase,
                                 oid: u8 = oid,
                                 phase: u8 = 0,
                                 status: u8 =
@@ -1791,7 +1791,7 @@ mod app {
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
-                                crate::ankyra::replies::FociCommissionPhase,
+                                foci_firmware::ankyra::replies::FociCommissionPhase,
                                 oid: u8 = oid,
                                 phase: u8 = 0,
                                 status: u8 =
@@ -1807,7 +1807,7 @@ mod app {
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
-                                crate::ankyra::replies::FociCommissionPhase,
+                                foci_firmware::ankyra::replies::FociCommissionPhase,
                                 oid: u8 = oid,
                                 phase: u8 = 0,
                                 status: u8 =
@@ -1858,7 +1858,7 @@ mod app {
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
-                                crate::ankyra::replies::FociSelftestDone,
+                                foci_firmware::ankyra::replies::FociSelftestDone,
                                 oid: u8 = oid,
                                 status: u8 =
                                     foci_firmware::autotune::CommissionError::MotorEnabled

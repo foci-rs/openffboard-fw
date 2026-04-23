@@ -25,7 +25,7 @@ pub fn foci_selftest(_ctx: &mut FirmwareCtx<'_>, oid: u8) {
     if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
         defmt::warn!("foci_selftest rejected: commission in flight");
         ::ankyra::klipper_reply!(
-            crate::ankyra::replies::FociSelftestDone,
+            foci_firmware::ankyra::replies::FociSelftestDone,
             oid: u8 = oid,
             status: u8 = foci_firmware::autotune::CommissionError::AlreadyRunning.status_code()
         );
@@ -34,7 +34,7 @@ pub fn foci_selftest(_ctx: &mut FirmwareCtx<'_>, oid: u8) {
     if !tmc_send(foci_firmware::tmc::tmc_selftest(oid)) {
         COMMISSION_IN_FLIGHT.store(false, Relaxed);
         ::ankyra::klipper_reply!(
-            crate::ankyra::replies::FociSelftestDone,
+            foci_firmware::ankyra::replies::FociSelftestDone,
             oid: u8 = oid,
             status: u8 = foci_firmware::autotune::CommissionError::QueueFull.status_code()
         );
@@ -59,7 +59,7 @@ pub fn foci_calibrate(_ctx: &mut FirmwareCtx<'_>, oid: u8) {
             "foci_calibrate rejected: STEP_WIDTH not configured (host must call tmc_set_encoder first)"
         );
         ::ankyra::klipper_reply!(
-            crate::ankyra::replies::FociCalibrateResult,
+            foci_firmware::ankyra::replies::FociCalibrateResult,
             oid: u8 = oid,
             status: u8 = foci_firmware::calibration::CalibrationError::ConfigFault.status_code(),
             adc_i0: u16 = 0,
@@ -71,7 +71,7 @@ pub fn foci_calibrate(_ctx: &mut FirmwareCtx<'_>, oid: u8) {
     if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
         defmt::warn!("foci_calibrate rejected: commission in flight");
         ::ankyra::klipper_reply!(
-            crate::ankyra::replies::FociCalibrateResult,
+            foci_firmware::ankyra::replies::FociCalibrateResult,
             oid: u8 = oid,
             status: u8 = foci_firmware::calibration::CalibrationError::InternalError.status_code(),
             adc_i0: u16 = 0,
@@ -83,7 +83,7 @@ pub fn foci_calibrate(_ctx: &mut FirmwareCtx<'_>, oid: u8) {
     if !tmc_send(foci_firmware::tmc::tmc_calibrate(oid)) {
         COMMISSION_IN_FLIGHT.store(false, Relaxed);
         ::ankyra::klipper_reply!(
-            crate::ankyra::replies::FociCalibrateResult,
+            foci_firmware::ankyra::replies::FociCalibrateResult,
             oid: u8 = oid,
             status: u8 = foci_firmware::calibration::CalibrationError::InternalError.status_code(),
             adc_i0: u16 = 0,
@@ -129,7 +129,7 @@ pub fn foci_commission(_ctx: &mut FirmwareCtx<'_>, oid: u8, profile: u8) {
     use core::sync::atomic::Ordering::Relaxed;
     if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
         ::ankyra::klipper_reply!(
-            crate::ankyra::replies::FociCommissionPhase,
+            foci_firmware::ankyra::replies::FociCommissionPhase,
             oid: u8 = oid,
             phase: u8 = 0,
             status: u8 = foci_firmware::autotune::CommissionError::AlreadyRunning.status_code()
@@ -139,7 +139,7 @@ pub fn foci_commission(_ctx: &mut FirmwareCtx<'_>, oid: u8, profile: u8) {
     if !tmc_send(foci_firmware::tmc::tmc_commission(oid, profile)) {
         COMMISSION_IN_FLIGHT.store(false, Relaxed);
         ::ankyra::klipper_reply!(
-            crate::ankyra::replies::FociCommissionPhase,
+            foci_firmware::ankyra::replies::FociCommissionPhase,
             oid: u8 = oid,
             phase: u8 = 0,
             status: u8 = foci_firmware::autotune::CommissionError::QueueFull.status_code()
