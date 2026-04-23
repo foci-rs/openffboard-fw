@@ -3,11 +3,11 @@
 //! declared in `main.rs`; the task shells handle only RTIC plumbing
 //! (Mono, local-resource binding) and delegate all work here.
 
-use crate::ankyra::outputs::Stats;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use embassy_stm32::gpio::Output;
 use embassy_stm32::peripherals;
 use embassy_stm32::wdg::IndependentWatchdog;
+use foci_firmware::ankyra::outputs::Stats;
 use foci_firmware::ankyra::replies::TrsyncState;
 
 /// SumSq base used by `stats`. Must match `STATS_SUMSQ_BASE` advertised

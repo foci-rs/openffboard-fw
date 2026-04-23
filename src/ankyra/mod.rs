@@ -13,9 +13,12 @@
 pub mod constants;
 pub mod enumerations;
 pub mod handlers;
-pub mod outputs;
 pub mod provider;
 // Re-export foci-firmware replies as a local module for ankyra_provider! macro compatibility.
 pub mod replies {
     pub use foci_firmware::ankyra::replies::*;
+}
+// Re-export foci-firmware outputs as a local module for ankyra_provider! macro compatibility.
+pub mod outputs {
+    pub use foci_firmware::ankyra::outputs::*;
 }
