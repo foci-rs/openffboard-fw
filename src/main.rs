@@ -2923,4 +2923,8 @@ mod app {
         "trsync_trigger failed",
         "update_digital_out failed",
     ],
+    app = "foci",
+    version = env!("CARGO_PKG_VERSION"),
+    build_versions = "",
+    license = "MIT OR Apache-2.0",
 }
