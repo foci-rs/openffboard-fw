@@ -3,7 +3,6 @@
 //! `main.rs` by Task 8c so handlers and background reply emitters
 //! share a single implementation.
 
-use anchor::klipper_reply;
 use foci_firmware::tmc::TmcRequest;
 
 use crate::state::tmc::{COMMISSION_IN_FLIGHT, TMC_REQUEST_SENDER};
@@ -52,11 +51,12 @@ pub(crate) fn foci_tune_inner(params: FociTuneParams) {
         current_bw,
     } = params;
     if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
-        klipper_reply!(
-            foci_commission_phase,
+        ::ankyra::klipper_reply_from!(
+            &mut crate::_ankyra_config::Sender,
+            crate::ankyra::replies::FociCommissionPhase,
             oid: u8 = oid,
             phase: u8 = 0,
-            status: u8 = foci_firmware::autotune::CommissionError::AlreadyRunning.status_code()
+            status: u8 = foci_firmware::autotune::CommissionError::AlreadyRunning.status_code(),
         );
         return;
     }
@@ -70,11 +70,12 @@ pub(crate) fn foci_tune_inner(params: FociTuneParams) {
         current_bw,
     )) {
         COMMISSION_IN_FLIGHT.store(false, Relaxed);
-        klipper_reply!(
-            foci_commission_phase,
+        ::ankyra::klipper_reply_from!(
+            &mut crate::_ankyra_config::Sender,
+            crate::ankyra::replies::FociCommissionPhase,
             oid: u8 = oid,
             phase: u8 = 0,
-            status: u8 = foci_firmware::autotune::CommissionError::QueueFull.status_code()
+            status: u8 = foci_firmware::autotune::CommissionError::QueueFull.status_code(),
         );
     }
 }

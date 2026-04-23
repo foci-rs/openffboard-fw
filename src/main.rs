@@ -28,7 +28,7 @@ mod usb_task;
 mod app {
     use core::cell::RefCell;
 
-    use anchor::*;
+    use ::ankyra::klipper_constant;
     use critical_section::Mutex;
     use embassy_stm32::gpio::{Level, Output, Speed};
     use embassy_stm32::spi::Spi;
@@ -501,11 +501,12 @@ mod app {
                 let reg = foci_tmc4671::registers::Register::new(addr);
                 match tmc.read_register(reg).await {
                     Ok(value) => {
-                        klipper_reply!(
-                            tmc_register_value,
+                        ::ankyra::klipper_reply_from!(
+                            &mut crate::_ankyra_config::Sender,
+                            crate::ankyra::replies::TmcRegisterValue,
                             oid: u8 = oid,
                             addr: u8 = addr,
-                            value: u32 = value
+                            value: u32 = value,
                         );
                     }
                     Err(_) => {
@@ -588,11 +589,12 @@ mod app {
                             0
                         }
                     };
-                    klipper_reply!(
-                        foci_dump_value,
+                    ::ankyra::klipper_reply_from!(
+                        &mut crate::_ankyra_config::Sender,
+                        crate::ankyra::replies::FociDumpValue,
                         oid: u8 = oid,
                         addr: u8 = addr,
-                        value: u32 = value
+                        value: u32 = value,
                     );
                 }
                 // Sub-registers (INTERIM, PID_ERROR) use synthetic addrs 0x80+
@@ -609,15 +611,20 @@ mod app {
                             0
                         }
                     };
-                    klipper_reply!(
-                        foci_dump_value,
+                    ::ankyra::klipper_reply_from!(
+                        &mut crate::_ankyra_config::Sender,
+                        crate::ankyra::replies::FociDumpValue,
                         oid: u8 = oid,
                         addr: u8 = synthetic_addr,
-                        value: u32 = value
+                        value: u32 = value,
                     );
                 }
                 Mono::delay(1.millis()).await;
-                klipper_reply!(foci_dump_done, oid: u8 = oid);
+                ::ankyra::klipper_reply_from!(
+                    &mut crate::_ankyra_config::Sender,
+                    crate::ankyra::replies::FociDumpDone,
+                    oid: u8 = oid,
+                );
             }
             TmcRequest::SetPidGains { .. } => {
                 defmt::warn!("handle_tmc_request: SetPidGains handled by main loop");
@@ -644,8 +651,9 @@ mod app {
             // after commissioning completes, so this is not a functional gap.
             TmcRequest::TraceInfo { oid } => {
                 let info = unsafe { trace_buf() }.info(oid);
-                klipper_reply!(
-                    foci_trace_info_result,
+                ::ankyra::klipper_reply_from!(
+                    &mut crate::_ankyra_config::Sender,
+                    crate::ankyra::replies::FociTraceInfoResult,
                     oid: u8 = oid,
                     state: u8 = info.state,
                     generation: u8 = info.generation,
@@ -653,7 +661,7 @@ mod app {
                     count: u16 = info.count,
                     phase: u8 = info.phase_id,
                     sample_period_us: u16 = info.sample_period_us,
-                    dropped: u16 = info.dropped
+                    dropped: u16 = info.dropped,
                 );
             }
             TmcRequest::TraceFetch {
@@ -669,30 +677,33 @@ mod app {
                         } else {
                             buf.sample_bytes_fast(ring_idx)
                         };
-                        klipper_reply!(
-                            foci_trace_data,
+                        ::ankyra::klipper_reply_from!(
+                            &mut crate::_ankyra_config::Sender,
+                            crate::ankyra::replies::FociTraceData,
                             oid: u8 = oid,
                             offset: u16 = offset,
                             status: u8 = 0,
-                            data: &[u8] = data
+                            data: &[u8] = data,
                         );
                     }
                     foci_firmware::trace::FetchResult::Busy => {
-                        klipper_reply!(
-                            foci_trace_data,
+                        ::ankyra::klipper_reply_from!(
+                            &mut crate::_ankyra_config::Sender,
+                            crate::ankyra::replies::FociTraceData,
                             oid: u8 = oid,
                             offset: u16 = offset,
                             status: u8 = 1,
-                            data: &[u8] = &[]
+                            data: &[u8] = &[],
                         );
                     }
                     foci_firmware::trace::FetchResult::Invalid => {
-                        klipper_reply!(
-                            foci_trace_data,
+                        ::ankyra::klipper_reply_from!(
+                            &mut crate::_ankyra_config::Sender,
+                            crate::ankyra::replies::FociTraceData,
                             oid: u8 = oid,
                             offset: u16 = offset,
                             status: u8 = 2,
-                            data: &[u8] = &[]
+                            data: &[u8] = &[],
                         );
                     }
                 }
@@ -914,7 +925,11 @@ mod app {
                     );
                     ctx.shared.app_state.lock(|state| {
                         if enter_shutdown(state) {
-                            klipper_shutdown!("TMC4671 chip ID mismatch", read_tim5());
+                            ::ankyra::klipper_shutdown_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                "TMC4671 chip ID mismatch",
+                                read_tim5(),
+                            );
                         }
                     });
                     return;
@@ -924,7 +939,11 @@ mod app {
                 defmt::error!("TMC4671 SPI communication failed");
                 ctx.shared.app_state.lock(|state| {
                     if enter_shutdown(state) {
-                        klipper_shutdown!("TMC4671 SPI failed at boot", read_tim5());
+                        ::ankyra::klipper_shutdown_from!(
+                            &mut crate::_ankyra_config::Sender,
+                            "TMC4671 SPI failed at boot",
+                            read_tim5(),
+                        );
                     }
                 });
                 return;
@@ -1120,11 +1139,12 @@ mod app {
                             }
                         }
                         unsafe { trace_buf().set_phase(phase_id.to_u8()) };
-                        klipper_reply!(
-                            foci_commission_phase,
+                        ::ankyra::klipper_reply_from!(
+                            &mut crate::_ankyra_config::Sender,
+                            crate::ankyra::replies::FociCommissionPhase,
                             oid: u8 = oid,
                             phase: u8 = phase_id.to_u8(),
-                            status: u8 = 0
+                            status: u8 = 0,
                         );
                         Mono::delay(1.millis()).await;
                         continue;
@@ -1144,37 +1164,41 @@ mod app {
                             // old CalibrationError mapping was lossy (4
                             // errors mapped to one code). Python handles
                             // the full CommissionError code range (1-17).
-                            klipper_reply!(
-                                foci_calibrate_result,
+                            ::ankyra::klipper_reply_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                crate::ankyra::replies::FociCalibrateResult,
                                 oid: u8 = oid,
                                 status: u8 = error.status_code(),
                                 adc_i0: u16 = 0,
                                 adc_i1: u16 = 0,
-                                encoder_count: u32 = 0
+                                encoder_count: u32 = 0,
                             );
                         } else if is_selftest {
                             // Emit any collected stage results, then the
                             // terminal done with the error code.
                             for (stage, v) in selftest_results.iter() {
-                                klipper_reply!(
-                                    foci_selftest_result,
+                                ::ankyra::klipper_reply_from!(
+                                    &mut crate::_ankyra_config::Sender,
+                                    crate::ankyra::replies::FociSelftestResult,
                                     oid: u8 = oid,
                                     stage: u8 = stage,
                                     status: u8 = v.status,
-                                    value: u32 = v.value
+                                    value: u32 = v.value,
                                 );
                             }
-                            klipper_reply!(
-                                foci_selftest_done,
+                            ::ankyra::klipper_reply_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                crate::ankyra::replies::FociSelftestDone,
                                 oid: u8 = oid,
-                                status: u8 = error.status_code()
+                                status: u8 = error.status_code(),
                             );
                         } else {
-                            klipper_reply!(
-                                foci_commission_phase,
+                            ::ankyra::klipper_reply_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                crate::ankyra::replies::FociCommissionPhase,
                                 oid: u8 = oid,
                                 phase: u8 = 0,
-                                status: u8 = error.status_code()
+                                status: u8 = error.status_code(),
                             );
                         }
                     }
@@ -1252,8 +1276,9 @@ mod app {
                             COMMISSION_IN_FLIGHT.store(false, R);
                             motor_enabled = false;
                             calibrated = false;
-                            klipper_reply!(
-                                foci_tune_result,
+                            ::ankyra::klipper_reply_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                crate::ankyra::replies::FociTuneResult,
                                 oid: u8 = oid,
                                 status: u8 = foci_firmware::autotune::CommissionError::Spi
                                     .status_code(),
@@ -1279,7 +1304,7 @@ mod app {
                                 synth_velocity_p: u16 = 0,
                                 synth_velocity_i: u16 = 0,
                                 synth_position_p: u16 = 0,
-                                synth_position_i: u16 = 0
+                                synth_position_i: u16 = 0,
                             );
                             continue;
                         }
@@ -1299,8 +1324,9 @@ mod app {
                             foci_firmware::autotune::CommissionStatus::InnerOnly => 2,
                             foci_firmware::autotune::CommissionStatus::Failed(e) => e.status_code(),
                         };
-                        klipper_reply!(
-                            foci_tune_result,
+                        ::ankyra::klipper_reply_from!(
+                            &mut crate::_ankyra_config::Sender,
+                            crate::ankyra::replies::FociTuneResult,
                             oid: u8 = oid,
                             status: u8 = status,
                             velocity_p: u16 = outer.velocity_p,
@@ -1325,7 +1351,7 @@ mod app {
                             synth_velocity_p: u16 = outer.synth_velocity_p,
                             synth_velocity_i: u16 = outer.synth_velocity_i,
                             synth_position_p: u16 = outer.synth_position_p,
-                            synth_position_i: u16 = outer.synth_position_i
+                            synth_position_i: u16 = outer.synth_position_i,
                         );
                     }
                     foci_firmware::commission::StepResult::OuterFailed(error) => {
@@ -1420,11 +1446,12 @@ mod app {
                         };
 
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
-                        klipper_reply!(
-                            foci_commission_phase,
+                        ::ankyra::klipper_reply_from!(
+                            &mut crate::_ankyra_config::Sender,
+                            crate::ankyra::replies::FociCommissionPhase,
                             oid: u8 = oid,
                             phase: u8 = 0,
-                            status: u8 = reply_status
+                            status: u8 = reply_status,
                         );
                     }
                     foci_firmware::commission::StepResult::CalibrateDone(cal_result) => {
@@ -1492,13 +1519,14 @@ mod app {
                             foci_firmware::selftest::restore_safe_state(tmc, enable_pin).await;
                             COMMISSION_IN_FLIGHT
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
-                            klipper_reply!(
-                                foci_calibrate_result,
+                            ::ankyra::klipper_reply_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                crate::ankyra::replies::FociCalibrateResult,
                                 oid: u8 = oid,
                                 status: u8 = foci_firmware::calibration::CalibrationError::SpiError.status_code(),
                                 adc_i0: u16 = 0,
                                 adc_i1: u16 = 0,
-                                encoder_count: u32 = 0
+                                encoder_count: u32 = 0,
                             );
                             continue;
                         }
@@ -1516,13 +1544,14 @@ mod app {
                         arm_check::spawn().ok();
                         COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
                         defmt::info!("foci_calibrate complete: oid={}", oid);
-                        klipper_reply!(
-                            foci_calibrate_result,
+                        ::ankyra::klipper_reply_from!(
+                            &mut crate::_ankyra_config::Sender,
+                            crate::ankyra::replies::FociCalibrateResult,
                             oid: u8 = oid,
                             status: u8 = 0,
                             adc_i0: u16 = cal_result.adc_i0,
                             adc_i1: u16 = cal_result.adc_i1,
-                            encoder_count: u32 = cal_result.encoder_count
+                            encoder_count: u32 = cal_result.encoder_count,
                         );
                     }
                     foci_firmware::commission::StepResult::SelftestDone => {
@@ -1534,18 +1563,20 @@ mod app {
                         // Emit one result message per populated stage, then the
                         // terminal done message.
                         for (stage, stage_value) in results.iter() {
-                            klipper_reply!(
-                                foci_selftest_result,
+                            ::ankyra::klipper_reply_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                crate::ankyra::replies::FociSelftestResult,
                                 oid: u8 = oid,
                                 stage: u8 = stage,
                                 status: u8 = stage_value.status,
-                                value: u32 = stage_value.value
+                                value: u32 = stage_value.value,
                             );
                         }
-                        klipper_reply!(
-                            foci_selftest_done,
+                        ::ankyra::klipper_reply_from!(
+                            &mut crate::_ankyra_config::Sender,
+                            crate::ankyra::replies::FociSelftestDone,
                             oid: u8 = oid,
-                            status: u8 = 0
+                            status: u8 = 0,
                         );
                     }
                     foci_firmware::commission::StepResult::CommissionDone(commission_result) => {
@@ -1612,8 +1643,9 @@ mod app {
                             foci_firmware::autotune::CommissionStatus::Failed(e) => e.status_code(),
                         };
                         defmt::info!("foci_commission complete: oid={} status={}", oid, status);
-                        klipper_reply!(
-                            foci_commission_result,
+                        ::ankyra::klipper_reply_from!(
+                            &mut crate::_ankyra_config::Sender,
+                            crate::ankyra::replies::FociCommissionResult,
                             oid: u8 = oid,
                             status: u8 = status,
                             r_mohm: u32 = inner.r_mohm,
@@ -1630,7 +1662,7 @@ mod app {
                             fallback_velocity_i: u16 = commission_result.fallback_velocity_i,
                             fallback_position_p: u16 = commission_result.fallback_position_p,
                             fallback_position_i: u16 = commission_result.fallback_position_i,
-                            fallback_velocity_limit: u32 = commission_result.fallback_velocity_limit
+                            fallback_velocity_limit: u32 = commission_result.fallback_velocity_limit,
                         );
                     }
                 }
@@ -1702,13 +1734,14 @@ mod app {
                             defmt::warn!("foci_calibrate rejected: motor already enabled");
                             COMMISSION_IN_FLIGHT
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
-                            klipper_reply!(
-                                foci_calibrate_result,
+                            ::ankyra::klipper_reply_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                crate::ankyra::replies::FociCalibrateResult,
                                 oid: u8 = oid,
                                 status: u8 = foci_firmware::calibration::CalibrationError::AlreadyEnabled.status_code(),
                                 adc_i0: u16 = 0,
                                 adc_i1: u16 = 0,
-                                encoder_count: u32 = 0
+                                encoder_count: u32 = 0,
                             );
                             continue;
                         }
@@ -1775,13 +1808,14 @@ mod app {
                         if motor_enabled {
                             COMMISSION_IN_FLIGHT
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
-                            klipper_reply!(
-                                foci_commission_phase,
+                            ::ankyra::klipper_reply_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                crate::ankyra::replies::FociCommissionPhase,
                                 oid: u8 = oid,
                                 phase: u8 = 0,
                                 status: u8 =
                                     foci_firmware::autotune::CommissionError::MotorEnabled
-                                        .status_code()
+                                        .status_code(),
                             );
                             continue;
                         }
@@ -1790,13 +1824,14 @@ mod app {
                         if current_limit == 0 {
                             COMMISSION_IN_FLIGHT
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
-                            klipper_reply!(
-                                foci_commission_phase,
+                            ::ankyra::klipper_reply_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                crate::ankyra::replies::FociCommissionPhase,
                                 oid: u8 = oid,
                                 phase: u8 = 0,
                                 status: u8 =
                                     foci_firmware::autotune::CommissionError::NoCurrent
-                                        .status_code()
+                                        .status_code(),
                             );
                             continue;
                         }
@@ -1827,13 +1862,14 @@ mod app {
                         if !motor_enabled || !calibrated {
                             COMMISSION_IN_FLIGHT
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
-                            klipper_reply!(
-                                foci_commission_phase,
+                            ::ankyra::klipper_reply_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                crate::ankyra::replies::FociCommissionPhase,
                                 oid: u8 = oid,
                                 phase: u8 = 0,
                                 status: u8 =
                                     foci_firmware::autotune::CommissionError::EncoderNotAligned
-                                        .status_code()
+                                        .status_code(),
                             );
                             continue;
                         }
@@ -1842,13 +1878,14 @@ mod app {
                         if current_limit == 0 {
                             COMMISSION_IN_FLIGHT
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
-                            klipper_reply!(
-                                foci_commission_phase,
+                            ::ankyra::klipper_reply_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                crate::ankyra::replies::FociCommissionPhase,
                                 oid: u8 = oid,
                                 phase: u8 = 0,
                                 status: u8 =
                                     foci_firmware::autotune::CommissionError::NoCurrent
-                                        .status_code()
+                                        .status_code(),
                             );
                             continue;
                         }
@@ -1892,12 +1929,13 @@ mod app {
                             defmt::warn!("foci_selftest rejected: motor enabled");
                             COMMISSION_IN_FLIGHT
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
-                            klipper_reply!(
-                                foci_selftest_done,
+                            ::ankyra::klipper_reply_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                crate::ankyra::replies::FociSelftestDone,
                                 oid: u8 = oid,
                                 status: u8 =
                                     foci_firmware::autotune::CommissionError::MotorEnabled
-                                        .status_code()
+                                        .status_code(),
                             );
                             continue;
                         }
@@ -1910,7 +1948,11 @@ mod app {
                         if handle_tmc_request(req, tmc).await.is_err() {
                             ctx.shared.app_state.lock(|state| {
                                 if enter_shutdown(state) {
-                                    klipper_shutdown!("TMC request validation failed", read_tim5());
+                                    ::ankyra::klipper_shutdown_from!(
+                                        &mut crate::_ankyra_config::Sender,
+                                        "TMC request validation failed",
+                                        read_tim5(),
+                                    );
                                 }
                             });
                         }
@@ -1927,7 +1969,11 @@ mod app {
                         if handle_tmc_request(other, tmc).await.is_err() {
                             ctx.shared.app_state.lock(|state| {
                                 if enter_shutdown(state) {
-                                    klipper_shutdown!("TMC request validation failed", read_tim5());
+                                    ::ankyra::klipper_shutdown_from!(
+                                        &mut crate::_ankyra_config::Sender,
+                                        "TMC request validation failed",
+                                        read_tim5(),
+                                    );
                                 }
                             });
                         }
@@ -1967,17 +2013,26 @@ mod app {
                 ctx.shared.app_state.lock(|state| {
                     if flags & NOT_PLL_LOCKED != 0 {
                         if enter_shutdown(state) {
-                            klipper_shutdown!("TMC4671: PLL not locked (clock lost)", read_tim5());
+                            ::ankyra::klipper_shutdown_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                "TMC4671: PLL not locked (clock lost)",
+                                read_tim5(),
+                            );
                         }
                     } else if flags & ADC_I_CLIPPED != 0 {
                         if enter_shutdown(state) {
-                            klipper_shutdown!(
+                            ::ankyra::klipper_shutdown_from!(
+                                &mut crate::_ankyra_config::Sender,
                                 "TMC4671: ADC current clipped (overcurrent)",
-                                read_tim5()
+                                read_tim5(),
                             );
                         }
                     } else if enter_shutdown(state) {
-                        klipper_shutdown!("TMC4671 fault", read_tim5());
+                        ::ankyra::klipper_shutdown_from!(
+                            &mut crate::_ankyra_config::Sender,
+                            "TMC4671 fault",
+                            read_tim5(),
+                        );
                     }
                 });
             }
@@ -2906,9 +2961,41 @@ mod app {
     }
 }
 
-use anchor::klipper_config_generate;
-
-klipper_config_generate!(
+::ankyra::ankyra_config! {
     transport = crate::transport::TRANSPORT_OUTPUT: crate::transport::BufferTransportOutput,
-    context = &'ctx mut foci_klipper::state::State,
-);
+    context = &'ctx mut crate::firmware_ctx::FirmwareCtx<'ctx>,
+    providers = [crate::ankyra::provider::BOARD_PROVIDER],
+    static_strings = [
+        "Can't reset time when stepper active",
+        "Command request",
+        "Invalid TMC channel",
+        "Motor enable/disable lost (queue full)",
+        "Shutdown cleared when not shutdown",
+        "TMC request validation failed",
+        "TMC4671 SPI failed at boot",
+        "TMC4671 chip ID mismatch",
+        "TMC4671 fault",
+        "TMC4671: ADC current clipped (overcurrent)",
+        "TMC4671: PLL not locked (clock lost)",
+        "config_digital_out failed",
+        "config_endstop failed",
+        "config_reset only available when shutdown",
+        "config_stepper failed",
+        "config_trsync failed",
+        "endstop_home failed",
+        "endstop_query_state failed",
+        "queue_digital_out failed",
+        "queue_step failed",
+        "stepper_stop_on_trigger failed",
+        "stepper_stop_on_trigger: unknown stepper",
+        "tmc_set_current lost (queue full)",
+        "tmc_set_encoder lost (queue full)",
+        "tmc_set_encoder_dir lost (queue full)",
+        "tmc_set_pid_gains lost (queue full)",
+        "tmc_set_position_gains lost (queue full)",
+        "trsync_set_timeout failed",
+        "trsync_start failed",
+        "trsync_trigger failed",
+        "update_digital_out failed",
+    ],
+}
