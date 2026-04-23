@@ -5,10 +5,11 @@
 //! the Klipper protocol via the caller-supplied state lock closure, and
 //! flushes TX after each wake.
 
-use anchor::{InputBuffer, SliceInputBuffer};
+use ankyra::{InputBuffer, SliceInputBuffer};
 use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use foci_klipper::state::State;
 
+use crate::firmware_ctx::FirmwareCtx;
 use crate::transport::USB_WAKE;
 
 /// One wake cycle of the USB task: wait for a wake signal, drain RX
@@ -41,7 +42,8 @@ pub async fn pump(
         // Partial frames at the end must stay in the RX buffer.
         let mut input = SliceInputBuffer::new(&local_buf[..len]);
         lock_app_state(&mut |state| {
-            crate::KLIPPER_TRANSPORT.receive(&mut input, state);
+            let mut ctx = FirmwareCtx::new(state);
+            crate::KLIPPER_TRANSPORT.receive(&mut input, &mut ctx);
         });
         let consumed = len - input.available();
         foci_usb_stm32::rx_consume(consumed);
