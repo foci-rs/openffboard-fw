@@ -6,25 +6,21 @@
 //!
 //! # Wire-name preservation
 //!
-//! Ankyra derives the protocol name from the struct identifier verbatim
-//! (`protocol_name = struct_ident.to_string()`); there is no `rename`
-//! attribute. To keep wire compatibility with the pre-migration anchor
-//! firmware and the Klipper host's expectations, struct names in this
-//! module match the on-the-wire protocol names exactly — including the
-//! `snake_case` forms Klipper uses. The `#[allow(non_camel_case_types)]`
-//! attribute is applied per struct so clippy/rustc accept the lowercase
-//! identifier that matches the wire name.
+//! Ankyra derives the protocol name from the struct identifier and
+//! automatically converts PascalCase idents to `snake_case` on the wire
+//! (e.g. `TrsyncState` → `trsync_state`). Struct names in this module
+//! therefore use idiomatic Rust PascalCase while preserving the
+//! on-the-wire protocol names expected by the Klipper host.
 
 use ankyra::prelude::klipper_reply;
 
 /// `trsync_state` reply — emitted by the trigger subsystem as trsync
 /// snapshots are drained.
 ///
-/// The struct identifier is intentionally snake_case so ankyra produces
-/// `trsync_state` as the protocol name; see the module-level docs.
+/// Ankyra emits the wire name `trsync_state` via the automatic
+/// PascalCase-to-snake_case conversion.
 #[klipper_reply]
-#[allow(non_camel_case_types)]
-pub struct trsync_state {
+pub struct TrsyncState {
     /// Object id of the trsync endpoint reporting the snapshot.
     pub oid: u8,
     /// Non-zero while the trsync can still fire its trigger.

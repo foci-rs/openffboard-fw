@@ -8,15 +8,14 @@
 //!
 //! # Wire-name preservation
 //!
-//! Ankyra derives the protocol name from the struct identifier verbatim
-//! (`protocol_name = struct_ident.to_string()`) and — in the absence of
-//! an explicit `#[klipper_output(format = "...")]` override — synthesizes
-//! the Klipper-style message format as
-//! `"<struct_name> <field1>=%<spec1> ..."`. Struct names in this module
-//! therefore match the on-the-wire protocol name exactly (including any
-//! `snake_case` form the Klipper host expects). The
-//! `#[allow(non_camel_case_types)]` attribute is applied per struct so
-//! the lowercase identifier is accepted.
+//! Ankyra derives the protocol name from the struct identifier and
+//! automatically converts PascalCase idents to `snake_case` on the wire
+//! (e.g. `Stats` → `stats`). In the absence of an explicit
+//! `#[klipper_output(format = "...")]` override, ankyra synthesizes the
+//! Klipper-style message format as `"<wire_name> <field1>=%<spec1> ..."`.
+//! Struct names in this module therefore use idiomatic Rust PascalCase
+//! while preserving the on-the-wire protocol names expected by the
+//! Klipper host.
 
 use ankyra::prelude::klipper_output;
 
@@ -27,9 +26,10 @@ use ankyra::prelude::klipper_output;
 /// The field names and order reproduce the pre-migration anchor wire
 /// format `"stats count=%u sum=%u sumsq=%u"` so the Klipper host's
 /// dictionary match and per-field parser continue to work unchanged.
+/// Ankyra's PascalCase-to-snake_case conversion emits the wire name
+/// `stats` from the `Stats` ident.
 #[klipper_output]
-#[allow(non_camel_case_types)]
-pub struct stats {
+pub struct Stats {
     /// Number of stats ticks accumulated since the last emission.
     pub count: u32,
     /// Sum of the per-tick elapsed clock deltas.
