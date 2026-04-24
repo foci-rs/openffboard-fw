@@ -205,10 +205,6 @@ mod app {
         }
     }
 
-    /// Acceptable residual following error after a completed move, in ABN
-    /// encoder counts. Within this window the controller is fighting encoder
-    /// quantization and belt/motor compliance more than useful position error.
-    const HOLD_SETTLE_DEADBAND_COUNTS: u32 = 4;
     const HOLD_SETTLE_DELAY_MS: u8 = 100;
 
     // TriggerDomain, PHYSICAL_STEPPER_INDICES, TRIGGER_TIMER_MIN_LEAD_TICKS,
@@ -1237,7 +1233,8 @@ mod app {
                         }
 
                         // Re-apply biquad filters from stored atomics.
-                        apply_stored_filters(tmc).await;
+                        foci_firmware::tmc_ops::apply_stored_filters(tmc, TMC_CONFIG.pwm_maxcnt)
+                            .await;
 
                         enable_pin.set_high();
                         calibrated = true;
@@ -1462,7 +1459,8 @@ mod app {
                         // The engine's ClosedLoopEntry disabled all filters
                         // (no access to filter Hz atomics). Filters are
                         // best-effort -- failure does not abort calibration.
-                        apply_stored_filters(tmc).await;
+                        foci_firmware::tmc_ops::apply_stored_filters(tmc, TMC_CONFIG.pwm_maxcnt)
+                            .await;
 
                         enable_pin.set_high();
                         calibrated = true;
@@ -2021,7 +2019,10 @@ mod app {
             {
                 pid_error_clear_countdown_ms -= 1;
                 if pid_error_clear_countdown_ms == 0 {
-                    if settle_hold_and_clear_pid_errors(tmc).await.is_err() {
+                    if foci_firmware::tmc_ops::settle_hold_and_clear_pid_errors(tmc)
+                        .await
+                        .is_err()
+                    {
                         defmt::warn!("TMC4671 PID settle/clear failed");
                     } else {
                         defmt::info!("TMC4671 PID settled and cleared after motion");
@@ -2300,167 +2301,6 @@ mod app {
                 i_ux,
                 i_wy
             );
-        }
-    }
-
-    /// Clear TMC4671 PID error accumulators.
-    ///
-    /// The current-loop sums can saturate during commissioning and step
-    /// transients, then keep STATUS_FLAGS asserted even after the commanded
-    /// position has returned to zero. Clearing all four sums at lifecycle
-    /// boundaries removes stale integral state without changing configured
-    /// gains or the active position target.
-    async fn clear_pid_error_sums(tmc: &mut Tmc4671Spi<TmcSpiDevice>) -> Result<(), ()> {
-        use foci_tmc4671::registers::*;
-
-        tmc.write_sub_register(PID_ERROR_PID_TORQUE_ERROR_SUM, 0)
-            .await
-            .map_err(|_| ())?;
-        tmc.write_sub_register(PID_ERROR_PID_FLUX_ERROR_SUM, 0)
-            .await
-            .map_err(|_| ())?;
-        tmc.write_sub_register(PID_ERROR_PID_VELOCITY_ERROR_SUM, 0)
-            .await
-            .map_err(|_| ())?;
-        tmc.write_sub_register(PID_ERROR_PID_POSITION_ERROR_SUM, 0)
-            .await
-            .map_err(|_| ())?;
-        Ok(())
-    }
-
-    async fn settle_hold_and_clear_pid_errors(
-        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
-    ) -> Result<(), ()> {
-        use core::sync::atomic::Ordering::Relaxed;
-        use foci_tmc4671::registers::*;
-
-        let target = tmc
-            .read_register(PID_POSITION_TARGET)
-            .await
-            .map_err(|_| ())?;
-        let actual = tmc
-            .read_register(PID_POSITION_ACTUAL)
-            .await
-            .map_err(|_| ())?;
-        let step_width = STEP_WIDTH_VALUE.load(Relaxed).unsigned_abs().max(1);
-        let deadband = step_width.saturating_mul(HOLD_SETTLE_DEADBAND_COUNTS);
-        let error = (actual as i32).wrapping_sub(target as i32);
-        if error.unsigned_abs() <= deadband {
-            // With ABN feedback active, PID_POSITION_ACTUAL is driven by
-            // encoder phase. Accept tiny settled error by moving the internal
-            // TMC hold target to the measured actual position; firmware and
-            // Klipper logical step counts remain unchanged.
-            tmc.write_register(PID_POSITION_TARGET, actual)
-                .await
-                .map_err(|_| ())?;
-        }
-
-        clear_pid_error_sums(tmc).await?;
-        tmc.write_register(STATUS_FLAGS, 0).await.map_err(|_| ())?;
-        Ok(())
-    }
-
-    /// Re-apply biquad filters from stored atomics.
-    ///
-    /// Called after CalibrateDone to restore filters that the engine's
-    /// ClosedLoopEntry phase disabled (it has no access to the filter
-    /// Hz atomics). Best-effort: warns on failure, does not abort.
-    async fn apply_stored_filters(tmc: &mut Tmc4671Spi<TmcSpiDevice>) {
-        use core::sync::atomic::Ordering::Relaxed;
-        use foci_tmc4671::registers::*;
-
-        let pwm_maxcnt = TMC_CONFIG.pwm_maxcnt;
-
-        // Velocity biquad.
-        let filter_hz = VELOCITY_FILTER_HZ.load(Relaxed);
-        if filter_hz > 0
-            && let Some(coeffs) = foci_firmware::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt)
-        {
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_V_A_1, coeffs.a_1 as u32)
-                .await;
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_V_A_2, coeffs.a_2 as u32)
-                .await;
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_V_B_0, coeffs.b_0 as u32)
-                .await;
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_V_B_1, coeffs.b_1 as u32)
-                .await;
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_V_B_2, coeffs.b_2 as u32)
-                .await;
-            let _ = tmc.write_sub_register(CONFIG_BIQUAD_V_ENABLE, 1).await;
-        }
-
-        // Torque biquad.
-        let filter_hz = TORQUE_FILTER_HZ.load(Relaxed);
-        if filter_hz > 0
-            && let Some(coeffs) = foci_firmware::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt)
-        {
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_T_A_1, coeffs.a_1 as u32)
-                .await;
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_T_A_2, coeffs.a_2 as u32)
-                .await;
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_T_B_0, coeffs.b_0 as u32)
-                .await;
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_T_B_1, coeffs.b_1 as u32)
-                .await;
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_T_B_2, coeffs.b_2 as u32)
-                .await;
-            let _ = tmc.write_sub_register(CONFIG_BIQUAD_T_ENABLE, 1).await;
-        }
-
-        // Position biquad.
-        let filter_hz = POSITION_FILTER_HZ.load(Relaxed);
-        if filter_hz > 0
-            && let Some(coeffs) = foci_firmware::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt)
-        {
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_X_A_1, coeffs.a_1 as u32)
-                .await;
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_X_A_2, coeffs.a_2 as u32)
-                .await;
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_X_B_0, coeffs.b_0 as u32)
-                .await;
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_X_B_1, coeffs.b_1 as u32)
-                .await;
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_X_B_2, coeffs.b_2 as u32)
-                .await;
-            let _ = tmc.write_sub_register(CONFIG_BIQUAD_X_ENABLE, 1).await;
-        }
-
-        // Flux biquad.
-        let filter_hz = FLUX_FILTER_HZ.load(Relaxed);
-        if filter_hz > 0
-            && let Some(coeffs) = foci_firmware::biquad::butterworth_lowpass(filter_hz, pwm_maxcnt)
-        {
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_F_A_1, coeffs.a_1 as u32)
-                .await;
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_F_A_2, coeffs.a_2 as u32)
-                .await;
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_F_B_0, coeffs.b_0 as u32)
-                .await;
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_F_B_1, coeffs.b_1 as u32)
-                .await;
-            let _ = tmc
-                .write_sub_register(CONFIG_BIQUAD_F_B_2, coeffs.b_2 as u32)
-                .await;
-            let _ = tmc.write_sub_register(CONFIG_BIQUAD_F_ENABLE, 1).await;
         }
     }
 
