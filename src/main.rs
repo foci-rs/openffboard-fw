@@ -81,21 +81,6 @@ mod app {
     // TRIGGER_DOMAIN, with_trigger_domain(), and stop_physical_stepper_no_lock()
     // live in crate::trigger_domain and are re-imported below.
 
-    /// Get a mutable reference to the trace buffer.
-    ///
-    /// # Safety
-    ///
-    /// Must only be called from tmc_control (P1) after init has completed.
-    #[inline]
-    unsafe fn trace_buf() -> &'static mut foci_firmware::trace::TraceBuffer {
-        // Use addr_of_mut! to avoid creating a reference to the mutable static
-        // (Rust 2024 edition compatibility). MaybeUninit<T> has the same layout as T.
-        // SAFETY: caller upholds the P1-only + post-init contract of `trace_buf`.
-        unsafe {
-            &mut *core::ptr::addr_of_mut!(TRACE_BUF).cast::<foci_firmware::trace::TraceBuffer>()
-        }
-    }
-
     // ---- Klipper constants ----
     // Declared in `crate::ankyra::constants` and registered into the data
     // dictionary via the `constants: [...]` list in `crate::ankyra::provider`.
