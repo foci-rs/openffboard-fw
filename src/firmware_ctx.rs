@@ -341,16 +341,20 @@ impl<'a> TrsyncHost for FirmwareCtx<'a> {
         pin_value_expected: bool,
         trsync_oid: u8,
         trigger_reason: u8,
-        pin_id: u8,
     ) -> Result<(), ()> {
         with_trigger_domain(|td| {
             let idx = match td.endstop_by_oid.get(&oid) {
                 Some(&idx) => idx,
                 None => return Err(()),
             };
+            // Zero sample_count is a disarm request — no trsync needed.
             if sample_count != 0 && !td.trsync_by_oid.contains_key(&trsync_oid) {
                 return Err(());
             }
+            // Retrieve pin_id from config-time storage inside the
+            // critical section so the endstop runtime gets the correct
+            // physical pin without an extra atomic read by the handler.
+            let pin_id = ENDSTOP_PIN_IDS[idx].load(core::sync::atomic::Ordering::Relaxed);
             td.scheduler.cancel(|k| {
                 matches!(k,
                     foci_klipper::scheduler::SchedulerEventKind::EndstopSample(i) if *i == idx
