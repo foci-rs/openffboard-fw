@@ -34,6 +34,7 @@ mod app {
     use embedded_hal_bus::spi::ExclusiveDevice;
     use foci_klipper::state::State;
     use foci_tmc4671::spi::Tmc4671Spi;
+    use rtic_monotonics::fugit::ExtU64;
     use rtic_monotonics::stm32::prelude::*;
     use rtic_sync::channel::Receiver;
 
@@ -197,6 +198,10 @@ mod app {
 
         fn operational_velocity_limit(&self) -> u32 {
             VELOCITY_LIMIT_CFG.load(core::sync::atomic::Ordering::Relaxed)
+        }
+
+        async fn delay_us(&mut self, us: u32) {
+            Mono::delay((us as u64).micros()).await;
         }
     }
 
