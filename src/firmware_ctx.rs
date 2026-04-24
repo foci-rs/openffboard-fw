@@ -17,6 +17,8 @@ use foci_firmware::context::{
     ClockSource, EndstopHost, QueueFull, ShutdownRecovery, StateAccess, StepperHost, TmcHost,
     TrsyncHost,
 };
+use foci_firmware::state::tmc::MOTOR_ARMED;
+use foci_firmware::state::trsync::ENDSTOP_PIN_IDS;
 use foci_firmware::tmc::TmcRequest;
 use foci_klipper::commands::CommandError;
 use foci_klipper::state::State;
@@ -26,9 +28,9 @@ use crate::helpers::stepper::arm_step_timer;
 use crate::helpers::trsync::{gpio_configure_input, gpio_read_pin};
 use crate::state::stepper::{ISR_STEPPER, P2_STEPPER, STEP_QUEUE};
 use crate::state::tmc::TMC_REQUEST_SENDER;
-use crate::trigger_domain::with_trigger_domain;
-use foci_firmware::state::tmc::MOTOR_ARMED;
-use foci_firmware::state::trsync::ENDSTOP_PIN_IDS;
+use crate::trigger_domain::{
+    PHYSICAL_STEPPER_INDICES, stop_physical_stepper_no_lock, with_trigger_domain,
+};
 
 /// Full shutdown: Klipper-level transition, board-local trigger-domain
 /// quiesce, and post-quiesce atomic resets. Returns `true` if this call
@@ -41,9 +43,6 @@ use foci_firmware::state::trsync::ENDSTOP_PIN_IDS;
 /// delegates to this function so handler-path and RTIC-path shutdowns
 /// share the same cleanup.
 pub(crate) fn enter_shutdown(state: &mut State) -> bool {
-    use crate::trigger_domain::{
-        PHYSICAL_STEPPER_INDICES, stop_physical_stepper_no_lock, with_trigger_domain,
-    };
     use core::sync::atomic::Ordering::Relaxed;
     use foci_firmware::state::lifecycle::REPORT_PENDING;
     use foci_firmware::state::trsync::{HOMING_STATE, HOMING_TRIGGERED};
@@ -235,8 +234,6 @@ impl<'a> EndstopHost for FirmwareCtx<'a> {
 
 impl<'a> TrsyncHost for FirmwareCtx<'a> {
     fn reset_all(&mut self) {
-        use crate::trigger_domain::{PHYSICAL_STEPPER_INDICES, stop_physical_stepper_no_lock};
-
         with_trigger_domain(|td| {
             td.scheduler.clear();
             let tim5 = embassy_stm32::pac::TIM5;
