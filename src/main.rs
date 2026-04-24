@@ -600,6 +600,137 @@ mod app {
         Ok(())
     }
 
+    /// Emit the terminal reply for a completed commissioning engine.
+    ///
+    /// Wraps the per-variant `klipper_reply_from!` calls into a single
+    /// dispatcher driven by the [`foci_firmware::commission_dispatch::ReplyPayload`]
+    /// returned from `drive_commission_result`.
+    fn emit_terminal_reply(payload: foci_firmware::commission_dispatch::ReplyPayload) {
+        use foci_firmware::commission_dispatch::ReplyPayload;
+        match payload {
+            ReplyPayload::CommissionPhase { oid, phase, status } => {
+                ::ankyra::klipper_reply_from!(
+                    &mut crate::_ankyra_config::Sender,
+                    foci_firmware::ankyra::replies::FociCommissionPhase,
+                    oid: u8 = oid,
+                    phase: u8 = phase,
+                    status: u8 = status,
+                );
+            }
+            ReplyPayload::CalibrateResult {
+                oid,
+                status,
+                result,
+            } => {
+                ::ankyra::klipper_reply_from!(
+                    &mut crate::_ankyra_config::Sender,
+                    foci_firmware::ankyra::replies::FociCalibrateResult,
+                    oid: u8 = oid,
+                    status: u8 = status,
+                    adc_i0: u16 = result.adc_i0,
+                    adc_i1: u16 = result.adc_i1,
+                    encoder_count: u32 = result.encoder_count,
+                );
+            }
+            ReplyPayload::CommissionResult {
+                oid,
+                status,
+                result,
+            } => {
+                let inner = &result.inner;
+                ::ankyra::klipper_reply_from!(
+                    &mut crate::_ankyra_config::Sender,
+                    foci_firmware::ankyra::replies::FociCommissionResult,
+                    oid: u8 = oid,
+                    status: u8 = status,
+                    r_mohm: u32 = inner.r_mohm,
+                    l_uh: u32 = inner.l_uh,
+                    flux_p: u16 = inner.flux_p,
+                    flux_i: u16 = inner.flux_i,
+                    torque_p: u16 = inner.torque_p,
+                    torque_i: u16 = inner.torque_i,
+                    lambda_us: u32 = inner.lambda_us,
+                    theta_e_us: u32 = inner.theta_e_us,
+                    ringing_count: u8 = inner.ringing_count,
+                    bandwidth_hz: u32 = inner.bandwidth_hz,
+                    fallback_velocity_p: u16 = result.fallback_velocity_p,
+                    fallback_velocity_i: u16 = result.fallback_velocity_i,
+                    fallback_position_p: u16 = result.fallback_position_p,
+                    fallback_position_i: u16 = result.fallback_position_i,
+                    fallback_velocity_limit: u32 = result.fallback_velocity_limit,
+                );
+            }
+            ReplyPayload::TuneResult {
+                oid,
+                status,
+                result,
+            } => {
+                ::ankyra::klipper_reply_from!(
+                    &mut crate::_ankyra_config::Sender,
+                    foci_firmware::ankyra::replies::FociTuneResult,
+                    oid: u8 = oid,
+                    status: u8 = status,
+                    velocity_p: u16 = result.velocity_p,
+                    velocity_i: u16 = result.velocity_i,
+                    velocity_limit: u32 = result.velocity_limit,
+                    position_p: u16 = result.position_p,
+                    position_i: u16 = result.position_i,
+                    velocity_filter_hz: u16 = result.velocity_filter_hz,
+                    position_filter_hz: u16 = result.position_filter_hz,
+                    flux_filter_hz: u16 = result.flux_filter_hz,
+                    torque_filter_hz: u16 = result.torque_filter_hz,
+                    j_eff: u32 = result.j_eff,
+                    b_eff: u32 = result.b_eff,
+                    warning_code: u8 = result.warning_code,
+                    mech_torque_step: u16 = result.mech_torque_step,
+                    mech_fwd_accel: u32 = result.mech_fwd_accel,
+                    mech_rev_accel: u32 = result.mech_rev_accel,
+                    mech_fwd_peak_velocity: u32 = result.mech_fwd_peak_velocity,
+                    mech_rev_peak_velocity: u32 = result.mech_rev_peak_velocity,
+                    mech_fwd_travel: u32 = result.mech_fwd_travel,
+                    mech_rev_travel: u32 = result.mech_rev_travel,
+                    synth_velocity_p: u16 = result.synth_velocity_p,
+                    synth_velocity_i: u16 = result.synth_velocity_i,
+                    synth_position_p: u16 = result.synth_position_p,
+                    synth_position_i: u16 = result.synth_position_i,
+                );
+            }
+            ReplyPayload::Selftest {
+                oid,
+                results,
+                done_status,
+            } => {
+                for (stage, value) in results.iter() {
+                    ::ankyra::klipper_reply_from!(
+                        &mut crate::_ankyra_config::Sender,
+                        foci_firmware::ankyra::replies::FociSelftestResult,
+                        oid: u8 = oid,
+                        stage: u8 = stage,
+                        status: u8 = value.status,
+                        value: u32 = value.value,
+                    );
+                }
+                ::ankyra::klipper_reply_from!(
+                    &mut crate::_ankyra_config::Sender,
+                    foci_firmware::ankyra::replies::FociSelftestDone,
+                    oid: u8 = oid,
+                    status: u8 = done_status,
+                );
+            }
+        }
+    }
+
+    /// Emit a `FociCommissionPhase` reply for a phase transition.
+    fn emit_phase_reply(oid: u8, phase_id: foci_firmware::autotune::PhaseId) {
+        ::ankyra::klipper_reply_from!(
+            &mut crate::_ankyra_config::Sender,
+            foci_firmware::ankyra::replies::FociCommissionPhase,
+            oid: u8 = oid,
+            phase: u8 = phase_id.to_u8(),
+            status: u8 = 0,
+        );
+    }
+
     /// TMC4671 control task. Runs at priority 1 (preempted by protocol tasks).
     ///
     /// On startup, reads the TMC4671 chip identification register to verify
@@ -820,17 +951,43 @@ mod app {
 
             // Tick the commissioning engine if one is active.
             // Each step() does at most 1ms of work, then returns.
-            if let Some(engine) = commission_engine.as_mut() {
+            if commission_engine.is_some() {
                 // Capture deadline before engine.step() so SPI time consumed
                 // by the engine reduces the remaining trace budget.
                 let engine_tick_deadline =
                     Mono::now() + fugit::Duration::<u64, 1, 1_000_000>::millis(1);
-                let mut backend = OpenFFBoardBackend { tmc, enable_pin };
-                let result = engine.step(&mut backend).await;
-                match result {
-                    foci_firmware::commission::StepResult::Continue => {
-                        // Trace capture runs here — the main-loop trace call
-                        // is unreachable due to 'continue'.
+
+                // Sequential borrows: engine.step() consumes the backend
+                // first, then drive_commission_result re-borrows it for
+                // post-processing. Two scoped constructions keep the
+                // borrows non-overlapping.
+                let result = {
+                    let mut backend = OpenFFBoardBackend { tmc, enable_pin };
+                    commission_engine.as_mut().unwrap().step(&mut backend).await
+                };
+
+                let outcome = {
+                    let mut backend = OpenFFBoardBackend { tmc, enable_pin };
+                    let mut state = foci_firmware::commission_dispatch::DispatchState {
+                        calibrated: &mut calibrated,
+                        motor_enabled: &mut motor_enabled,
+                        stored_gains: &mut stored_gains,
+                    };
+                    foci_firmware::commission_dispatch::drive_commission_result(
+                        result,
+                        &mut commission_engine,
+                        &mut backend,
+                        &mut state,
+                        TMC_CONFIG.pwm_maxcnt,
+                    )
+                    .await
+                };
+
+                use foci_firmware::commission_dispatch::CommissionOutcome;
+                match outcome {
+                    CommissionOutcome::Continue => {
+                        // Trace capture during Continue tick — engine.step's
+                        // SPI eats into the 1ms trace budget.
                         foci_firmware::trace::sample_tick(
                             tmc,
                             unsafe { trace_buf() },
@@ -846,14 +1003,17 @@ mod app {
                         Mono::delay(1.millis()).await;
                         continue;
                     }
-                    foci_firmware::commission::StepResult::PhaseChanged(phase_id) => {
-                        let oid = engine.oid();
+                    CommissionOutcome::PhaseChanged {
+                        oid,
+                        phase_id,
+                        engine_kind,
+                    } => {
+                        use foci_firmware::commissioning::types::EngineKind;
                         // Start fast trace on ClosedLoopEntry for Stage 1
-                        // (Commission only, not Calibrate — spec excludes
-                        // Calibrate-on-enable and foci_calibrate CLE paths).
+                        // commission only (not Calibrate, not Selftest, not
+                        // OuterTune).
                         if phase_id == foci_firmware::autotune::PhaseId::ClosedLoopEntry
-                            && engine.kind()
-                                == foci_firmware::commissioning::types::EngineKind::Commission
+                            && engine_kind == EngineKind::Commission
                             && !unsafe { trace_buf() }.is_capturing()
                         {
                             unsafe {
@@ -861,539 +1021,24 @@ mod app {
                             }
                         }
                         unsafe { trace_buf().set_phase(phase_id.to_u8()) };
-                        ::ankyra::klipper_reply_from!(
-                            &mut crate::_ankyra_config::Sender,
-                            foci_firmware::ankyra::replies::FociCommissionPhase,
-                            oid: u8 = oid,
-                            phase: u8 = phase_id.to_u8(),
-                            status: u8 = 0,
-                        );
+                        emit_phase_reply(oid, phase_id);
                         Mono::delay(1.millis()).await;
                         continue;
                     }
-                    foci_firmware::commission::StepResult::InnerFailed(error) => {
-                        unsafe { trace_buf().stop() };
-                        let oid = engine.oid();
-                        let kind = engine.kind();
-                        let is_calibrate =
-                            kind == foci_firmware::commissioning::types::EngineKind::Calibrate;
-                        let is_selftest =
-                            kind == foci_firmware::commissioning::types::EngineKind::Selftest;
-                        let selftest_results = engine.take_selftest_results();
-                        defmt::error!("InnerFailed: calibrate={} error={}", is_calibrate, error,);
-                        commission_engine = None;
-                        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
-                        foci_firmware::selftest::restore_safe_state(tmc, enable_pin).await;
-                        if is_calibrate {
-                            // Send raw CommissionError status code — the
-                            // old CalibrationError mapping was lossy (4
-                            // errors mapped to one code). Python handles
-                            // the full CommissionError code range (1-17).
-                            ::ankyra::klipper_reply_from!(
-                                &mut crate::_ankyra_config::Sender,
-                                foci_firmware::ankyra::replies::FociCalibrateResult,
-                                oid: u8 = oid,
-                                status: u8 = error.status_code(),
-                                adc_i0: u16 = 0,
-                                adc_i1: u16 = 0,
-                                encoder_count: u32 = 0,
-                            );
-                        } else if is_selftest {
-                            // Emit any collected stage results, then the
-                            // terminal done with the error code.
-                            for (stage, v) in selftest_results.iter() {
-                                ::ankyra::klipper_reply_from!(
-                                    &mut crate::_ankyra_config::Sender,
-                                    foci_firmware::ankyra::replies::FociSelftestResult,
-                                    oid: u8 = oid,
-                                    stage: u8 = stage,
-                                    status: u8 = v.status,
-                                    value: u32 = v.value,
-                                );
-                            }
-                            ::ankyra::klipper_reply_from!(
-                                &mut crate::_ankyra_config::Sender,
-                                foci_firmware::ankyra::replies::FociSelftestDone,
-                                oid: u8 = oid,
-                                status: u8 = error.status_code(),
-                            );
-                        } else {
-                            ::ankyra::klipper_reply_from!(
-                                &mut crate::_ankyra_config::Sender,
-                                foci_firmware::ankyra::replies::FociCommissionPhase,
-                                oid: u8 = oid,
-                                phase: u8 = 0,
-                                status: u8 = error.status_code(),
-                            );
+                    CommissionOutcome::Terminal { reply, actions } => {
+                        if actions.stop_trace {
+                            unsafe { trace_buf().stop() };
                         }
-                    }
-                    foci_firmware::commission::StepResult::OuterDone(outer) => {
-                        unsafe { trace_buf().stop() };
-                        let oid = engine.oid();
-                        commission_engine = None;
-
-                        // Persist outer gains to atomics for closed-loop entry.
-                        use core::sync::atomic::Ordering::Relaxed as R;
-                        POSITION_P_VALUE.store(outer.position_p, R);
-                        POSITION_I_VALUE.store(outer.position_i, R);
-                        VELOCITY_P_VALUE.store(outer.velocity_p, R);
-                        VELOCITY_I_VALUE.store(outer.velocity_i, R);
-                        VELOCITY_LIMIT_CFG.store(outer.velocity_limit, R);
-                        VELOCITY_FILTER_HZ.store(outer.velocity_filter_hz, R);
-                        POSITION_FILTER_HZ.store(outer.position_filter_hz, R);
-                        FLUX_FILTER_HZ.store(outer.flux_filter_hz, R);
-                        TORQUE_FILTER_HZ.store(outer.torque_filter_hz, R);
-
-                        // Restore TMC4671 to operational state. The outer
-                        // tuning phases leave the chip in stopped/torque
-                        // mode with safety-envelope limits. We must write
-                        // the tuned gains, operational limits, filters,
-                        // and re-enter position mode before declaring done.
-                        let restore = async {
-                            use foci_tmc4671::registers::*;
-
-                            // Tuned velocity + position gains.
-                            let velocity_reg =
-                                (outer.velocity_p as u32) << 16 | outer.velocity_i as u32;
-                            tmc.write_register(PID_VELOCITY_P_VELOCITY_I, velocity_reg)
-                                .await
-                                .map_err(|_| ())?;
-                            let position_reg =
-                                (outer.position_p as u32) << 16 | outer.position_i as u32;
-                            tmc.write_register(PID_POSITION_P_POSITION_I, position_reg)
-                                .await
-                                .map_err(|_| ())?;
-
-                            // Operational limits (not safety caps).
-                            tmc.write_register(PID_VELOCITY_LIMIT, outer.velocity_limit)
-                                .await
-                                .map_err(|_| ())?;
-                            let current_limit = CURRENT_LIMIT_REG.load(R);
-                            tmc.write_register(PID_TORQUE_FLUX_LIMITS, current_limit)
-                                .await
-                                .map_err(|_| ())?;
-                            tmc.write_register(PIDOUT_UQ_UD_LIMITS, 1024)
-                                .await
-                                .map_err(|_| ())?;
-
-                            // Clear PID error sums before mode switch.
-                            tmc.write_register(PID_POSITION_ACTUAL, 0)
-                                .await
-                                .map_err(|_| ())?;
-                            let target =
-                                tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
-                            let target_scaled =
-                                target.wrapping_mul(STEP_WIDTH_VALUE.load(R) as u32);
-                            tmc.write_register(PID_POSITION_TARGET, target_scaled)
-                                .await
-                                .map_err(|_| ())?;
-
-                            // Enter position mode (advanced PID cascade).
-                            tmc.write_register(MODE_RAMP_MODE_MOTION, 0x8000_0003)
-                                .await
-                                .map_err(|_| ())?;
-
-                            Ok::<(), ()>(())
-                        };
-                        if restore.await.is_err() {
-                            defmt::error!("OuterDone: position-mode restore SPI failed");
-                            foci_firmware::selftest::restore_safe_state(tmc, enable_pin).await;
-                            COMMISSION_IN_FLIGHT.store(false, R);
-                            motor_enabled = false;
-                            calibrated = false;
-                            ::ankyra::klipper_reply_from!(
-                                &mut crate::_ankyra_config::Sender,
-                                foci_firmware::ankyra::replies::FociTuneResult,
-                                oid: u8 = oid,
-                                status: u8 = foci_firmware::autotune::CommissionError::Spi
-                                    .status_code(),
-                                velocity_p: u16 = 0,
-                                velocity_i: u16 = 0,
-                                velocity_limit: u32 = 0,
-                                position_p: u16 = 0,
-                                position_i: u16 = 0,
-                                velocity_filter_hz: u16 = 0,
-                                position_filter_hz: u16 = 0,
-                                flux_filter_hz: u16 = 0,
-                                torque_filter_hz: u16 = 0,
-                                j_eff: u32 = 0,
-                                b_eff: u32 = 0,
-                                warning_code: u8 = 0,
-                                mech_torque_step: u16 = 0,
-                                mech_fwd_accel: u32 = 0,
-                                mech_rev_accel: u32 = 0,
-                                mech_fwd_peak_velocity: u32 = 0,
-                                mech_rev_peak_velocity: u32 = 0,
-                                mech_fwd_travel: u32 = 0,
-                                mech_rev_travel: u32 = 0,
-                                synth_velocity_p: u16 = 0,
-                                synth_velocity_i: u16 = 0,
-                                synth_position_p: u16 = 0,
-                                synth_position_i: u16 = 0,
-                            );
-                            continue;
-                        }
-
-                        // Re-apply biquad filters from stored atomics.
-                        foci_firmware::tmc_ops::apply_stored_filters(tmc, TMC_CONFIG.pwm_maxcnt)
-                            .await;
-
-                        enable_pin.set_high();
-                        calibrated = true;
-                        motor_enabled = true;
-                        MOTOR_ARMED.store(true, R);
-                        COMMISSION_IN_FLIGHT.store(false, R);
-
-                        let status = match outer.status {
-                            foci_firmware::autotune::CommissionStatus::Accepted => 0u8,
-                            foci_firmware::autotune::CommissionStatus::AcceptedWithWarnings => 1,
-                            foci_firmware::autotune::CommissionStatus::InnerOnly => 2,
-                            foci_firmware::autotune::CommissionStatus::Failed(e) => e.status_code(),
-                        };
-                        ::ankyra::klipper_reply_from!(
-                            &mut crate::_ankyra_config::Sender,
-                            foci_firmware::ankyra::replies::FociTuneResult,
-                            oid: u8 = oid,
-                            status: u8 = status,
-                            velocity_p: u16 = outer.velocity_p,
-                            velocity_i: u16 = outer.velocity_i,
-                            velocity_limit: u32 = outer.velocity_limit,
-                            position_p: u16 = outer.position_p,
-                            position_i: u16 = outer.position_i,
-                            velocity_filter_hz: u16 = outer.velocity_filter_hz,
-                            position_filter_hz: u16 = outer.position_filter_hz,
-                            flux_filter_hz: u16 = outer.flux_filter_hz,
-                            torque_filter_hz: u16 = outer.torque_filter_hz,
-                            j_eff: u32 = outer.j_eff,
-                            b_eff: u32 = outer.b_eff,
-                            warning_code: u8 = outer.warning_code,
-                            mech_torque_step: u16 = outer.mech_torque_step,
-                            mech_fwd_accel: u32 = outer.mech_fwd_accel,
-                            mech_rev_accel: u32 = outer.mech_rev_accel,
-                            mech_fwd_peak_velocity: u32 = outer.mech_fwd_peak_velocity,
-                            mech_rev_peak_velocity: u32 = outer.mech_rev_peak_velocity,
-                            mech_fwd_travel: u32 = outer.mech_fwd_travel,
-                            mech_rev_travel: u32 = outer.mech_rev_travel,
-                            synth_velocity_p: u16 = outer.synth_velocity_p,
-                            synth_velocity_i: u16 = outer.synth_velocity_i,
-                            synth_position_p: u16 = outer.synth_position_p,
-                            synth_position_i: u16 = outer.synth_position_i,
-                        );
-                    }
-                    foci_firmware::commission::StepResult::OuterFailed(error) => {
-                        unsafe { trace_buf().stop() };
-                        let oid = engine.oid();
-                        let snapshot = engine.entry_snapshot();
-                        commission_engine = None;
-                        // Keep COMMISSION_IN_FLIGHT set until the restore
-                        // check and terminal reply are complete, preventing
-                        // a new foci_tune from racing the restore window.
-
-                        // Classify the original error: Spi, Shutdown, and
-                        // SafetyEnvelopeViolation are safety faults that
-                        // must hard-disable immediately. All other errors
-                        // are soft failures eligible for entry-gain restore.
-                        use foci_firmware::autotune::CommissionError as CE;
-                        let is_safety_fault =
-                            matches!(error, CE::Spi | CE::Shutdown | CE::SafetyEnvelopeViolation);
-
-                        let restore_failure: Option<CE> = if is_safety_fault {
-                            Some(error)
-                        } else if let Some(snapshot) = snapshot {
-                            let mut restore_backend = OpenFFBoardBackend { tmc, enable_pin };
-                            match foci_firmware::commissioning::inner::restore_entry_gains(
-                                &snapshot,
-                                &mut restore_backend,
-                            )
-                            .await
-                            {
-                                Ok(()) => {
-                                    // Stability check with cooperative delay.
-                                    Mono::delay(10.millis()).await;
-                                    let pos1 = tmc
-                                        .read_register(foci_tmc4671::registers::PID_POSITION_ACTUAL)
-                                        .await;
-                                    Mono::delay(10.millis()).await;
-                                    let pos2 = tmc
-                                        .read_register(foci_tmc4671::registers::PID_POSITION_ACTUAL)
-                                        .await;
-                                    match (pos1, pos2) {
-                                        (Ok(p1), Ok(p2)) => {
-                                            let drift =
-                                                (p2 as i32).wrapping_sub(p1 as i32).unsigned_abs();
-                                            if drift > 2 {
-                                                defmt::error!(
-                                                    "restore: unstable: p1={}, p2={}, drift={}",
-                                                    p1,
-                                                    p2,
-                                                    drift
-                                                );
-                                                Some(CE::CurrentValidationFailed)
-                                            } else {
-                                                None
-                                            }
-                                        }
-                                        _ => {
-                                            defmt::error!("restore: stability read SPI failed");
-                                            Some(CE::Spi)
-                                        }
-                                    }
-                                }
-                                Err(restore_err) => {
-                                    defmt::error!("Stage 2 restore failed: {}", restore_err);
-                                    Some(restore_err)
-                                }
-                            }
-                        } else {
-                            Some(CE::Spi)
-                        };
-
-                        let reply_status = if let Some(fault) = restore_failure {
-                            // Safety fault: hard disable, clear all state.
-                            // Report the actual restore failure to the host.
-                            let _ = tmc
-                                .write_register(foci_tmc4671::registers::MODE_RAMP_MODE_MOTION, 0)
-                                .await;
-                            foci_firmware::selftest::restore_safe_state(tmc, enable_pin).await;
-                            calibrated = false;
-                            motor_enabled = false;
-                            MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+                        if actions.stop_stepper {
                             stepper_stop_from_p1();
-                            defmt::error!("Stage 2 safety fault ({}), motor disabled", fault);
-                            fault.status_code()
-                        } else {
-                            // Soft failure: motor holding with entry gains.
-                            enable_pin.set_high();
-                            calibrated = true;
-                            motor_enabled = true;
-                            MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
-                            defmt::warn!("Stage 2 soft failure ({}), entry gains restored", error);
-                            error.status_code()
-                        };
-
-                        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
-                        ::ankyra::klipper_reply_from!(
-                            &mut crate::_ankyra_config::Sender,
-                            foci_firmware::ankyra::replies::FociCommissionPhase,
-                            oid: u8 = oid,
-                            phase: u8 = 0,
-                            status: u8 = reply_status,
-                        );
-                    }
-                    foci_firmware::commission::StepResult::CalibrateDone(cal_result) => {
-                        let oid = engine.oid();
-                        commission_engine = None;
-
-                        // The engine's ClosedLoopEntry phase entered position
-                        // mode with conservative defaults. Re-apply the
-                        // saved gain set from atomics (host-configured or
-                        // outer-commissioned values). SPI failures abort
-                        // and restore safe state -- reporting success with
-                        // wrong gains active is worse than failing.
-                        //
-                        // NOTE: the stability check ran with conservative
-                        // defaults, not the saved gains. A post-restore
-                        // stability re-check is not implemented (the old
-                        // tmc_enter_closedloop didn't have one either).
-                        let gain_restore = async {
-                            use core::sync::atomic::Ordering::Relaxed;
-                            use foci_tmc4671::registers::*;
-
-                            // Current-loop gains from prior commissioning.
-                            if let Some(gains) = stored_gains {
-                                let (flux_reg, torque_reg) = gains.to_registers();
-                                tmc.write_register(PID_FLUX_P_FLUX_I, flux_reg)
-                                    .await
-                                    .map_err(|_| ())?;
-                                tmc.write_register(PID_TORQUE_P_TORQUE_I, torque_reg)
-                                    .await
-                                    .map_err(|_| ())?;
-                            }
-
-                            // Velocity gains.
-                            let velocity_p = VELOCITY_P_VALUE.load(Relaxed);
-                            let velocity_i = VELOCITY_I_VALUE.load(Relaxed);
-                            let velocity_reg = (velocity_p as u32) << 16 | velocity_i as u32;
-                            tmc.write_register(PID_VELOCITY_P_VELOCITY_I, velocity_reg)
-                                .await
-                                .map_err(|_| ())?;
-
-                            // Position gains.
-                            let position_p = POSITION_P_VALUE.load(Relaxed);
-                            let position_i = POSITION_I_VALUE.load(Relaxed);
-                            let position_reg = (position_p as u32) << 16 | position_i as u32;
-                            tmc.write_register(PID_POSITION_P_POSITION_I, position_reg)
-                                .await
-                                .map_err(|_| ())?;
-
-                            // Velocity limit.
-                            let velocity_limit = VELOCITY_LIMIT_CFG.load(Relaxed);
-                            tmc.write_register(PID_VELOCITY_LIMIT, velocity_limit)
-                                .await
-                                .map_err(|_| ())?;
-
-                            // Current limit (TMC4671 resets on mode change).
-                            let current_limit = CURRENT_LIMIT_REG.load(Relaxed);
-                            tmc.write_register(PID_TORQUE_FLUX_LIMITS, current_limit)
-                                .await
-                                .map_err(|_| ())?;
-
-                            Ok::<(), ()>(())
-                        };
-                        if gain_restore.await.is_err() {
-                            defmt::error!("CalibrateDone: saved gain restore SPI failed");
-                            foci_firmware::selftest::restore_safe_state(tmc, enable_pin).await;
-                            COMMISSION_IN_FLIGHT
-                                .store(false, core::sync::atomic::Ordering::Relaxed);
-                            ::ankyra::klipper_reply_from!(
-                                &mut crate::_ankyra_config::Sender,
-                                foci_firmware::ankyra::replies::FociCalibrateResult,
-                                oid: u8 = oid,
-                                status: u8 = foci_firmware::calibration::CalibrationError::SpiError.status_code(),
-                                adc_i0: u16 = 0,
-                                adc_i1: u16 = 0,
-                                encoder_count: u32 = 0,
-                            );
-                            continue;
                         }
-
-                        // Re-apply biquad filters from stored atomics.
-                        // The engine's ClosedLoopEntry disabled all filters
-                        // (no access to filter Hz atomics). Filters are
-                        // best-effort -- failure does not abort calibration.
-                        foci_firmware::tmc_ops::apply_stored_filters(tmc, TMC_CONFIG.pwm_maxcnt)
-                            .await;
-
-                        enable_pin.set_high();
-                        calibrated = true;
-                        motor_enabled = true;
-                        MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
-                        arm_check::spawn().ok();
-                        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
-                        defmt::info!("foci_calibrate complete: oid={}", oid);
-                        ::ankyra::klipper_reply_from!(
-                            &mut crate::_ankyra_config::Sender,
-                            foci_firmware::ankyra::replies::FociCalibrateResult,
-                            oid: u8 = oid,
-                            status: u8 = 0,
-                            adc_i0: u16 = cal_result.adc_i0,
-                            adc_i1: u16 = cal_result.adc_i1,
-                            encoder_count: u32 = cal_result.encoder_count,
-                        );
-                    }
-                    foci_firmware::commission::StepResult::SelftestDone => {
-                        let oid = engine.oid();
-                        let results = engine.take_selftest_results();
-                        commission_engine = None;
-                        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
-                        // Engine already restored safe state internally.
-                        // Emit one result message per populated stage, then the
-                        // terminal done message.
-                        for (stage, stage_value) in results.iter() {
-                            ::ankyra::klipper_reply_from!(
-                                &mut crate::_ankyra_config::Sender,
-                                foci_firmware::ankyra::replies::FociSelftestResult,
-                                oid: u8 = oid,
-                                stage: u8 = stage,
-                                status: u8 = stage_value.status,
-                                value: u32 = stage_value.value,
-                            );
+                        if actions.spawn_arm_check {
+                            arm_check::spawn().ok();
                         }
-                        ::ankyra::klipper_reply_from!(
-                            &mut crate::_ankyra_config::Sender,
-                            foci_firmware::ankyra::replies::FociSelftestDone,
-                            oid: u8 = oid,
-                            status: u8 = 0,
-                        );
-                    }
-                    foci_firmware::commission::StepResult::CommissionDone(commission_result) => {
-                        unsafe { trace_buf().stop() };
-                        let oid = engine.oid();
-                        commission_engine = None;
-
-                        // The engine's ClosedLoopEntry phase already
-                        // configured PID gains, limits, filters, and
-                        // entered position mode. Re-apply current limit.
-                        let current_limit =
-                            CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
-                        let _ = tmc
-                            .write_register(
-                                foci_tmc4671::registers::PID_TORQUE_FLUX_LIMITS,
-                                current_limit,
-                            )
-                            .await;
-
-                        // Persist inner gains so future calibrate uses them.
-                        let inner = &commission_result.inner;
-                        stored_gains = Some(foci_firmware::pid::InnerLoopGains {
-                            flux_p: inner.flux_p,
-                            flux_i: inner.flux_i,
-                            torque_p: inner.torque_p,
-                            torque_i: inner.torque_i,
-                        });
-
-                        // Sync all outer-gain atomics to match the
-                        // fallback values the engine wrote to hardware.
-                        // CalibrateDone reads these on the next re-enable.
-                        POSITION_P_VALUE.store(
-                            commission_result.fallback_position_p,
-                            core::sync::atomic::Ordering::Relaxed,
-                        );
-                        POSITION_I_VALUE.store(
-                            commission_result.fallback_position_i,
-                            core::sync::atomic::Ordering::Relaxed,
-                        );
-                        VELOCITY_P_VALUE.store(
-                            commission_result.fallback_velocity_p,
-                            core::sync::atomic::Ordering::Relaxed,
-                        );
-                        VELOCITY_I_VALUE.store(
-                            commission_result.fallback_velocity_i,
-                            core::sync::atomic::Ordering::Relaxed,
-                        );
-                        VELOCITY_LIMIT_CFG.store(
-                            commission_result.fallback_velocity_limit,
-                            core::sync::atomic::Ordering::Relaxed,
-                        );
-
-                        enable_pin.set_high();
-                        calibrated = true;
-                        motor_enabled = true;
-                        MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
-                        arm_check::spawn().ok();
-                        COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
-
-                        let status = match inner.status {
-                            foci_firmware::autotune::CommissionStatus::Accepted => 0u8,
-                            foci_firmware::autotune::CommissionStatus::AcceptedWithWarnings => 1,
-                            foci_firmware::autotune::CommissionStatus::InnerOnly => 2,
-                            foci_firmware::autotune::CommissionStatus::Failed(e) => e.status_code(),
-                        };
-                        defmt::info!("foci_commission complete: oid={} status={}", oid, status);
-                        ::ankyra::klipper_reply_from!(
-                            &mut crate::_ankyra_config::Sender,
-                            foci_firmware::ankyra::replies::FociCommissionResult,
-                            oid: u8 = oid,
-                            status: u8 = status,
-                            r_mohm: u32 = inner.r_mohm,
-                            l_uh: u32 = inner.l_uh,
-                            flux_p: u16 = inner.flux_p,
-                            flux_i: u16 = inner.flux_i,
-                            torque_p: u16 = inner.torque_p,
-                            torque_i: u16 = inner.torque_i,
-                            lambda_us: u32 = inner.lambda_us,
-                            theta_e_us: u32 = inner.theta_e_us,
-                            ringing_count: u8 = inner.ringing_count,
-                            bandwidth_hz: u32 = inner.bandwidth_hz,
-                            fallback_velocity_p: u16 = commission_result.fallback_velocity_p,
-                            fallback_velocity_i: u16 = commission_result.fallback_velocity_i,
-                            fallback_position_p: u16 = commission_result.fallback_position_p,
-                            fallback_position_i: u16 = commission_result.fallback_position_i,
-                            fallback_velocity_limit: u32 = commission_result.fallback_velocity_limit,
-                        );
+                        emit_terminal_reply(reply);
                     }
                 }
-                // For Done/Failed cases, fall through to normal processing
+                // For Terminal cases, fall through to normal channel-receive processing.
             }
 
             match select(rx.recv(), Mono::delay(1.millis())).await {
