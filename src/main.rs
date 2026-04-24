@@ -847,7 +847,8 @@ mod app {
                         // (Commission only, not Calibrate — spec excludes
                         // Calibrate-on-enable and foci_calibrate CLE paths).
                         if phase_id == foci_firmware::autotune::PhaseId::ClosedLoopEntry
-                            && !engine.is_calibrate()
+                            && engine.kind()
+                                == foci_firmware::commissioning::types::EngineKind::Commission
                             && !unsafe { trace_buf() }.is_capturing()
                         {
                             unsafe {
@@ -868,8 +869,11 @@ mod app {
                     foci_firmware::commission::StepResult::InnerFailed(error) => {
                         unsafe { trace_buf().stop() };
                         let oid = engine.oid();
-                        let is_calibrate = engine.is_calibrate();
-                        let is_selftest = engine.is_selftest();
+                        let kind = engine.kind();
+                        let is_calibrate =
+                            kind == foci_firmware::commissioning::types::EngineKind::Calibrate;
+                        let is_selftest =
+                            kind == foci_firmware::commissioning::types::EngineKind::Selftest;
                         let selftest_results = engine.take_selftest_results();
                         defmt::error!("InnerFailed: calibrate={} error={}", is_calibrate, error,);
                         commission_engine = None;
