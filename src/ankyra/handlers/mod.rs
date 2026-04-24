@@ -1,11 +1,8 @@
-//! Ankyra `#[klipper_command]` handler modules, decomposed by
-//! subsystem. Populated progressively by Tasks 8e–8l.
+//! Board-local ankyra `#[klipper_command]` handlers. After Task 24,
+//! only `foci` remains here — it contains `foci_tune`, which emits
+//! replies through the board-local transport sender and cannot be
+//! lifted to foci-firmware. All other handlers were lifted to
+//! foci-firmware and are re-exported through `FOCI_FIRMWARE_PROVIDER`
+//! in the `foci_ankyra_config!` macro.
 
-pub mod digital_out;
-pub mod endstop;
 pub mod foci;
-pub mod lifecycle;
-pub mod spi;
-pub mod stepper;
-pub mod tmc;
-pub mod trsync;
