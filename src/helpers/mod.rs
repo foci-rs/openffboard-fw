@@ -5,6 +5,8 @@
 //! corresponding `state::*` statics. Task 8c–8d populate these from
 //! `mod app` in main.rs.
 
+#[cfg(feature = "dev")]
+pub mod dev;
 pub mod lifecycle;
 pub mod stepper;
 pub mod tmc;
