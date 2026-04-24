@@ -438,63 +438,14 @@ mod app {
                 }
             }
             TmcRequest::SetCurrent { run_ma } => {
-                use foci_tmc4671::registers::*;
-                // User configures RMS current (Klipper convention). The TMC4671
-                // PID limits operate on peak amplitude in the d-q frame
-                // (datasheet eq. 19/21: I_phase = I_D * sin(phi_e)).
-                // Convert: peak = RMS * sqrt(2).
-                let peak_ma = run_ma as f32 * core::f32::consts::SQRT_2;
-                let counts = (peak_ma / CURRENT_SCALE_MA_PER_LSB) as u32;
-                let limit = (counts << 16) | counts;
-                if tmc
-                    .write_register(PID_TORQUE_FLUX_LIMITS, limit)
-                    .await
-                    .is_err()
-                {
-                    defmt::error!("TMC4671 SPI write failed: PID_TORQUE_FLUX_LIMITS");
-                    return Err(());
-                }
-                CURRENT_LIMIT_REG.store(limit, core::sync::atomic::Ordering::Relaxed);
-                defmt::info!(
-                    "TMC4671 current: {}mA RMS -> {} counts (peak)",
-                    run_ma,
-                    counts
-                );
+                foci_firmware::tmc_ops::apply_set_current(tmc, run_ma, CURRENT_SCALE_MA_PER_LSB)
+                    .await?;
             }
             TmcRequest::SetEncoder { ppr } => {
-                use foci_tmc4671::registers::*;
-                if ppr == 0 {
-                    defmt::error!("Invalid encoder PPR: 0");
-                    return Err(());
-                }
-                let quadrature_ppr = ppr.saturating_mul(4);
-                if tmc
-                    .write_register(ABN_DECODER_PPR, quadrature_ppr)
-                    .await
-                    .is_err()
-                {
-                    defmt::error!("TMC4671 SPI write failed: ABN_DECODER_PPR");
-                    return Err(());
-                }
-                let step_width = 65536u64 * 50 / quadrature_ppr as u64;
-                defmt::info!("TMC4671 encoder: {} PPR, step_width={}", ppr, step_width);
+                foci_firmware::tmc_ops::apply_set_encoder(tmc, ppr).await?;
             }
             TmcRequest::SetEncoderDir { invert } => {
-                use foci_tmc4671::registers::*;
-                let mode = if invert { 1u32 << 12 } else { 0 };
-                if tmc.write_register(ABN_DECODER_MODE, mode).await.is_err() {
-                    defmt::error!("TMC4671 SPI write failed: ABN_DECODER_MODE");
-                    return Err(());
-                }
-                ENCODER_REVERSED.store(invert, core::sync::atomic::Ordering::Relaxed);
-                // Signal the tick loop to reset feedforward state: prev_position_target
-                // has the wrong sign after a direction flip, which would produce a
-                // one-tick velocity impulse in the feedforward delta computation.
-                FEEDFORWARD_RESET.store(true, core::sync::atomic::Ordering::Relaxed);
-                defmt::info!(
-                    "TMC4671 encoder direction: {}",
-                    if invert { "reversed" } else { "default" }
-                );
+                foci_firmware::tmc_ops::apply_set_encoder_dir(tmc, invert).await?;
             }
             TmcRequest::SelfTest { .. } => {
                 defmt::warn!("handle_tmc_request: SelfTest handled by main loop");
