@@ -6,4 +6,5 @@
 //! continue to name them. Task 20 replaces this shim with an
 //! `ankyra_reexport_provider!` of the upstream `FOCI_FIRMWARE_PROVIDER`.
 
+#[allow(unused_imports)]
 pub use foci_firmware::ankyra::handlers::lifecycle::*;

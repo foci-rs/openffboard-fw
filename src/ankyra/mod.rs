@@ -15,16 +15,22 @@ pub mod enumerations;
 pub mod handlers;
 pub mod provider;
 // Re-export foci-firmware replies as a local module for ankyra_provider! macro compatibility.
+// The allow(unused_imports) suppresses the dead-shim warning introduced in Tasks 21/22 once
+// BOARD_PROVIDER no longer enumerates these items directly. Task 24 removes this module.
 pub mod replies {
+    #[allow(unused_imports)]
     pub use foci_firmware::ankyra::replies::*;
 }
 // Re-export foci-firmware outputs as a local module for ankyra_provider! macro compatibility.
+// Task 24 removes this module.
 pub mod outputs {
+    #[allow(unused_imports)]
     pub use foci_firmware::ankyra::outputs::*;
 }
 // Re-export foci-firmware firmware-wide constants for ankyra_provider! compatibility.
 // Board-specific constants (CLOCK_FREQ, MCU, RESERVE_PINS_*) are defined in the local
-// constants module.
+// constants module. Task 24 removes this module.
 pub mod firmware_constants {
+    #[allow(unused_imports)]
     pub use foci_firmware::ankyra::constants::*;
 }

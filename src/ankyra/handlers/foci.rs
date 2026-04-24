@@ -12,6 +12,7 @@
 //! `foci_tune_inner`, which emits replies via the board-local ankyra
 //! transport sender.
 
+#[allow(unused_imports)]
 pub use foci_firmware::ankyra::handlers::foci::*;
 
 use ankyra::prelude::klipper_command;

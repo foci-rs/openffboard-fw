@@ -2891,7 +2891,10 @@ mod app {
 foci_firmware::foci_ankyra_config! {
     transport = crate::transport::TRANSPORT_OUTPUT: crate::transport::BufferTransportOutput,
     context = &'ctx mut crate::firmware_ctx::FirmwareCtx<'ctx>,
-    providers = [crate::ankyra::provider::BOARD_PROVIDER],
+    providers = [
+        foci_firmware::ankyra::provider::FOCI_FIRMWARE_PROVIDER,
+        crate::ankyra::provider::BOARD_PROVIDER,
+    ],
     board_static_strings = [],
     app = "foci",
     version = env!("CARGO_PKG_VERSION"),
