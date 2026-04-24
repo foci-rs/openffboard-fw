@@ -903,12 +903,19 @@ mod app {
             if SHUTDOWN_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
                 if !shutdown_handled {
                     commission_engine.take();
-                    foci_firmware::selftest::restore_safe_state(tmc, enable_pin).await;
-                    motor_enabled = false;
-                    calibrated = false;
+                    {
+                        let mut backend = OpenFFBoardBackend { tmc, enable_pin };
+                        let mut state = foci_firmware::commission_dispatch::DispatchState {
+                            calibrated: &mut calibrated,
+                            motor_enabled: &mut motor_enabled,
+                            stored_gains: &mut stored_gains,
+                        };
+                        // disarm_motor clears MOTOR_ARMED, motor_enabled, calibrated,
+                        // and runs restore_safe_state_via_backend (best-effort SPI writes).
+                        foci_firmware::tmc_ops::disarm_motor(&mut backend, &mut state).await;
+                    }
                     COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
                     stepper_stop_from_p1();
-                    MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
                     shutdown_handled = true;
                 }
                 Mono::delay(1.millis()).await;
@@ -926,7 +933,13 @@ mod app {
                 // hardware state (zero targets, disable outputs) so the motor
                 // is not left energized in whatever mode the engine last set.
                 if commission_engine.take().is_some() {
-                    foci_firmware::selftest::restore_safe_state(tmc, enable_pin).await;
+                    let mut backend = OpenFFBoardBackend { tmc, enable_pin };
+                    let mut state = foci_firmware::commission_dispatch::DispatchState {
+                        calibrated: &mut calibrated,
+                        motor_enabled: &mut motor_enabled,
+                        stored_gains: &mut stored_gains,
+                    };
+                    foci_firmware::tmc_ops::disarm_motor(&mut backend, &mut state).await;
                 }
                 COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
                 // Clear commissioned outer configuration so the next closed-
@@ -1072,28 +1085,46 @@ mod app {
                                 // encoder alignment + closed-loop entry.
                                 continue;
                             }
-                            motor_enabled = true;
-                            enable_pin.set_high();
-
-                            // Zero firmware position counter
-                            STEPPER_POSITION.store(0, core::sync::atomic::Ordering::Relaxed);
-
-                            // Arm stepper: allow TIM5 CC1 ISR to fire
-                            MOTOR_ARMED.store(true, core::sync::atomic::Ordering::Relaxed);
+                            // Existing precondition: this arm runs only when
+                            // calibrated == true (the !calibrated branch above
+                            // continues to the auto-calibrate path).
+                            {
+                                let mut backend = OpenFFBoardBackend { tmc, enable_pin };
+                                let mut state = foci_firmware::commission_dispatch::DispatchState {
+                                    calibrated: &mut calibrated,
+                                    motor_enabled: &mut motor_enabled,
+                                    stored_gains: &mut stored_gains,
+                                };
+                                foci_firmware::tmc_ops::arm_motor_electrical(
+                                    &mut backend,
+                                    &mut state,
+                                );
+                                // Zero firmware position counter before arming step timer.
+                                STEPPER_POSITION.store(0, core::sync::atomic::Ordering::Relaxed);
+                                foci_firmware::tmc_ops::arm_motor_for_steps(&mut state);
+                            }
 
                             // If queue already has moves (burst-drain scenario),
-                            // arm timer to start processing them
+                            // arm timer to start processing them.
                             arm_check::spawn().ok();
 
                             defmt::info!("Motor enabled (calibrated, step/dir armed)");
                         } else {
-                            // Disable: stop stepping, kill motor
+                            // Disable: stop stepping first (clears MOTOR_ARMED so
+                            // arm_check sees the disarmed state), then kill motor
+                            // electrically.
                             MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
                             stepper_stop_from_p1();
-
-                            motor_enabled = false;
-                            calibrated = false;
-                            foci_firmware::selftest::restore_safe_state(tmc, enable_pin).await;
+                            {
+                                let mut backend = OpenFFBoardBackend { tmc, enable_pin };
+                                let mut state = foci_firmware::commission_dispatch::DispatchState {
+                                    calibrated: &mut calibrated,
+                                    motor_enabled: &mut motor_enabled,
+                                    stored_gains: &mut stored_gains,
+                                };
+                                foci_firmware::tmc_ops::disarm_motor(&mut backend, &mut state)
+                                    .await;
+                            }
 
                             // Zero position counter
                             STEPPER_POSITION.store(0, core::sync::atomic::Ordering::Relaxed);
