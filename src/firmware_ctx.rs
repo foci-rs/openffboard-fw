@@ -70,6 +70,10 @@ impl<'a> ShutdownRecovery for FirmwareCtx<'a> {
         #[allow(clippy::empty_loop)]
         loop {}
     }
+
+    fn send_shutdown(&mut self, reason: foci_firmware::shutdown::ShutdownReason, clock: u32) {
+        foci_firmware::dispatch_shutdown!(reason, clock, &mut crate::_ankyra_config::Sender);
+    }
 }
 
 impl<'a> StepperHost for FirmwareCtx<'a> {
