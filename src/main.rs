@@ -851,7 +851,7 @@ mod app {
                         chip_id
                     );
                     ctx.shared.app_state.lock(|state| {
-                        if enter_shutdown(state) {
+                        if foci_firmware::helpers::lifecycle::enter_shutdown(state) {
                             ::ankyra::klipper_shutdown_from!(
                                 &mut crate::_ankyra_config::Sender,
                                 "TMC4671 chip ID mismatch",
@@ -865,7 +865,7 @@ mod app {
             Err(_) => {
                 defmt::error!("TMC4671 SPI communication failed");
                 ctx.shared.app_state.lock(|state| {
-                    if enter_shutdown(state) {
+                    if foci_firmware::helpers::lifecycle::enter_shutdown(state) {
                         ::ankyra::klipper_shutdown_from!(
                             &mut crate::_ankyra_config::Sender,
                             "TMC4671 SPI failed at boot",
@@ -1874,7 +1874,7 @@ mod app {
                     req @ TmcRequest::SetEncoder { .. } => {
                         if handle_tmc_request(req, tmc).await.is_err() {
                             ctx.shared.app_state.lock(|state| {
-                                if enter_shutdown(state) {
+                                if foci_firmware::helpers::lifecycle::enter_shutdown(state) {
                                     ::ankyra::klipper_shutdown_from!(
                                         &mut crate::_ankyra_config::Sender,
                                         "TMC request validation failed",
@@ -1895,7 +1895,7 @@ mod app {
                     other => {
                         if handle_tmc_request(other, tmc).await.is_err() {
                             ctx.shared.app_state.lock(|state| {
-                                if enter_shutdown(state) {
+                                if foci_firmware::helpers::lifecycle::enter_shutdown(state) {
                                     ::ankyra::klipper_shutdown_from!(
                                         &mut crate::_ankyra_config::Sender,
                                         "TMC request validation failed",
@@ -1939,7 +1939,7 @@ mod app {
                 const ADC_I_CLIPPED: u32 = 1 << 26;
                 ctx.shared.app_state.lock(|state| {
                     if flags & NOT_PLL_LOCKED != 0 {
-                        if enter_shutdown(state) {
+                        if foci_firmware::helpers::lifecycle::enter_shutdown(state) {
                             ::ankyra::klipper_shutdown_from!(
                                 &mut crate::_ankyra_config::Sender,
                                 "TMC4671: PLL not locked (clock lost)",
@@ -1947,14 +1947,14 @@ mod app {
                             );
                         }
                     } else if flags & ADC_I_CLIPPED != 0 {
-                        if enter_shutdown(state) {
+                        if foci_firmware::helpers::lifecycle::enter_shutdown(state) {
                             ::ankyra::klipper_shutdown_from!(
                                 &mut crate::_ankyra_config::Sender,
                                 "TMC4671: ADC current clipped (overcurrent)",
                                 read_tim5(),
                             );
                         }
-                    } else if enter_shutdown(state) {
+                    } else if foci_firmware::helpers::lifecycle::enter_shutdown(state) {
                         ::ankyra::klipper_shutdown_from!(
                             &mut crate::_ankyra_config::Sender,
                             "TMC4671 fault",

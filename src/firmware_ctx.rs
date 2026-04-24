@@ -21,7 +21,7 @@ use foci_firmware::tmc::TmcRequest;
 use foci_klipper::commands::CommandError;
 use foci_klipper::state::State;
 
-use crate::helpers::lifecycle::{KATAPULT_BYPASS, enter_shutdown, katapult_reset, read_tim5};
+use crate::helpers::lifecycle::{KATAPULT_BYPASS, katapult_reset, read_tim5};
 use crate::helpers::stepper::arm_step_timer;
 use crate::helpers::trsync::{gpio_configure_input, gpio_read_pin};
 use crate::state::stepper::{ISR_STEPPER, P2_STEPPER, STEP_QUEUE};
@@ -60,7 +60,60 @@ impl<'a> ClockSource for FirmwareCtx<'a> {
 
 impl<'a> ShutdownRecovery for FirmwareCtx<'a> {
     fn enter_shutdown(&mut self) -> bool {
-        enter_shutdown(self.state)
+        use crate::trigger_domain::{
+            PHYSICAL_STEPPER_INDICES, stop_physical_stepper_no_lock, with_trigger_domain,
+        };
+        use core::sync::atomic::Ordering::Relaxed;
+        use foci_firmware::state::lifecycle::REPORT_PENDING;
+        use foci_firmware::state::trsync::{HOMING_STATE, HOMING_TRIGGERED};
+
+        let entered = foci_firmware::helpers::lifecycle::enter_shutdown(self.state);
+        if entered {
+            // Quiesce TriggerDomain: cancel timers, stop steppers
+            with_trigger_domain(|td| {
+                td.scheduler.clear();
+                let tim5 = embassy_stm32::pac::TIM5;
+                tim5.dier().modify(|w| w.set_ccie(1, false));
+                // Stop physical steppers
+                for &idx in PHYSICAL_STEPPER_INDICES {
+                    stop_physical_stepper_no_lock(idx);
+                    td.set_timer_active(idx, false);
+                }
+                // Clear transient stepper state
+                for ss in td.stepper_stop.iter_mut() {
+                    ss.need_reset = true;
+                    ss.blocked_by_trigger = false;
+                    ss.blocked_by_trsync = None;
+                }
+                // Clear transient trsync state (preserve OID maps).
+                // Trigger each trsync to clear can_trigger per spec,
+                // then cancel timers and pending reports.
+                for (trsync_idx, ts) in td.trsync.iter_mut().enumerate() {
+                    // Find OID for this index (if configured)
+                    let oid = td
+                        .trsync_by_oid
+                        .iter()
+                        .find(|&(_, &idx)| idx == trsync_idx)
+                        .map(|(&oid, _)| oid)
+                        .unwrap_or(0);
+                    ts.trigger(oid, 0, 0); // Sets can_trigger=false
+                    ts.cancel_timers();
+                    ts.clear_pending_report();
+                }
+                // Clear stop signals and endstop homing
+                for sig in td.stop_signals.iter_mut() {
+                    *sig = None;
+                }
+                for es in td.endstops.iter_mut() {
+                    es.reset();
+                }
+            });
+            // Post-quiesce atomics — order preserved from pre-lift body
+            REPORT_PENDING.store(false, Relaxed);
+            HOMING_TRIGGERED.store(0xFF, Relaxed);
+            HOMING_STATE.store(0, Relaxed);
+        }
+        entered
     }
 
     fn reset_to_bootloader(&mut self) -> ! {
