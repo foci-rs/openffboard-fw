@@ -1075,16 +1075,14 @@ mod app {
                         HOMING_STATE.store(2, Relaxed);
                         defmt::info!("homing: position I suppressed");
                     }
-                    2 => {
-                        // Suppressing: check if a trigger has fired via the
-                        // HOMING_TRIGGERED sentinel (set by TriggerDomain on
-                        // first trigger, 0xFF = no trigger pending).
-                        // P1 never enters TriggerDomain per spec.
-                        // If host's trsync_trigger runs before P1 polls,
-                        // trsync_trigger advances HOMING_STATE 2→3 directly.
-                        if HOMING_TRIGGERED.load(Relaxed) != 0xFF {
-                            HOMING_STATE.store(3, Relaxed);
-                        }
+                    // Suppressing: advance to RestorePending once a trigger
+                    // has fired via the HOMING_TRIGGERED sentinel (set by
+                    // TriggerDomain on first trigger, 0xFF = no trigger
+                    // pending). P1 never enters TriggerDomain per spec. If
+                    // host's trsync_trigger runs before P1 polls,
+                    // trsync_trigger advances HOMING_STATE 2->3 directly.
+                    2 if HOMING_TRIGGERED.load(Relaxed) != 0xFF => {
+                        HOMING_STATE.store(3, Relaxed);
                     }
                     3 => {
                         // RestorePending: restore position I and clear integrator
