@@ -1,11 +1,12 @@
 [package]
 name = "openffboard-fw"
 version = "0.1.0"
-edition.workspace = true
-license.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/foci-rs/openffboard-fw"
 
 [dependencies]
-# RTIC framework
+# RTIC
 rtic = { version = "2.2", features = ["thumbv7-backend"] }
 rtic-monotonics = { version = "2.1", features = ["stm32_tim2", "stm32f407vg"] }
 rtic-sync = "1.4"
@@ -20,8 +21,8 @@ embassy-stm32 = { version = "0.6", features = [
 ] }
 embassy-time = "0.5"
 embassy-futures = "0.1"
-embassy-sync.workspace = true
-embedded-hal-async = { workspace = true }
+embassy-sync = "0.6"
+embedded-hal-async = "1.0"
 embedded-hal-bus = { version = "0.3", features = ["async"] }
 
 # Cortex-M
@@ -29,24 +30,24 @@ cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single
 cortex-m-rt = "0.7"
 critical-section = "1.2"
 
-# Klipper protocol
-ankyra.workspace = true
-ankyra-macros.workspace = true
-ankyra-assemble.workspace = true
+# Klipper protocol (ankyra)
+ankyra = { git = "https://github.com/foci-rs/ankyra" }
+ankyra-macros = { git = "https://github.com/foci-rs/ankyra" }
+ankyra-assemble = { git = "https://github.com/foci-rs/ankyra" }
 
-# Project crates
-foci-tmc4671 = { path = "../../shared/foci-tmc4671" }
-foci-klipper = { path = "../../shared/foci-klipper" }
-foci-usb-stm32 = { path = "../../shared/foci-usb-stm32" }
-foci-firmware = { path = "../../shared/foci-firmware" }
+# FOCI crates
+foci-firmware = { git = "https://github.com/foci-rs/foci-firmware" }
+foci-klipper = { git = "https://github.com/foci-rs/foci-klipper" }
+foci-tmc4671 = { git = "https://github.com/foci-rs/foci-tmc4671" }
+foci-usb-stm32 = { git = "https://github.com/foci-rs/foci-usb-stm32" }
 
 # Logging
-defmt.workspace = true
+defmt = "1.0"
 defmt-rtt = "1.1"
 panic-probe = { version = "1.0", features = ["print-defmt"] }
 
 # no_std utilities
-heapless.workspace = true
+heapless = { version = "0.9", features = ["defmt"] }
 
 [features]
 dev = ["foci-firmware/dev"]
