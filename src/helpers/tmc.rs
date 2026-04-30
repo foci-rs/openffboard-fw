@@ -19,6 +19,10 @@ pub(crate) struct FociTuneParams {
     pub(crate) theta_e: u32,
     pub(crate) current_ringing: u8,
     pub(crate) current_bw: u32,
+    pub(crate) tau_e_us: u32,
+    pub(crate) tau_e_crosscheck_us: u32,
+    pub(crate) tau_residual_permille: u16,
+    pub(crate) inner_warning_flags: u8,
 }
 
 /// Send a request to the tmc_control task.
@@ -50,6 +54,10 @@ pub(crate) fn foci_tune_inner(params: FociTuneParams) {
         theta_e,
         current_ringing,
         current_bw,
+        tau_e_us,
+        tau_e_crosscheck_us,
+        tau_residual_permille,
+        inner_warning_flags,
     } = params;
     if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
         ::ankyra::klipper_reply_from!(
@@ -69,6 +77,10 @@ pub(crate) fn foci_tune_inner(params: FociTuneParams) {
         theta_e,
         current_ringing,
         current_bw,
+        tau_e_us,
+        tau_e_crosscheck_us,
+        tau_residual_permille,
+        inner_warning_flags,
     )) {
         COMMISSION_IN_FLIGHT.store(false, Relaxed);
         ::ankyra::klipper_reply_from!(

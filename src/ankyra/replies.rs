@@ -58,6 +58,10 @@ pub(crate) fn emit_terminal_reply(payload: foci_firmware::commission_dispatch::R
                 fallback_position_p: u16 = result.fallback_position_p,
                 fallback_position_i: u16 = result.fallback_position_i,
                 fallback_velocity_limit: u32 = result.fallback_velocity_limit,
+                tau_e_us: u32 = inner.tau_e_us,
+                tau_e_crosscheck_us: u32 = inner.tau_e_crosscheck_us,
+                tau_residual_permille: u16 = inner.tau_residual_permille,
+                inner_warning_flags: u8 = inner.inner_warning_flags,
             );
         }
         ReplyPayload::TuneResult {

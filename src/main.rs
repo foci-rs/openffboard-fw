@@ -791,6 +791,10 @@ mod app {
                         theta_e_us,
                         current_ringing_count,
                         current_bandwidth_hz,
+                        tau_e_us,
+                        tau_e_crosscheck_us,
+                        tau_residual_permille,
+                        inner_warning_flags,
                     } => {
                         // Stage 2 requires the motor to be enabled and
                         // holding in closed-loop position mode (from Stage 1
@@ -847,6 +851,10 @@ mod app {
                             theta_e_us,
                             current_ringing: current_ringing_count > 1,
                             current_bandwidth_hz,
+                            tau_e_us,
+                            tau_e_crosscheck_us,
+                            tau_residual_permille,
+                            inner_warning_flags,
                         };
                         commission_engine =
                             Some(foci_firmware::commission::CommissioningEngine::new_outer(

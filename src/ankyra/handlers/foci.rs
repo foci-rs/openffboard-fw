@@ -36,6 +36,10 @@ pub fn foci_tune(
     theta_e: u32,
     current_ringing: u8,
     current_bw: u32,
+    tau_e_us: u32,
+    tau_e_crosscheck_us: u32,
+    tau_residual_permille: u16,
+    inner_warning_flags: u8,
 ) {
     foci_tune_inner(FociTuneParams {
         oid,
@@ -45,5 +49,9 @@ pub fn foci_tune(
         theta_e,
         current_ringing,
         current_bw,
+        tau_e_us,
+        tau_e_crosscheck_us,
+        tau_residual_permille,
+        inner_warning_flags,
     });
 }
