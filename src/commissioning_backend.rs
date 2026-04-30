@@ -55,6 +55,10 @@ impl<'a> foci_firmware::commission::CommissioningBackend for OpenFFBoardBackend<
         self.tmc.read_register(ABN_DECODER_COUNT).await.unwrap_or(0)
     }
 
+    async fn try_read_encoder_count(&mut self) -> Result<u32, Self::Error> {
+        self.tmc.read_register(ABN_DECODER_COUNT).await
+    }
+
     fn elapsed_us(&self) -> u64 {
         // Microseconds since Mono start. Returned as u64 so deadline
         // comparisons in commission.rs never wrap across the 51-second
