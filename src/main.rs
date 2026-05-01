@@ -575,11 +575,13 @@ mod app {
                         if actions.stop_trace {
                             unsafe { trace_buf().stop() };
                         }
-                        if actions.stop_stepper {
-                            stepper_stop_from_p1();
-                        }
-                        if actions.spawn_arm_check {
-                            arm_check::spawn().ok();
+                        {
+                            let mut state = foci_firmware::commission_dispatch::DispatchState {
+                                calibrated: &mut calibrated,
+                                motor_enabled: &mut motor_enabled,
+                                stored_gains: &mut stored_gains,
+                            };
+                            apply_stepper_post_action(actions.stepper, &mut state);
                         }
                         emit_terminal_reply(reply);
                     }
@@ -599,6 +601,10 @@ mod app {
                                 // commissioning engine to run ADC calibration
                                 // asynchronously; the CalibrateDone handler will
                                 // complete encoder alignment and closed-loop entry.
+                                if !foci_firmware::tmc::auto_calibrate_on_enable_allowed() {
+                                    defmt::warn!("Auto-calibrate rejected: host gate closed");
+                                    continue;
+                                }
                                 if COMMISSION_IN_FLIGHT
                                     .swap(true, core::sync::atomic::Ordering::Relaxed)
                                 {
@@ -621,6 +627,10 @@ mod app {
                             // Existing precondition: this arm runs only when
                             // calibrated == true (the !calibrated branch above
                             // continues to the auto-calibrate path).
+                            if motor_enabled {
+                                defmt::info!("Motor enable sync (already armed)");
+                                continue;
+                            }
                             {
                                 let mut backend = OpenFFBoardBackend { tmc, enable_pin };
                                 let mut state = foci_firmware::commission_dispatch::DispatchState {
@@ -632,14 +642,11 @@ mod app {
                                     &mut backend,
                                     &mut state,
                                 );
-                                // Zero firmware position counter before arming step timer.
-                                STEPPER_POSITION.store(0, core::sync::atomic::Ordering::Relaxed);
-                                foci_firmware::tmc_ops::arm_motor_for_steps(&mut state);
+                                apply_stepper_post_action(
+                                    foci_firmware::commission_dispatch::StepperPostAction::ArmZeroPosition,
+                                    &mut state,
+                                );
                             }
-
-                            // If queue already has moves (burst-drain scenario),
-                            // arm timer to start processing them.
-                            arm_check::spawn().ok();
 
                             defmt::info!("Motor enabled (calibrated, step/dir armed)");
                         } else {

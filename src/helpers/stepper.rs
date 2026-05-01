@@ -3,7 +3,9 @@
 //! step-timer ISR share a single implementation.
 
 use crate::trigger_domain::stop_physical_stepper_no_lock;
-use foci_firmware::state::stepper::STEP_TIMER_ACTIVE_MIRROR;
+use foci_firmware::commission_dispatch::{DispatchState, StepperPostAction};
+use foci_firmware::state::stepper::{STEP_TIMER_ACTIVE_MIRROR, STEPPER_POSITION};
+use foci_firmware::state::tmc::MOTOR_ARMED;
 
 /// Minimum lead time when arming TIM5 CC1 from thread context.
 ///
@@ -49,4 +51,27 @@ pub(crate) fn stepper_stop_from_p1() {
     stop_physical_stepper_no_lock(0);
     STEP_TIMER_ACTIVE_MIRROR.store(false, core::sync::atomic::Ordering::Relaxed);
     crate::app::stop_check::spawn().ok();
+}
+
+/// Apply a board-owned stepper runtime transition after commissioning dispatch.
+///
+/// This is the single owner of firmware step-epoch zeroing, `MOTOR_ARMED=true`,
+/// and `arm_check` spawning. Dispatch only decides which transition is needed.
+pub(crate) fn apply_stepper_post_action(action: StepperPostAction, state: &mut DispatchState<'_>) {
+    match action {
+        StepperPostAction::None => {}
+        StepperPostAction::Stop => {
+            MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+            stepper_stop_from_p1();
+        }
+        StepperPostAction::ArmZeroPosition => {
+            STEPPER_POSITION.store(0, core::sync::atomic::Ordering::Relaxed);
+            foci_firmware::tmc_ops::arm_motor_for_steps(state);
+            crate::app::arm_check::spawn().ok();
+        }
+        StepperPostAction::ArmPreservePosition => {
+            foci_firmware::tmc_ops::arm_motor_for_steps(state);
+            crate::app::arm_check::spawn().ok();
+        }
+    }
 }
