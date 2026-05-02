@@ -487,8 +487,7 @@ mod app {
                 POSITION_FILTER_HZ.store(0, R);
                 FLUX_FILTER_HZ.store(0, R);
                 TORQUE_FILTER_HZ.store(0, R);
-                // Reset hardware stepper state
-                MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+                // Reset hardware stepper state.
                 stepper_stop_from_p1();
                 STEPPER_POSITION.store(0, core::sync::atomic::Ordering::Relaxed);
                 FAULT_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
@@ -650,10 +649,7 @@ mod app {
 
                             defmt::info!("Motor enabled (calibrated, step/dir armed)");
                         } else {
-                            // Disable: stop stepping first (clears MOTOR_ARMED so
-                            // arm_check sees the disarmed state), then kill motor
-                            // electrically.
-                            MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+                            // Disable: stop stepping first, then kill motor electrically.
                             stepper_stop_from_p1();
                             {
                                 let mut backend = OpenFFBoardBackend { tmc, enable_pin };
@@ -945,7 +941,6 @@ mod app {
             // the fault to Klipper so the host knows the MCU is down.
             if TMC_DISABLE_SIGNAL.try_take().is_some() {
                 // Stop hardware stepper immediately
-                MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
                 stepper_stop_from_p1();
                 FAULT_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
 

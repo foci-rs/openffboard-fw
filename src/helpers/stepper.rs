@@ -4,8 +4,9 @@
 
 use crate::trigger_domain::stop_physical_stepper_no_lock;
 use foci_firmware::commission_dispatch::{DispatchState, StepperPostAction};
-use foci_firmware::state::stepper::{STEP_TIMER_ACTIVE_MIRROR, STEPPER_POSITION};
+use foci_firmware::state::stepper::STEP_TIMER_ACTIVE_MIRROR;
 use foci_firmware::state::tmc::MOTOR_ARMED;
+use foci_firmware::tmc_ops::StepperTaskDirective;
 
 /// Minimum lead time when arming TIM5 CC1 from thread context.
 ///
@@ -48,6 +49,7 @@ pub(crate) fn arm_step_timer(clock: u32) {
 /// inside `TriggerDomain`. P1 must never enter `TriggerDomain` per
 /// spec.
 pub(crate) fn stepper_stop_from_p1() {
+    MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
     stop_physical_stepper_no_lock(0);
     STEP_TIMER_ACTIVE_MIRROR.store(false, core::sync::atomic::Ordering::Relaxed);
     crate::app::stop_check::spawn().ok();
@@ -58,19 +60,12 @@ pub(crate) fn stepper_stop_from_p1() {
 /// This is the single owner of firmware step-epoch zeroing, `MOTOR_ARMED=true`,
 /// and `arm_check` spawning. Dispatch only decides which transition is needed.
 pub(crate) fn apply_stepper_post_action(action: StepperPostAction, state: &mut DispatchState<'_>) {
-    match action {
-        StepperPostAction::None => {}
-        StepperPostAction::Stop => {
-            MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+    match foci_firmware::tmc_ops::apply_stepper_post_action_state(action, state) {
+        StepperTaskDirective::None => {}
+        StepperTaskDirective::StopCheck => {
             stepper_stop_from_p1();
         }
-        StepperPostAction::ArmZeroPosition => {
-            STEPPER_POSITION.store(0, core::sync::atomic::Ordering::Relaxed);
-            foci_firmware::tmc_ops::arm_motor_for_steps(state);
-            crate::app::arm_check::spawn().ok();
-        }
-        StepperPostAction::ArmPreservePosition => {
-            foci_firmware::tmc_ops::arm_motor_for_steps(state);
+        StepperTaskDirective::ArmCheck => {
             crate::app::arm_check::spawn().ok();
         }
     }
