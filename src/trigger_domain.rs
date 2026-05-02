@@ -175,7 +175,12 @@ where
 
 /// Stop a physical stepper without locking TriggerDomain.
 ///
-/// Called from inside `with_trigger_domain()` during trigger dispatch.
+/// Called from two contexts:
+/// 1. Inside `with_trigger_domain()` during trigger dispatch (P2 holding
+///    an `interrupt::free` critical section; P2 producers cannot preempt).
+/// 2. From [`crate::helpers::stepper::stepper_stop_from_p1`] (P1 context
+///    with no critical section; P2 producers can preempt).
+///
 /// Only acts on physical stepper indices (CC1 timer, GPIO, queue).
 ///
 /// Per spec: disable CC1, clear interval, reset ISR stepper engine,
@@ -193,12 +198,30 @@ pub(crate) fn stop_physical_stepper_no_lock(stepper_idx: usize) {
     STEP_INTERVAL.store(0, Relaxed);
     PID_ERROR_SUMS_CLEAR.store(true, Relaxed);
     // 3. Reset ISR stepper engine state (clear stale partial segment)
-    // SAFETY: P3 (timer ISR) is quiesced by CC1IE disable above.
+    // SAFETY: ISR_STEPPER is exclusively touched by the P3 step-timer IRQ,
+    // which is quiesced by the CC1IE disable above. Sole accessor here.
     unsafe {
         (*core::ptr::addr_of_mut!(ISR_STEPPER)).reset();
     }
-    // 4. Drain queue
-    // SAFETY: P3 (timer ISR) is quiesced — we are the sole accessor.
+    // 4. Drain queue.
+    //
+    // SAFETY: STEP_QUEUE is a `heapless::spsc::Queue` — single-producer
+    // (P2 `queue_step_move`), single-consumer (P3 step-timer IRQ). The P3
+    // consumer is quiesced by the CC1IE disable above; here we act as the
+    // consumer and call `dequeue()`. The SPSC implementation supports
+    // concurrent producer/consumer access without a lock, so a P2 enqueue
+    // that races this drain is well-defined.
+    //
+    // Caller invariants for entries that survive the drain (i.e. P2
+    // enqueues completing after the loop exits):
+    // - From `with_trigger_domain` context: the `interrupt::free` critical
+    //   section blocks P2 producers, so no enqueue can race the drain.
+    // - From `stepper_stop_from_p1`: the caller has already cleared
+    //   `MOTOR_ARMED`, so the next `arm_check` and the step-timer IRQ both
+    //   bail; any surviving entry is gated from execution and either gets
+    //   processed at the next motor enable (against the freshly-zeroed
+    //   STEPPER_POSITION applied by `apply_stepper_post_action_state`) or
+    //   is drained again by the next `stepper_stop_from_p1`.
     unsafe { while (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue().is_some() {} }
     // 5. Reset direction GPIO (PA0) to known low state
     let gpio_a = embassy_stm32::pac::GPIOA;
