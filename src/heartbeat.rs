@@ -7,8 +7,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use embassy_stm32::gpio::Output;
 use embassy_stm32::peripherals;
 use embassy_stm32::wdg::IndependentWatchdog;
-use foci_firmware::ankyra::outputs::Stats;
-use foci_firmware::ankyra::replies::TrsyncState;
+use foci_firmware::ankyra::replies::{Stats, TrsyncState};
 
 /// SumSq base used by `stats`. Must match `STATS_SUMSQ_BASE` advertised
 /// to Klipper via `klipper_constant`.
@@ -73,7 +72,7 @@ pub fn stats_tick(
     }
 
     defmt::info!("stats tick");
-    ::ankyra::klipper_output_from!(
+    ::ankyra::klipper_reply_from!(
         &mut crate::_ankyra_config::Sender,
         Stats,
         count: u32 = accumulator.count,
