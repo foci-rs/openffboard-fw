@@ -12,6 +12,7 @@ use foci_firmware::state::tmc::COMMISSION_IN_FLIGHT;
 /// clippy's `too_many_arguments` lint. The `#[klipper_command]`
 /// handler signature is protocol-bound and cannot be changed.
 pub(crate) struct FociTuneParams {
+    pub(crate) channel: u8,
     pub(crate) oid: u8,
     pub(crate) profile: u8,
     pub(crate) mode: u8,
@@ -58,6 +59,7 @@ pub(crate) fn foci_tune_inner(params: FociTuneParams) {
         tau_e_crosscheck_us,
         tau_residual_permille,
         inner_warning_flags,
+        channel,
     } = params;
     if COMMISSION_IN_FLIGHT.swap(true, Relaxed) {
         ::ankyra::klipper_reply_from!(
@@ -70,6 +72,7 @@ pub(crate) fn foci_tune_inner(params: FociTuneParams) {
         return;
     }
     if !tmc_send(foci_firmware::tmc::tmc_tune(
+        channel,
         oid,
         profile,
         mode,

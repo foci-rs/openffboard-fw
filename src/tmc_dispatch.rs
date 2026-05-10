@@ -8,7 +8,7 @@
 //! DumpRegisters / TraceInfo / TraceFetch, and the `#[cfg(feature =
 //! "dev")]` Read / Write pair — dispatches here.
 
-use foci_firmware::tmc::TmcRequest;
+use foci_firmware::tmc::{TmcRequest, TmcRequestKind};
 use foci_tmc4671::spi::Tmc4671Spi;
 use rtic_monotonics::Monotonic;
 use rtic_monotonics::fugit::ExtU64;
@@ -26,16 +26,21 @@ pub(crate) async fn handle_tmc_request(
     req: TmcRequest,
     tmc: &mut Tmc4671Spi<TmcSpiDevice>,
 ) -> Result<(), ()> {
-    match req {
+    if req.channel != 0 {
+        defmt::error!("OpenFFBoard received invalid TMC channel {}", req.channel);
+        return Err(());
+    }
+
+    match req.kind {
         #[cfg(feature = "dev")]
-        TmcRequest::Write { addr, value } => {
+        TmcRequestKind::Write { addr, value } => {
             let reg = foci_tmc4671::registers::Register::new(addr);
             if tmc.write_register(reg, value).await.is_err() {
                 defmt::error!("TMC4671 SPI write failed: addr={:#04x}", addr);
             }
         }
         #[cfg(feature = "dev")]
-        TmcRequest::Read { oid, addr } => {
+        TmcRequestKind::Read { oid, addr } => {
             let reg = foci_tmc4671::registers::Register::new(addr);
             match tmc.read_register(reg).await {
                 Ok(value) => {
@@ -52,20 +57,20 @@ pub(crate) async fn handle_tmc_request(
                 }
             }
         }
-        TmcRequest::SetCurrent { run_ma } => {
+        TmcRequestKind::SetCurrent { run_ma } => {
             foci_firmware::tmc_ops::apply_set_current(tmc, run_ma, CURRENT_SCALE_MA_PER_LSB)
                 .await?;
         }
-        TmcRequest::SetEncoder { ppr } => {
+        TmcRequestKind::SetEncoder { ppr } => {
             foci_firmware::tmc_ops::apply_set_encoder(tmc, ppr).await?;
         }
-        TmcRequest::SetEncoderDir { invert } => {
+        TmcRequestKind::SetEncoderDir { invert } => {
             foci_firmware::tmc_ops::apply_set_encoder_dir(tmc, invert).await?;
         }
-        TmcRequest::SelfTest { .. } => {
+        TmcRequestKind::SelfTest { .. } => {
             defmt::warn!("handle_tmc_request: SelfTest handled by main loop");
         }
-        TmcRequest::DumpRegisters { oid } => {
+        TmcRequestKind::DumpRegisters { oid } => {
             for &addr in foci_firmware::dump::DUMP_REGISTERS {
                 // Yield between SPI reads to let USB task drain TX buffer.
                 Mono::delay(1.millis()).await;
@@ -115,30 +120,30 @@ pub(crate) async fn handle_tmc_request(
                 oid: u8 = oid,
             );
         }
-        TmcRequest::SetPidGains { .. } => {
+        TmcRequestKind::SetPidGains { .. } => {
             defmt::warn!("handle_tmc_request: SetPidGains handled by main loop");
         }
-        TmcRequest::SetEnable(_) => {
+        TmcRequestKind::SetEnable(_) => {
             defmt::warn!("handle_tmc_request: SetEnable handled by main loop");
         }
-        TmcRequest::Calibrate { .. } => {
+        TmcRequestKind::Calibrate { .. } => {
             defmt::warn!("handle_tmc_request: Calibrate handled by main loop");
         }
-        TmcRequest::SetVelocityFilter { .. } => {}
-        TmcRequest::SetTorqueFilter { .. } => {}
-        TmcRequest::SetPositionFilter { .. } => {}
-        TmcRequest::SetFluxFilter { .. } => {}
-        TmcRequest::SetPositionGains { .. } => {
+        TmcRequestKind::SetVelocityFilter { .. } => {}
+        TmcRequestKind::SetTorqueFilter { .. } => {}
+        TmcRequestKind::SetPositionFilter { .. } => {}
+        TmcRequestKind::SetFluxFilter { .. } => {}
+        TmcRequestKind::SetPositionGains { .. } => {
             defmt::warn!("handle_tmc_request: SetPositionGains handled by main loop");
         }
-        TmcRequest::SetVelocityFeedforward { .. } => {}
+        TmcRequestKind::SetVelocityFeedforward { .. } => {}
         // During active commissioning, trace requests queue until the
         // engine reaches a terminal state (Continue/PhaseChanged both
         // `continue` before rx.recv()). By that point stop() has run,
         // so FetchResult::Busy is protocol-correct but not observable
         // during commissioning. The Python FOCI_TRACE command runs
         // after commissioning completes, so this is not a functional gap.
-        TmcRequest::TraceInfo { oid } => {
+        TmcRequestKind::TraceInfo { oid } => {
             let info = unsafe { trace_buf() }.info(oid);
             ::ankyra::klipper_reply_from!(
                 &mut crate::_ankyra_config::Sender,
@@ -153,7 +158,7 @@ pub(crate) async fn handle_tmc_request(
                 dropped: u16 = info.dropped,
             );
         }
-        TmcRequest::TraceFetch {
+        TmcRequestKind::TraceFetch {
             oid,
             offset,
             generation,
@@ -197,18 +202,18 @@ pub(crate) async fn handle_tmc_request(
                 }
             }
         }
-        TmcRequest::Commission { .. } => {
+        TmcRequestKind::Commission { .. } => {
             defmt::warn!("handle_tmc_request: Commission handled by main loop");
         }
-        TmcRequest::Tune { .. } => {
+        TmcRequestKind::Tune { .. } => {
             defmt::warn!("handle_tmc_request: Tune handled by main loop");
         }
         #[cfg(feature = "dev")]
-        TmcRequest::Init => {
+        TmcRequestKind::Init => {
             defmt::warn!("handle_tmc_request: Init handled by main loop");
         }
         #[cfg(feature = "dev")]
-        TmcRequest::TestSpin { .. } => {
+        TmcRequestKind::TestSpin { .. } => {
             defmt::warn!("handle_tmc_request: TestSpin handled by main loop");
         }
     }

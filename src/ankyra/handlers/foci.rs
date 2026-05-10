@@ -16,6 +16,8 @@
 pub use foci_firmware::ankyra::handlers::foci::*;
 
 use ankyra::prelude::klipper_command;
+use foci_firmware::context::{ClockSource, ShutdownRecovery, StateAccess};
+use foci_firmware::shutdown::ShutdownReason;
 
 use crate::firmware_ctx::FirmwareCtx;
 use crate::helpers::tmc::{FociTuneParams, foci_tune_inner};
@@ -28,7 +30,7 @@ use crate::helpers::tmc::{FociTuneParams, foci_tune_inner};
 #[allow(clippy::too_many_arguments)]
 #[klipper_command]
 pub fn foci_tune(
-    _ctx: &mut FirmwareCtx<'_>,
+    ctx: &mut FirmwareCtx<'_>,
     oid: u8,
     profile: u8,
     mode: u8,
@@ -41,7 +43,18 @@ pub fn foci_tune(
     tau_residual_permille: u16,
     inner_warning_flags: u8,
 ) {
+    let channel = match ctx.state().foci_channel_for_oid(oid) {
+        Some(channel) => channel,
+        None => {
+            if ctx.enter_shutdown() {
+                let clock = ctx.now();
+                ctx.send_shutdown(ShutdownReason::InvalidTmcChannel, clock);
+            }
+            return;
+        }
+    };
     foci_tune_inner(FociTuneParams {
+        channel,
         oid,
         profile,
         mode,

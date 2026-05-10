@@ -71,7 +71,7 @@ mod app {
     // automatically via an extended u64 counter in a TimerQueueBackend.
     stm32_tim2_monotonic!(Mono, 1_000_000);
 
-    use foci_firmware::tmc::TmcRequest;
+    use foci_firmware::tmc::{TmcRequest, TmcRequestKind};
 
     use crate::board_config::TMC_CONFIG;
     use crate::commissioning_backend::OpenFFBoardBackend;
@@ -591,7 +591,22 @@ mod app {
             match select(rx.recv(), Mono::delay(1.millis())).await {
                 // Channel message received
                 Either::First(Ok(req)) => match req {
-                    TmcRequest::SetEnable(enabled) => {
+                    TmcRequest { channel, .. } if channel != 0 => {
+                        ctx.shared.app_state.lock(|state| {
+                            if crate::firmware_ctx::enter_shutdown(state) {
+                                ::ankyra::klipper_shutdown_from!(
+                                    &mut crate::_ankyra_config::Sender,
+                                    "Invalid TMC channel",
+                                    read_tim5(),
+                                );
+                            }
+                        });
+                        continue;
+                    }
+                    TmcRequest {
+                        kind: TmcRequestKind::SetEnable(enabled),
+                        ..
+                    } => {
                         if enabled {
                             if !calibrated {
                                 // Auto-calibrate: Klipper may send enable before
@@ -668,7 +683,10 @@ mod app {
                             defmt::info!("TMC4671 motor disabled");
                         }
                     }
-                    TmcRequest::Calibrate { oid } => {
+                    TmcRequest {
+                        kind: TmcRequestKind::Calibrate { oid },
+                        ..
+                    } => {
                         if motor_enabled {
                             defmt::warn!("foci_calibrate rejected: motor already enabled");
                             COMMISSION_IN_FLIGHT
@@ -692,19 +710,29 @@ mod app {
                         );
                     }
                     #[cfg(feature = "dev")]
-                    TmcRequest::Init => {
+                    TmcRequest {
+                        kind: TmcRequestKind::Init,
+                        ..
+                    } => {
                         defmt::info!("TMC4671 init: starting open-loop stepper config");
                         tmc_enter_openloop(tmc, enable_pin).await;
                     }
                     #[cfg(feature = "dev")]
-                    TmcRequest::TestSpin { revolutions } => {
+                    TmcRequest {
+                        kind: TmcRequestKind::TestSpin { revolutions },
+                        ..
+                    } => {
                         do_test_spin(tmc, revolutions).await;
                     }
-                    TmcRequest::SetPidGains {
-                        flux_p,
-                        flux_i,
-                        torque_p,
-                        torque_i,
+                    TmcRequest {
+                        kind:
+                            TmcRequestKind::SetPidGains {
+                                flux_p,
+                                flux_i,
+                                torque_p,
+                                torque_i,
+                            },
+                        ..
                     } => {
                         stored_gains = Some(foci_firmware::pid::InnerLoopGains {
                             flux_p,
@@ -720,11 +748,15 @@ mod app {
                             torque_i,
                         );
                     }
-                    TmcRequest::SetPositionGains {
-                        position_p,
-                        position_i,
-                        velocity_p,
-                        velocity_i,
+                    TmcRequest {
+                        kind:
+                            TmcRequestKind::SetPositionGains {
+                                position_p,
+                                position_i,
+                                velocity_p,
+                                velocity_i,
+                            },
+                        ..
                     } => {
                         POSITION_P_VALUE.store(position_p, core::sync::atomic::Ordering::Relaxed);
                         POSITION_I_VALUE.store(position_i, core::sync::atomic::Ordering::Relaxed);
@@ -738,12 +770,18 @@ mod app {
                             velocity_i,
                         );
                     }
-                    TmcRequest::SetVelocityFeedforward { enable } => {
+                    TmcRequest {
+                        kind: TmcRequestKind::SetVelocityFeedforward { enable },
+                        ..
+                    } => {
                         defmt::info!("Velocity feedforward: {} (via queue)", enable);
                         // Feedforward flag is already set by the atomic in the
                         // command handler; this arm exists for exhaustiveness.
                     }
-                    TmcRequest::Commission { oid, profile } => {
+                    TmcRequest {
+                        kind: TmcRequestKind::Commission { oid, profile },
+                        ..
+                    } => {
                         if motor_enabled {
                             COMMISSION_IN_FLIGHT
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
@@ -786,18 +824,22 @@ mod app {
                         // ClosedLoopEntry only — starting here would add SPI reads
                         // throughout inner diagnostics/electrical ID phases.
                     }
-                    TmcRequest::Tune {
-                        oid,
-                        profile,
-                        mode,
-                        inner_lambda_us,
-                        theta_e_us,
-                        current_ringing_count,
-                        current_bandwidth_hz,
-                        tau_e_us,
-                        tau_e_crosscheck_us,
-                        tau_residual_permille,
-                        inner_warning_flags,
+                    TmcRequest {
+                        kind:
+                            TmcRequestKind::Tune {
+                                oid,
+                                profile,
+                                mode,
+                                inner_lambda_us,
+                                theta_e_us,
+                                current_ringing_count,
+                                current_bandwidth_hz,
+                                tau_e_us,
+                                tau_e_crosscheck_us,
+                                tau_residual_permille,
+                                inner_warning_flags,
+                            },
+                        ..
                     } => {
                         // Stage 2 requires the motor to be enabled and
                         // holding in closed-loop position mode (from Stage 1
@@ -871,7 +913,10 @@ mod app {
                                 .set_phase(foci_firmware::autotune::PhaseId::MechanicalId.to_u8());
                         }
                     }
-                    TmcRequest::SelfTest { oid } => {
+                    TmcRequest {
+                        kind: TmcRequestKind::SelfTest { oid },
+                        ..
+                    } => {
                         if motor_enabled {
                             defmt::warn!("foci_selftest rejected: motor enabled");
                             COMMISSION_IN_FLIGHT
@@ -891,7 +936,10 @@ mod app {
                         commission_engine =
                             Some(foci_firmware::commission::CommissioningEngine::new_selftest(oid));
                     }
-                    req @ TmcRequest::SetEncoder { .. } => {
+                    req @ TmcRequest {
+                        kind: TmcRequestKind::SetEncoder { .. },
+                        ..
+                    } => {
                         if handle_tmc_request(req, tmc).await.is_err() {
                             ctx.shared.app_state.lock(|state| {
                                 if crate::firmware_ctx::enter_shutdown(state) {
