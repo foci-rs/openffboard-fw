@@ -14,13 +14,12 @@ use rtic_monotonics::fugit::ExtU64;
 use crate::app::Mono;
 use crate::app_types::TmcSpiDevice;
 use crate::board_config::TMC_CONFIG;
-use foci_firmware::state::tmc::{
-    CURRENT_LIMIT_REG, STEP_WIDTH_VALUE, TMC_DISABLE_SIGNAL, VELOCITY_LIMIT_CFG,
-};
+use foci_firmware::state::tmc::{TMC_DISABLE_SIGNAL, TmcChannelState};
 
 pub(crate) struct OpenFFBoardBackend<'a> {
     pub(crate) tmc: &'a mut Tmc4671Spi<TmcSpiDevice>,
     pub(crate) enable_pin: &'a mut Output<'static>,
+    pub(crate) tmc_state: &'static TmcChannelState,
 }
 
 impl<'a> foci_firmware::commission::CommissioningBackend for OpenFFBoardBackend<'a> {
@@ -78,7 +77,7 @@ impl<'a> foci_firmware::commission::CommissioningBackend for OpenFFBoardBackend<
     }
 
     fn current_limit(&self) -> u32 {
-        CURRENT_LIMIT_REG.load(Relaxed)
+        self.tmc_state.current_limit_reg.load(Relaxed)
     }
 
     fn pwm_maxcnt(&self) -> u16 {
@@ -102,11 +101,11 @@ impl<'a> foci_firmware::commission::CommissioningBackend for OpenFFBoardBackend<
     }
 
     fn step_width(&self) -> u32 {
-        STEP_WIDTH_VALUE.load(Relaxed).max(0) as u32
+        self.tmc_state.step_width_value.load(Relaxed).max(0) as u32
     }
 
     fn operational_velocity_limit(&self) -> u32 {
-        VELOCITY_LIMIT_CFG.load(Relaxed)
+        self.tmc_state.velocity_limit_cfg.load(Relaxed)
     }
 
     async fn delay_us(&mut self, us: u32) {

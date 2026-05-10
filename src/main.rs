@@ -50,8 +50,7 @@ mod app {
     use crate::state::trace::*;
     use crate::trigger_domain::{TRIGGER_DOMAIN, TriggerDomain, with_trigger_domain};
     use foci_firmware::state::lifecycle::*;
-    use foci_firmware::state::stepper::*;
-    use foci_firmware::state::tmc::*;
+    use foci_firmware::state::tmc::{TMC_DISABLE_SIGNAL, TMC_QUEUE_FLUSH};
     use foci_firmware::state::trsync::*;
 
     bind_interrupts!(struct Irqs {
@@ -77,6 +76,39 @@ mod app {
     use crate::commissioning_backend::OpenFFBoardBackend;
 
     const HOLD_SETTLE_DELAY_MS: u8 = 100;
+
+    fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
+        foci_firmware::state::tmc::tmc_channel0()
+    }
+
+    fn stepper_state() -> &'static foci_firmware::state::stepper::StepperChannelState {
+        foci_firmware::state::stepper::stepper_channel0()
+    }
+
+    fn dispatch_state<'a>(
+        calibrated: &'a mut bool,
+        motor_enabled: &'a mut bool,
+        stored_gains: &'a mut Option<foci_firmware::pid::InnerLoopGains>,
+    ) -> foci_firmware::commission_dispatch::DispatchState<'a> {
+        foci_firmware::commission_dispatch::DispatchState::new(
+            tmc_state(),
+            stepper_state(),
+            calibrated,
+            motor_enabled,
+            stored_gains,
+        )
+    }
+
+    fn openffboard_backend<'a>(
+        tmc: &'a mut Tmc4671Spi<TmcSpiDevice>,
+        enable_pin: &'a mut Output<'static>,
+    ) -> OpenFFBoardBackend<'a> {
+        OpenFFBoardBackend {
+            tmc,
+            enable_pin,
+            tmc_state: tmc_state(),
+        }
+    }
 
     // TriggerDomain, PHYSICAL_STEPPER_INDICES, TRIGGER_TIMER_MIN_LEAD_TICKS,
     // TRIGGER_DOMAIN, with_trigger_domain(), and stop_physical_stepper_no_lock()
@@ -197,29 +229,32 @@ mod app {
 
         crate::board_init::enable_dwt_cyccnt();
 
-        // Initialize trace buffer in CCM RAM
+        // Initialize trace buffers in CCM RAM
         unsafe {
             // Use addr_of_mut! to avoid creating a reference to the mutable static
             let ptr =
-                core::ptr::addr_of_mut!(TRACE_BUF).cast::<foci_firmware::trace::TraceBuffer>();
+                core::ptr::addr_of_mut!(TRACE_BUFS).cast::<foci_firmware::trace::TraceBuffer>();
             // Validate address is in CCM range
             let addr = ptr as usize;
             defmt::assert!(
                 (0x1000_0000..0x1001_0000).contains(&addr),
-                "TRACE_BUF not in CCM RAM: {:#010x}",
+                "TRACE_BUFS not in CCM RAM: {:#010x}",
                 addr
             );
             defmt::info!(
-                "trace: buffer at {:#010x}, size {} bytes",
+                "trace: buffers at {:#010x}, size {} bytes",
                 addr,
                 core::mem::size_of::<foci_firmware::trace::TraceBuffer>()
+                    * crate::board_config::TMC_CHANNEL_COUNT as usize
             );
-            core::ptr::write(ptr, {
-                let mut buf = core::mem::zeroed::<foci_firmware::trace::TraceBuffer>();
-                // reset() sets magic and all fields to valid initial state
-                buf.reset();
-                buf
-            });
+            for channel in 0..crate::board_config::TMC_CHANNEL_COUNT as usize {
+                core::ptr::write(ptr.add(channel), {
+                    let mut buf = core::mem::zeroed::<foci_firmware::trace::TraceBuffer>();
+                    // reset() sets magic and all fields to valid initial state
+                    buf.reset();
+                    buf
+                });
+            }
         }
 
         // Initialize TriggerDomain
@@ -425,7 +460,7 @@ mod app {
 
         // Main loop: wait for channel message or 1ms timeout.
         // On message: handle request. On timeout: write position target.
-        // Position is read from STEPPER_POSITION_TARGET atomic (updated
+        // Position is read from stepper_state().position_target atomic (updated
         // by usb_receive at P2) — no shared resource lock needed.
         loop {
             use embassy_futures::select::{Either, select};
@@ -437,17 +472,16 @@ mod app {
                 if !shutdown_handled {
                     commission_engine.take();
                     {
-                        let mut backend = OpenFFBoardBackend { tmc, enable_pin };
-                        let mut state = foci_firmware::commission_dispatch::DispatchState {
-                            calibrated: &mut calibrated,
-                            motor_enabled: &mut motor_enabled,
-                            stored_gains: &mut stored_gains,
-                        };
-                        // disarm_motor clears MOTOR_ARMED, motor_enabled, calibrated,
+                        let mut backend = openffboard_backend(tmc, enable_pin);
+                        let mut state =
+                            dispatch_state(&mut calibrated, &mut motor_enabled, &mut stored_gains);
+                        // disarm_motor clears tmc_state().motor_armed, motor_enabled, calibrated,
                         // and runs restore_safe_state_via_backend (best-effort SPI writes).
                         foci_firmware::tmc_ops::disarm_motor(&mut backend, &mut state).await;
                     }
-                    COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+                    tmc_state()
+                        .commission_in_flight
+                        .store(false, core::sync::atomic::Ordering::Relaxed);
                     stepper_stop_from_p1();
                     shutdown_handled = true;
                 }
@@ -466,30 +500,31 @@ mod app {
                 // hardware state (zero targets, disable outputs) so the motor
                 // is not left energized in whatever mode the engine last set.
                 if commission_engine.take().is_some() {
-                    let mut backend = OpenFFBoardBackend { tmc, enable_pin };
-                    let mut state = foci_firmware::commission_dispatch::DispatchState {
-                        calibrated: &mut calibrated,
-                        motor_enabled: &mut motor_enabled,
-                        stored_gains: &mut stored_gains,
-                    };
+                    let mut backend = openffboard_backend(tmc, enable_pin);
+                    let mut state =
+                        dispatch_state(&mut calibrated, &mut motor_enabled, &mut stored_gains);
                     foci_firmware::tmc_ops::disarm_motor(&mut backend, &mut state).await;
                 }
-                COMMISSION_IN_FLIGHT.store(false, core::sync::atomic::Ordering::Relaxed);
+                tmc_state()
+                    .commission_in_flight
+                    .store(false, core::sync::atomic::Ordering::Relaxed);
                 // Clear commissioned outer configuration so the next closed-
                 // loop entry uses defaults, not stale commissioned values.
                 use core::sync::atomic::Ordering::Relaxed as R;
-                VELOCITY_LIMIT_CFG.store(500_000, R);
-                POSITION_P_VALUE.store(640, R);
-                POSITION_I_VALUE.store(0, R);
-                VELOCITY_P_VALUE.store(1152, R);
-                VELOCITY_I_VALUE.store(0, R);
-                VELOCITY_FILTER_HZ.store(0, R);
-                POSITION_FILTER_HZ.store(0, R);
-                FLUX_FILTER_HZ.store(0, R);
-                TORQUE_FILTER_HZ.store(0, R);
+                tmc_state().velocity_limit_cfg.store(500_000, R);
+                tmc_state().position_p_value.store(640, R);
+                tmc_state().position_i_value.store(0, R);
+                tmc_state().velocity_p_value.store(1152, R);
+                tmc_state().velocity_i_value.store(0, R);
+                tmc_state().velocity_filter_hz.store(0, R);
+                tmc_state().position_filter_hz.store(0, R);
+                tmc_state().flux_filter_hz.store(0, R);
+                tmc_state().torque_filter_hz.store(0, R);
                 // Reset hardware stepper state.
                 stepper_stop_from_p1();
-                STEPPER_POSITION.store(0, core::sync::atomic::Ordering::Relaxed);
+                stepper_state()
+                    .position
+                    .store(0, core::sync::atomic::Ordering::Relaxed);
                 FAULT_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
                 defmt::info!("TMC request queue flushed after config_reset");
             }
@@ -507,17 +542,14 @@ mod app {
                 // post-processing. Two scoped constructions keep the
                 // borrows non-overlapping.
                 let result = {
-                    let mut backend = OpenFFBoardBackend { tmc, enable_pin };
+                    let mut backend = openffboard_backend(tmc, enable_pin);
                     commission_engine.as_mut().unwrap().step(&mut backend).await
                 };
 
                 let outcome = {
-                    let mut backend = OpenFFBoardBackend { tmc, enable_pin };
-                    let mut state = foci_firmware::commission_dispatch::DispatchState {
-                        calibrated: &mut calibrated,
-                        motor_enabled: &mut motor_enabled,
-                        stored_gains: &mut stored_gains,
-                    };
+                    let mut backend = openffboard_backend(tmc, enable_pin);
+                    let mut state =
+                        dispatch_state(&mut calibrated, &mut motor_enabled, &mut stored_gains);
                     foci_firmware::commission_dispatch::drive_commission_result(
                         result,
                         &mut commission_engine,
@@ -535,7 +567,7 @@ mod app {
                         // SPI eats into the 1ms trace budget.
                         foci_firmware::trace::sample_tick(
                             tmc,
-                            unsafe { trace_buf() },
+                            unsafe { trace_buf0() },
                             || {
                                 engine_tick_deadline
                                     .checked_duration_since(Mono::now())
@@ -559,27 +591,27 @@ mod app {
                         // OuterTune).
                         if phase_id == foci_firmware::autotune::PhaseId::ClosedLoopEntry
                             && engine_kind == EngineKind::Commission
-                            && !unsafe { trace_buf() }.is_capturing()
+                            && !unsafe { trace_buf0() }.is_capturing()
                         {
                             unsafe {
-                                trace_buf().start(oid, foci_firmware::trace::PRESET_FAST);
+                                trace_buf0().start(oid, foci_firmware::trace::PRESET_FAST);
                             }
                         }
-                        unsafe { trace_buf().set_phase(phase_id.to_u8()) };
+                        unsafe { trace_buf0().set_phase(phase_id.to_u8()) };
                         emit_phase_reply(oid, phase_id);
                         Mono::delay(1.millis()).await;
                         continue;
                     }
                     CommissionOutcome::Terminal { reply, actions } => {
                         if actions.stop_trace {
-                            unsafe { trace_buf().stop() };
+                            unsafe { trace_buf0().stop() };
                         }
                         {
-                            let mut state = foci_firmware::commission_dispatch::DispatchState {
-                                calibrated: &mut calibrated,
-                                motor_enabled: &mut motor_enabled,
-                                stored_gains: &mut stored_gains,
-                            };
+                            let mut state = dispatch_state(
+                                &mut calibrated,
+                                &mut motor_enabled,
+                                &mut stored_gains,
+                            );
                             apply_stepper_post_action(actions.stepper, &mut state);
                         }
                         emit_terminal_reply(reply);
@@ -615,11 +647,12 @@ mod app {
                                 // commissioning engine to run ADC calibration
                                 // asynchronously; the CalibrateDone handler will
                                 // complete encoder alignment and closed-loop entry.
-                                if !foci_firmware::tmc::auto_calibrate_on_enable_allowed() {
+                                if !foci_firmware::tmc::auto_calibrate_on_enable_allowed(0) {
                                     defmt::warn!("Auto-calibrate rejected: host gate closed");
                                     continue;
                                 }
-                                if COMMISSION_IN_FLIGHT
+                                if tmc_state()
+                                    .commission_in_flight
                                     .swap(true, core::sync::atomic::Ordering::Relaxed)
                                 {
                                     defmt::warn!("Auto-calibrate skipped: commission in flight");
@@ -629,11 +662,12 @@ mod app {
                                 // OpenFFBoard but needs OID routing for multi-motor boards.
                                 defmt::info!("Auto-calibrating on enable");
                                 commission_engine = Some(
-                                    foci_firmware::commission::CommissioningEngine::new_calibrate(
+                                    foci_firmware::commission::CommissioningEngine::new_calibrate_for_tmc(
                                         0,
+                                        tmc_state(),
                                     ),
                                 );
-                                // Don't set motor_enabled/MOTOR_ARMED yet --
+                                // Don't set motor_enabled/tmc_state().motor_armed yet --
                                 // the CalibrateDone handler does that after
                                 // encoder alignment + closed-loop entry.
                                 continue;
@@ -646,12 +680,12 @@ mod app {
                                 continue;
                             }
                             {
-                                let mut backend = OpenFFBoardBackend { tmc, enable_pin };
-                                let mut state = foci_firmware::commission_dispatch::DispatchState {
-                                    calibrated: &mut calibrated,
-                                    motor_enabled: &mut motor_enabled,
-                                    stored_gains: &mut stored_gains,
-                                };
+                                let mut backend = openffboard_backend(tmc, enable_pin);
+                                let mut state = dispatch_state(
+                                    &mut calibrated,
+                                    &mut motor_enabled,
+                                    &mut stored_gains,
+                                );
                                 foci_firmware::tmc_ops::arm_motor_electrical(
                                     &mut backend,
                                     &mut state,
@@ -667,18 +701,20 @@ mod app {
                             // Disable: stop stepping first, then kill motor electrically.
                             stepper_stop_from_p1();
                             {
-                                let mut backend = OpenFFBoardBackend { tmc, enable_pin };
-                                let mut state = foci_firmware::commission_dispatch::DispatchState {
-                                    calibrated: &mut calibrated,
-                                    motor_enabled: &mut motor_enabled,
-                                    stored_gains: &mut stored_gains,
-                                };
+                                let mut backend = openffboard_backend(tmc, enable_pin);
+                                let mut state = dispatch_state(
+                                    &mut calibrated,
+                                    &mut motor_enabled,
+                                    &mut stored_gains,
+                                );
                                 foci_firmware::tmc_ops::disarm_motor(&mut backend, &mut state)
                                     .await;
                             }
 
                             // Zero position counter
-                            STEPPER_POSITION.store(0, core::sync::atomic::Ordering::Relaxed);
+                            stepper_state()
+                                .position
+                                .store(0, core::sync::atomic::Ordering::Relaxed);
 
                             defmt::info!("TMC4671 motor disabled");
                         }
@@ -689,7 +725,8 @@ mod app {
                     } => {
                         if motor_enabled {
                             defmt::warn!("foci_calibrate rejected: motor already enabled");
-                            COMMISSION_IN_FLIGHT
+                            tmc_state()
+                                .commission_in_flight
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
@@ -706,7 +743,10 @@ mod app {
                         // performs encoder alignment and closed-loop entry.
                         calibrated = false;
                         commission_engine = Some(
-                            foci_firmware::commission::CommissioningEngine::new_calibrate(oid),
+                            foci_firmware::commission::CommissioningEngine::new_calibrate_for_tmc(
+                                oid,
+                                tmc_state(),
+                            ),
                         );
                     }
                     #[cfg(feature = "dev")]
@@ -758,10 +798,18 @@ mod app {
                             },
                         ..
                     } => {
-                        POSITION_P_VALUE.store(position_p, core::sync::atomic::Ordering::Relaxed);
-                        POSITION_I_VALUE.store(position_i, core::sync::atomic::Ordering::Relaxed);
-                        VELOCITY_P_VALUE.store(velocity_p, core::sync::atomic::Ordering::Relaxed);
-                        VELOCITY_I_VALUE.store(velocity_i, core::sync::atomic::Ordering::Relaxed);
+                        tmc_state()
+                            .position_p_value
+                            .store(position_p, core::sync::atomic::Ordering::Relaxed);
+                        tmc_state()
+                            .position_i_value
+                            .store(position_i, core::sync::atomic::Ordering::Relaxed);
+                        tmc_state()
+                            .velocity_p_value
+                            .store(velocity_p, core::sync::atomic::Ordering::Relaxed);
+                        tmc_state()
+                            .velocity_i_value
+                            .store(velocity_i, core::sync::atomic::Ordering::Relaxed);
                         defmt::info!(
                             "Position gains received: pos P={} I={}, vel P={} I={}",
                             position_p,
@@ -783,7 +831,8 @@ mod app {
                         ..
                     } => {
                         if motor_enabled {
-                            COMMISSION_IN_FLIGHT
+                            tmc_state()
+                                .commission_in_flight
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
@@ -796,10 +845,12 @@ mod app {
                             );
                             continue;
                         }
-                        let current_limit =
-                            CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
+                        let current_limit = tmc_state()
+                            .current_limit_reg
+                            .load(core::sync::atomic::Ordering::Relaxed);
                         if current_limit == 0 {
-                            COMMISSION_IN_FLIGHT
+                            tmc_state()
+                                .commission_in_flight
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
@@ -814,8 +865,9 @@ mod app {
                         }
                         calibrated = false;
                         commission_engine = Some(
-                            foci_firmware::commission::CommissioningEngine::new_commission(
+                            foci_firmware::commission::CommissioningEngine::new_commission_for_tmc(
                                 oid,
+                                tmc_state(),
                                 foci_firmware::autotune::CommissionProfile::from_u8(profile),
                             ),
                         );
@@ -845,7 +897,8 @@ mod app {
                         // holding in closed-loop position mode (from Stage 1
                         // or a prior calibrate). Reject if not ready.
                         if !motor_enabled || !calibrated {
-                            COMMISSION_IN_FLIGHT
+                            tmc_state()
+                                .commission_in_flight
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
@@ -858,10 +911,12 @@ mod app {
                             );
                             continue;
                         }
-                        let current_limit =
-                            CURRENT_LIMIT_REG.load(core::sync::atomic::Ordering::Relaxed);
+                        let current_limit = tmc_state()
+                            .current_limit_reg
+                            .load(core::sync::atomic::Ordering::Relaxed);
                         if current_limit == 0 {
-                            COMMISSION_IN_FLIGHT
+                            tmc_state()
+                                .commission_in_flight
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
@@ -877,16 +932,16 @@ mod app {
                         let entry_snapshot = {
                             use core::sync::atomic::Ordering::Relaxed;
                             foci_firmware::commission::EntrySnapshot {
-                                velocity_p: VELOCITY_P_VALUE.load(Relaxed),
-                                velocity_i: VELOCITY_I_VALUE.load(Relaxed),
-                                position_p: POSITION_P_VALUE.load(Relaxed),
-                                position_i: POSITION_I_VALUE.load(Relaxed),
-                                velocity_limit: VELOCITY_LIMIT_CFG.load(Relaxed),
+                                velocity_p: tmc_state().velocity_p_value.load(Relaxed),
+                                velocity_i: tmc_state().velocity_i_value.load(Relaxed),
+                                position_p: tmc_state().position_p_value.load(Relaxed),
+                                position_i: tmc_state().position_i_value.load(Relaxed),
+                                velocity_limit: tmc_state().velocity_limit_cfg.load(Relaxed),
                                 voltage_limit: 16000,
-                                velocity_filter_hz: VELOCITY_FILTER_HZ.load(Relaxed),
-                                torque_filter_hz: TORQUE_FILTER_HZ.load(Relaxed),
-                                position_filter_hz: POSITION_FILTER_HZ.load(Relaxed),
-                                flux_filter_hz: FLUX_FILTER_HZ.load(Relaxed),
+                                velocity_filter_hz: tmc_state().velocity_filter_hz.load(Relaxed),
+                                torque_filter_hz: tmc_state().torque_filter_hz.load(Relaxed),
+                                position_filter_hz: tmc_state().position_filter_hz.load(Relaxed),
+                                flux_filter_hz: tmc_state().flux_filter_hz.load(Relaxed),
                             }
                         };
                         let outer_params = foci_firmware::commission::OuterTuneParams {
@@ -901,15 +956,17 @@ mod app {
                             tau_residual_permille,
                             inner_warning_flags,
                         };
-                        commission_engine =
-                            Some(foci_firmware::commission::CommissioningEngine::new_outer(
+                        commission_engine = Some(
+                            foci_firmware::commission::CommissioningEngine::new_outer_for_tmc(
                                 oid,
+                                tmc_state(),
                                 outer_params,
                                 entry_snapshot,
-                            ));
+                            ),
+                        );
                         unsafe {
-                            trace_buf().start(oid, foci_firmware::trace::PRESET_FULL);
-                            trace_buf()
+                            trace_buf0().start(oid, foci_firmware::trace::PRESET_FULL);
+                            trace_buf0()
                                 .set_phase(foci_firmware::autotune::PhaseId::MechanicalId.to_u8());
                         }
                     }
@@ -919,7 +976,8 @@ mod app {
                     } => {
                         if motor_enabled {
                             defmt::warn!("foci_selftest rejected: motor enabled");
-                            COMMISSION_IN_FLIGHT
+                            tmc_state()
+                                .commission_in_flight
                                 .store(false, core::sync::atomic::Ordering::Relaxed);
                             ::ankyra::klipper_reply_from!(
                                 &mut crate::_ankyra_config::Sender,
@@ -933,8 +991,12 @@ mod app {
                         }
                         // Engine tick drives selftest phases; SelftestDone
                         // handler sends the completion signal.
-                        commission_engine =
-                            Some(foci_firmware::commission::CommissioningEngine::new_selftest(oid));
+                        commission_engine = Some(
+                            foci_firmware::commission::CommissioningEngine::new_selftest_for_tmc(
+                                oid,
+                                tmc_state(),
+                            ),
+                        );
                     }
                     req @ TmcRequest {
                         kind: TmcRequestKind::SetEncoder { .. },
@@ -953,7 +1015,8 @@ mod app {
                         }
                         // Compute feedforward scale factor from step_width and PWM config
                         velocity_scale = foci_firmware::tmc::compute_velocity_scale_factor(
-                            STEP_WIDTH_VALUE
+                            tmc_state()
+                                .step_width_value
                                 .load(core::sync::atomic::Ordering::Relaxed)
                                 .unsigned_abs(),
                             CLOCK_FREQ,
@@ -1040,23 +1103,31 @@ mod app {
             // and write to PID_VELOCITY_OFFSET. Gated on:
             // - motor_enabled (closedloop active, safe to write 0x67)
             // - velocity_scale != 0 (encoder configured)
-            // - VELOCITY_FEEDFORWARD enabled (host config)
+            // - tmc_state().velocity_feedforward enabled (host config)
             // - commission_engine is None (not commissioning)
             // - homing not active
             let ff_active = motor_enabled
                 && velocity_scale != 0
-                && VELOCITY_FEEDFORWARD.load(core::sync::atomic::Ordering::Relaxed)
+                && tmc_state()
+                    .velocity_feedforward
+                    .load(core::sync::atomic::Ordering::Relaxed)
                 && commission_engine.is_none();
 
             if ff_active {
                 let homing_active = HOMING_STATE.load(core::sync::atomic::Ordering::Relaxed) != 0;
-                let reset = FEEDFORWARD_RESET.swap(false, core::sync::atomic::Ordering::Relaxed);
+                let reset = tmc_state()
+                    .feedforward_reset
+                    .swap(false, core::sync::atomic::Ordering::Relaxed);
 
                 let offset = if homing_active || reset {
                     0i32
                 } else {
-                    let interval = STEP_INTERVAL.load(core::sync::atomic::Ordering::Relaxed);
-                    let forward = STEP_DIRECTION.load(core::sync::atomic::Ordering::Relaxed);
+                    let interval = stepper_state()
+                        .interval
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    let forward = stepper_state()
+                        .direction
+                        .load(core::sync::atomic::Ordering::Relaxed);
                     foci_firmware::tmc::compute_velocity_offset(velocity_scale, interval, forward)
                 };
 
@@ -1077,7 +1148,7 @@ mod app {
             let tick_deadline = tick_start + fugit::Duration::<u64, 1, 1_000_000>::millis(1);
             foci_firmware::trace::sample_tick(
                 tmc,
-                unsafe { trace_buf() },
+                unsafe { trace_buf0() },
                 || {
                     tick_deadline
                         .checked_duration_since(Mono::now())
@@ -1088,10 +1159,15 @@ mod app {
             )
             .await;
 
-            if PID_ERROR_SUMS_CLEAR.swap(false, core::sync::atomic::Ordering::Relaxed) {
+            if tmc_state()
+                .pid_error_sums_clear
+                .swap(false, core::sync::atomic::Ordering::Relaxed)
+            {
                 pid_error_clear_countdown_ms = HOLD_SETTLE_DELAY_MS;
             }
-            let timer_active = STEP_TIMER_ACTIVE_MIRROR.load(core::sync::atomic::Ordering::Relaxed);
+            let timer_active = stepper_state()
+                .timer_active_mirror
+                .load(core::sync::atomic::Ordering::Relaxed);
             if motor_enabled
                 && commission_engine.is_none()
                 && !timer_active
@@ -1099,7 +1175,7 @@ mod app {
             {
                 pid_error_clear_countdown_ms -= 1;
                 if pid_error_clear_countdown_ms == 0 {
-                    if foci_firmware::tmc_ops::settle_hold_and_clear_pid_errors(tmc)
+                    if foci_firmware::tmc_ops::settle_hold_and_clear_pid_errors(tmc, tmc_state())
                         .await
                         .is_err()
                     {
@@ -1125,7 +1201,7 @@ mod app {
                 match homing {
                     1 => {
                         // SuppressPending: write position P with I=0
-                        let pos_p = POSITION_P_VALUE.load(Relaxed);
+                        let pos_p = tmc_state().position_p_value.load(Relaxed);
                         let reg = (pos_p as u32) << 16; // P in upper half, I=0
                         let _ = tmc
                             .write_register(foci_tmc4671::registers::PID_POSITION_P_POSITION_I, reg)
@@ -1144,8 +1220,8 @@ mod app {
                     }
                     3 => {
                         // RestorePending: restore position I and clear integrator
-                        let pos_p = POSITION_P_VALUE.load(Relaxed);
-                        let pos_i = POSITION_I_VALUE.load(Relaxed);
+                        let pos_p = tmc_state().position_p_value.load(Relaxed);
+                        let pos_i = tmc_state().position_i_value.load(Relaxed);
                         let reg = ((pos_p as u32) << 16) | pos_i as u32;
                         let _ = tmc
                             .write_register(foci_tmc4671::registers::PID_POSITION_P_POSITION_I, reg)
@@ -1209,7 +1285,11 @@ mod app {
     #[task(priority = 2)]
     async fn arm_check(_ctx: arm_check::Context) {
         with_trigger_domain(|td| {
-            if !MOTOR_ARMED.load(core::sync::atomic::Ordering::Relaxed) || td.timer_active(0) {
+            if !tmc_state()
+                .motor_armed
+                .load(core::sync::atomic::Ordering::Relaxed)
+                || td.timer_active(0)
+            {
                 return;
             }
 
@@ -1380,7 +1460,7 @@ mod app {
         if FAULT_ACTIVE.load(Relaxed) {
             return;
         }
-        if !MOTOR_ARMED.load(Relaxed) {
+        if !tmc_state().motor_armed.load(Relaxed) {
             return;
         }
 
@@ -1399,23 +1479,27 @@ mod app {
                 match unsafe { (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue() } {
                     Some(m) => {
                         let dir_changed = stepper.load_move(m);
-                        STEP_INTERVAL.store(stepper.current_interval(), Relaxed);
+                        stepper_state()
+                            .interval
+                            .store(stepper.current_interval(), Relaxed);
                         let dir_val = if stepper.dir_state() {
                             embassy_stm32::pac::gpio::vals::Odr::HIGH
                         } else {
                             embassy_stm32::pac::gpio::vals::Odr::LOW
                         };
                         gpio_a.odr().modify(|w| w.set_odr(0, dir_val));
-                        STEP_DIRECTION.store(stepper.dir_state(), Relaxed);
+                        stepper_state()
+                            .direction
+                            .store(stepper.dir_state(), Relaxed);
                         if dir_changed {
-                            FEEDFORWARD_RESET.store(true, Relaxed);
+                            tmc_state().feedforward_reset.store(true, Relaxed);
                         }
                     }
                     None => {
                         // Queue empty: disarm timer, go idle
                         tim5.dier().modify(|w| w.set_ccie(0, false));
-                        STEP_INTERVAL.store(0, Relaxed);
-                        PID_ERROR_SUMS_CLEAR.store(true, Relaxed);
+                        stepper_state().interval.store(0, Relaxed);
+                        tmc_state().pid_error_sums_clear.store(true, Relaxed);
                         with_trigger_domain(|td| {
                             td.set_timer_active(0, false);
                         });
@@ -1454,7 +1538,7 @@ mod app {
                 // step is a pair of events. Event 1 drives STEP HIGH (step
                 // phase, TMC4671 sees a rising edge and advances its counter);
                 // event 2 drives STEP LOW (unstep phase, no-op for the
-                // TMC4671). STEPPER_POSITION only advances on the step phase
+                // TMC4671). stepper_state().position only advances on the step phase
                 // so the firmware counter matches the TMC4671's view of
                 // position. Matches Klipper C `stepper_event_full`.
                 {
@@ -1479,9 +1563,11 @@ mod app {
                         let is_step = matches!(phase, StepPhase::Step);
                         if is_step {
                             let dir = if stepper.dir_state() { 1i32 } else { -1i32 };
-                            STEPPER_POSITION.fetch_add(dir, Relaxed);
+                            stepper_state().position.fetch_add(dir, Relaxed);
                         }
-                        STEP_INTERVAL.store(stepper.current_interval(), Relaxed);
+                        stepper_state()
+                            .interval
+                            .store(stepper.current_interval(), Relaxed);
                         let now = tim5.cnt().read();
                         match stepper.check_deadline(clock, now, CLOCK_FREQ) {
                             Ok(compare) => {

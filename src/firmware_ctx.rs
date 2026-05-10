@@ -17,7 +17,6 @@ use foci_firmware::context::{
     BoardChannels, ClockSource, EndstopHost, QueueFull, ShutdownRecovery, StateAccess, StepperHost,
     TmcHost, TrsyncHost,
 };
-use foci_firmware::state::tmc::MOTOR_ARMED;
 use foci_firmware::state::trsync::ENDSTOP_PIN_IDS;
 use foci_firmware::tmc::TmcRequest;
 use foci_klipper::commands::CommandError;
@@ -31,6 +30,10 @@ use crate::state::tmc::TMC_REQUEST_SENDER;
 use crate::trigger_domain::{
     PHYSICAL_STEPPER_INDICES, stop_physical_stepper_no_lock, with_trigger_domain,
 };
+
+fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
+    foci_firmware::state::tmc::tmc_channel0()
+}
 
 /// Full shutdown: Klipper-level transition, board-local trigger-domain
 /// quiesce, and post-quiesce atomic resets. Returns `true` if this call
@@ -201,7 +204,9 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
                     }
 
                     if !td.timer_active(0)
-                        && MOTOR_ARMED.load(core::sync::atomic::Ordering::Relaxed)
+                        && tmc_state()
+                            .motor_armed
+                            .load(core::sync::atomic::Ordering::Relaxed)
                     {
                         let now = read_tim5();
                         arm_step_timer(now.wrapping_add(1));

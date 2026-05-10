@@ -4,8 +4,6 @@
 
 use crate::trigger_domain::stop_physical_stepper_no_lock;
 use foci_firmware::commission_dispatch::{DispatchState, StepperPostAction};
-use foci_firmware::state::stepper::STEP_TIMER_ACTIVE_MIRROR;
-use foci_firmware::state::tmc::MOTOR_ARMED;
 use foci_firmware::tmc_ops::StepperTaskDirective;
 
 /// Minimum lead time when arming TIM5 CC1 from thread context.
@@ -15,6 +13,14 @@ use foci_firmware::tmc_ops::StepperTaskDirective;
 /// 32-bit at 84 MHz, so a missed match would not reoccur until wrap
 /// (~51 s later).
 pub(crate) const STEP_TIMER_ARM_MIN_LEAD_TICKS: u32 = 128;
+
+fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
+    foci_firmware::state::tmc::tmc_channel0()
+}
+
+fn stepper_state() -> &'static foci_firmware::state::stepper::StepperChannelState {
+    foci_firmware::state::stepper::stepper_channel0()
+}
 
 /// Arm the TIM5 CC1 step timer for a compare at `clock`.
 ///
@@ -49,15 +55,19 @@ pub(crate) fn arm_step_timer(clock: u32) {
 /// inside `TriggerDomain`. P1 must never enter `TriggerDomain` per
 /// spec.
 pub(crate) fn stepper_stop_from_p1() {
-    MOTOR_ARMED.store(false, core::sync::atomic::Ordering::Relaxed);
+    tmc_state()
+        .motor_armed
+        .store(false, core::sync::atomic::Ordering::Relaxed);
     stop_physical_stepper_no_lock(0);
-    STEP_TIMER_ACTIVE_MIRROR.store(false, core::sync::atomic::Ordering::Relaxed);
+    stepper_state()
+        .timer_active_mirror
+        .store(false, core::sync::atomic::Ordering::Relaxed);
     crate::app::stop_check::spawn().ok();
 }
 
 /// Apply a board-owned stepper runtime transition after commissioning dispatch.
 ///
-/// This is the single owner of firmware step-epoch zeroing, `MOTOR_ARMED=true`,
+/// This is the single owner of firmware step-epoch zeroing, channel motor arming,
 /// and `arm_check` spawning. Dispatch only decides which transition is needed.
 pub(crate) fn apply_stepper_post_action(action: StepperPostAction, state: &mut DispatchState<'_>) {
     match foci_firmware::tmc_ops::apply_stepper_post_action_state(action, state) {
