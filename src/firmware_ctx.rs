@@ -14,8 +14,8 @@
 //! bind against.
 
 use foci_firmware::context::{
-    ClockSource, EndstopHost, QueueFull, ShutdownRecovery, StateAccess, StepperHost, TmcHost,
-    TrsyncHost,
+    BoardChannels, ClockSource, EndstopHost, QueueFull, ShutdownRecovery, StateAccess, StepperHost,
+    TmcHost, TrsyncHost,
 };
 use foci_firmware::state::tmc::MOTOR_ARMED;
 use foci_firmware::state::trsync::ENDSTOP_PIN_IDS;
@@ -139,6 +139,24 @@ impl<'a> ShutdownRecovery for FirmwareCtx<'a> {
 
     fn send_shutdown(&mut self, reason: foci_firmware::shutdown::ShutdownReason, clock: u32) {
         foci_firmware::dispatch_shutdown!(reason, clock, &mut crate::_ankyra_config::Sender);
+    }
+}
+
+impl<'a> BoardChannels for FirmwareCtx<'a> {
+    fn tmc_channel_count(&self) -> u8 {
+        crate::board_config::TMC_CHANNEL_COUNT
+    }
+
+    fn step_pin_channel(&self, pin: u8) -> Option<u8> {
+        crate::board_config::step_pin_channel(pin)
+    }
+
+    fn dir_pin_channel(&self, pin: u8) -> Option<u8> {
+        crate::board_config::dir_pin_channel(pin)
+    }
+
+    fn enable_pin_channel(&self, pin: u32) -> Option<u8> {
+        crate::board_config::enable_pin_channel(pin)
     }
 }
 
