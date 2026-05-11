@@ -7,7 +7,7 @@
 //! the subsystem `state/*` modules makes the coordination surface
 //! inspectable independently of RTIC's macro expansion.
 
-use crate::state::stepper::{ISR_STEPPER, STEP_QUEUE};
+use crate::state::stepper::{isr_stepper, step_queue};
 use foci_firmware::state::trsync::HOMING_TRIGGERED;
 
 // ---- TriggerDomain: unified trsync/endstop/stepper-stop resource ----
@@ -166,8 +166,7 @@ pub(crate) static mut TRIGGER_DOMAIN: core::mem::MaybeUninit<TriggerDomain> =
 /// Equivalent to P3 ceiling since P3 is the highest application priority.
 /// Callable from P2 command handlers and P3 ISR.
 ///
-/// Uses `addr_of_mut!` to avoid the `static_mut_refs` lint (matching the
-/// `STEP_QUEUE` access pattern in the existing codebase).
+/// Uses `addr_of_mut!` to avoid the `static_mut_refs` lint.
 #[inline]
 pub(crate) fn with_trigger_domain<F, R>(f: F) -> R
 where
@@ -206,14 +205,16 @@ pub(crate) fn stop_physical_stepper_no_lock(stepper_idx: usize) {
     stepper_state().interval.store(0, Relaxed);
     tmc_state().pid_error_sums_clear.store(true, Relaxed);
     // 3. Reset ISR stepper engine state (clear stale partial segment)
-    // SAFETY: ISR_STEPPER is exclusively touched by the P3 step-timer IRQ,
-    // which is quiesced by the CC1IE disable above. Sole accessor here.
+    // SAFETY: ISR stepper state is exclusively touched by the P3 step-timer
+    // IRQ, which is quiesced by the CC1IE disable above. Sole accessor here.
     unsafe {
-        (*core::ptr::addr_of_mut!(ISR_STEPPER)).reset();
+        isr_stepper(0)
+            .expect("OpenFFBoard channel 0 exists")
+            .reset();
     }
     // 4. Drain queue.
     //
-    // SAFETY: STEP_QUEUE is a `heapless::spsc::Queue` — single-producer
+    // SAFETY: The step queue is a `heapless::spsc::Queue` — single-producer
     // (P2 `queue_step_move`), single-consumer (P3 step-timer IRQ). The P3
     // consumer is quiesced by the CC1IE disable above; here we act as the
     // consumer and call `dequeue()`. The SPSC implementation supports
@@ -230,7 +231,12 @@ pub(crate) fn stop_physical_stepper_no_lock(stepper_idx: usize) {
     //   gets processed at the next motor enable (against the freshly-zeroed
     //   channel position applied by `apply_stepper_post_action_state`) or is
     //   drained again by the next `stepper_stop_from_p1`.
-    unsafe { while (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue().is_some() {} }
+    while unsafe {
+        step_queue(0)
+            .expect("OpenFFBoard channel 0 exists")
+            .dequeue()
+            .is_some()
+    } {}
     // 5. Reset direction GPIO (PA0) to known low state
     let gpio_a = embassy_stm32::pac::GPIOA;
     gpio_a

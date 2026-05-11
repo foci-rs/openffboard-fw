@@ -25,7 +25,7 @@ use foci_klipper::state::State;
 use crate::helpers::lifecycle::{KATAPULT_BYPASS, katapult_reset, read_tim5};
 use crate::helpers::stepper::arm_step_timer;
 use crate::helpers::trsync::{gpio_configure_input, gpio_read_pin};
-use crate::state::stepper::{ISR_STEPPER, P2_STEPPER, STEP_QUEUE};
+use crate::state::stepper::{isr_stepper, p2_stepper, step_queue};
 use crate::state::tmc::TMC_REQUEST_SENDER;
 use crate::trigger_domain::{
     PHYSICAL_STEPPER_INDICES, stop_physical_stepper_no_lock, with_trigger_domain,
@@ -186,9 +186,11 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
             return;
         }
 
-        // SAFETY: P2_STEPPER is only accessed from P2 command handlers.
+        // SAFETY: P2 stepper state is only accessed from P2 command handlers.
         unsafe {
-            (*core::ptr::addr_of_mut!(P2_STEPPER)).set_next_step_dir(forward);
+            p2_stepper(channel)
+                .expect("OpenFFBoard channel 0 exists")
+                .set_next_step_dir(forward);
         }
     }
 
@@ -207,7 +209,9 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
             let need_reset = td.stepper_stop[0].need_reset;
 
             // SAFETY: P2 is the sole producer. Queue len read is safe from P2.
-            let queue_was_empty = unsafe { (*core::ptr::addr_of_mut!(STEP_QUEUE)).is_empty() };
+            let queue =
+                unsafe { step_queue(channel).ok_or(CommandError::InvalidChannel(channel))? };
+            let queue_was_empty = queue.is_empty();
 
             // `queue_step_hw` takes the move's step count — the
             // caller-provided `count` field on `StepMove`.
@@ -215,16 +219,15 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
                 Ok(QueueStepResult::Discarded) => Ok(()),
                 Err(e) => Err(e),
                 Ok(_result) => {
-                    // SAFETY: P2_STEPPER is only accessed from P2 command handlers.
-                    let prepared =
-                        unsafe { (*core::ptr::addr_of_mut!(P2_STEPPER)).prepare_move(move_) };
+                    // SAFETY: P2 stepper state is only accessed from P2 command handlers.
+                    let prepared = unsafe {
+                        p2_stepper(channel)
+                            .ok_or(CommandError::InvalidChannel(channel))?
+                            .prepare_move(move_)
+                    };
 
                     // SAFETY: P2 is the sole producer.
-                    let ok = unsafe {
-                        (*core::ptr::addr_of_mut!(STEP_QUEUE))
-                            .enqueue(prepared)
-                            .is_ok()
-                    };
+                    let ok = queue.enqueue(prepared).is_ok();
                     if !ok {
                         return Err(CommandError::QueueFull);
                     }
@@ -254,15 +257,18 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
 
             // Drain any stale items from a previous stop.
             // SAFETY: Timer is not active (checked above), P3 is quiesced.
-            unsafe { while (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue().is_some() {} }
+            unsafe {
+                let queue = step_queue(channel).ok_or(CommandError::InvalidChannel(channel))?;
+                while queue.dequeue().is_some() {}
+            }
 
             // SAFETY: reset_step_clock_hw accepted only because the timer is
-            // inactive, so P3 is not using ISR_STEPPER. P2_STEPPER is only
+            // inactive, so P3 is not using the ISR stepper. P2 stepper is only
             // accessed from P2 command handlers.
             unsafe {
                 foci_klipper::commands::stepper::reset_stepper_clocks(
-                    &mut *core::ptr::addr_of_mut!(P2_STEPPER),
-                    &mut *core::ptr::addr_of_mut!(ISR_STEPPER),
+                    p2_stepper(channel).ok_or(CommandError::InvalidChannel(channel))?,
+                    isr_stepper(channel).ok_or(CommandError::InvalidChannel(channel))?,
                     clock,
                 );
             }

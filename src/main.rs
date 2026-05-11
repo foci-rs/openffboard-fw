@@ -1294,7 +1294,11 @@ mod app {
             }
 
             // SAFETY: P2 is the sole producer while the timer is inactive.
-            let queue_has_moves = unsafe { !(*core::ptr::addr_of_mut!(STEP_QUEUE)).is_empty() };
+            let queue_has_moves = unsafe {
+                !step_queue(0)
+                    .expect("OpenFFBoard channel 0 exists")
+                    .is_empty()
+            };
             if queue_has_moves {
                 arm_step_timer(read_tim5().wrapping_add(1));
                 td.set_timer_active(0, true);
@@ -1464,9 +1468,9 @@ mod app {
             return;
         }
 
-        // SAFETY: ISR_STEPPER is only accessed from this P3 ISR.
+        // SAFETY: ISR stepper state is only accessed from this P3 ISR.
         // P3 tasks cannot preempt each other on Cortex-M.
-        let stepper = unsafe { &mut *core::ptr::addr_of_mut!(ISR_STEPPER) };
+        let stepper = unsafe { isr_stepper(0).expect("OpenFFBoard channel 0 exists") };
 
         let gpio_b = embassy_stm32::pac::GPIOB;
         let gpio_a = embassy_stm32::pac::GPIOA;
@@ -1476,7 +1480,11 @@ mod app {
                 // Need a new move from the queue
                 // SAFETY: P3 is the sole consumer of the queue.
                 // P3 ISRs cannot preempt each other on Cortex-M.
-                match unsafe { (*core::ptr::addr_of_mut!(STEP_QUEUE)).dequeue() } {
+                match unsafe {
+                    step_queue(0)
+                        .expect("OpenFFBoard channel 0 exists")
+                        .dequeue()
+                } {
                     Some(m) => {
                         let dir_changed = stepper.load_move(m);
                         stepper_state()
