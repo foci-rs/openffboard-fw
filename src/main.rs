@@ -482,7 +482,7 @@ mod app {
                     tmc_state()
                         .commission_in_flight
                         .store(false, core::sync::atomic::Ordering::Relaxed);
-                    stepper_stop_from_p1();
+                    stepper_stop_from_p1(0);
                     shutdown_handled = true;
                 }
                 Mono::delay(1.millis()).await;
@@ -521,7 +521,7 @@ mod app {
                 tmc_state().flux_filter_hz.store(0, R);
                 tmc_state().torque_filter_hz.store(0, R);
                 // Reset hardware stepper state.
-                stepper_stop_from_p1();
+                stepper_stop_from_p1(0);
                 stepper_state()
                     .position
                     .store(0, core::sync::atomic::Ordering::Relaxed);
@@ -699,7 +699,7 @@ mod app {
                             defmt::info!("Motor enabled (calibrated, step/dir armed)");
                         } else {
                             // Disable: stop stepping first, then kill motor electrically.
-                            stepper_stop_from_p1();
+                            stepper_stop_from_p1(0);
                             {
                                 let mut backend = openffboard_backend(tmc, enable_pin);
                                 let mut state = dispatch_state(
@@ -1052,7 +1052,7 @@ mod app {
             // the fault to Klipper so the host knows the MCU is down.
             if TMC_DISABLE_SIGNAL.try_take().is_some() {
                 // Stop hardware stepper immediately
-                stepper_stop_from_p1();
+                stepper_stop_from_p1(0);
                 FAULT_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
 
                 motor_enabled = false;

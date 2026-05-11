@@ -164,7 +164,28 @@ impl<'a> BoardChannels for FirmwareCtx<'a> {
 }
 
 impl<'a> StepperHost for FirmwareCtx<'a> {
-    fn set_next_step_dir(&mut self, forward: bool) {
+    fn set_next_step_dir(&mut self, channel: u8, forward: bool) {
+        if channel != 0 {
+            ::ankyra::klipper_reply_from!(
+                &mut crate::_ankyra_config::Sender,
+                foci_firmware::ankyra::replies::FociDiagnostic,
+                fault: u8 = foci_firmware::diagnostic::FaultClass::InvalidChannel as u8,
+                operation: u8 = foci_firmware::diagnostic::operation::SET_NEXT_STEP_DIR,
+                oid: u8 = 255,
+                channel: u8 = channel,
+                data0: u32 = 0,
+                data1: u32 = 0,
+            );
+            if crate::firmware_ctx::enter_shutdown(self.state) {
+                ::ankyra::klipper_shutdown_from!(
+                    &mut crate::_ankyra_config::Sender,
+                    "Invalid stepper channel",
+                    read_tim5(),
+                );
+            }
+            return;
+        }
+
         // SAFETY: P2_STEPPER is only accessed from P2 command handlers.
         unsafe {
             (*core::ptr::addr_of_mut!(P2_STEPPER)).set_next_step_dir(forward);
@@ -173,8 +194,13 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
 
     fn queue_step_move(
         &mut self,
+        channel: u8,
         move_: foci_klipper::stepper::StepMove,
     ) -> Result<(), CommandError> {
+        if channel != 0 {
+            return Err(CommandError::InvalidChannel(channel));
+        }
+
         use foci_klipper::commands::stepper::{QueueStepResult, queue_step_hw};
 
         with_trigger_domain(|td| {
@@ -218,7 +244,11 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
         })
     }
 
-    fn reset_step_clock(&mut self, clock: u32) -> Result<(), CommandError> {
+    fn reset_step_clock(&mut self, channel: u8, clock: u32) -> Result<(), CommandError> {
+        if channel != 0 {
+            return Err(CommandError::InvalidChannel(channel));
+        }
+
         with_trigger_domain(|td| {
             foci_klipper::commands::stepper::reset_step_clock_hw(td.stepper_stop[0].timer_active)?;
 

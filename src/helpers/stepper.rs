@@ -54,11 +54,19 @@ pub(crate) fn arm_step_timer(clock: u32) {
 /// `stop_check` at P2 to update the authoritative `timer_active`
 /// inside `TriggerDomain`. P1 must never enter `TriggerDomain` per
 /// spec.
-pub(crate) fn stepper_stop_from_p1() {
+pub(crate) fn stepper_stop_from_p1(channel: u8) {
+    if channel != 0 {
+        defmt::error!(
+            "stepper_stop_from_p1: invalid OpenFFBoard channel {}",
+            channel
+        );
+        return;
+    }
+
     tmc_state()
         .motor_armed
         .store(false, core::sync::atomic::Ordering::Relaxed);
-    stop_physical_stepper_no_lock(0);
+    stop_physical_stepper_no_lock(channel as usize);
     stepper_state()
         .timer_active_mirror
         .store(false, core::sync::atomic::Ordering::Relaxed);
@@ -73,7 +81,7 @@ pub(crate) fn apply_stepper_post_action(action: StepperPostAction, state: &mut D
     match foci_firmware::tmc_ops::apply_stepper_post_action_state(action, state) {
         StepperTaskDirective::None => {}
         StepperTaskDirective::StopCheck => {
-            stepper_stop_from_p1();
+            stepper_stop_from_p1(0);
         }
         StepperTaskDirective::ArmCheck => {
             crate::app::arm_check::spawn().ok();
