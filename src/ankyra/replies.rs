@@ -8,7 +8,13 @@
 pub(crate) fn emit_terminal_reply(payload: foci_firmware::commission_dispatch::ReplyPayload) {
     use foci_firmware::commission_dispatch::ReplyPayload;
     match payload {
-        ReplyPayload::CommissionPhase { oid, phase, status } => {
+        ReplyPayload::CommissionPhase {
+            oid,
+            phase,
+            status,
+            diagnostics,
+        } => {
+            emit_commission_diagnostics(oid, diagnostics);
             ::ankyra::klipper_reply_from!(
                 &mut crate::_ankyra_config::Sender,
                 foci_firmware::ankyra::replies::FociCommissionPhase,
@@ -102,8 +108,10 @@ pub(crate) fn emit_terminal_reply(payload: foci_firmware::commission_dispatch::R
         ReplyPayload::Selftest {
             oid,
             results,
+            diagnostics,
             done_status,
         } => {
+            emit_commission_diagnostics(oid, diagnostics);
             for (stage, value) in results.iter() {
                 ::ankyra::klipper_reply_from!(
                     &mut crate::_ankyra_config::Sender,
@@ -121,6 +129,25 @@ pub(crate) fn emit_terminal_reply(payload: foci_firmware::commission_dispatch::R
                 status: u8 = done_status,
             );
         }
+    }
+}
+
+fn emit_commission_diagnostics(
+    oid: u8,
+    diagnostics: foci_firmware::selftest::CommissionDiagnostics,
+) {
+    for event in diagnostics.iter() {
+        ::ankyra::klipper_reply_from!(
+            &mut crate::_ankyra_config::Sender,
+            foci_firmware::ankyra::replies::FociCommissionDetail,
+            oid: u8 = oid,
+            phase: u8 = event.phase,
+            code: u8 = event.code,
+            status: u8 = event.status,
+            value0: u32 = event.value0,
+            value1: u32 = event.value1,
+            value2: u32 = event.value2,
+        );
     }
 }
 
