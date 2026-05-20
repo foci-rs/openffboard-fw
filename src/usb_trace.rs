@@ -6,10 +6,47 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, 
 
 use foci_firmware::trace_stream::{FrameBuf, METADATA_PAYLOAD_MAX};
 
-use crate::state::usb_trace::{QueuedFrame, TRACE_COUNTERS, current_tx, event_queue, motion_queue};
+use crate::state::usb_trace::{
+    PENDING_EVENTS, PendingEvent, QueuedFrame, TRACE_COUNTERS, current_tx, event_queue,
+    motion_queue,
+};
 
 /// Product string used by trace builds.
 pub(crate) const TRACE_PRODUCT: &str = "FOCI OpenFFBoard (trace)";
+
+pub(crate) const EVENT_LEVEL_INFO: u8 = 1;
+#[allow(dead_code)]
+pub(crate) const EVENT_LEVEL_WARN: u8 = 2;
+pub(crate) const EVENT_LEVEL_ERROR: u8 = 3;
+
+pub(crate) const SUBSYSTEM_TMC_CONTROL: u8 = 1;
+#[allow(dead_code)]
+pub(crate) const SUBSYSTEM_STEP_TIMER: u8 = 2;
+pub(crate) const SUBSYSTEM_USB_TRACE: u8 = 3;
+#[allow(dead_code)]
+pub(crate) const SUBSYSTEM_KLIPPER: u8 = 4;
+#[allow(dead_code)]
+pub(crate) const SUBSYSTEM_HOMING_ENDSTOP: u8 = 5;
+pub(crate) const SUBSYSTEM_SAFETY_SHUTDOWN: u8 = 6;
+#[allow(dead_code)]
+pub(crate) const SUBSYSTEM_COMMISSIONING: u8 = 7;
+
+pub(crate) const EVENT_FIRMWARE_BOOT: u16 = 1;
+pub(crate) const EVENT_USB_CONFIGURED: u16 = 2;
+pub(crate) const EVENT_MOTOR_ARM: u16 = 3;
+pub(crate) const EVENT_MOTOR_DISARM: u16 = 4;
+#[allow(dead_code)]
+pub(crate) const EVENT_HOMING_OR_ENDSTOP: u16 = 5;
+#[allow(dead_code)]
+pub(crate) const EVENT_GAIN_APPLIED: u16 = 6;
+#[allow(dead_code)]
+pub(crate) const EVENT_TRACE_QUEUE_OVERFLOW: u16 = 7;
+#[allow(dead_code)]
+pub(crate) const EVENT_SPI_ERROR: u16 = 8;
+pub(crate) const EVENT_STATUS_INTERRUPT: u16 = 9;
+#[allow(dead_code)]
+pub(crate) const EVENT_SHUTDOWN: u16 = 10;
+pub(crate) const EVENT_SPI_SAMPLE_DURATION: u16 = 11;
 
 struct TraceClockExt {
     last_low: u32,
@@ -152,6 +189,20 @@ pub(crate) fn note_usb_configured() {
         .boot_id
         .store(compute_boot_id(), Ordering::Relaxed);
     TRACE_COUNTERS.configured.store(true, Ordering::Relaxed);
+    request_event(
+        EVENT_LEVEL_INFO,
+        SUBSYSTEM_TMC_CONTROL,
+        EVENT_FIRMWARE_BOOT,
+        [0; 4],
+        0,
+    );
+    request_event(
+        EVENT_LEVEL_INFO,
+        SUBSYSTEM_USB_TRACE,
+        EVENT_USB_CONFIGURED,
+        [0; 4],
+        0,
+    );
 }
 
 fn header(
@@ -182,6 +233,108 @@ fn motion_flags() -> u8 {
     } else {
         0
     }
+}
+
+/// Request a structured event from any RTIC context.
+pub(crate) fn request_event(
+    level: u8,
+    subsystem_id: u8,
+    event_id: u16,
+    args: [i32; 4],
+    arg_count: u8,
+) {
+    if !is_configured() {
+        return;
+    }
+    let event = PendingEvent {
+        level,
+        subsystem_id,
+        event_id,
+        args,
+        arg_count,
+    };
+    // O(1) critical section: push one fixed-size event or count one drop.
+    cortex_m::interrupt::free(|_| unsafe {
+        let queue = &mut *core::ptr::addr_of_mut!(PENDING_EVENTS);
+        if queue.push_back(event).is_err() {
+            TRACE_COUNTERS.event_drops.fetch_add(1, Ordering::Relaxed);
+            TRACE_COUNTERS.event_drop_gap.store(true, Ordering::Relaxed);
+        }
+    });
+}
+
+fn enqueue_event_frame(event: PendingEvent) {
+    use foci_firmware::trace_stream::*;
+
+    let sample = EventSample {
+        level: event.level,
+        subsystem_id: event.subsystem_id,
+        event_id: event.event_id,
+        arg_count: event.arg_count,
+        args: event.args,
+    };
+    let mut payload = [0u8; EVENT_PAYLOAD_LEN];
+    encode_event_payload(&sample, &mut payload);
+    let flags = if TRACE_COUNTERS.event_drop_gap.swap(false, Ordering::Relaxed) {
+        FLAG_DROP_GAP_BEFORE_THIS_FRAME
+    } else {
+        0
+    };
+    let mut frame = FrameBuf::new();
+    frame.write_header(header(
+        FRAME_TYPE_EVENT,
+        EVENT_PAYLOAD_LEN,
+        SOURCE_KIND_BOARD,
+        SOURCE_INDEX_NA,
+        flags,
+    ));
+    frame
+        .payload_mut(EVENT_PAYLOAD_LEN)
+        .copy_from_slice(&payload);
+    enqueue_event(frame);
+}
+
+/// Convert pending multi-producer event requests into event frames.
+pub(crate) fn drain_pending_events() {
+    loop {
+        let event = cortex_m::interrupt::free(|_| unsafe {
+            let queue = &mut *core::ptr::addr_of_mut!(PENDING_EVENTS);
+            queue.pop_front()
+        });
+        let Some(event) = event else {
+            break;
+        };
+        enqueue_event_frame(event);
+    }
+}
+
+/// Emit a one-shot event with the measured trace SPI sample duration.
+pub(crate) fn request_spi_duration_event_if_ready() {
+    if TRACE_TIMING
+        .first_spi_duration_reported
+        .swap(true, Ordering::Relaxed)
+    {
+        return;
+    }
+    let cycles = TRACE_TIMING.first_spi_sample_cycles.load(Ordering::Relaxed);
+    if cycles == 0 {
+        TRACE_TIMING
+            .first_spi_duration_reported
+            .store(false, Ordering::Relaxed);
+        return;
+    }
+    request_event(
+        EVENT_LEVEL_INFO,
+        SUBSYSTEM_TMC_CONTROL,
+        EVENT_SPI_SAMPLE_DURATION,
+        [
+            cycles as i32,
+            TRACE_TIMING.max_spi_sample_cycles.load(Ordering::Relaxed) as i32,
+            0,
+            0,
+        ],
+        2,
+    );
 }
 
 /// Trace timing diagnostics.

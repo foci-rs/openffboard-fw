@@ -720,6 +720,14 @@ mod app {
                             }
 
                             defmt::info!("Motor enabled (calibrated, step/dir armed)");
+                            #[cfg(feature = "trace")]
+                            crate::usb_trace::request_event(
+                                crate::usb_trace::EVENT_LEVEL_INFO,
+                                crate::usb_trace::SUBSYSTEM_TMC_CONTROL,
+                                crate::usb_trace::EVENT_MOTOR_ARM,
+                                [0; 4],
+                                0,
+                            );
                         } else {
                             // Disable: stop stepping first, then kill motor electrically.
                             stepper_stop_from_p1(0);
@@ -735,6 +743,14 @@ mod app {
                             }
 
                             defmt::info!("TMC4671 motor disabled");
+                            #[cfg(feature = "trace")]
+                            crate::usb_trace::request_event(
+                                crate::usb_trace::EVENT_LEVEL_INFO,
+                                crate::usb_trace::SUBSYSTEM_TMC_CONTROL,
+                                crate::usb_trace::EVENT_MOTOR_DISARM,
+                                [0; 4],
+                                0,
+                            );
                         }
                     }
                     TmcRequest {
@@ -1131,6 +1147,14 @@ mod app {
                     flags,
                     0,
                 );
+                #[cfg(feature = "trace")]
+                crate::usb_trace::request_event(
+                    crate::usb_trace::EVENT_LEVEL_ERROR,
+                    crate::usb_trace::SUBSYSTEM_SAFETY_SHUTDOWN,
+                    crate::usb_trace::EVENT_STATUS_INTERRUPT,
+                    [flags as i32, 0, 0, 0],
+                    1,
+                );
                 defmt::error!("TMC4671 emergency disable: STATUS={:#010x}", flags);
                 // Report shutdown to Klipper with a specific reason.
                 const NOT_PLL_LOCKED: u32 = 1 << 19;
@@ -1259,6 +1283,8 @@ mod app {
                     trace_control_tick.is_multiple_of(100),
                 )
                 .await;
+                crate::usb_trace::request_spi_duration_event_if_ready();
+                crate::usb_trace::drain_pending_events();
                 if trace_control_tick.is_multiple_of(1000) {
                     crate::usb_trace::emit_metadata();
                 }

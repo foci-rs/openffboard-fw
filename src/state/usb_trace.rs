@@ -17,6 +17,19 @@ pub(crate) const MOTION_QUEUE_DEPTH: usize = 32;
 /// Depth 8 keeps this queue at 2 KiB.
 pub(crate) const EVENT_QUEUE_DEPTH: usize = 8;
 
+/// Pending structured-event queue depth.
+pub(crate) const PENDING_EVENT_DEPTH: usize = 16;
+
+/// Structured event request safe to create from any RTIC context.
+#[derive(Clone, Copy)]
+pub(crate) struct PendingEvent {
+    pub(crate) level: u8,
+    pub(crate) subsystem_id: u8,
+    pub(crate) event_id: u16,
+    pub(crate) args: [i32; 4],
+    pub(crate) arg_count: u8,
+}
+
 /// A queued frame currently being packetized over 64-byte full-speed USB packets.
 #[derive(Clone, Copy)]
 pub(crate) struct QueuedFrame {
@@ -90,6 +103,8 @@ pub(crate) static mut MOTION_QUEUE: heapless::spsc::Queue<QueuedFrame, MOTION_QU
     heapless::spsc::Queue::new();
 pub(crate) static mut EVENT_QUEUE: heapless::spsc::Queue<QueuedFrame, EVENT_QUEUE_DEPTH> =
     heapless::spsc::Queue::new();
+pub(crate) static mut PENDING_EVENTS: heapless::Deque<PendingEvent, PENDING_EVENT_DEPTH> =
+    heapless::Deque::new();
 
 /// Partially sent frame owned by the single USB trace consumer.
 pub(crate) static mut CURRENT_TX: Option<QueuedFrame> = None;
