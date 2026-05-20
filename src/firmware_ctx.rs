@@ -17,13 +17,13 @@ use foci_firmware::context::{
     BoardChannels, ClockSource, EndstopHost, QueueFull, ShutdownRecovery, StateAccess, StepperHost,
     TmcHost, TrsyncHost,
 };
+use foci_firmware::diagnostic::StepperEventReason;
 use foci_firmware::state::trsync::ENDSTOP_PIN_IDS;
 use foci_firmware::tmc::TmcRequest;
 use foci_klipper::commands::CommandError;
 use foci_klipper::state::State;
 
 use crate::helpers::lifecycle::{KATAPULT_BYPASS, katapult_reset, read_tim5};
-use crate::helpers::stepper::arm_step_timer;
 use crate::helpers::trsync::{gpio_configure_input, gpio_read_pin};
 use crate::state::stepper::{isr_stepper, p2_stepper, step_queue};
 use crate::state::tmc::TMC_REQUEST_SENDER;
@@ -55,11 +55,10 @@ pub(crate) fn enter_shutdown(state: &mut State) -> bool {
         // Quiesce TriggerDomain: cancel timers, stop steppers
         with_trigger_domain(|td| {
             td.scheduler.clear();
-            let tim5 = embassy_stm32::pac::TIM5;
-            tim5.dier().modify(|w| w.set_ccie(1, false));
+            td.disarm_timer();
             // Stop physical steppers
             for &idx in PHYSICAL_STEPPER_INDICES {
-                stop_physical_stepper_no_lock(idx);
+                stop_physical_stepper_no_lock(idx, StepperEventReason::TmcDisableSignal);
                 td.set_timer_active(idx, false);
             }
             // Clear transient stepper state
@@ -216,7 +215,13 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
             // `queue_step_hw` takes the move's step count — the
             // caller-provided `count` field on `StepMove`.
             match queue_step_hw(need_reset, move_.count, queue_was_empty) {
-                Ok(QueueStepResult::Discarded) => Ok(()),
+                Ok(QueueStepResult::Discarded) => {
+                    crate::state::stepper_diag::record_discarded_segment(
+                        channel,
+                        u32::from(move_.count),
+                    );
+                    Ok(())
+                }
                 Err(e) => Err(e),
                 Ok(_result) => {
                     // SAFETY: P2 stepper state is only accessed from P2 command handlers.
@@ -231,6 +236,10 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
                     if !ok {
                         return Err(CommandError::QueueFull);
                     }
+                    crate::state::stepper_diag::record_queued_segment(
+                        channel,
+                        u32::from(move_.count),
+                    );
 
                     if !td.timer_active(0)
                         && tmc_state()
@@ -238,8 +247,20 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
                             .load(core::sync::atomic::Ordering::Relaxed)
                     {
                         let now = read_tim5();
-                        arm_step_timer(now.wrapping_add(1));
+                        crate::state::stepper_diag::record_timer_activation(channel, now);
+                        td.scheduler.cancel(|kind| {
+                            matches!(
+                                kind,
+                                foci_klipper::scheduler::SchedulerEventKind::Stepper(0)
+                            )
+                        });
+                        td.scheduler
+                            .schedule(foci_klipper::scheduler::SchedulerEvent {
+                                wake_clock: now.wrapping_add(1),
+                                kind: foci_klipper::scheduler::SchedulerEventKind::Stepper(0),
+                            });
                         td.set_timer_active(0, true);
+                        td.reprogram_timer();
                     }
                     Ok(())
                 }
@@ -257,10 +278,16 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
 
             // Drain any stale items from a previous stop.
             // SAFETY: Timer is not active (checked above), P3 is quiesced.
-            unsafe {
+            let (drained_segments, drained_steps) = unsafe {
                 let queue = step_queue(channel).ok_or(CommandError::InvalidChannel(channel))?;
-                while queue.dequeue().is_some() {}
-            }
+                let mut drained_segments = 0u32;
+                let mut drained_steps = 0u32;
+                while let Some(m) = queue.dequeue() {
+                    drained_segments = drained_segments.saturating_add(1);
+                    drained_steps = drained_steps.saturating_add(u32::from(m.count));
+                }
+                (drained_segments, drained_steps)
+            };
 
             // SAFETY: reset_step_clock_hw accepted only because the timer is
             // inactive, so P3 is not using the ISR stepper. P2 stepper is only
@@ -272,6 +299,16 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
                     clock,
                 );
             }
+            crate::state::stepper_diag::record_reset(channel, drained_segments, drained_steps);
+
+            crate::helpers::stepper_diag::record_stepper_event(
+                StepperEventReason::ResetStepClock,
+                channel,
+                read_tim5(),
+                0,
+                clock,
+                0,
+            );
 
             if !td.stepper_stop[0].blocked_by_trigger {
                 td.stepper_stop[0].need_reset = false;
@@ -295,8 +332,7 @@ impl<'a> TrsyncHost for FirmwareCtx<'a> {
     fn reset_all(&mut self) {
         with_trigger_domain(|td| {
             td.scheduler.clear();
-            let tim5 = embassy_stm32::pac::TIM5;
-            tim5.dier().modify(|w| w.set_ccie(1, false));
+            td.disarm_timer();
             for ts in td.trsync.iter_mut() {
                 ts.reset();
             }
@@ -309,7 +345,7 @@ impl<'a> TrsyncHost for FirmwareCtx<'a> {
             td.trsync_by_oid.clear();
             td.endstop_by_oid.clear();
             for &idx in PHYSICAL_STEPPER_INDICES {
-                stop_physical_stepper_no_lock(idx);
+                stop_physical_stepper_no_lock(idx, StepperEventReason::TmcDisableSignal);
                 td.set_timer_active(idx, false);
             }
             for ss in td.stepper_stop.iter_mut() {
@@ -372,7 +408,7 @@ impl<'a> TrsyncHost for FirmwareCtx<'a> {
                         kind: foci_klipper::scheduler::SchedulerEventKind::TrSyncReport(idx),
                     });
             }
-            td.reprogram_cc2();
+            td.reprogram_timer();
             Ok(())
         })
     }
@@ -395,7 +431,7 @@ impl<'a> TrsyncHost for FirmwareCtx<'a> {
                         wake_clock: clock,
                         kind: foci_klipper::scheduler::SchedulerEventKind::TrSyncExpire(idx),
                     });
-                td.reprogram_cc2();
+                td.reprogram_timer();
             }
             Ok(())
         })
@@ -435,7 +471,7 @@ impl<'a> TrsyncHost for FirmwareCtx<'a> {
                 }
             }
 
-            td.reprogram_cc2();
+            td.reprogram_timer();
             Ok(trigger_reason)
         })
     }
@@ -500,7 +536,7 @@ impl<'a> TrsyncHost for FirmwareCtx<'a> {
                         kind: foci_klipper::scheduler::SchedulerEventKind::EndstopSample(idx),
                     });
             }
-            td.reprogram_cc2();
+            td.reprogram_timer();
             Ok(())
         })
     }

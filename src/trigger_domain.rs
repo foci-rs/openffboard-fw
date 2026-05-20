@@ -1,5 +1,5 @@
 //! Trigger domain: the critical-section-guarded coordination point
-//! between the step-queue producer (P2 context), the step-timer ISR
+//! between the step-queue producer (P2 context), the TIM5 scheduler ISR
 //! (P3 context), and the trsync/endstop subsystem.
 //!
 //! Promoted from `mod app` in Task 8b2 — previously declared inline
@@ -8,11 +8,12 @@
 //! inspectable independently of RTIC's macro expansion.
 
 use crate::state::stepper::{isr_stepper, step_queue};
+use foci_firmware::diagnostic::StepperEventReason;
 use foci_firmware::state::trsync::HOMING_TRIGGERED;
 
 // ---- TriggerDomain: unified trsync/endstop/stepper-stop resource ----
 
-/// Physical stepper indices that drive real motors via TIM5 CC1.
+/// Physical stepper indices that drive real motors via TIM5.
 /// OpenFFBoard has one physical stepper (index 0).
 pub(crate) const PHYSICAL_STEPPER_INDICES: &[usize] = &[0];
 
@@ -107,7 +108,18 @@ impl TriggerDomain {
             }
             // Dispatch physical stops and update stepper state
             for &stepper_idx in &stopped_indices {
-                stop_physical_stepper_no_lock(stepper_idx);
+                self.scheduler.cancel(|kind| {
+                    matches!(kind, foci_klipper::scheduler::SchedulerEventKind::Stepper(i) if *i == stepper_idx)
+                });
+                stop_physical_stepper_no_lock(stepper_idx, StepperEventReason::TrsyncStop);
+                crate::helpers::stepper_diag::record_stepper_event(
+                    StepperEventReason::TrsyncStop,
+                    stepper_idx as u8,
+                    clock,
+                    0,
+                    trsync_oid as u32,
+                    reason as u32,
+                );
                 self.stepper_stop[stepper_idx].need_reset = true;
                 self.stepper_stop[stepper_idx].blocked_by_trigger = true;
                 self.stepper_stop[stepper_idx].blocked_by_trsync = Some(trsync_oid);
@@ -123,13 +135,50 @@ impl TriggerDomain {
         result
     }
 
-    /// Reprogram TIM5 CC2 from the scheduler's earliest deadline.
+    /// Arm TIM5 CC1 for the next unified scheduler deadline.
     ///
-    /// Called inside the TriggerDomain lock from both P2 command handlers
-    /// and the P3 ISR after processing events.
-    pub(crate) fn reprogram_cc2(&mut self) {
+    /// Called inside the TriggerDomain lock from both P2 command handlers and
+    /// the P3 ISR after processing events.
+    pub(crate) fn arm_timer_at(&mut self, clock: u32) {
         let tim5 = embassy_stm32::pac::TIM5;
+        tim5.ccr(0).write_value(clock);
+        tim5.sr().modify(|w| {
+            w.set_ccif(0, false);
+            w.set_ccif(1, false);
+        });
+        tim5.dier().modify(|w| {
+            w.set_ccie(0, true);
+            w.set_ccie(1, false);
+        });
+        // Ensure NVIC is unmasked (idempotent)
+        unsafe {
+            cortex_m::peripheral::NVIC::unmask(embassy_stm32::pac::Interrupt::TIM5);
+        }
+        self.scheduler.set_cc2_active(true);
+    }
+
+    /// Disable the unified TIM5 scheduler compare.
+    pub(crate) fn disarm_timer(&mut self) {
+        let tim5 = embassy_stm32::pac::TIM5;
+        tim5.dier().modify(|w| {
+            w.set_ccie(0, false);
+            w.set_ccie(1, false);
+        });
+        tim5.sr().modify(|w| {
+            w.set_ccif(0, false);
+            w.set_ccif(1, false);
+        });
+        self.scheduler.set_cc2_active(false);
+    }
+
+    /// Reprogram TIM5 CC1 from the scheduler's earliest deadline.
+    ///
+    /// Called inside the TriggerDomain lock from P2 command handlers. The P3
+    /// dispatch loop handles near-future deadlines by busy-waiting instead of
+    /// clamping them.
+    pub(crate) fn reprogram_timer(&mut self) {
         if let Some(earliest) = self.scheduler.earliest_deadline() {
+            let tim5 = embassy_stm32::pac::TIM5;
             let now = tim5.cnt().read();
             let delta = earliest.wrapping_sub(now) as i32;
             let clamped = if delta <= TRIGGER_TIMER_MIN_LEAD_TICKS as i32 {
@@ -137,22 +186,14 @@ impl TriggerDomain {
             } else {
                 earliest
             };
-            tim5.ccr(1).write_value(clamped);
-            tim5.sr().modify(|w| w.set_ccif(1, false));
-            tim5.dier().modify(|w| w.set_ccie(1, true));
-            // Ensure NVIC is unmasked (idempotent)
-            unsafe {
-                cortex_m::peripheral::NVIC::unmask(embassy_stm32::pac::Interrupt::TIM5);
-            }
-            self.scheduler.set_cc2_active(true);
+            self.arm_timer_at(clamped);
         } else {
-            tim5.dier().modify(|w| w.set_ccie(1, false));
-            self.scheduler.set_cc2_active(false);
+            self.disarm_timer();
         }
     }
 }
 
-/// Minimum lead time for TIM5 CC2 arming (trigger scheduler).
+/// Minimum lead time for TIM5 scheduler arming.
 /// 128 ticks at 84 MHz = ~1.5 us.
 pub(crate) const TRIGGER_TIMER_MIN_LEAD_TICKS: u32 = 128;
 
@@ -188,38 +229,49 @@ where
 /// 2. From [`crate::helpers::stepper::stepper_stop_from_p1`] (P1 context
 ///    with no critical section; P2 producers can preempt).
 ///
-/// Only acts on physical stepper indices (CC1 timer, GPIO, queue).
+/// Only acts on physical stepper indices (GPIO and queue).
 ///
-/// Per spec: disable CC1, clear interval, reset ISR stepper engine,
-/// drain queue, reset direction GPIO.
-pub(crate) fn stop_physical_stepper_no_lock(stepper_idx: usize) {
+/// Per spec: clear interval, reset ISR stepper engine, drain queue, reset
+/// direction GPIO. The unified TIM5 scheduler is not disabled here because it
+/// may also be carrying endstop and trsync timers; callers cancel the stepper
+/// scheduler event through `TriggerDomain`.
+pub(crate) fn stop_physical_stepper_no_lock(stepper_idx: usize, reason: StepperEventReason) {
     use core::sync::atomic::Ordering::Relaxed;
     if !PHYSICAL_STEPPER_INDICES.contains(&stepper_idx) {
         return;
     }
-    let tim5 = embassy_stm32::pac::TIM5;
-    // 1. Disable CC1 interrupt — quiesce P3 step timer
-    tim5.dier().modify(|w| w.set_ccie(0, false));
-    tim5.sr().modify(|w| w.set_ccif(0, false));
-    // 2. Clear step interval
+    // 1. Clear step interval
     stepper_state().interval.store(0, Relaxed);
     tmc_state().pid_error_sums_clear.store(true, Relaxed);
-    // 3. Reset ISR stepper engine state (clear stale partial segment)
-    // SAFETY: ISR stepper state is exclusively touched by the P3 step-timer
-    // IRQ, which is quiesced by the CC1IE disable above. Sole accessor here.
+    let remaining_events = unsafe {
+        isr_stepper(0)
+            .expect("OpenFFBoard channel 0 exists")
+            .active_event_count()
+    };
+    let queue_len = unsafe {
+        step_queue(0)
+            .expect("OpenFFBoard channel 0 exists")
+            .len()
+            .min(u16::MAX as usize) as u16
+    };
+    // 2. Reset ISR stepper engine state (clear stale partial segment).
+    // SAFETY: Triggered stops call this inside `with_trigger_domain()` with
+    // interrupts disabled. P1 stops clear `motor_armed` before calling this,
+    // and the unified ISR checks that gate before touching stepper state.
     unsafe {
         isr_stepper(0)
             .expect("OpenFFBoard channel 0 exists")
             .reset();
     }
-    // 4. Drain queue.
+    // 3. Drain queue.
     //
     // SAFETY: The step queue is a `heapless::spsc::Queue` — single-producer
-    // (P2 `queue_step_move`), single-consumer (P3 step-timer IRQ). The P3
-    // consumer is quiesced by the CC1IE disable above; here we act as the
-    // consumer and call `dequeue()`. The SPSC implementation supports
-    // concurrent producer/consumer access without a lock, so a P2 enqueue
-    // that races this drain is well-defined.
+    // (P2 `queue_step_move`), single-consumer (P3 TIM5 scheduler IRQ). Triggered
+    // stops run with interrupts disabled. P1 stops clear `motor_armed` before
+    // this drain, so the ISR will discard a stale stepper timer without
+    // consuming the queue. The SPSC implementation supports concurrent
+    // producer/consumer access without a lock, so a P2 enqueue that races this
+    // drain is well-defined.
     //
     // Caller invariants for entries that survive the drain (i.e. P2
     // enqueues completing after the loop exits):
@@ -231,19 +283,31 @@ pub(crate) fn stop_physical_stepper_no_lock(stepper_idx: usize) {
     //   gets processed at the next motor enable (against the freshly-zeroed
     //   channel position applied by `apply_stepper_post_action_state`) or is
     //   drained again by the next `stepper_stop_from_p1`.
-    while unsafe {
+    let mut drained_segments = 0u32;
+    let mut drained_steps = 0u32;
+    while let Some(m) = unsafe {
         step_queue(0)
             .expect("OpenFFBoard channel 0 exists")
             .dequeue()
-            .is_some()
-    } {}
-    // 5. Reset direction GPIO (PA0) to known low state
+    } {
+        drained_segments = drained_segments.saturating_add(1);
+        drained_steps = drained_steps.saturating_add(u32::from(m.count));
+    }
+    crate::state::stepper_diag::record_physical_stop(
+        stepper_idx as u8,
+        reason,
+        remaining_events,
+        queue_len,
+        drained_segments,
+        drained_steps,
+    );
+    // 4. Reset direction GPIO (PA0) to known low state
     let gpio_a = embassy_stm32::pac::GPIOA;
     gpio_a
         .odr()
         .modify(|w| w.set_odr(0, embassy_stm32::pac::gpio::vals::Odr::LOW));
     stepper_state().direction.store(true, Relaxed); // Forward = default
-    // 6. Reset STEP GPIO (PB11) to LOW.
+    // 5. Reset STEP GPIO (PB11) to LOW.
     //
     // Full-mode scheduling relies on the ISR toggling from a known
     // starting state: the first event of each segment must drive STEP

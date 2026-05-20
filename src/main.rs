@@ -44,11 +44,15 @@ mod app {
     use crate::app_types::{CycleDelay, TmcSpiDevice};
     use crate::helpers::lifecycle::*;
     use crate::helpers::stepper::*;
+    use crate::helpers::stepper_diag::*;
     use crate::helpers::trsync::*;
     use crate::state::stepper::*;
     use crate::state::tmc::*;
     use crate::state::trace::*;
-    use crate::trigger_domain::{TRIGGER_DOMAIN, TriggerDomain, with_trigger_domain};
+    use crate::trigger_domain::{
+        TRIGGER_DOMAIN, TRIGGER_TIMER_MIN_LEAD_TICKS, TriggerDomain, with_trigger_domain,
+    };
+    use foci_firmware::diagnostic::StepperEventReason;
     use foci_firmware::state::lifecycle::*;
     use foci_firmware::state::tmc::{TMC_DISABLE_SIGNAL, TMC_QUEUE_FLUSH};
     use foci_firmware::state::trsync::*;
@@ -1105,6 +1109,14 @@ mod app {
                     .read_register(foci_tmc4671::registers::STATUS_FLAGS)
                     .await
                     .unwrap_or(0);
+                record_stepper_event(
+                    StepperEventReason::TmcDisableSignal,
+                    0,
+                    read_tim5(),
+                    UNKNOWN_QUEUE_LEN,
+                    flags,
+                    0,
+                );
                 defmt::error!("TMC4671 emergency disable: STATUS={:#010x}", flags);
                 // Report shutdown to Klipper with a specific reason.
                 const NOT_PLL_LOCKED: u32 = 1 << 19;
@@ -1318,17 +1330,24 @@ mod app {
     /// P2 software task: clear TriggerDomain timer_active after P1 stop.
     ///
     /// Spawned by `stepper_stop_from_p1()`. P1 performs the physical
-    /// quiesce (CC1 disable, queue drain) immediately, then this task
-    /// updates the authoritative flag so `reset_step_clock` and
+    /// quiesce immediately, then this task cancels the stale stepper timer
+    /// and updates the authoritative flag so `reset_step_clock` and
     /// `arm_check` see the correct state.
     #[task(priority = 2)]
     async fn stop_check(_ctx: stop_check::Context) {
         with_trigger_domain(|td| {
+            td.scheduler.cancel(|kind| {
+                matches!(
+                    kind,
+                    foci_klipper::scheduler::SchedulerEventKind::Stepper(0)
+                )
+            });
             td.set_timer_active(0, false);
+            td.reprogram_timer();
         });
     }
 
-    /// P2 software task: arm TIM5 CC1 if motor is ready and queue has moves.
+    /// P2 software task: arm TIM5 scheduler if motor is ready and queue has moves.
     ///
     /// Spawned by P1 after calibration/enable completion. P1 must never
     /// enter TriggerDomain — this task crosses the boundary at P2.
@@ -1350,177 +1369,55 @@ mod app {
                     .is_empty()
             };
             if queue_has_moves {
-                arm_step_timer(read_tim5().wrapping_add(1));
+                let now = read_tim5();
+                crate::state::stepper_diag::record_timer_activation(0, now);
+                td.scheduler.cancel(|kind| {
+                    matches!(
+                        kind,
+                        foci_klipper::scheduler::SchedulerEventKind::Stepper(0)
+                    )
+                });
+                td.scheduler
+                    .schedule(foci_klipper::scheduler::SchedulerEvent {
+                        wake_clock: now.wrapping_add(1),
+                        kind: foci_klipper::scheduler::SchedulerEventKind::Stepper(0),
+                    });
                 td.set_timer_active(0, true);
+                td.reprogram_timer();
             }
         });
     }
 
-    /// TIM5 CC1 step timer interrupt.
+    /// Maximum continuous TIM5 scheduler dispatch before deferring.
     ///
-    /// Dequeues moves from SPSC consumer, toggles STEP GPIO, schedules
-    /// next compare. Same priority as USB OTG and fault EXTI (P3).
-    #[task(binds = TIM5, priority = 3)]
-    fn step_timer_irq(_ctx: step_timer_irq::Context) {
-        use core::sync::atomic::Ordering::Relaxed;
-        use foci_klipper::stepper::StepEventResult;
+    /// Matches Klipper's repeat guard shape: process bursts in one IRQ, but
+    /// avoid monopolizing P3 if a pathological stream stays immediately due.
+    const TIM5_SCHEDULER_REPEAT_TICKS: u32 = CLOCK_FREQ / 10_000;
 
-        let tim5 = embassy_stm32::pac::TIM5;
-
-        // --- CC2: trigger scheduler (process before CC1) ---
-        if tim5.sr().read().ccif(1) && tim5.dier().read().ccie(1) {
-            tim5.sr().modify(|w| w.set_ccif(1, false));
-            let mut need_report = false;
-            with_trigger_domain(|td| {
-                use foci_klipper::scheduler::SchedulerEventKind;
-                let now = read_tim5();
-                let due_indices = td.scheduler.find_due(now);
-                // Collect (kind, wake_clock) pairs before mutating scheduler
-                let mut due_events: heapless::Vec<(SchedulerEventKind, u32), 12> =
-                    heapless::Vec::new();
-                for &slot_idx in &due_indices {
-                    if let Some(event) = td.scheduler.get(slot_idx) {
-                        let _ = due_events.push((event.kind, event.wake_clock));
-                    }
-                    td.scheduler.remove(slot_idx);
-                }
-
-                for &(kind, wake_clock) in &due_events {
-                    match kind {
-                        SchedulerEventKind::Stepper(_) => {}
-                        SchedulerEventKind::EndstopSample(endstop_idx) => {
-                            use foci_klipper::endstop::{EndstopPhase, EndstopSampleResult};
-                            let pin_id = ENDSTOP_PIN_IDS[endstop_idx].load(Relaxed);
-                            let read_pin = || -> bool {
-                                if pin_id != 0xFF {
-                                    gpio_read_pin(pin_id)
-                                } else {
-                                    false
-                                }
-                            };
-
-                            let phase = td.endstops[endstop_idx].phase();
-                            let result = match phase {
-                                EndstopPhase::Scanning => {
-                                    td.endstops[endstop_idx].scan(read_pin(), wake_clock)
-                                }
-                                EndstopPhase::Oversampling => {
-                                    td.endstops[endstop_idx].oversample(read_pin(), wake_clock)
-                                }
-                            };
-
-                            match result {
-                                EndstopSampleResult::EnterOversamplingNow => {
-                                    // Second GPIO read (C double-read)
-                                    match td.endstops[endstop_idx]
-                                        .oversample(read_pin(), wake_clock)
-                                    {
-                                        EndstopSampleResult::Triggered { trsync_oid, reason } => {
-                                            td.trigger(trsync_oid, reason, now);
-                                            need_report = true;
-                                        }
-                                        EndstopSampleResult::Reschedule { next_clock } => {
-                                            td.scheduler.schedule(
-                                                foci_klipper::scheduler::SchedulerEvent {
-                                                    wake_clock: next_clock,
-                                                    kind: SchedulerEventKind::EndstopSample(
-                                                        endstop_idx,
-                                                    ),
-                                                },
-                                            );
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                EndstopSampleResult::Triggered { trsync_oid, reason } => {
-                                    td.trigger(trsync_oid, reason, now);
-                                    need_report = true;
-                                }
-                                EndstopSampleResult::Reschedule { next_clock } => {
-                                    td.scheduler.schedule(
-                                        foci_klipper::scheduler::SchedulerEvent {
-                                            wake_clock: next_clock,
-                                            kind: SchedulerEventKind::EndstopSample(endstop_idx),
-                                        },
-                                    );
-                                }
-                                EndstopSampleResult::Inactive => {}
-                            }
-                        }
-                        SchedulerEventKind::TrSyncExpire(trsync_idx) => {
-                            // The scheduler event already confirms the deadline
-                            // has passed. Call td.trigger() directly — do NOT call
-                            // check_timeout() which internally triggers the
-                            // TrSyncRuntime, causing td.trigger() to see
-                            // AlreadyTriggered and skip stop signal dispatch.
-                            let oid = td
-                                .trsync_by_oid
-                                .iter()
-                                .find(|&(_, &idx)| idx == trsync_idx)
-                                .map(|(&oid, _)| oid);
-                            if let Some(oid) = oid {
-                                let expire_reason = td.trsync[trsync_idx].expire_reason();
-                                td.trigger(oid, expire_reason, now);
-                                need_report = true;
-                            }
-                        }
-                        SchedulerEventKind::TrSyncReport(trsync_idx) => {
-                            let oid = td
-                                .trsync_by_oid
-                                .iter()
-                                .find(|&(_, &idx)| idx == trsync_idx)
-                                .map(|(&oid, _)| oid);
-                            if let Some(oid) = oid
-                                && td.trsync[trsync_idx].can_trigger()
-                            {
-                                td.trsync[trsync_idx].set_liveness_report(oid, now);
-                                need_report = true;
-                                // Advance report_clock by report_ticks (stable cadence)
-                                let report_ticks = td.trsync[trsync_idx].report_ticks();
-                                if report_ticks > 0 {
-                                    let next_report = td.trsync[trsync_idx]
-                                        .report_clock()
-                                        .wrapping_add(report_ticks);
-                                    td.trsync[trsync_idx].set_report_clock(next_report);
-                                    td.scheduler.schedule(
-                                        foci_klipper::scheduler::SchedulerEvent {
-                                            wake_clock: next_report,
-                                            kind: SchedulerEventKind::TrSyncReport(trsync_idx),
-                                        },
-                                    );
-                                }
-                                // After trigger, no more liveness reports — don't reschedule
-                            }
-                        }
-                    }
-                }
-                td.reprogram_cc2();
+    fn schedule_stepper_timer(td: &mut TriggerDomain, stepper_idx: usize, clock: u32) {
+        td.scheduler
+            .schedule(foci_klipper::scheduler::SchedulerEvent {
+                wake_clock: clock,
+                kind: foci_klipper::scheduler::SchedulerEventKind::Stepper(stepper_idx),
             });
-            if need_report {
-                REPORT_PENDING.store(true, Relaxed);
-                report_task::spawn().ok();
-            }
-        }
+    }
 
-        // --- CC1: step timer (existing logic) ---
-        // Skip CC1 if the flag is not set, or if CC2 trigger processing
-        // disabled CC1 (stepper stop) — prevents one extra step after trigger.
-        if !tim5.sr().read().ccif(0) || !tim5.dier().read().ccie(0) {
+    fn process_stepper_timer(td: &mut TriggerDomain, stepper_idx: usize) {
+        use core::sync::atomic::Ordering::Relaxed;
+        use foci_klipper::stepper::{StepEventResult, StepPhase};
+
+        if stepper_idx != 0 {
             return;
         }
-        // Clear CC1 interrupt flag
-        tim5.sr().modify(|w| w.set_ccif(0, false));
-
-        // Check gates
-        if FAULT_ACTIVE.load(Relaxed) {
-            return;
-        }
-        if !tmc_state().motor_armed.load(Relaxed) {
+        if FAULT_ACTIVE.load(Relaxed) || !tmc_state().motor_armed.load(Relaxed) {
+            td.set_timer_active(0, false);
+            stepper_state().interval.store(0, Relaxed);
+            tmc_state().pid_error_sums_clear.store(true, Relaxed);
             return;
         }
 
-        // SAFETY: ISR stepper state is only accessed from this P3 ISR.
-        // P3 tasks cannot preempt each other on Cortex-M.
+        // SAFETY: ISR stepper state is only accessed from this P3 ISR or from
+        // stop paths that first gate/cancel the stepper timer.
         let stepper = unsafe { isr_stepper(0).expect("OpenFFBoard channel 0 exists") };
 
         let gpio_b = embassy_stm32::pac::GPIOB;
@@ -1528,15 +1425,15 @@ mod app {
 
         loop {
             if !stepper.has_active_segment() {
-                // Need a new move from the queue
-                // SAFETY: P3 is the sole consumer of the queue.
-                // P3 ISRs cannot preempt each other on Cortex-M.
-                match unsafe {
+                // Need a new move from the queue.
+                // SAFETY: P3 is the sole consumer while motor_armed is true.
+                let loaded_steps = match unsafe {
                     step_queue(0)
                         .expect("OpenFFBoard channel 0 exists")
                         .dequeue()
                 } {
                     Some(m) => {
+                        let loaded_steps = u32::from(m.count);
                         let dir_changed = stepper.load_move(m);
                         stepper_state()
                             .interval
@@ -1553,120 +1450,281 @@ mod app {
                         if dir_changed {
                             tmc_state().feedforward_reset.store(true, Relaxed);
                         }
+                        loaded_steps
                     }
                     None => {
-                        // Queue empty: disarm timer, go idle
-                        tim5.dier().modify(|w| w.set_ccie(0, false));
+                        stepper.mark_idle();
+                        crate::state::stepper_diag::record_queue_empty(0);
+                        if HOMING_STATE.load(Relaxed) != 0 {
+                            record_stepper_event(
+                                StepperEventReason::QueueEmpty,
+                                0,
+                                read_tim5(),
+                                0,
+                                0,
+                                0,
+                            );
+                        }
                         stepper_state().interval.store(0, Relaxed);
                         tmc_state().pid_error_sums_clear.store(true, Relaxed);
-                        with_trigger_domain(|td| {
-                            td.set_timer_active(0, false);
-                        });
+                        td.set_timer_active(0, false);
                         return;
                     }
-                }
+                };
 
-                // Check deadline for the first step of this segment
-                let now = tim5.cnt().read();
+                let now = read_tim5();
                 let scheduled = stepper.next_step_clock();
                 match stepper.check_deadline(scheduled, now, CLOCK_FREQ) {
                     Ok(compare) => {
-                        let immediate = compare != scheduled;
-                        tim5.ccr(0).write_value(compare);
-                        if !immediate {
-                            return;
-                        }
+                        crate::state::stepper_diag::record_loaded_segment_timing(
+                            0,
+                            loaded_steps,
+                            now,
+                            scheduled,
+                            compare,
+                        );
+                        schedule_stepper_timer(td, 0, compare);
+                        return;
                     }
                     Err(_) => {
-                        tim5.dier().modify(|w| w.set_ccie(0, false));
-                        with_trigger_domain(|td| {
-                            td.set_timer_active(0, false);
-                        });
+                        crate::state::stepper_diag::record_loaded_segment(0, loaded_steps);
+                        crate::state::stepper_diag::record_missed_deadline(0);
+                        record_stepper_event(
+                            StepperEventReason::MissedDeadlineLoad,
+                            0,
+                            now,
+                            UNKNOWN_QUEUE_LEN,
+                            scheduled,
+                            now,
+                        );
+                        td.set_timer_active(0, false);
                         TMC_DISABLE_SIGNAL.signal(());
                         defmt::error!("Stepper too far in past");
                         return;
                     }
                 }
-            } else {
-                // Active segment: execute one timer event (step or unstep).
-                //
-                // Full-mode scheduling (STEPPER_STEP_BOTH_EDGE=0): each motor
-                // step is a pair of events. Event 1 drives STEP HIGH (step
-                // phase, TMC4671 sees a rising edge and advances its counter);
-                // event 2 drives STEP LOW (unstep phase, no-op for the
-                // TMC4671). stepper_state().position only advances on the step phase
-                // so the firmware counter matches the TMC4671's view of
-                // position. Matches Klipper C `stepper_event_full`.
-                {
-                    use embassy_stm32::pac::gpio::vals::Idr;
-                    let is_high = gpio_b.idr().read().idr(11) == Idr::HIGH;
-                    gpio_b.bsrr().write(|w| {
-                        if is_high {
-                            w.set_br(11, true);
-                        } else {
-                            w.set_bs(11, true);
-                        }
-                    });
-                }
+            }
 
-                match stepper.step_event() {
-                    StepEventResult::ScheduleNext { clock, phase } => {
-                        // Rising edge (LOW → HIGH) → TMC4671 advances, so the
-                        // firmware counter advances too. Falling edge (HIGH →
-                        // LOW) is the second half of the pulse and does not
-                        // change the driver's position.
-                        use foci_klipper::stepper::StepPhase;
-                        let is_step = matches!(phase, StepPhase::Step);
-                        if is_step {
-                            let dir = if stepper.dir_state() { 1i32 } else { -1i32 };
-                            stepper_state().position.fetch_add(dir, Relaxed);
+            {
+                use embassy_stm32::pac::gpio::vals::Idr;
+                let is_high = gpio_b.idr().read().idr(11) == Idr::HIGH;
+                gpio_b.bsrr().write(|w| {
+                    if is_high {
+                        w.set_br(11, true);
+                    } else {
+                        w.set_bs(11, true);
+                    }
+                });
+            }
+
+            match stepper.step_event() {
+                StepEventResult::ScheduleNext { clock, phase } => {
+                    let is_step = matches!(phase, StepPhase::Step);
+                    if is_step {
+                        let dir = if stepper.dir_state() { 1i32 } else { -1i32 };
+                        stepper_state().position.fetch_add(dir, Relaxed);
+                        crate::state::stepper_diag::record_executed_step(
+                            0,
+                            stepper.dir_state(),
+                            read_tim5(),
+                        );
+                    }
+                    stepper_state()
+                        .interval
+                        .store(stepper.current_interval(), Relaxed);
+                    let now = read_tim5();
+                    match stepper.check_deadline(clock, now, CLOCK_FREQ) {
+                        Ok(compare) => {
+                            schedule_stepper_timer(td, 0, compare);
+                            return;
                         }
-                        stepper_state()
-                            .interval
-                            .store(stepper.current_interval(), Relaxed);
-                        let now = tim5.cnt().read();
-                        match stepper.check_deadline(clock, now, CLOCK_FREQ) {
-                            Ok(compare) => {
-                                let immediate = compare != clock;
-                                // Only rebase the cadence anchor when the
-                                // scheduled event IS the next rising edge
-                                // (Unstep phase returns `next_step_clock`).
-                                // For Step phase `clock` is the pulse-close
-                                // time, only STEP_PULSE_TICKS past the
-                                // rising edge — it is almost always in the
-                                // past by the time we read TIM5 here, so
-                                // rebasing would drag every subsequent
-                                // rising edge forward by the pulse-close
-                                // latency and stretch the step interval.
-                                // Leaving the anchor untouched lets the
-                                // following Unstep event schedule the next
-                                // rising edge at `original_step_clock +
-                                // interval` as intended.
-                                tim5.ccr(0).write_value(compare);
-                                if !immediate {
-                                    return;
-                                }
-                                continue;
-                            }
-                            Err(_) => {
-                                tim5.dier().modify(|w| w.set_ccie(0, false));
-                                with_trigger_domain(|td| {
-                                    td.set_timer_active(0, false);
-                                });
-                                TMC_DISABLE_SIGNAL.signal(());
-                                defmt::error!("Stepper too far in past");
-                                return;
-                            }
+                        Err(_) => {
+                            crate::state::stepper_diag::record_missed_deadline(0);
+                            record_stepper_event(
+                                StepperEventReason::MissedDeadlineStep,
+                                0,
+                                now,
+                                UNKNOWN_QUEUE_LEN,
+                                clock,
+                                now,
+                            );
+                            td.set_timer_active(0, false);
+                            TMC_DISABLE_SIGNAL.signal(());
+                            defmt::error!("Stepper too far in past");
+                            return;
                         }
                     }
-                    StepEventResult::NeedMove => {
-                        // Final unstep of the segment: the GPIO toggle above
-                        // already drove STEP LOW, leaving the pin in the
-                        // quiescent state before we dequeue the next move.
-                        continue;
+                }
+                StepEventResult::NeedMove => {
+                    // Final unstep already drove STEP low; load the next segment
+                    // in the same scheduler callback if one is queued.
+                }
+            }
+        }
+    }
+
+    fn process_trigger_timer(
+        td: &mut TriggerDomain,
+        kind: foci_klipper::scheduler::SchedulerEventKind,
+        wake_clock: u32,
+        need_report: &mut bool,
+    ) {
+        use core::sync::atomic::Ordering::Relaxed;
+        use foci_klipper::scheduler::SchedulerEventKind;
+
+        match kind {
+            SchedulerEventKind::Stepper(stepper_idx) => process_stepper_timer(td, stepper_idx),
+            SchedulerEventKind::EndstopSample(endstop_idx) => {
+                use foci_klipper::endstop::{EndstopPhase, EndstopSampleResult};
+                let pin_id = ENDSTOP_PIN_IDS[endstop_idx].load(Relaxed);
+                let read_pin = || -> bool {
+                    if pin_id != 0xFF {
+                        gpio_read_pin(pin_id)
+                    } else {
+                        false
+                    }
+                };
+
+                let phase = td.endstops[endstop_idx].phase();
+                let result = match phase {
+                    EndstopPhase::Scanning => td.endstops[endstop_idx].scan(read_pin(), wake_clock),
+                    EndstopPhase::Oversampling => {
+                        td.endstops[endstop_idx].oversample(read_pin(), wake_clock)
+                    }
+                };
+
+                match result {
+                    EndstopSampleResult::EnterOversamplingNow => {
+                        match td.endstops[endstop_idx].oversample(read_pin(), wake_clock) {
+                            EndstopSampleResult::Triggered { trsync_oid, reason } => {
+                                td.trigger(trsync_oid, reason, read_tim5());
+                                *need_report = true;
+                            }
+                            EndstopSampleResult::Reschedule { next_clock } => {
+                                td.scheduler
+                                    .schedule(foci_klipper::scheduler::SchedulerEvent {
+                                        wake_clock: next_clock,
+                                        kind: SchedulerEventKind::EndstopSample(endstop_idx),
+                                    });
+                            }
+                            _ => {}
+                        }
+                    }
+                    EndstopSampleResult::Triggered { trsync_oid, reason } => {
+                        td.trigger(trsync_oid, reason, read_tim5());
+                        *need_report = true;
+                    }
+                    EndstopSampleResult::Reschedule { next_clock } => {
+                        td.scheduler
+                            .schedule(foci_klipper::scheduler::SchedulerEvent {
+                                wake_clock: next_clock,
+                                kind: SchedulerEventKind::EndstopSample(endstop_idx),
+                            });
+                    }
+                    EndstopSampleResult::Inactive => {}
+                }
+            }
+            SchedulerEventKind::TrSyncExpire(trsync_idx) => {
+                let oid = td
+                    .trsync_by_oid
+                    .iter()
+                    .find(|&(_, &idx)| idx == trsync_idx)
+                    .map(|(&oid, _)| oid);
+                if let Some(oid) = oid {
+                    let expire_reason = td.trsync[trsync_idx].expire_reason();
+                    td.trigger(oid, expire_reason, read_tim5());
+                    *need_report = true;
+                }
+            }
+            SchedulerEventKind::TrSyncReport(trsync_idx) => {
+                let oid = td
+                    .trsync_by_oid
+                    .iter()
+                    .find(|&(_, &idx)| idx == trsync_idx)
+                    .map(|(&oid, _)| oid);
+                if let Some(oid) = oid
+                    && td.trsync[trsync_idx].can_trigger()
+                {
+                    let now = read_tim5();
+                    td.trsync[trsync_idx].set_liveness_report(oid, now);
+                    *need_report = true;
+                    let report_ticks = td.trsync[trsync_idx].report_ticks();
+                    if report_ticks > 0 {
+                        let next_report = td.trsync[trsync_idx]
+                            .report_clock()
+                            .wrapping_add(report_ticks);
+                        td.trsync[trsync_idx].set_report_clock(next_report);
+                        td.scheduler
+                            .schedule(foci_klipper::scheduler::SchedulerEvent {
+                                wake_clock: next_report,
+                                kind: SchedulerEventKind::TrSyncReport(trsync_idx),
+                            });
                     }
                 }
             }
+        }
+    }
+
+    fn dispatch_tim5_scheduler(td: &mut TriggerDomain, need_report: &mut bool) {
+        let dispatch_start = read_tim5();
+        loop {
+            let now = read_tim5();
+            if let Some(event) = td.scheduler.pop_due(now) {
+                process_trigger_timer(td, event.kind, event.wake_clock, need_report);
+                let elapsed = read_tim5().wrapping_sub(dispatch_start) as i32;
+                if elapsed >= TIM5_SCHEDULER_REPEAT_TICKS as i32 {
+                    td.reprogram_timer();
+                    return;
+                }
+                continue;
+            }
+
+            let Some(next_clock) = td.scheduler.earliest_deadline() else {
+                td.disarm_timer();
+                return;
+            };
+            let now = read_tim5();
+            let delta = next_clock.wrapping_sub(now) as i32;
+            if delta <= 0 {
+                continue;
+            }
+            if delta <= TRIGGER_TIMER_MIN_LEAD_TICKS as i32 {
+                while (next_clock.wrapping_sub(read_tim5()) as i32) > 0 {}
+                continue;
+            }
+            td.arm_timer_at(next_clock);
+            return;
+        }
+    }
+
+    /// TIM5 unified Klipper scheduler interrupt.
+    ///
+    /// Dispatches stepper, endstop, and trsync timers from one ordered software
+    /// queue on the TIM5 clock. Same priority as USB OTG and fault EXTI (P3).
+    #[task(binds = TIM5, priority = 3)]
+    fn step_timer_irq(_ctx: step_timer_irq::Context) {
+        use core::sync::atomic::Ordering::Relaxed;
+
+        let tim5 = embassy_stm32::pac::TIM5;
+        let sr = tim5.sr().read();
+        let dier = tim5.dier().read();
+        let cc1_pending = sr.ccif(0) && dier.ccie(0);
+        let cc2_pending = sr.ccif(1) && dier.ccie(1);
+        if !cc1_pending && !cc2_pending {
+            return;
+        }
+        tim5.sr().modify(|w| {
+            w.set_ccif(0, false);
+            w.set_ccif(1, false);
+        });
+
+        let mut need_report = false;
+        with_trigger_domain(|td| {
+            dispatch_tim5_scheduler(td, &mut need_report);
+        });
+        if need_report {
+            REPORT_PENDING.store(true, Relaxed);
+            report_task::spawn().ok();
         }
     }
 
