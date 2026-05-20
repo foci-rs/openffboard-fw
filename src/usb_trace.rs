@@ -941,6 +941,10 @@ pub(crate) async fn emit_status_frames<B>(
     use foci_firmware::trace_stream::*;
     use foci_tmc4671::registers::STATUS_FLAGS;
 
+    if !is_configured() {
+        return;
+    }
+
     let pending_change = TRACE_TIMING.pending_status_change.swap(false, Relaxed);
     if !regular_tick && !pending_change {
         return;
