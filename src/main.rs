@@ -157,6 +157,8 @@ mod app {
         defmt::info!("SYSCLK: 168 MHz, USB: 48 MHz");
 
         crate::board_init::init_tim5_clock();
+        #[cfg(feature = "trace")]
+        crate::usb_trace::note_trace_boot();
         crate::board_init::init_stepdir_gpio();
         defmt::info!("TIM5 enabled for Klipper clock @ 84 MHz, STEP/DIR GPIO configured");
 
@@ -1480,6 +1482,8 @@ mod app {
 
                 let now = read_tim5();
                 let scheduled = stepper.next_step_clock();
+                #[cfg(feature = "trace")]
+                crate::usb_trace::record_step_timing(scheduled, now);
                 match stepper.check_deadline(scheduled, now, CLOCK_FREQ) {
                     Ok(compare) => {
                         crate::state::stepper_diag::record_loaded_segment_timing(
@@ -1495,6 +1499,10 @@ mod app {
                     Err(_) => {
                         crate::state::stepper_diag::record_loaded_segment(0, loaded_steps);
                         crate::state::stepper_diag::record_missed_deadline(0);
+                        #[cfg(feature = "trace")]
+                        crate::usb_trace::TRACE_TIMING
+                            .missed_or_deferred_steps
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                         record_stepper_event(
                             StepperEventReason::MissedDeadlineLoad,
                             0,
@@ -1539,6 +1547,8 @@ mod app {
                         .interval
                         .store(stepper.current_interval(), Relaxed);
                     let now = read_tim5();
+                    #[cfg(feature = "trace")]
+                    crate::usb_trace::record_step_timing(clock, now);
                     match stepper.check_deadline(clock, now, CLOCK_FREQ) {
                         Ok(compare) => {
                             schedule_stepper_timer(td, 0, compare);
@@ -1546,6 +1556,10 @@ mod app {
                         }
                         Err(_) => {
                             crate::state::stepper_diag::record_missed_deadline(0);
+                            #[cfg(feature = "trace")]
+                            crate::usb_trace::TRACE_TIMING
+                                .missed_or_deferred_steps
+                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                             record_stepper_event(
                                 StepperEventReason::MissedDeadlineStep,
                                 0,

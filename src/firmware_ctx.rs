@@ -104,6 +104,10 @@ pub struct FirmwareCtx<'a> {
 
 impl<'a> FirmwareCtx<'a> {
     pub fn new(state: &'a mut State) -> Self {
+        #[cfg(feature = "trace")]
+        crate::usb_trace::store_last_klipper_command_service_tick(
+            crate::usb_trace::trace_now_ticks(),
+        );
         Self { state }
     }
 }
@@ -236,6 +240,10 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
                     if !ok {
                         return Err(CommandError::QueueFull);
                     }
+                    #[cfg(feature = "trace")]
+                    crate::usb_trace::TRACE_TIMING
+                        .klipper_rx_queue_depth
+                        .store(queue.len() as u16, core::sync::atomic::Ordering::Relaxed);
                     crate::state::stepper_diag::record_queued_segment(
                         channel,
                         u32::from(move_.count),
