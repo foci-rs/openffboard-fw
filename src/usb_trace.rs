@@ -401,7 +401,6 @@ pub(crate) fn store_last_served_step_tick(ticks: u64) {
 }
 
 /// Load the last served step tick.
-#[allow(dead_code)]
 pub(crate) fn load_last_served_step_tick() -> u64 {
     load_split_u64(
         &TRACE_TIMING.last_served_step_tick_low,
@@ -419,7 +418,6 @@ pub(crate) fn store_last_klipper_command_service_tick(ticks: u64) {
 }
 
 /// Load the last Klipper command-service tick.
-#[allow(dead_code)]
 pub(crate) fn load_last_klipper_command_service_tick() -> u64 {
     load_split_u64(
         &TRACE_TIMING.last_klipper_command_service_tick_low,
@@ -428,7 +426,6 @@ pub(crate) fn load_last_klipper_command_service_tick() -> u64 {
 }
 
 /// Record a TMC SPI error for status frames.
-#[allow(dead_code)]
 pub(crate) fn record_spi_error() {
     TRACE_TIMING.spi_error_count.fetch_add(1, Ordering::Relaxed);
     TRACE_TIMING
@@ -447,7 +444,6 @@ pub(crate) fn record_status_interrupt() {
 }
 
 /// Record measured SPI sampling duration.
-#[allow(dead_code)]
 pub(crate) fn record_spi_sample_cycles(cycles: u32) {
     // DWT cycles are CPU-clock cycles. This threshold is sized for the 168 MHz
     // F407 CPU clock and is intentionally not derived from CLOCK_FREQ, which
@@ -520,7 +516,6 @@ pub(crate) fn record_step_timing(scheduled: u32, actual: u32) {
 }
 
 /// Take per-window step jitter and deadline slack accumulators.
-#[allow(dead_code)]
 pub(crate) fn take_jitter_and_slack() -> (u32, i32) {
     let jitter = TRACE_TIMING
         .max_step_jitter_ticks
@@ -607,7 +602,6 @@ pub(crate) fn emit_metadata() {
 }
 
 /// Enqueue a motion/counter frame without blocking.
-#[allow(dead_code)]
 pub(crate) fn enqueue_motion(frame: FrameBuf) {
     // SAFETY: Trace producers enqueue complete frames; the USB task is the
     // only consumer. RTIC priorities prevent overlapping mutable queue use for
@@ -637,7 +631,6 @@ pub(crate) fn enqueue_motion(frame: FrameBuf) {
 }
 
 /// Enqueue an event frame without blocking.
-#[allow(dead_code)]
 pub(crate) fn enqueue_event(frame: FrameBuf) {
     // SAFETY: Trace event producers enqueue complete frames; the USB task is
     // the only consumer in this initial wiring slice.
@@ -683,6 +676,28 @@ where
             0
         }
     }
+}
+
+async fn read_register_counting_errors<B>(
+    tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
+    register: foci_tmc4671::registers::Register,
+) -> u32
+where
+    B: embedded_hal_async::spi::SpiDevice<u8>,
+{
+    let mut ignored_flags = 0u8;
+    read_register_trace(tmc, register, &mut ignored_flags).await
+}
+
+async fn read_sub_register_counting_errors<B>(
+    tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
+    register: foci_tmc4671::registers::SubRegister,
+) -> u32
+where
+    B: embedded_hal_async::spi::SpiDevice<u8>,
+{
+    let mut ignored_flags = 0u8;
+    read_sub_register_trace(tmc, register, &mut ignored_flags).await
 }
 
 /// Sample critical and control-detail trace frames from the 1 ms control tick.
@@ -766,42 +781,31 @@ pub(crate) async fn sample_tick<B>(
     let emit_control_detail = control_tick.is_multiple_of(2)
         && !TRACE_TIMING.skip_next_control_detail.swap(false, Relaxed);
     if emit_control_detail {
-        let mut detail_flags = 0u8;
         let detail = ControlDetailSample {
-            interim_pidout_target_torque: read_sub_register_trace(
+            interim_pidout_target_torque: read_sub_register_counting_errors(
                 tmc,
                 INTERIM_PIDOUT_TARGET_TORQUE,
-                &mut detail_flags,
             )
             .await,
-            interim_pidout_target_flux: read_sub_register_trace(
+            interim_pidout_target_flux: read_sub_register_counting_errors(
                 tmc,
                 INTERIM_PIDOUT_TARGET_FLUX,
-                &mut detail_flags,
             )
             .await,
-            interim_pidin_target_velocity: read_sub_register_trace(
+            interim_pidin_target_velocity: read_sub_register_counting_errors(
                 tmc,
                 INTERIM_PIDIN_TARGET_VELOCITY,
-                &mut detail_flags,
             )
             .await,
-            interim_pidout_target_velocity: read_sub_register_trace(
+            interim_pidout_target_velocity: read_sub_register_counting_errors(
                 tmc,
                 INTERIM_PIDOUT_TARGET_VELOCITY,
-                &mut detail_flags,
             )
             .await,
-            pidout_uq_ud_limits: read_register_trace(tmc, PIDOUT_UQ_UD_LIMITS, &mut detail_flags)
+            pidout_uq_ud_limits: read_register_counting_errors(tmc, PIDOUT_UQ_UD_LIMITS).await,
+            pid_torque_flux_limits: read_register_counting_errors(tmc, PID_TORQUE_FLUX_LIMITS)
                 .await,
-            pid_torque_flux_limits: read_register_trace(
-                tmc,
-                PID_TORQUE_FLUX_LIMITS,
-                &mut detail_flags,
-            )
-            .await,
-            pid_velocity_limit: read_register_trace(tmc, PID_VELOCITY_LIMIT, &mut detail_flags)
-                .await,
+            pid_velocity_limit: read_register_counting_errors(tmc, PID_VELOCITY_LIMIT).await,
         };
         let mut payload = [0u8; CONTROL_DETAIL_PAYLOAD_LEN];
         encode_control_detail_payload(&detail, &mut payload);
