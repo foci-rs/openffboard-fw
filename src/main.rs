@@ -1387,6 +1387,7 @@ mod app {
 
                 for &(kind, wake_clock) in &due_events {
                     match kind {
+                        SchedulerEventKind::Stepper(_) => {}
                         SchedulerEventKind::EndstopSample(endstop_idx) => {
                             use foci_klipper::endstop::{EndstopPhase, EndstopSampleResult};
                             let pin_id = ENDSTOP_PIN_IDS[endstop_idx].load(Relaxed);
@@ -1571,9 +1572,6 @@ mod app {
                 match stepper.check_deadline(scheduled, now, CLOCK_FREQ) {
                     Ok(compare) => {
                         let immediate = compare != scheduled;
-                        if immediate {
-                            stepper.rebase_next_step_clock(compare);
-                        }
                         tim5.ccr(0).write_value(compare);
                         if !immediate {
                             return;
@@ -1644,9 +1642,6 @@ mod app {
                                 // following Unstep event schedule the next
                                 // rising edge at `original_step_clock +
                                 // interval` as intended.
-                                if immediate && !is_step {
-                                    stepper.rebase_next_step_clock(compare);
-                                }
                                 tim5.ccr(0).write_value(compare);
                                 if !immediate {
                                     return;
