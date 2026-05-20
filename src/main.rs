@@ -421,13 +421,13 @@ mod app {
         }
 
         // Configure STATUS_MASK: route critical fault flags to the STATUS
-        // output pin (PE8 EXTI). Only PLL lock loss and ADC current clipping
-        // warrant immediate hardware interrupt — other flags are polled.
+        // output pin (PE8 EXTI). TMC4671-LA Rev 1, 02/2024 Table 30 marks
+        // bit 19 as reserved, so only ADC current clipping is interrupting;
+        // other flags are polled.
         {
             use foci_tmc4671::registers::*;
-            const STATUS_NOT_PLL_LOCKED: u32 = 1 << 19;
             const STATUS_ADC_I_CLIPPED: u32 = 1 << 26;
-            let mask = STATUS_NOT_PLL_LOCKED | STATUS_ADC_I_CLIPPED;
+            let mask = STATUS_ADC_I_CLIPPED;
             let _ = tmc.write_register(STATUS_MASK, mask).await;
             // Clear pending STATUS flags from power-on, then configure
             // PE8 EXTI for rising edge interrupt on STATUS assertion.
@@ -1157,18 +1157,9 @@ mod app {
                 );
                 defmt::error!("TMC4671 emergency disable: STATUS={:#010x}", flags);
                 // Report shutdown to Klipper with a specific reason.
-                const NOT_PLL_LOCKED: u32 = 1 << 19;
                 const ADC_I_CLIPPED: u32 = 1 << 26;
                 ctx.shared.app_state.lock(|state| {
-                    if flags & NOT_PLL_LOCKED != 0 {
-                        if crate::firmware_ctx::enter_shutdown(state) {
-                            ::ankyra::klipper_shutdown_from!(
-                                &mut crate::_ankyra_config::Sender,
-                                "TMC4671: PLL not locked (clock lost)",
-                                read_tim5(),
-                            );
-                        }
-                    } else if flags & ADC_I_CLIPPED != 0 {
+                    if flags & ADC_I_CLIPPED != 0 {
                         if crate::firmware_ctx::enter_shutdown(state) {
                             ::ankyra::klipper_shutdown_from!(
                                 &mut crate::_ankyra_config::Sender,
@@ -1372,7 +1363,7 @@ mod app {
             }
 
             // Poll STATUS_FLAGS every ~1 second for warning-level flags.
-            // Critical faults (PLL lost, ADC clipped) are handled by EXTI.
+            // Critical ADC clipping faults are handled by EXTI.
             status_poll_counter += 1;
             if status_poll_counter >= 1000 {
                 status_poll_counter = 0;
@@ -1383,7 +1374,7 @@ mod app {
                     // Warning flags: PID output limits (position, velocity, current)
                     const PID_LIMIT_MASK: u32 = 0x0000_FFFF; // bits 0-15
                     const PWM_LIMIT_MASK: u32 = (1 << 24) | (1 << 25); // pwm_min, pwm_max
-                    const FAULT_MASK: u32 = (1 << 19) | (1 << 26); // not_PLL_locked, adc_i_clipped
+                    const FAULT_MASK: u32 = 1 << 26; // adc_i_clipped
 
                     if flags & FAULT_MASK != 0 {
                         defmt::error!("TMC4671 STATUS fault: {:#010x}", flags);
@@ -1820,9 +1811,9 @@ mod app {
 
     /// TMC4671 STATUS pin interrupt (PE8, EXTI line 8).
     ///
-    /// Fires when any STATUS_MASK-enabled flag is asserted (not_PLL_locked,
-    /// adc_i_clipped). Signals immediate motor disable; tmc_control reads
-    /// STATUS_FLAGS on next tick to log the cause.
+    /// Fires when any STATUS_MASK-enabled flag is asserted. Currently this is
+    /// `adc_i_clipped`; tmc_control reads STATUS_FLAGS on the next tick to log
+    /// the cause.
     #[task(binds = EXTI9_5, priority = 3)]
     fn tmc_status_irq(_ctx: tmc_status_irq::Context) {
         crate::interrupts::tmc_status_irq(&FAULT_ACTIVE, &TMC_DISABLE_SIGNAL);
