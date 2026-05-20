@@ -2,9 +2,9 @@
 
 #![cfg(feature = "trace")]
 
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, Ordering};
 
-use foci_firmware::trace_stream::FrameBuf;
+use foci_firmware::trace_stream::{FrameBuf, METADATA_PAYLOAD_MAX};
 
 use crate::state::usb_trace::{QueuedFrame, TRACE_COUNTERS, current_tx, event_queue, motion_queue};
 
@@ -26,6 +26,9 @@ static mut TRACE_CLOCK_EXT: TraceClockExt = TraceClockExt {
     high: 0,
 };
 
+static TRACE_SERIAL_LEN: AtomicU8 = AtomicU8::new(0);
+static mut TRACE_SERIAL: [u8; 31] = [0; 31];
+
 fn compute_boot_id() -> u32 {
     const UID_BASE: *const u32 = 0x1FFF_7A10 as *const u32;
     // SAFETY: UID registers are always readable at this address on STM32F4.
@@ -37,6 +40,26 @@ fn compute_boot_id() -> u32 {
     let tim5 = crate::helpers::lifecycle::read_tim5();
     let dwt = cortex_m::peripheral::DWT::cycle_count();
     uid0 ^ uid1 ^ uid2 ^ tim5 ^ dwt
+}
+
+/// Cache the USB serial string for metadata frames.
+pub(crate) fn set_trace_serial(serial: &str) {
+    let bytes = serial.as_bytes();
+    let len = bytes.len().min(31);
+    cortex_m::interrupt::free(|_| unsafe {
+        let dst = core::ptr::addr_of_mut!(TRACE_SERIAL).cast::<u8>();
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, len);
+        TRACE_SERIAL_LEN.store(len as u8, Ordering::Relaxed);
+    });
+}
+
+fn trace_serial() -> &'static str {
+    let len = TRACE_SERIAL_LEN.load(Ordering::Relaxed) as usize;
+    cortex_m::interrupt::free(|_| unsafe {
+        let src = core::ptr::addr_of!(TRACE_SERIAL).cast::<u8>();
+        let bytes = core::slice::from_raw_parts(src, len);
+        core::str::from_utf8_unchecked(bytes)
+    })
 }
 
 fn store_split_u64(low: &AtomicU32, high: &AtomicU32, value: u64) {
@@ -129,6 +152,36 @@ pub(crate) fn note_usb_configured() {
         .boot_id
         .store(compute_boot_id(), Ordering::Relaxed);
     TRACE_COUNTERS.configured.store(true, Ordering::Relaxed);
+}
+
+fn header(
+    frame_type: u8,
+    payload_len: usize,
+    source_kind: u8,
+    source_index: u8,
+    flags: u8,
+) -> foci_firmware::trace_stream::FrameHeader {
+    foci_firmware::trace_stream::FrameHeader {
+        frame_type,
+        flags,
+        payload_len: payload_len as u16,
+        source_kind,
+        source_index,
+        sequence: TRACE_COUNTERS.next_sequence(),
+        timestamp_ticks: trace_now_ticks(),
+        boot_id: TRACE_COUNTERS.boot_id.load(Ordering::Relaxed),
+    }
+}
+
+fn motion_flags() -> u8 {
+    if TRACE_COUNTERS
+        .motion_drop_gap
+        .swap(false, Ordering::Relaxed)
+    {
+        foci_firmware::trace_stream::FLAG_DROP_GAP_BEFORE_THIS_FRAME
+    } else {
+        0
+    }
 }
 
 /// Trace timing diagnostics.
@@ -328,6 +381,75 @@ pub(crate) fn is_configured() -> bool {
     TRACE_COUNTERS.configured.load(Ordering::Relaxed) && foci_usb_stm32::is_configured()
 }
 
+fn push_str(out: &mut heapless::Vec<u8, METADATA_PAYLOAD_MAX>, value: &str) {
+    let bytes = value.as_bytes();
+    let len = bytes.len().min(31);
+    let _ = out.push(len as u8);
+    let _ = out.extend_from_slice(&bytes[..len]);
+}
+
+/// Emit stream metadata.
+pub(crate) fn emit_metadata() {
+    use core::sync::atomic::Ordering::Relaxed;
+    use foci_firmware::trace_stream::*;
+
+    if !is_configured() {
+        return;
+    }
+
+    let mut payload: heapless::Vec<u8, METADATA_PAYLOAD_MAX> = heapless::Vec::new();
+    let _ = payload.extend_from_slice(&[
+        1, // metadata schema
+        1, // trace feature revision
+        1, // source count
+        3, // skipped sample counter count
+    ]);
+    let _ = payload.extend_from_slice(&crate::ankyra::constants::CLOCK_FREQ.to_le_bytes());
+    let _ = payload.extend_from_slice(&1000u32.to_le_bytes());
+    let _ = payload.extend_from_slice(&500u32.to_le_bytes());
+    let _ = payload.extend_from_slice(&10u32.to_le_bytes());
+    let _ = payload.extend_from_slice(
+        &TRACE_COUNTERS
+            .pre_config_elapsed_ms
+            .load(Relaxed)
+            .to_le_bytes(),
+    );
+    let _ = payload.extend_from_slice(
+        &TRACE_COUNTERS
+            .pre_config_skipped_critical
+            .load(Relaxed)
+            .to_le_bytes(),
+    );
+    let _ = payload.extend_from_slice(
+        &TRACE_COUNTERS
+            .pre_config_skipped_control_detail
+            .load(Relaxed)
+            .to_le_bytes(),
+    );
+    let _ = payload.extend_from_slice(
+        &TRACE_COUNTERS
+            .pre_config_skipped_status
+            .load(Relaxed)
+            .to_le_bytes(),
+    );
+    push_str(&mut payload, "openffboard-fw");
+    push_str(&mut payload, TRACE_PRODUCT);
+    push_str(&mut payload, trace_serial());
+    let _ = payload.extend_from_slice(&[SOURCE_KIND_FOCI, 0, 7]);
+    let _ = payload.extend_from_slice(b"channel");
+
+    let mut frame = FrameBuf::new();
+    frame.write_header(header(
+        FRAME_TYPE_METADATA,
+        payload.len(),
+        SOURCE_KIND_BOARD,
+        SOURCE_INDEX_NA,
+        0,
+    ));
+    frame.payload_mut(payload.len()).copy_from_slice(&payload);
+    enqueue_motion(frame);
+}
+
 /// Enqueue a motion/counter frame without blocking.
 #[allow(dead_code)]
 pub(crate) fn enqueue_motion(frame: FrameBuf) {
@@ -369,6 +491,393 @@ pub(crate) fn enqueue_event(frame: FrameBuf) {
             TRACE_COUNTERS.event_drop_gap.store(true, Ordering::Relaxed);
         }
     }
+}
+
+async fn read_register_trace<B>(
+    tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
+    register: foci_tmc4671::registers::Register,
+    sample_flags: &mut u8,
+) -> u32
+where
+    B: embedded_hal_async::spi::SpiDevice<u8>,
+{
+    match tmc.read_register(register).await {
+        Ok(value) => value,
+        Err(_) => {
+            record_spi_error();
+            *sample_flags |= foci_firmware::trace_stream::SAMPLE_FLAG_SPI_ERROR;
+            0
+        }
+    }
+}
+
+async fn read_sub_register_trace<B>(
+    tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
+    register: foci_tmc4671::registers::SubRegister,
+    sample_flags: &mut u8,
+) -> u32
+where
+    B: embedded_hal_async::spi::SpiDevice<u8>,
+{
+    match tmc.read_sub_register(register).await {
+        Ok(value) => value,
+        Err(_) => {
+            record_spi_error();
+            *sample_flags |= foci_firmware::trace_stream::SAMPLE_FLAG_SPI_ERROR;
+            0
+        }
+    }
+}
+
+/// Sample critical and control-detail trace frames from the 1 ms control tick.
+pub(crate) async fn sample_tick<B>(
+    tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
+    motor_enabled: bool,
+    cached_velocity_offset: i32,
+    control_tick: u32,
+) where
+    B: embedded_hal_async::spi::SpiDevice<u8>,
+{
+    use core::sync::atomic::Ordering::Relaxed;
+    use foci_firmware::trace_stream::*;
+    use foci_tmc4671::registers::*;
+
+    if !is_configured() {
+        return;
+    }
+
+    let spi_sample_start = cortex_m::peripheral::DWT::cycle_count();
+    let stepper = foci_firmware::state::stepper::stepper_channel0();
+    let (jitter, slack) = take_jitter_and_slack();
+    let mut sample_flags = 0u8;
+
+    let position_actual =
+        read_register_trace(tmc, PID_POSITION_ACTUAL, &mut sample_flags).await as i32;
+    // PID_VELOCITY_TARGET exists in foci_tmc4671::registers at 0x66, matching
+    // TMC4671-LA datasheet Rev 1, 02/2024, section 7 "PID Controller". Do not
+    // use `StepperChannelState.interval` here; it is AtomicU32 timer ticks per
+    // step, not a velocity.
+    let pid_velocity_target =
+        read_register_trace(tmc, PID_VELOCITY_TARGET, &mut sample_flags).await as i32;
+    let pid_velocity_actual =
+        read_register_trace(tmc, PID_VELOCITY_ACTUAL, &mut sample_flags).await as i32;
+    let pid_torque_flux_target =
+        read_register_trace(tmc, PID_TORQUE_FLUX_TARGET, &mut sample_flags).await;
+    let pid_torque_flux_actual =
+        read_register_trace(tmc, PID_TORQUE_FLUX_ACTUAL, &mut sample_flags).await;
+    let foc_uq_ud = read_sub_register_trace(tmc, INTERIM_FOC_UQ_UD, &mut sample_flags).await;
+    let foc_uq_ud_limited =
+        read_sub_register_trace(tmc, INTERIM_FOC_UQ_UD_LIMITED, &mut sample_flags).await;
+    let step_position = stepper.position.load(Relaxed);
+
+    let sample = CriticalSample {
+        step_position,
+        tmc_position_actual: position_actual,
+        position_error: step_position.wrapping_sub(position_actual),
+        target_velocity: pid_velocity_target,
+        pid_velocity_actual,
+        cached_pid_velocity_offset: cached_velocity_offset,
+        velocity_error: pid_velocity_target.wrapping_sub(pid_velocity_actual),
+        enable_and_direction: (if motor_enabled { 0x80 } else { 0 })
+            | (u8::from(stepper.direction.load(Relaxed)) & 0x01),
+        sample_flags,
+        timer_queue_depth: TRACE_TIMING.klipper_rx_queue_depth.load(Relaxed),
+        step_timer_jitter: jitter,
+        min_deadline_slack: slack,
+        last_served_step_tick: load_last_served_step_tick(),
+        last_klipper_command_service_tick: load_last_klipper_command_service_tick(),
+        missed_or_deferred_step_counter: TRACE_TIMING.missed_or_deferred_steps.load(Relaxed),
+        pid_torque_flux_target,
+        pid_torque_flux_actual,
+        interim_foc_uq_ud: foc_uq_ud,
+        interim_foc_uq_ud_limited: foc_uq_ud_limited,
+    };
+    let mut payload = [0u8; CRITICAL_PAYLOAD_LEN];
+    encode_critical_payload(&sample, &mut payload);
+    let mut frame = FrameBuf::new();
+    frame.write_header(header(
+        FRAME_TYPE_CRITICAL,
+        CRITICAL_PAYLOAD_LEN,
+        SOURCE_KIND_FOCI,
+        0,
+        motion_flags(),
+    ));
+    frame
+        .payload_mut(CRITICAL_PAYLOAD_LEN)
+        .copy_from_slice(&payload);
+    enqueue_motion(frame);
+
+    let emit_control_detail = control_tick.is_multiple_of(2)
+        && !TRACE_TIMING.skip_next_control_detail.swap(false, Relaxed);
+    if emit_control_detail {
+        let mut detail_flags = 0u8;
+        let detail = ControlDetailSample {
+            interim_pidout_target_torque: read_sub_register_trace(
+                tmc,
+                INTERIM_PIDOUT_TARGET_TORQUE,
+                &mut detail_flags,
+            )
+            .await,
+            interim_pidout_target_flux: read_sub_register_trace(
+                tmc,
+                INTERIM_PIDOUT_TARGET_FLUX,
+                &mut detail_flags,
+            )
+            .await,
+            interim_pidin_target_velocity: read_sub_register_trace(
+                tmc,
+                INTERIM_PIDIN_TARGET_VELOCITY,
+                &mut detail_flags,
+            )
+            .await,
+            interim_pidout_target_velocity: read_sub_register_trace(
+                tmc,
+                INTERIM_PIDOUT_TARGET_VELOCITY,
+                &mut detail_flags,
+            )
+            .await,
+            pidout_uq_ud_limits: read_register_trace(tmc, PIDOUT_UQ_UD_LIMITS, &mut detail_flags)
+                .await,
+            pid_torque_flux_limits: read_register_trace(
+                tmc,
+                PID_TORQUE_FLUX_LIMITS,
+                &mut detail_flags,
+            )
+            .await,
+            pid_velocity_limit: read_register_trace(tmc, PID_VELOCITY_LIMIT, &mut detail_flags)
+                .await,
+        };
+        let mut payload = [0u8; CONTROL_DETAIL_PAYLOAD_LEN];
+        encode_control_detail_payload(&detail, &mut payload);
+        let mut frame = FrameBuf::new();
+        frame.write_header(header(
+            FRAME_TYPE_CONTROL_DETAIL,
+            CONTROL_DETAIL_PAYLOAD_LEN,
+            SOURCE_KIND_FOCI,
+            0,
+            motion_flags(),
+        ));
+        frame
+            .payload_mut(CONTROL_DETAIL_PAYLOAD_LEN)
+            .copy_from_slice(&payload);
+        enqueue_motion(frame);
+    }
+
+    let spi_sample_cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(spi_sample_start);
+    record_spi_sample_cycles(spi_sample_cycles);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StatusSnapshot {
+    source_kind: u8,
+    source_index: u8,
+    sample: foci_firmware::trace_stream::StatusSample,
+}
+
+static mut LAST_STATUS: [StatusSnapshot; 4] = [StatusSnapshot {
+    source_kind: 0,
+    source_index: 0,
+    sample: foci_firmware::trace_stream::StatusSample {
+        status_flags: 0,
+        status_interrupt_count: 0,
+        clipping_flags: 0,
+        spi_error_count: 0,
+        watchdog_or_step_overrun_count: 0,
+        klipper_rx_queue_depth: 0,
+        usb_trace_queue_high_water: 0,
+        dropped_motion_sample_count: 0,
+        dropped_event_log_count: 0,
+        endpoint_not_ready_count: 0,
+        suppressed_status_change_count: 0,
+    },
+}; 4];
+
+fn status_trigger_nonzero(sample: &foci_firmware::trace_stream::StatusSample) -> bool {
+    sample.status_flags != 0
+        || sample.status_interrupt_count != 0
+        || sample.clipping_flags != 0
+        || sample.spi_error_count != 0
+        || sample.watchdog_or_step_overrun_count != 0
+        || sample.dropped_motion_sample_count != 0
+        || sample.dropped_event_log_count != 0
+        || sample.endpoint_not_ready_count != 0
+        || sample.suppressed_status_change_count != 0
+}
+
+fn status_trigger_changed(
+    previous: &foci_firmware::trace_stream::StatusSample,
+    next: &foci_firmware::trace_stream::StatusSample,
+) -> bool {
+    // Queue depth and queue high-water are intentionally omitted from the
+    // change trigger so normal command traffic does not cause status spam.
+    previous.status_flags != next.status_flags
+        || previous.status_interrupt_count != next.status_interrupt_count
+        || previous.clipping_flags != next.clipping_flags
+        || previous.spi_error_count != next.spi_error_count
+        || previous.watchdog_or_step_overrun_count != next.watchdog_or_step_overrun_count
+        || previous.dropped_motion_sample_count != next.dropped_motion_sample_count
+        || previous.dropped_event_log_count != next.dropped_event_log_count
+        || previous.endpoint_not_ready_count != next.endpoint_not_ready_count
+        || previous.suppressed_status_change_count != next.suppressed_status_change_count
+}
+
+fn emit_one_status(
+    slot: usize,
+    source_kind: u8,
+    source_index: u8,
+    sample: foci_firmware::trace_stream::StatusSample,
+    force: bool,
+) {
+    use foci_firmware::trace_stream::*;
+
+    let previous = unsafe {
+        let ptr = core::ptr::addr_of!(LAST_STATUS).cast::<StatusSnapshot>();
+        core::ptr::read(ptr.add(slot))
+    };
+    let changed = previous.source_kind != source_kind
+        || previous.source_index != source_index
+        || status_trigger_changed(&previous.sample, &sample);
+    let should_emit = force || status_trigger_nonzero(&sample) || changed;
+    if !should_emit {
+        return;
+    }
+
+    let mut payload = [0u8; STATUS_PAYLOAD_LEN];
+    encode_status_payload(&sample, &mut payload);
+    let mut frame = FrameBuf::new();
+    frame.write_header(header(
+        FRAME_TYPE_STATUS,
+        STATUS_PAYLOAD_LEN,
+        source_kind,
+        source_index,
+        motion_flags(),
+    ));
+    frame
+        .payload_mut(STATUS_PAYLOAD_LEN)
+        .copy_from_slice(&payload);
+    enqueue_motion(frame);
+    unsafe {
+        let ptr = core::ptr::addr_of_mut!(LAST_STATUS).cast::<StatusSnapshot>();
+        core::ptr::write(
+            ptr.add(slot),
+            StatusSnapshot {
+                source_kind,
+                source_index,
+                sample,
+            },
+        );
+    }
+}
+
+/// Emit board, FOCI, USB, and Klipper status frames when due.
+pub(crate) async fn emit_status_frames<B>(
+    tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
+    control_tick: u32,
+    regular_tick: bool,
+) where
+    B: embedded_hal_async::spi::SpiDevice<u8>,
+{
+    use core::sync::atomic::Ordering::Relaxed;
+    use foci_firmware::trace_stream::*;
+    use foci_tmc4671::registers::STATUS_FLAGS;
+
+    let pending_change = TRACE_TIMING.pending_status_change.swap(false, Relaxed);
+    if !regular_tick && !pending_change {
+        return;
+    }
+    if pending_change {
+        let previous = TRACE_TIMING.last_status_change_emit_tick.load(Relaxed);
+        if control_tick.wrapping_sub(previous) < 10 {
+            TRACE_TIMING
+                .suppressed_status_change_count
+                .fetch_add(1, Relaxed);
+            return;
+        }
+        TRACE_TIMING
+            .last_status_change_emit_tick
+            .store(control_tick, Relaxed);
+    }
+
+    // TMC4671-LA datasheet Rev 1, 02/2024, section 5 "Safety Functions",
+    // Table 30 defines STATUS_FLAGS (0x7C). It displays the actual status
+    // flags; reads do not clear bits. Clearing requires a write, and the trace
+    // path must never write this register. Table 30 marks bit 19 as reserved;
+    // do not introduce a PLL-not-locked bit without separate silicon evidence.
+    let mut status_sample_flags = 0u8;
+    let status_flags = read_register_trace(tmc, STATUS_FLAGS, &mut status_sample_flags).await;
+    const STATUS_PID_LIMIT_MASK: u32 = (1 << 0)
+        | (1 << 2)
+        | (1 << 3)
+        | (1 << 4)
+        | (1 << 6)
+        | (1 << 7)
+        | (1 << 8)
+        | (1 << 10)
+        | (1 << 11)
+        | (1 << 12)
+        | (1 << 14)
+        | (1 << 15);
+    const STATUS_IPARK_LIMIT_MASK: u32 = (1 << 16) | (1 << 17) | (1 << 18);
+    const STATUS_PWM_LIMIT_MASK: u32 = (1 << 24) | (1 << 25);
+    const STATUS_ADC_CLIP_MASK: u32 = (1 << 26) | (1 << 27);
+    let clipping_flags = status_flags
+        & (STATUS_PID_LIMIT_MASK
+            | STATUS_IPARK_LIMIT_MASK
+            | STATUS_PWM_LIMIT_MASK
+            | STATUS_ADC_CLIP_MASK);
+    let spi_errors = TRACE_TIMING.spi_error_count.load(Relaxed);
+    let status_interrupts = TRACE_TIMING.status_interrupt_count.load(Relaxed);
+    let missed = TRACE_TIMING.missed_or_deferred_steps.load(Relaxed);
+    let trace_pressure = TRACE_TIMING.trace_deadline_pressure_count.load(Relaxed);
+    let endpoint_or_trace_pressure = TRACE_COUNTERS
+        .endpoint_not_ready
+        .load(Relaxed)
+        .saturating_add(trace_pressure);
+    let suppressed = TRACE_TIMING.suppressed_status_change_count.load(Relaxed);
+
+    // Fields that do not apply to a source kind are encoded as zero. Board and
+    // FOCI frames both carry the full STATUS_FLAGS value by design: the
+    // duplicate bytes are cheaper than making host parsing source-specific.
+    // Trace deadline pressure is telemetry degradation, so it is reported with
+    // endpoint-not-ready pressure instead of motion watchdog/step overruns.
+    let board = StatusSample {
+        status_flags,
+        status_interrupt_count: status_interrupts,
+        clipping_flags,
+        spi_error_count: spi_errors,
+        watchdog_or_step_overrun_count: missed,
+        klipper_rx_queue_depth: TRACE_TIMING.klipper_rx_queue_depth.load(Relaxed),
+        usb_trace_queue_high_water: TRACE_COUNTERS.high_water.load(Relaxed),
+        dropped_motion_sample_count: TRACE_COUNTERS.motion_drops.load(Relaxed),
+        dropped_event_log_count: TRACE_COUNTERS.event_drops.load(Relaxed),
+        endpoint_not_ready_count: endpoint_or_trace_pressure,
+        suppressed_status_change_count: suppressed,
+    };
+    let foci = StatusSample {
+        status_flags,
+        status_interrupt_count: status_interrupts,
+        clipping_flags,
+        spi_error_count: spi_errors,
+        watchdog_or_step_overrun_count: missed,
+        ..StatusSample::default()
+    };
+    let usb = StatusSample {
+        usb_trace_queue_high_water: TRACE_COUNTERS.high_water.load(Relaxed),
+        dropped_motion_sample_count: TRACE_COUNTERS.motion_drops.load(Relaxed),
+        dropped_event_log_count: TRACE_COUNTERS.event_drops.load(Relaxed),
+        endpoint_not_ready_count: endpoint_or_trace_pressure,
+        suppressed_status_change_count: suppressed,
+        ..StatusSample::default()
+    };
+    let klipper = StatusSample {
+        klipper_rx_queue_depth: TRACE_TIMING.klipper_rx_queue_depth.load(Relaxed),
+        ..StatusSample::default()
+    };
+
+    emit_one_status(0, SOURCE_KIND_BOARD, SOURCE_INDEX_NA, board, regular_tick);
+    emit_one_status(1, SOURCE_KIND_FOCI, 0, foci, false);
+    emit_one_status(2, SOURCE_KIND_USB, SOURCE_INDEX_NA, usb, false);
+    emit_one_status(3, SOURCE_KIND_KLIPPER, SOURCE_INDEX_NA, klipper, false);
 }
 
 /// Drain at most one 64-byte trace packet to USB.

@@ -217,6 +217,8 @@ mod app {
         crate::board_init::enable_usb_clock();
 
         let uid = crate::board_init::read_stm32_uid(ctx.local.uid_str);
+        #[cfg(feature = "trace")]
+        crate::usb_trace::set_trace_serial(uid);
 
         // SAFETY: Called exactly once, before any other klipper-usb function.
         // base_addr is the USB_OTG_FS peripheral base on STM32F407.
@@ -452,6 +454,10 @@ mod app {
 
         // Counter for 1s STATUS_FLAGS poll (1000 * 1ms ticks).
         let mut status_poll_counter: u16 = 0;
+        #[cfg(feature = "trace")]
+        let mut trace_control_tick: u32 = 0;
+        #[cfg(feature = "trace")]
+        let mut cached_trace_velocity_offset: i32 = 0;
 
         // Stored PID gains from host (explicit or R/L-derived).
         // None = use defaults during calibration.
@@ -1204,11 +1210,19 @@ mod app {
                 let _ = tmc
                     .write_register(foci_tmc4671::registers::PID_VELOCITY_OFFSET, offset as u32)
                     .await;
+                #[cfg(feature = "trace")]
+                {
+                    cached_trace_velocity_offset = offset;
+                }
             } else if feedforward_was_active {
                 // Feedforward just deactivated — clear stale offset
                 let _ = tmc
                     .write_register(foci_tmc4671::registers::PID_VELOCITY_OFFSET, 0)
                     .await;
+                #[cfg(feature = "trace")]
+                {
+                    cached_trace_velocity_offset = 0;
+                }
             }
             feedforward_was_active = ff_active;
 
@@ -1228,6 +1242,27 @@ mod app {
                 168,
             )
             .await;
+
+            #[cfg(feature = "trace")]
+            {
+                crate::usb_trace::sample_tick(
+                    tmc,
+                    motor_enabled,
+                    cached_trace_velocity_offset,
+                    trace_control_tick,
+                )
+                .await;
+                trace_control_tick = trace_control_tick.wrapping_add(1);
+                crate::usb_trace::emit_status_frames(
+                    tmc,
+                    trace_control_tick,
+                    trace_control_tick.is_multiple_of(100),
+                )
+                .await;
+                if trace_control_tick.is_multiple_of(1000) {
+                    crate::usb_trace::emit_metadata();
+                }
+            }
 
             if tmc_state()
                 .pid_error_sums_clear
