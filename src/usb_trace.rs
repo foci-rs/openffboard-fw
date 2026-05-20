@@ -80,6 +80,9 @@ fn compute_boot_id() -> u32 {
 }
 
 /// Cache the USB serial string for metadata frames.
+///
+/// Call once during init before trace producers run. The metadata path reads
+/// the cached bytes without an ownership handoff.
 pub(crate) fn set_trace_serial(serial: &str) {
     let bytes = serial.as_bytes();
     let len = bytes.len().min(31);
@@ -144,6 +147,9 @@ pub(crate) fn extend_tim5_low(low: u32) -> u64 {
 /// Record the trace boot timestamp after TIM5 starts.
 pub(crate) fn note_trace_boot() {
     let boot = trace_now_ticks();
+    TRACE_COUNTERS
+        .boot_id
+        .store(compute_boot_id(), Ordering::Relaxed);
     store_split_u64(
         &TRACE_COUNTERS.boot_tick_low,
         &TRACE_COUNTERS.boot_tick_high,
@@ -185,9 +191,6 @@ fn note_trace_usb_configured_time() {
 /// Mark the trace stream configured after USB configuration.
 pub(crate) fn note_usb_configured() {
     note_trace_usb_configured_time();
-    TRACE_COUNTERS
-        .boot_id
-        .store(compute_boot_id(), Ordering::Relaxed);
     TRACE_COUNTERS.configured.store(true, Ordering::Relaxed);
     request_event(
         EVENT_LEVEL_INFO,
