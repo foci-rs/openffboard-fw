@@ -967,8 +967,7 @@ pub(crate) async fn emit_status_frames<B>(
     // flags; reads do not clear bits. Clearing requires a write, and the trace
     // path must never write this register. Table 30 marks bit 19 as reserved;
     // do not introduce a PLL-not-locked bit without separate silicon evidence.
-    let mut status_sample_flags = 0u8;
-    let status_flags = read_register_trace(tmc, STATUS_FLAGS, &mut status_sample_flags).await;
+    let status_flags = read_register_counting_errors(tmc, STATUS_FLAGS).await;
     const STATUS_PID_LIMIT_MASK: u32 = (1 << 0)
         | (1 << 2)
         | (1 << 3)
