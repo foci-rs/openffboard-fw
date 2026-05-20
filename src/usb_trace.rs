@@ -613,6 +613,8 @@ pub(crate) fn enqueue_motion(frame: FrameBuf) {
             TRACE_COUNTERS
                 .motion_drop_gap
                 .store(true, Ordering::Relaxed);
+        } else {
+            crate::transport::USB_WAKE.signal(());
         }
         let len = queue.len() as u16;
         let mut current = TRACE_COUNTERS.high_water.load(Ordering::Relaxed);
@@ -638,6 +640,8 @@ pub(crate) fn enqueue_event(frame: FrameBuf) {
         if event_queue().enqueue(QueuedFrame::new(frame)).is_err() {
             TRACE_COUNTERS.event_drops.fetch_add(1, Ordering::Relaxed);
             TRACE_COUNTERS.event_drop_gap.store(true, Ordering::Relaxed);
+        } else {
+            crate::transport::USB_WAKE.signal(());
         }
     }
 }
