@@ -1722,6 +1722,12 @@ mod app {
         );
     }
 
+    /// Send pending stepper diagnostic events outside ISR/P1 contexts.
+    #[task(priority = 2)]
+    async fn stepper_diag_task(_ctx: stepper_diag_task::Context) {
+        crate::heartbeat::emit_stepper_diagnostics();
+    }
+
     /// Periodic stats heartbeat sent to Klipper.
     ///
     /// Klipper requires regular stats messages to confirm the MCU is alive.

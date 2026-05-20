@@ -5,5 +5,6 @@
 //! atomics and the TMC disable signal have moved to `foci_firmware::state::*`.
 
 pub mod stepper;
+pub mod stepper_diag;
 pub mod tmc;
 pub mod trace;

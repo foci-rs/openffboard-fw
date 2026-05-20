@@ -1,0 +1,36 @@
+//! Stepper diagnostic event capture.
+
+use core::sync::atomic::Ordering::Relaxed;
+
+use foci_firmware::diagnostic::{StepperDiagnosticEvent, StepperEventReason};
+
+/// Queue length value used when a call site cannot safely inspect the queue.
+pub(crate) const UNKNOWN_QUEUE_LEN: u16 = u16::MAX;
+
+fn stepper_state() -> &'static foci_firmware::state::stepper::StepperChannelState {
+    foci_firmware::state::stepper::stepper_channel0()
+}
+
+/// Capture a bounded stepper diagnostic event and schedule host emission.
+pub(crate) fn record_stepper_event(
+    reason: StepperEventReason,
+    channel: u8,
+    clock: u32,
+    queue_len: u16,
+    data0: u32,
+    data1: u32,
+) {
+    let state = stepper_state();
+    crate::state::stepper_diag::push_event(StepperDiagnosticEvent {
+        reason,
+        channel,
+        position: state.position.load(Relaxed),
+        clock,
+        timer_active: state.timer_active_mirror.load(Relaxed),
+        queue_len,
+        direction: state.direction.load(Relaxed),
+        data0,
+        data1,
+    });
+    crate::app::stepper_diag_task::spawn().ok();
+}

@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use embassy_stm32::gpio::Output;
 use embassy_stm32::peripherals;
 use embassy_stm32::wdg::IndependentWatchdog;
-use foci_firmware::ankyra::replies::{Stats, TrsyncState};
+use foci_firmware::ankyra::replies::{FociStepperEvent, Stats, TrsyncState};
 
 /// SumSq base used by `stats`. Must match `STATS_SUMSQ_BASE` advertised
 /// to Klipper via `klipper_constant`.
@@ -108,6 +108,25 @@ where
             can_trigger: u8 = snap.can_trigger,
             trigger_reason: u8 = snap.trigger_reason,
             clock: u32 = snap.clock,
+        );
+    }
+}
+
+/// Drain pending stepper diagnostic events and emit host-visible replies.
+pub fn emit_stepper_diagnostics() {
+    while let Some(event) = crate::state::stepper_diag::pop_event() {
+        ::ankyra::klipper_reply_from!(
+            &mut crate::_ankyra_config::Sender,
+            FociStepperEvent,
+            reason: u8 = event.reason as u8,
+            channel: u8 = event.channel,
+            position: i32 = event.position,
+            clock: u32 = event.clock,
+            timer_active: u8 = event.timer_active as u8,
+            queue_len: u16 = event.queue_len,
+            direction: u8 = event.direction as u8,
+            data0: u32 = event.data0,
+            data1: u32 = event.data1,
         );
     }
 }
