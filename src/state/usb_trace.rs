@@ -1,0 +1,135 @@
+//! USB trace stream state for trace builds.
+
+#![cfg(feature = "trace")]
+
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+
+use foci_firmware::trace_stream::FrameBuf;
+
+/// Motion/counter queue depth in frames.
+///
+/// `FrameBuf` is 256 bytes so metadata can fit. Depth 32 keeps this queue at
+/// 8 KiB, matching the SRAM budget in the design spec.
+pub(crate) const MOTION_QUEUE_DEPTH: usize = 32;
+
+/// Event queue depth in frames.
+///
+/// Depth 8 keeps this queue at 2 KiB.
+pub(crate) const EVENT_QUEUE_DEPTH: usize = 8;
+
+/// A queued frame currently being packetized over 64-byte full-speed USB packets.
+#[derive(Clone, Copy)]
+pub(crate) struct QueuedFrame {
+    pub(crate) frame: FrameBuf,
+    pub(crate) offset: u16,
+}
+
+impl QueuedFrame {
+    /// Create a queued frame with no bytes sent yet.
+    pub(crate) const fn new(frame: FrameBuf) -> Self {
+        Self { frame, offset: 0 }
+    }
+}
+
+/// Trace queue counters.
+#[allow(dead_code)]
+pub(crate) struct TraceCounters {
+    pub(crate) configured: AtomicBool,
+    pub(crate) boot_id: AtomicU32,
+    pub(crate) boot_tick_low: AtomicU32,
+    pub(crate) boot_tick_high: AtomicU32,
+    pub(crate) configured_tick_low: AtomicU32,
+    pub(crate) configured_tick_high: AtomicU32,
+    pub(crate) pre_config_elapsed_ms: AtomicU32,
+    pub(crate) pre_config_skipped_critical: AtomicU32,
+    pub(crate) pre_config_skipped_control_detail: AtomicU32,
+    pub(crate) pre_config_skipped_status: AtomicU32,
+    pub(crate) sequence: AtomicU32,
+    pub(crate) motion_drops: AtomicU32,
+    pub(crate) event_drops: AtomicU32,
+    pub(crate) motion_drop_gap: AtomicBool,
+    pub(crate) event_drop_gap: AtomicBool,
+    pub(crate) high_water: AtomicU16,
+    pub(crate) endpoint_not_ready: AtomicU32,
+}
+
+impl TraceCounters {
+    /// Create zeroed trace counters.
+    pub(crate) const fn new() -> Self {
+        Self {
+            configured: AtomicBool::new(false),
+            boot_id: AtomicU32::new(0),
+            boot_tick_low: AtomicU32::new(0),
+            boot_tick_high: AtomicU32::new(0),
+            configured_tick_low: AtomicU32::new(0),
+            configured_tick_high: AtomicU32::new(0),
+            pre_config_elapsed_ms: AtomicU32::new(0),
+            pre_config_skipped_critical: AtomicU32::new(0),
+            pre_config_skipped_control_detail: AtomicU32::new(0),
+            pre_config_skipped_status: AtomicU32::new(0),
+            sequence: AtomicU32::new(0),
+            motion_drops: AtomicU32::new(0),
+            event_drops: AtomicU32::new(0),
+            motion_drop_gap: AtomicBool::new(false),
+            event_drop_gap: AtomicBool::new(false),
+            high_water: AtomicU16::new(0),
+            endpoint_not_ready: AtomicU32::new(0),
+        }
+    }
+
+    /// Allocate the next global per-device frame sequence.
+    #[allow(dead_code)]
+    pub(crate) fn next_sequence(&self) -> u32 {
+        self.sequence.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+pub(crate) static TRACE_COUNTERS: TraceCounters = TraceCounters::new();
+
+pub(crate) static mut MOTION_QUEUE: heapless::spsc::Queue<QueuedFrame, MOTION_QUEUE_DEPTH> =
+    heapless::spsc::Queue::new();
+pub(crate) static mut EVENT_QUEUE: heapless::spsc::Queue<QueuedFrame, EVENT_QUEUE_DEPTH> =
+    heapless::spsc::Queue::new();
+
+/// Partially sent frame owned by the single USB trace consumer.
+pub(crate) static mut CURRENT_TX: Option<QueuedFrame> = None;
+
+/// Return the trace motion/counter queue.
+///
+/// # Safety
+///
+/// Callers must uphold the single-producer/single-consumer access discipline:
+/// producer contexts enqueue only, and the USB task is the sole consumer.
+#[inline]
+pub(crate) unsafe fn motion_queue()
+-> &'static mut heapless::spsc::Queue<QueuedFrame, MOTION_QUEUE_DEPTH> {
+    let ptr = core::ptr::addr_of_mut!(MOTION_QUEUE);
+    // SAFETY: The caller guarantees exclusive access for this RTIC context.
+    unsafe { &mut *ptr }
+}
+
+/// Return the trace event queue.
+///
+/// # Safety
+///
+/// Callers must uphold the single-producer/single-consumer access discipline:
+/// producer contexts enqueue only, and the USB task is the sole consumer.
+#[inline]
+pub(crate) unsafe fn event_queue()
+-> &'static mut heapless::spsc::Queue<QueuedFrame, EVENT_QUEUE_DEPTH> {
+    let ptr = core::ptr::addr_of_mut!(EVENT_QUEUE);
+    // SAFETY: The caller guarantees exclusive access for this RTIC context.
+    unsafe { &mut *ptr }
+}
+
+/// Return the partial trace TX frame slot.
+///
+/// # Safety
+///
+/// Only the USB task may call this function.
+#[inline]
+pub(crate) unsafe fn current_tx() -> &'static mut Option<QueuedFrame> {
+    let ptr = core::ptr::addr_of_mut!(CURRENT_TX);
+    // SAFETY: The caller is the only consumer of this state.
+    unsafe { &mut *ptr }
+}

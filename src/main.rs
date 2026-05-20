@@ -26,6 +26,8 @@ mod tmc_dispatch;
 mod transport;
 mod trigger_domain;
 mod usb_task;
+#[cfg(feature = "trace")]
+mod usb_trace;
 
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [UART4, UART5, USART3])]
 mod app {
@@ -226,7 +228,16 @@ mod app {
                 vid: 0x1D50,
                 pid: 0x614E,
                 manufacturer: "foci",
-                product: "FOCI OpenFFBoard",
+                product: {
+                    #[cfg(feature = "trace")]
+                    {
+                        crate::usb_trace::TRACE_PRODUCT
+                    }
+                    #[cfg(not(feature = "trace"))]
+                    {
+                        "FOCI OpenFFBoard"
+                    }
+                },
                 serial: uid,
             });
         }
