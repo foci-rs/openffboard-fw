@@ -695,7 +695,7 @@ mod app {
                                     &mut state,
                                 );
                                 apply_stepper_post_action(
-                                    foci_firmware::commission_dispatch::StepperPostAction::ArmZeroPosition,
+                                    foci_firmware::commission_dispatch::StepperPostAction::ArmPreservePosition,
                                     &mut state,
                                 );
                             }
@@ -714,11 +714,6 @@ mod app {
                                 foci_firmware::tmc_ops::disarm_motor(&mut backend, &mut state)
                                     .await;
                             }
-
-                            // Zero position counter
-                            stepper_state()
-                                .position
-                                .store(0, core::sync::atomic::Ordering::Relaxed);
 
                             defmt::info!("TMC4671 motor disabled");
                         }
