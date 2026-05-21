@@ -698,9 +698,10 @@ mod app {
                                 // OpenFFBoard but needs OID routing for multi-motor boards.
                                 defmt::info!("Auto-calibrating on enable");
                                 commission_engine = Some(
-                                    foci_firmware::commission::CommissioningEngine::new_calibrate_for_tmc(
+                                    foci_firmware::commission::CommissioningEngine::new_calibrate_for_tmc_with_gains(
                                         0,
                                         tmc_state(),
+                                        stored_gains,
                                     ),
                                 );
                                 // Don't set motor_enabled/tmc_state().motor_armed yet --
@@ -790,9 +791,10 @@ mod app {
                         // performs encoder alignment and closed-loop entry.
                         calibrated = false;
                         commission_engine = Some(
-                            foci_firmware::commission::CommissioningEngine::new_calibrate_for_tmc(
+                            foci_firmware::commission::CommissioningEngine::new_calibrate_for_tmc_with_gains(
                                 oid,
                                 tmc_state(),
+                                stored_gains,
                             ),
                         );
                     }
