@@ -457,6 +457,10 @@ mod app {
         #[cfg(feature = "trace")]
         let mut trace_control_tick: u32 = 0;
         #[cfg(feature = "trace")]
+        let trace_control_period = fugit::Duration::<u64, 1, 1_000_000>::millis(1);
+        #[cfg(feature = "trace")]
+        let mut trace_next_control_tick = Mono::now() + trace_control_period;
+        #[cfg(feature = "trace")]
         let mut cached_trace_velocity_offset: i32 = 0;
 
         // Stored PID gains from host (explicit or R/L-derived).
@@ -643,7 +647,16 @@ mod app {
                 // For Terminal cases, fall through to normal channel-receive processing.
             }
 
-            match select(rx.recv(), Mono::delay(1.millis())).await {
+            #[cfg(feature = "trace")]
+            let control_sleep = Mono::delay_until(trace_next_control_tick);
+            #[cfg(not(feature = "trace"))]
+            let control_sleep = Mono::delay(1.millis());
+
+            let selected = select(rx.recv(), control_sleep).await;
+            #[cfg(feature = "trace")]
+            let control_tick_due = selected.is_second();
+
+            match selected {
                 // Channel message received
                 Either::First(Ok(req)) => match req {
                     TmcRequest { channel, .. } if channel != 0 => {
@@ -1116,6 +1129,13 @@ mod app {
                 Either::First(Err(_)) => {}
                 // 1ms timeout — write position target via SPI
                 Either::Second(()) => {}
+            }
+            #[cfg(feature = "trace")]
+            {
+                if !control_tick_due {
+                    continue;
+                }
+                trace_next_control_tick = Mono::now() + trace_control_period;
             }
 
             // Capture tick start for deadline computation. Must be after
