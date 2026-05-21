@@ -9,8 +9,8 @@ use foci_firmware::trace_stream::{
 };
 
 use crate::state::usb_trace::{
-    PENDING_EVENTS, PendingEvent, QueuedFrame, TRACE_COUNTERS, current_tx, event_queue,
-    motion_queue,
+    MOTION_QUEUE_DEPTH, PENDING_EVENTS, PendingEvent, QueuedFrame, TRACE_COUNTERS, current_tx,
+    event_queue, motion_queue,
 };
 
 /// Product string used by trace builds.
@@ -648,6 +648,13 @@ pub(crate) fn enqueue_event(frame: FrameBuf) {
     }
 }
 
+fn motion_queue_len() -> usize {
+    // SAFETY: Trace producers may inspect the queue length for decimation. The
+    // USB task remains the sole consumer, and enqueue paths retain ownership of
+    // actual queue mutation.
+    unsafe { motion_queue().len() }
+}
+
 fn dequeue_next_frame() -> Option<QueuedFrame> {
     // SAFETY: The USB task is the only trace consumer. Peeking copies sequence
     // numbers from queue heads before dequeuing from exactly one queue.
@@ -808,8 +815,12 @@ pub(crate) async fn sample_tick<B>(
         .copy_from_slice(&payload);
     enqueue_motion(frame);
 
-    let emit_control_detail = control_tick.is_multiple_of(2)
-        && !TRACE_TIMING.skip_next_control_detail.swap(false, Relaxed);
+    let emit_control_detail = control_detail_due(
+        control_tick,
+        motion_queue_len(),
+        MOTION_QUEUE_DEPTH,
+        TRACE_TIMING.skip_next_control_detail.swap(false, Relaxed),
+    );
     if emit_control_detail {
         let detail = ControlDetailSample {
             interim_pidout_target_torque: read_sub_register_counting_errors(
