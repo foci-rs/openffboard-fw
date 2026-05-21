@@ -4,7 +4,9 @@
 
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, Ordering};
 
-use foci_firmware::trace_stream::{FrameBuf, METADATA_PAYLOAD_MAX};
+use foci_firmware::trace_stream::{
+    FrameBuf, METADATA_PAYLOAD_MAX, frame_sequence, sequence_before_or_equal,
+};
 
 use crate::state::usb_trace::{
     PENDING_EVENTS, PendingEvent, QueuedFrame, TRACE_COUNTERS, current_tx, event_queue,
@@ -646,6 +648,30 @@ pub(crate) fn enqueue_event(frame: FrameBuf) {
     }
 }
 
+fn dequeue_next_frame() -> Option<QueuedFrame> {
+    // SAFETY: The USB task is the only trace consumer. Peeking copies sequence
+    // numbers from queue heads before dequeuing from exactly one queue.
+    unsafe {
+        let motion = motion_queue();
+        let event = event_queue();
+        let motion_seq = motion.peek().map(|queued| frame_sequence(&queued.frame));
+        let event_seq = event.peek().map(|queued| frame_sequence(&queued.frame));
+
+        match (motion_seq, event_seq) {
+            (Some(motion_seq), Some(event_seq)) => {
+                if sequence_before_or_equal(motion_seq, event_seq) {
+                    motion.dequeue()
+                } else {
+                    event.dequeue()
+                }
+            }
+            (Some(_), None) => motion.dequeue(),
+            (None, Some(_)) => event.dequeue(),
+            (None, None) => None,
+        }
+    }
+}
+
 async fn read_register_trace<B>(
     tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
     register: foci_tmc4671::registers::Register,
@@ -1055,7 +1081,7 @@ pub(crate) fn drain_once() {
     unsafe {
         let current_tx = current_tx();
         if current_tx.is_none() {
-            *current_tx = motion_queue().dequeue().or_else(|| event_queue().dequeue());
+            *current_tx = dequeue_next_frame();
         }
         let Some(current) = current_tx.as_mut() else {
             return;
