@@ -1573,6 +1573,11 @@ mod app {
     /// Matches Klipper's repeat guard shape: process bursts in one IRQ, but
     /// avoid monopolizing P3 if a pathological stream stays immediately due.
     const TIM5_SCHEDULER_REPEAT_TICKS: u32 = CLOCK_FREQ / 10_000;
+    /// Short defer after a saturated TIM5 dispatch burst.
+    ///
+    /// Klipper C uses a 5 us defer when timer dispatch keeps main tasks busy.
+    /// On OpenFFBoard TIM5 runs at 84 MHz, so this is 420 timer ticks.
+    const TIM5_SCHEDULER_DEFER_TICKS: u32 = CLOCK_FREQ / 200_000;
 
     fn schedule_stepper_timer(td: &mut TriggerDomain, stepper_idx: usize, clock: u32) {
         td.scheduler
@@ -1861,6 +1866,18 @@ mod app {
         }
     }
 
+    fn defer_tim5_scheduler(td: &mut TriggerDomain) {
+        if td.scheduler.is_empty() {
+            td.disarm_timer();
+            return;
+        }
+        #[cfg(feature = "trace")]
+        crate::usb_trace::TRACE_TIMING
+            .missed_or_deferred_steps
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        td.arm_timer_at(read_tim5().wrapping_add(TIM5_SCHEDULER_DEFER_TICKS));
+    }
+
     fn dispatch_tim5_scheduler(td: &mut TriggerDomain, need_report: &mut bool) {
         let dispatch_start = read_tim5();
         loop {
@@ -1869,7 +1886,7 @@ mod app {
                 process_trigger_timer(td, event.kind, event.wake_clock, need_report);
                 let elapsed = read_tim5().wrapping_sub(dispatch_start) as i32;
                 if elapsed >= TIM5_SCHEDULER_REPEAT_TICKS as i32 {
-                    td.reprogram_timer();
+                    defer_tim5_scheduler(td);
                     return;
                 }
                 continue;
@@ -1880,15 +1897,12 @@ mod app {
                 return;
             };
             let now = read_tim5();
-            let delta = next_clock.wrapping_sub(now) as i32;
-            if delta <= 0 {
-                continue;
-            }
-            if delta <= TRIGGER_TIMER_MIN_LEAD_TICKS as i32 {
-                while (next_clock.wrapping_sub(read_tim5()) as i32) > 0 {}
-                continue;
-            }
-            td.arm_timer_at(next_clock);
+            let compare = foci_klipper::scheduler::timer_arm_clock(
+                now,
+                next_clock,
+                TRIGGER_TIMER_MIN_LEAD_TICKS,
+            );
+            td.arm_timer_at(compare);
             return;
         }
     }

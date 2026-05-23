@@ -173,19 +173,18 @@ impl TriggerDomain {
 
     /// Reprogram TIM5 CC1 from the scheduler's earliest deadline.
     ///
-    /// Called inside the TriggerDomain lock from P2 command handlers. The P3
-    /// dispatch loop handles near-future deadlines by busy-waiting instead of
-    /// clamping them.
+    /// Called inside the TriggerDomain lock from P2 command handlers. Deadlines
+    /// that are too close to arm reliably are clamped forward instead of
+    /// forcing the TIM5 ISR to busy-wait with interrupts disabled.
     pub(crate) fn reprogram_timer(&mut self) {
         if let Some(earliest) = self.scheduler.earliest_deadline() {
             let tim5 = embassy_stm32::pac::TIM5;
             let now = tim5.cnt().read();
-            let delta = earliest.wrapping_sub(now) as i32;
-            let clamped = if delta <= TRIGGER_TIMER_MIN_LEAD_TICKS as i32 {
-                now.wrapping_add(TRIGGER_TIMER_MIN_LEAD_TICKS)
-            } else {
-                earliest
-            };
+            let clamped = foci_klipper::scheduler::timer_arm_clock(
+                now,
+                earliest,
+                TRIGGER_TIMER_MIN_LEAD_TICKS,
+            );
             self.arm_timer_at(clamped);
         } else {
             self.disarm_timer();
