@@ -559,7 +559,7 @@ pub(crate) fn emit_metadata() {
     ]);
     let _ = payload.extend_from_slice(&crate::ankyra::constants::CLOCK_FREQ.to_le_bytes());
     let _ = payload.extend_from_slice(&1000u32.to_le_bytes());
-    let _ = payload.extend_from_slice(&500u32.to_le_bytes());
+    let _ = payload.extend_from_slice(&100u32.to_le_bytes());
     let _ = payload.extend_from_slice(&10u32.to_le_bytes());
     let _ = payload.extend_from_slice(
         &TRACE_COUNTERS
@@ -764,16 +764,6 @@ pub(crate) async fn sample_tick<B>(
 
     let position_actual =
         read_register_trace(tmc, PID_POSITION_ACTUAL, &mut sample_flags).await as i32;
-    // PID_VELOCITY_TARGET exists in foci_tmc4671::registers at 0x66, matching
-    // TMC4671-LA datasheet Rev 1, 02/2024, section 7 "PID Controller". Do not
-    // use `StepperChannelState.interval` here; it is AtomicU32 timer ticks per
-    // step, not a velocity.
-    let pid_velocity_target =
-        read_register_trace(tmc, PID_VELOCITY_TARGET, &mut sample_flags).await as i32;
-    let pid_velocity_actual =
-        read_register_trace(tmc, PID_VELOCITY_ACTUAL, &mut sample_flags).await as i32;
-    let interim_pidin_target_torque =
-        read_sub_register_trace(tmc, INTERIM_PIDIN_TARGET_TORQUE, &mut sample_flags).await;
     let interim_pid_torque_target_actual = read_sub_register_trace(
         tmc,
         INTERIM_PID_TORQUE_TARGET_TORQUE_ACTUAL,
@@ -789,10 +779,10 @@ pub(crate) async fn sample_tick<B>(
         step_position,
         tmc_position_actual: position_actual,
         position_error: step_position.wrapping_sub(position_actual),
-        target_velocity: pid_velocity_target,
-        pid_velocity_actual,
+        target_velocity: 0,
+        pid_velocity_actual: 0,
         cached_pid_velocity_offset: cached_velocity_offset,
-        velocity_error: pid_velocity_target.wrapping_sub(pid_velocity_actual),
+        velocity_error: 0,
         enable_and_direction: (if motor_enabled { 0x80 } else { 0 })
             | (u8::from(stepper.direction.load(Relaxed)) & 0x01),
         sample_flags,
@@ -802,7 +792,7 @@ pub(crate) async fn sample_tick<B>(
         last_served_step_tick: load_last_served_step_tick(),
         last_klipper_command_service_tick: load_last_klipper_command_service_tick(),
         missed_or_deferred_step_counter: TRACE_TIMING.missed_or_deferred_steps.load(Relaxed),
-        interim_pidin_target_torque,
+        interim_pidin_target_torque: 0,
         interim_pid_torque_target_actual,
         interim_foc_uq_ud: foc_uq_ud,
         interim_foc_uq_ud_limited: foc_uq_ud_limited,
@@ -825,7 +815,7 @@ pub(crate) async fn sample_tick<B>(
         .copy_from_slice(&payload);
     enqueue_motion(frame);
 
-    if current_path_due(control_tick, motion_queue_len(), MOTION_QUEUE_DEPTH) {
+    if current_path_due(false, control_tick, motion_queue_len(), MOTION_QUEUE_DEPTH) {
         let mut current_path_flags = 0u8;
         let interim_foc_iq_id =
             read_sub_register_trace(tmc, INTERIM_FOC_IQ_ID, &mut current_path_flags).await;
@@ -862,31 +852,19 @@ pub(crate) async fn sample_tick<B>(
         TRACE_TIMING.skip_next_control_detail.swap(false, Relaxed),
     );
     if emit_control_detail {
+        let state = foci_firmware::state::tmc::tmc_channel0();
         let detail = ControlDetailSample {
             interim_pidout_target_torque: read_sub_register_counting_errors(
                 tmc,
                 INTERIM_PIDOUT_TARGET_TORQUE,
             )
             .await,
-            interim_pidout_target_flux: read_sub_register_counting_errors(
-                tmc,
-                INTERIM_PIDOUT_TARGET_FLUX,
-            )
-            .await,
-            interim_pidin_target_velocity: read_sub_register_counting_errors(
-                tmc,
-                INTERIM_PIDIN_TARGET_VELOCITY,
-            )
-            .await,
-            interim_pidout_target_velocity: read_sub_register_counting_errors(
-                tmc,
-                INTERIM_PIDOUT_TARGET_VELOCITY,
-            )
-            .await,
-            pidout_uq_ud_limits: read_register_counting_errors(tmc, PIDOUT_UQ_UD_LIMITS).await,
-            pid_torque_flux_limits: read_register_counting_errors(tmc, PID_TORQUE_FLUX_LIMITS)
-                .await,
-            pid_velocity_limit: read_register_counting_errors(tmc, PID_VELOCITY_LIMIT).await,
+            interim_pidout_target_flux: 0,
+            interim_pidin_target_velocity: 0,
+            interim_pidout_target_velocity: 0,
+            pidout_uq_ud_limits: state.voltage_limit_cfg.load(Relaxed),
+            pid_torque_flux_limits: state.current_limit_reg.load(Relaxed),
+            pid_velocity_limit: state.velocity_limit_cfg.load(Relaxed),
         };
         let mut payload = [0u8; CONTROL_DETAIL_PAYLOAD_LEN];
         encode_control_detail_payload(&detail, &mut payload);
