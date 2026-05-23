@@ -102,6 +102,10 @@ mod app {
         id_during: i16,
         uq_limited: i16,
         ud_limited: i16,
+        encoder_before: u32,
+        encoder_after: u32,
+        encoder_delta: i32,
+        adc_vm_raw: u16,
     }
 
     fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
@@ -161,7 +165,28 @@ mod app {
             id_during: i16 = report.id_during,
             uq_limited: i16 = report.uq_limited,
             ud_limited: i16 = report.ud_limited,
+            encoder_before: u32 = report.encoder_before,
+            encoder_after: u32 = report.encoder_after,
+            encoder_delta: i32 = report.encoder_delta,
+            adc_vm_raw: u16 = report.adc_vm_raw,
         );
+    }
+
+    fn current_step_encoder_delta(before: u32, after: u32, counts_per_rev: u32) -> i32 {
+        let raw = (after as i32).wrapping_sub(before as i32);
+        let counts_per_rev = counts_per_rev as i32;
+        if counts_per_rev <= 0 {
+            return raw;
+        }
+
+        let half = counts_per_rev / 2;
+        if raw > half {
+            raw - counts_per_rev
+        } else if raw < -half {
+            raw + counts_per_rev
+        } else {
+            raw
+        }
     }
 
     async fn write_current_step_sub_register(
@@ -1210,6 +1235,10 @@ mod app {
                                 id_during: 0,
                                 uq_limited: 0,
                                 ud_limited: 0,
+                                encoder_before: 0,
+                                encoder_after: 0,
+                                encoder_delta: 0,
+                                adc_vm_raw: 0,
                             });
                             continue;
                         }
@@ -1234,6 +1263,10 @@ mod app {
                                     id_during: 0,
                                     uq_limited: 0,
                                     ud_limited: 0,
+                                    encoder_before: 0,
+                                    encoder_after: 0,
+                                    encoder_delta: 0,
+                                    adc_vm_raw: 0,
                                 });
                                 continue;
                             }
@@ -1261,6 +1294,10 @@ mod app {
                                     id_during: 0,
                                     uq_limited: 0,
                                     ud_limited: 0,
+                                    encoder_before: 0,
+                                    encoder_after: 0,
+                                    encoder_delta: 0,
+                                    adc_vm_raw: 0,
                                 });
                                 continue;
                             }
@@ -1275,6 +1312,10 @@ mod app {
                         let mut id_during = 0i16;
                         let mut uq_limited = 0i16;
                         let mut ud_limited = 0i16;
+                        let mut encoder_before = 0u32;
+                        let mut encoder_after = 0u32;
+                        let mut encoder_delta = 0i32;
+                        let mut adc_vm_raw = 0u16;
 
                         let result: Result<(), ()> = async {
                             use foci_tmc4671::registers::*;
@@ -1291,6 +1332,11 @@ mod app {
                                 .map_err(|_| ())?;
 
                             Mono::delay(CURRENT_STEP_SETTLE_MS.millis()).await;
+
+                            encoder_before =
+                                tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
+                            let encoder_counts_per_rev =
+                                tmc.read_register(ABN_DECODER_PPR).await.map_err(|_| ())?;
 
                             let before = tmc
                                 .read_register(PID_TORQUE_FLUX_ACTUAL)
@@ -1328,10 +1374,26 @@ mod app {
                             uq_limited = uq;
                             ud_limited = ud;
 
+                            // TMC4671-LA Rev 1, 02/2024, ADC_RAW_DATA 0x02 selected by
+                            // ADC_RAW_ADDR 0x03: selector 1 packs ADC_AGPI_A_RAW in
+                            // bits 31:16 and ADC_VM_RAW in bits 15:0.
+                            adc_vm_raw = tmc
+                                .read_sub_register(ADC_AGPI_A_RAW_ADC_VM_RAW)
+                                .await
+                                .map_err(|_| ())? as u16;
+
                             tmc.write_register(PID_TORQUE_FLUX_TARGET, 0)
                                 .await
                                 .map_err(|_| ())?;
                             Mono::delay(CURRENT_STEP_SETTLE_MS.millis()).await;
+
+                            encoder_after =
+                                tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
+                            encoder_delta = current_step_encoder_delta(
+                                encoder_before,
+                                encoder_after,
+                                encoder_counts_per_rev,
+                            );
 
                             let after = tmc
                                 .read_register(PID_TORQUE_FLUX_ACTUAL)
@@ -1387,6 +1449,10 @@ mod app {
                             id_during,
                             uq_limited,
                             ud_limited,
+                            encoder_before,
+                            encoder_after,
+                            encoder_delta,
+                            adc_vm_raw,
                         });
                     }
                     req @ TmcRequest {
