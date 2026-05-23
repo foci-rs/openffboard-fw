@@ -39,6 +39,8 @@ pub(crate) fn enable_pin_channel(pin: u32) -> Option<u8> {
 /// PWM at 25 kHz (PWM_MAXCNT=3999, fCLK=25 MHz per datasheet 4.9.3),
 /// 400ns BBM dead-time matching the OpenFFBoard v1.3 ACS724 firmware config,
 /// DSADC MDEC A=660, B=331 matching the OpenFFBoard v1.3 ACS724 firmware config.
+/// The 1024-count commissioning excitation compensates for the 400ns BBM dead-time
+/// while staying within the ADC setup phase's conservative voltage clamp.
 ///
 /// Bandwidth 150 Hz determined by sweep at 8 MHz SPI (2026-04-05):
 ///   50 Hz  — weak holding torque (P too low with accurate L)
@@ -57,7 +59,7 @@ pub(crate) const TMC_CONFIG: foci_firmware::config::TmcConfig = foci_firmware::c
     dsadc_mdec_b: 331,
     // OpenFFBoard v1.3 ACS724 routing: UX=I0, WY=I1, V=I2.
     adc_i_select: 0x1800_0100,
-    excitation_voltage: 512,
+    excitation_voltage: 1024,
     didt_cycles: 5000,
     bandwidth_hz: 150.0,
 };
@@ -66,3 +68,5 @@ const OPENFFBOARD_V13_BBM_REGISTER: u32 = 0x2828;
 const _: () = assert!(TMC_CONFIG.bbm_register() == OPENFFBOARD_V13_BBM_REGISTER);
 const OPENFFBOARD_V13_DSADC_MDEC_REGISTER: u32 = (331 << 16) | 660;
 const _: () = assert!(TMC_CONFIG.dsadc_mdec_register() == OPENFFBOARD_V13_DSADC_MDEC_REGISTER);
+const OPENFFBOARD_V13_EXCITATION_VOLTAGE: u16 = 1024;
+const _: () = assert!(TMC_CONFIG.excitation_voltage == OPENFFBOARD_V13_EXCITATION_VOLTAGE);
