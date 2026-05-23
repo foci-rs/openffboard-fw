@@ -77,6 +77,9 @@ pub(crate) async fn handle_tmc_request(
         TmcRequestKind::SetVoltageLimit { voltage_limit } => {
             foci_firmware::tmc_ops::apply_set_voltage_limit(tmc, tmc_state, voltage_limit).await?;
         }
+        TmcRequestKind::CurrentStepTest { .. } => {
+            defmt::warn!("handle_tmc_request: CurrentStepTest handled by main loop");
+        }
         TmcRequestKind::SelfTest { .. } => {
             defmt::warn!("handle_tmc_request: SelfTest handled by main loop");
         }

@@ -82,6 +82,27 @@ mod app {
     use crate::commissioning_backend::OpenFFBoardBackend;
 
     const HOLD_SETTLE_DELAY_MS: u8 = 100;
+    const CURRENT_STEP_TORQUE_MODE: u32 = 0x8000_0001;
+    const CURRENT_STEP_POSITION_MODE: u32 = 0x8000_0003;
+    const CURRENT_STEP_SETTLE_MS: u64 = 20;
+    const CURRENT_STEP_STATUS_NOT_READY: u8 = 1;
+    const CURRENT_STEP_STATUS_SPI: u8 = 2;
+
+    struct CurrentStepReport {
+        oid: u8,
+        status: u8,
+        target: i16,
+        duration_ms: u16,
+        voltage_limit: u16,
+        torque_before: i16,
+        torque_during: i16,
+        torque_after: i16,
+        flux_during: i16,
+        iq_during: i16,
+        id_during: i16,
+        uq_limited: i16,
+        ud_limited: i16,
+    }
 
     fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
         foci_firmware::state::tmc::tmc_channel0()
@@ -114,6 +135,53 @@ mod app {
             enable_pin,
             tmc_state: tmc_state(),
         }
+    }
+
+    fn split_signed_halves(value: u32) -> (i16, i16) {
+        (
+            foci_firmware::tmc::decode_signed_upper_half(value),
+            foci_firmware::tmc::decode_signed_lower_half(value),
+        )
+    }
+
+    fn current_step_reply(report: CurrentStepReport) {
+        ::ankyra::klipper_reply_from!(
+            &mut crate::_ankyra_config::Sender,
+            foci_firmware::ankyra::replies::FociCurrentStepResult,
+            oid: u8 = report.oid,
+            status: u8 = report.status,
+            target: i16 = report.target,
+            duration_ms: u16 = report.duration_ms,
+            voltage_limit: u16 = report.voltage_limit,
+            torque_before: i16 = report.torque_before,
+            torque_during: i16 = report.torque_during,
+            torque_after: i16 = report.torque_after,
+            flux_during: i16 = report.flux_during,
+            iq_during: i16 = report.iq_during,
+            id_during: i16 = report.id_during,
+            uq_limited: i16 = report.uq_limited,
+            ud_limited: i16 = report.ud_limited,
+        );
+    }
+
+    async fn write_current_step_sub_register(
+        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
+        sub: foci_tmc4671::registers::SubRegister,
+        value: u32,
+    ) -> Result<(), ()> {
+        tmc.write_register(sub.addr, sub.sub_addr as u32)
+            .await
+            .map_err(|_| ())?;
+        tmc.write_register(sub.data, value).await.map_err(|_| ())
+    }
+
+    async fn clear_current_step_integrators(tmc: &mut Tmc4671Spi<TmcSpiDevice>) -> Result<(), ()> {
+        use foci_tmc4671::registers::{
+            PID_ERROR_PID_FLUX_ERROR_SUM, PID_ERROR_PID_TORQUE_ERROR_SUM,
+        };
+
+        write_current_step_sub_register(tmc, PID_ERROR_PID_TORQUE_ERROR_SUM, 0).await?;
+        write_current_step_sub_register(tmc, PID_ERROR_PID_FLUX_ERROR_SUM, 0).await
     }
 
     // TriggerDomain, PHYSICAL_STEPPER_INDICES, TRIGGER_TIMER_MIN_LEAD_TICKS,
@@ -1111,6 +1179,215 @@ mod app {
                                 tmc_state(),
                             ),
                         );
+                    }
+                    TmcRequest {
+                        kind:
+                            TmcRequestKind::CurrentStepTest {
+                                oid,
+                                target,
+                                duration_ms,
+                                voltage_limit,
+                            },
+                        ..
+                    } => {
+                        let homing_active =
+                            HOMING_STATE.load(core::sync::atomic::Ordering::Relaxed) != 0;
+                        let stepper_active = stepper_state()
+                            .timer_active_mirror
+                            .load(core::sync::atomic::Ordering::Relaxed);
+                        if !motor_enabled || !calibrated || homing_active || stepper_active {
+                            current_step_reply(CurrentStepReport {
+                                oid,
+                                status: CURRENT_STEP_STATUS_NOT_READY,
+                                target,
+                                duration_ms,
+                                voltage_limit,
+                                torque_before: 0,
+                                torque_during: 0,
+                                torque_after: 0,
+                                flux_during: 0,
+                                iq_during: 0,
+                                id_during: 0,
+                                uq_limited: 0,
+                                ud_limited: 0,
+                            });
+                            continue;
+                        }
+
+                        let saved_mode = match tmc
+                            .read_register(foci_tmc4671::registers::MODE_RAMP_MODE_MOTION)
+                            .await
+                        {
+                            Ok(value) => value,
+                            Err(_) => {
+                                current_step_reply(CurrentStepReport {
+                                    oid,
+                                    status: CURRENT_STEP_STATUS_SPI,
+                                    target,
+                                    duration_ms,
+                                    voltage_limit,
+                                    torque_before: 0,
+                                    torque_during: 0,
+                                    torque_after: 0,
+                                    flux_during: 0,
+                                    iq_during: 0,
+                                    id_during: 0,
+                                    uq_limited: 0,
+                                    ud_limited: 0,
+                                });
+                                continue;
+                            }
+                        };
+                        let saved_voltage_limit = tmc_state()
+                            .voltage_limit_cfg
+                            .load(core::sync::atomic::Ordering::Relaxed);
+                        let position_actual = match tmc
+                            .read_register(foci_tmc4671::registers::PID_POSITION_ACTUAL)
+                            .await
+                        {
+                            Ok(value) => value,
+                            Err(_) => {
+                                current_step_reply(CurrentStepReport {
+                                    oid,
+                                    status: CURRENT_STEP_STATUS_SPI,
+                                    target,
+                                    duration_ms,
+                                    voltage_limit,
+                                    torque_before: 0,
+                                    torque_during: 0,
+                                    torque_after: 0,
+                                    flux_during: 0,
+                                    iq_during: 0,
+                                    id_during: 0,
+                                    uq_limited: 0,
+                                    ud_limited: 0,
+                                });
+                                continue;
+                            }
+                        };
+
+                        let mut status = 0u8;
+                        let mut torque_before = 0i16;
+                        let mut torque_during = 0i16;
+                        let mut torque_after = 0i16;
+                        let mut flux_during = 0i16;
+                        let mut iq_during = 0i16;
+                        let mut id_during = 0i16;
+                        let mut uq_limited = 0i16;
+                        let mut ud_limited = 0i16;
+
+                        let result: Result<(), ()> = async {
+                            use foci_tmc4671::registers::*;
+
+                            tmc.write_register(PID_TORQUE_FLUX_TARGET, 0)
+                                .await
+                                .map_err(|_| ())?;
+                            tmc.write_register(PIDOUT_UQ_UD_LIMITS, voltage_limit as u32)
+                                .await
+                                .map_err(|_| ())?;
+                            clear_current_step_integrators(tmc).await?;
+                            tmc.write_register(MODE_RAMP_MODE_MOTION, CURRENT_STEP_TORQUE_MODE)
+                                .await
+                                .map_err(|_| ())?;
+
+                            Mono::delay(CURRENT_STEP_SETTLE_MS.millis()).await;
+
+                            let before = tmc
+                                .read_register(PID_TORQUE_FLUX_ACTUAL)
+                                .await
+                                .map_err(|_| ())?;
+                            torque_before = foci_firmware::tmc::decode_signed_upper_half(before);
+
+                            let target_reg = foci_firmware::tmc::pack_torque_flux_target(target, 0);
+                            tmc.write_register(PID_TORQUE_FLUX_TARGET, target_reg)
+                                .await
+                                .map_err(|_| ())?;
+                            Mono::delay((duration_ms as u64).millis()).await;
+
+                            let actual = tmc
+                                .read_register(PID_TORQUE_FLUX_ACTUAL)
+                                .await
+                                .map_err(|_| ())?;
+                            let (torque, flux) = split_signed_halves(actual);
+                            torque_during = torque;
+                            flux_during = flux;
+
+                            let iq_id = tmc
+                                .read_sub_register(INTERIM_FOC_IQ_ID)
+                                .await
+                                .map_err(|_| ())?;
+                            let (iq, id) = split_signed_halves(iq_id);
+                            iq_during = iq;
+                            id_during = id;
+
+                            let uq_ud = tmc
+                                .read_sub_register(INTERIM_FOC_UQ_UD_LIMITED)
+                                .await
+                                .map_err(|_| ())?;
+                            let (uq, ud) = split_signed_halves(uq_ud);
+                            uq_limited = uq;
+                            ud_limited = ud;
+
+                            tmc.write_register(PID_TORQUE_FLUX_TARGET, 0)
+                                .await
+                                .map_err(|_| ())?;
+                            Mono::delay(CURRENT_STEP_SETTLE_MS.millis()).await;
+
+                            let after = tmc
+                                .read_register(PID_TORQUE_FLUX_ACTUAL)
+                                .await
+                                .map_err(|_| ())?;
+                            torque_after = foci_firmware::tmc::decode_signed_upper_half(after);
+                            Ok(())
+                        }
+                        .await;
+
+                        if result.is_err() {
+                            status = CURRENT_STEP_STATUS_SPI;
+                        }
+
+                        let _ = tmc
+                            .write_register(foci_tmc4671::registers::PID_TORQUE_FLUX_TARGET, 0)
+                            .await;
+                        let _ = tmc
+                            .write_register(
+                                foci_tmc4671::registers::PIDOUT_UQ_UD_LIMITS,
+                                saved_voltage_limit,
+                            )
+                            .await;
+                        let _ = tmc
+                            .write_register(
+                                foci_tmc4671::registers::PID_POSITION_TARGET,
+                                position_actual,
+                            )
+                            .await;
+                        let restore_mode = if saved_mode == 0 {
+                            CURRENT_STEP_POSITION_MODE
+                        } else {
+                            saved_mode
+                        };
+                        let _ = tmc
+                            .write_register(
+                                foci_tmc4671::registers::MODE_RAMP_MODE_MOTION,
+                                restore_mode,
+                            )
+                            .await;
+
+                        current_step_reply(CurrentStepReport {
+                            oid,
+                            status,
+                            target,
+                            duration_ms,
+                            voltage_limit,
+                            torque_before,
+                            torque_during,
+                            torque_after,
+                            flux_during,
+                            iq_during,
+                            id_during,
+                            uq_limited,
+                            ud_limited,
+                        });
                     }
                     req @ TmcRequest {
                         kind: TmcRequestKind::SetEncoder { .. },
