@@ -242,6 +242,7 @@ pub(crate) fn stop_physical_stepper_no_lock(stepper_idx: usize, reason: StepperE
     }
     // 1. Clear step interval
     stepper_state().interval.store(0, Relaxed);
+    stepper_state().interval_add.store(0, Relaxed);
     tmc_state().pid_error_sums_clear.store(true, Relaxed);
     let remaining_events = unsafe {
         isr_stepper(0)

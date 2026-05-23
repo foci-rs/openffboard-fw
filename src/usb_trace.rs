@@ -742,6 +742,9 @@ pub(crate) async fn sample_tick<B>(
     tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
     motor_enabled: bool,
     cached_velocity_offset: i32,
+    cached_accel_torque_offset: i32,
+    accel_feedforward_gain_permille: u16,
+    accel_feedforward_flags: u8,
     control_tick: u32,
 ) where
     B: embedded_hal_async::spi::SpiDevice<u8>,
@@ -769,10 +772,14 @@ pub(crate) async fn sample_tick<B>(
         read_register_trace(tmc, PID_VELOCITY_TARGET, &mut sample_flags).await as i32;
     let pid_velocity_actual =
         read_register_trace(tmc, PID_VELOCITY_ACTUAL, &mut sample_flags).await as i32;
-    let pid_torque_flux_target =
-        read_register_trace(tmc, PID_TORQUE_FLUX_TARGET, &mut sample_flags).await;
-    let pid_torque_flux_actual =
-        read_register_trace(tmc, PID_TORQUE_FLUX_ACTUAL, &mut sample_flags).await;
+    let interim_pidin_target_torque =
+        read_sub_register_trace(tmc, INTERIM_PIDIN_TARGET_TORQUE, &mut sample_flags).await;
+    let interim_pid_torque_target_actual = read_sub_register_trace(
+        tmc,
+        INTERIM_PID_TORQUE_TARGET_TORQUE_ACTUAL,
+        &mut sample_flags,
+    )
+    .await;
     let foc_uq_ud = read_sub_register_trace(tmc, INTERIM_FOC_UQ_UD, &mut sample_flags).await;
     let foc_uq_ud_limited =
         read_sub_register_trace(tmc, INTERIM_FOC_UQ_UD_LIMITED, &mut sample_flags).await;
@@ -795,10 +802,13 @@ pub(crate) async fn sample_tick<B>(
         last_served_step_tick: load_last_served_step_tick(),
         last_klipper_command_service_tick: load_last_klipper_command_service_tick(),
         missed_or_deferred_step_counter: TRACE_TIMING.missed_or_deferred_steps.load(Relaxed),
-        pid_torque_flux_target,
-        pid_torque_flux_actual,
+        interim_pidin_target_torque,
+        interim_pid_torque_target_actual,
         interim_foc_uq_ud: foc_uq_ud,
         interim_foc_uq_ud_limited: foc_uq_ud_limited,
+        cached_accel_torque_offset,
+        accel_feedforward_gain_permille,
+        accel_feedforward_flags,
     };
     let mut payload = [0u8; CRITICAL_PAYLOAD_LEN];
     encode_critical_payload(&sample, &mut payload);
@@ -814,6 +824,36 @@ pub(crate) async fn sample_tick<B>(
         .payload_mut(CRITICAL_PAYLOAD_LEN)
         .copy_from_slice(&payload);
     enqueue_motion(frame);
+
+    if current_path_due(control_tick, motion_queue_len(), MOTION_QUEUE_DEPTH) {
+        let mut current_path_flags = 0u8;
+        let interim_foc_iq_id =
+            read_sub_register_trace(tmc, INTERIM_FOC_IQ_ID, &mut current_path_flags).await;
+        let interim_foc_iwy_iux =
+            read_sub_register_trace(tmc, INTERIM_FOC_IWY_IUX, &mut current_path_flags).await;
+        let interim_adc_i1_i0 =
+            read_sub_register_trace(tmc, INTERIM_ADC_I1_I0, &mut current_path_flags).await;
+        let current_path = CurrentPathSample {
+            sample_flags: current_path_flags,
+            interim_foc_iq_id,
+            interim_foc_iwy_iux,
+            interim_adc_i1_i0,
+        };
+        let mut payload = [0u8; CURRENT_PATH_PAYLOAD_LEN];
+        encode_current_path_payload(&current_path, &mut payload);
+        let mut frame = FrameBuf::new();
+        frame.write_header(header(
+            FRAME_TYPE_CURRENT_PATH,
+            CURRENT_PATH_PAYLOAD_LEN,
+            SOURCE_KIND_FOCI,
+            0,
+            motion_flags(),
+        ));
+        frame
+            .payload_mut(CURRENT_PATH_PAYLOAD_LEN)
+            .copy_from_slice(&payload);
+        enqueue_motion(frame);
+    }
 
     let emit_control_detail = control_detail_due(
         control_tick,

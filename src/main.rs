@@ -462,6 +462,12 @@ mod app {
         let mut trace_next_control_tick = Mono::now() + trace_control_period;
         #[cfg(feature = "trace")]
         let mut cached_trace_velocity_offset: i32 = 0;
+        #[cfg(feature = "trace")]
+        let mut cached_trace_accel_torque_offset: i32 = 0;
+        #[cfg(feature = "trace")]
+        let mut cached_trace_accel_gain_permille: u16 = 0;
+        #[cfg(feature = "trace")]
+        let mut cached_trace_accel_flags: u8 = 0;
 
         // Stored PID gains from host (explicit or R/L-derived).
         // None = use defaults during calibration.
@@ -481,8 +487,9 @@ mod app {
         let mut velocity_scale: u32 = 0;
 
         // Track whether feedforward was active on the previous tick, so we
-        // can zero PID_VELOCITY_OFFSET on the deactivation edge.
+        // can zero offset registers on the deactivation edge.
         let mut feedforward_was_active = false;
+        let mut accel_feedforward_was_active = false;
         let mut pid_error_clear_countdown_ms: u8 = 0;
 
         // Main loop: wait for channel message or 1ms timeout.
@@ -918,6 +925,22 @@ mod app {
                         // command handler; this arm exists for exhaustiveness.
                     }
                     TmcRequest {
+                        kind:
+                            TmcRequestKind::SetAccelFeedforward {
+                                enable,
+                                gain_permille,
+                            },
+                        ..
+                    } => {
+                        defmt::info!(
+                            "Acceleration feedforward: {} gain_permille={} (via queue)",
+                            enable,
+                            gain_permille
+                        );
+                        // Feedforward flag is already set by the atomic in the
+                        // command handler; this arm exists for exhaustiveness.
+                    }
+                    TmcRequest {
                         kind: TmcRequestKind::Commission { oid, profile },
                         ..
                     } => {
@@ -1028,7 +1051,7 @@ mod app {
                                 position_p: tmc_state().position_p_value.load(Relaxed),
                                 position_i: tmc_state().position_i_value.load(Relaxed),
                                 velocity_limit: tmc_state().velocity_limit_cfg.load(Relaxed),
-                                voltage_limit: 16000,
+                                voltage_limit: tmc_state().voltage_limit_cfg.load(Relaxed),
                                 velocity_filter_hz: tmc_state().velocity_filter_hz.load(Relaxed),
                                 torque_filter_hz: tmc_state().torque_filter_hz.load(Relaxed),
                                 position_filter_hz: tmc_state().position_filter_hz.load(Relaxed),
@@ -1217,13 +1240,18 @@ mod app {
                     .velocity_feedforward
                     .load(core::sync::atomic::Ordering::Relaxed)
                 && commission_engine.is_none();
+            let accel_ff_active = motor_enabled
+                && velocity_scale != 0
+                && tmc_state()
+                    .accel_feedforward
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                && commission_engine.is_none();
+            let homing_active = HOMING_STATE.load(core::sync::atomic::Ordering::Relaxed) != 0;
+            let reset = tmc_state()
+                .feedforward_reset
+                .swap(false, core::sync::atomic::Ordering::Relaxed);
 
             if ff_active {
-                let homing_active = HOMING_STATE.load(core::sync::atomic::Ordering::Relaxed) != 0;
-                let reset = tmc_state()
-                    .feedforward_reset
-                    .swap(false, core::sync::atomic::Ordering::Relaxed);
-
                 let offset = if homing_active || reset {
                     0i32
                 } else {
@@ -1263,6 +1291,73 @@ mod app {
             }
             feedforward_was_active = ff_active;
 
+            if accel_ff_active {
+                let gain_permille = tmc_state()
+                    .accel_feedforward_gain_permille
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let torque_limit = tmc_state()
+                    .current_limit_reg
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let offset = if homing_active || reset {
+                    0i16
+                } else {
+                    let interval = stepper_state()
+                        .interval
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    let interval_add = stepper_state()
+                        .interval_add
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                        .clamp(i16::MIN as i32, i16::MAX as i32)
+                        as i16;
+                    let forward = stepper_state()
+                        .direction
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    foci_firmware::tmc::compute_accel_torque_offset(
+                        velocity_scale,
+                        CLOCK_FREQ,
+                        interval,
+                        interval_add,
+                        forward,
+                        gain_permille,
+                        torque_limit,
+                    )
+                };
+                #[cfg(feature = "trace")]
+                {
+                    let mut flags = if homing_active || reset {
+                        0
+                    } else {
+                        foci_firmware::trace_stream::ACCEL_FF_FLAG_ENABLED
+                    };
+                    if offset != 0 {
+                        flags |= foci_firmware::trace_stream::ACCEL_FF_FLAG_NONZERO;
+                    }
+                    if offset != 0
+                        && offset.unsigned_abs() as u32 >= torque_limit.min(i16::MAX as u32)
+                    {
+                        flags |= foci_firmware::trace_stream::ACCEL_FF_FLAG_CLAMPED;
+                    }
+                    cached_trace_accel_torque_offset = offset as i32;
+                    cached_trace_accel_gain_permille = gain_permille;
+                    cached_trace_accel_flags = flags;
+                }
+                let offset_reg = u32::from(offset as u16) << 16;
+                let _ = tmc
+                    .write_register(foci_tmc4671::registers::PID_TORQUE_FLUX_OFFSET, offset_reg)
+                    .await;
+            } else if accel_feedforward_was_active {
+                let _ = tmc
+                    .write_register(foci_tmc4671::registers::PID_TORQUE_FLUX_OFFSET, 0)
+                    .await;
+                #[cfg(feature = "trace")]
+                {
+                    cached_trace_accel_torque_offset = 0;
+                    cached_trace_accel_gain_permille = 0;
+                    cached_trace_accel_flags = 0;
+                }
+            }
+            accel_feedforward_was_active = accel_ff_active;
+
             // Trace capture: read registers and store sample.
             // Deadline = tick start + 1ms. Budget check inside ensures
             // trace SPI reads don't overrun the tick period.
@@ -1286,6 +1381,9 @@ mod app {
                     tmc,
                     motor_enabled,
                     cached_trace_velocity_offset,
+                    cached_trace_accel_torque_offset,
+                    cached_trace_accel_gain_permille,
+                    cached_trace_accel_flags,
                     trace_control_tick,
                 )
                 .await;
@@ -1494,6 +1592,7 @@ mod app {
         if FAULT_ACTIVE.load(Relaxed) || !tmc_state().motor_armed.load(Relaxed) {
             td.set_timer_active(0, false);
             stepper_state().interval.store(0, Relaxed);
+            stepper_state().interval_add.store(0, Relaxed);
             tmc_state().pid_error_sums_clear.store(true, Relaxed);
             return;
         }
@@ -1516,10 +1615,12 @@ mod app {
                 } {
                     Some(m) => {
                         let loaded_steps = u32::from(m.count);
+                        let interval_add = i32::from(m.add);
                         let dir_changed = stepper.load_move(m);
                         stepper_state()
                             .interval
                             .store(stepper.current_interval(), Relaxed);
+                        stepper_state().interval_add.store(interval_add, Relaxed);
                         let dir_val = if stepper.dir_state() {
                             embassy_stm32::pac::gpio::vals::Odr::HIGH
                         } else {
@@ -1548,6 +1649,7 @@ mod app {
                             );
                         }
                         stepper_state().interval.store(0, Relaxed);
+                        stepper_state().interval_add.store(0, Relaxed);
                         tmc_state().pid_error_sums_clear.store(true, Relaxed);
                         td.set_timer_active(0, false);
                         return;

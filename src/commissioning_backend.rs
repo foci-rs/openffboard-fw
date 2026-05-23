@@ -108,6 +108,10 @@ impl<'a> foci_firmware::commission::CommissioningBackend for OpenFFBoardBackend<
         self.tmc_state.velocity_limit_cfg.load(Relaxed)
     }
 
+    fn operational_voltage_limit(&self) -> u32 {
+        self.tmc_state.voltage_limit_cfg.load(Relaxed)
+    }
+
     async fn delay_us(&mut self, us: u32) {
         Mono::delay((us as u64).micros()).await;
     }
