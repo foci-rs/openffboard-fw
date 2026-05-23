@@ -80,6 +80,9 @@ pub(crate) async fn handle_tmc_request(
         TmcRequestKind::CurrentStepTest { .. } => {
             defmt::warn!("handle_tmc_request: CurrentStepTest handled by main loop");
         }
+        TmcRequestKind::CurrentVectorStepTest { .. } => {
+            defmt::warn!("handle_tmc_request: CurrentVectorStepTest handled by main loop");
+        }
         TmcRequestKind::SelfTest { .. } => {
             defmt::warn!("handle_tmc_request: SelfTest handled by main loop");
         }

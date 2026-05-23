@@ -91,7 +91,8 @@ mod app {
     struct CurrentStepReport {
         oid: u8,
         status: u8,
-        target: i16,
+        torque_target: i16,
+        flux_target: i16,
         duration_ms: u16,
         voltage_limit: u16,
         torque_before: i16,
@@ -154,7 +155,7 @@ mod app {
             foci_firmware::ankyra::replies::FociCurrentStepResult,
             oid: u8 = report.oid,
             status: u8 = report.status,
-            target: i16 = report.target,
+            target: i16 = report.torque_target,
             duration_ms: u16 = report.duration_ms,
             voltage_limit: u16 = report.voltage_limit,
             torque_before: i16 = report.torque_before,
@@ -170,6 +171,39 @@ mod app {
             encoder_delta: i32 = report.encoder_delta,
             adc_vm_raw: u16 = report.adc_vm_raw,
         );
+    }
+
+    fn current_vector_step_reply(report: CurrentStepReport) {
+        ::ankyra::klipper_reply_from!(
+            &mut crate::_ankyra_config::Sender,
+            foci_firmware::ankyra::replies::FociCurrentVectorStepResult,
+            oid: u8 = report.oid,
+            status: u8 = report.status,
+            torque_target: i16 = report.torque_target,
+            flux_target: i16 = report.flux_target,
+            duration_ms: u16 = report.duration_ms,
+            voltage_limit: u16 = report.voltage_limit,
+            torque_before: i16 = report.torque_before,
+            torque_during: i16 = report.torque_during,
+            torque_after: i16 = report.torque_after,
+            flux_during: i16 = report.flux_during,
+            iq_during: i16 = report.iq_during,
+            id_during: i16 = report.id_during,
+            uq_limited: i16 = report.uq_limited,
+            ud_limited: i16 = report.ud_limited,
+            encoder_before: u32 = report.encoder_before,
+            encoder_after: u32 = report.encoder_after,
+            encoder_delta: i32 = report.encoder_delta,
+            adc_vm_raw: u16 = report.adc_vm_raw,
+        );
+    }
+
+    fn send_current_step_reply(vector_reply: bool, report: CurrentStepReport) {
+        if vector_reply {
+            current_vector_step_reply(report);
+        } else {
+            current_step_reply(report);
+        }
     }
 
     fn current_step_encoder_delta(before: u32, after: u32, counts_per_rev: u32) -> i32 {
@@ -1207,52 +1241,53 @@ mod app {
                     }
                     TmcRequest {
                         kind:
+                            current_step_kind @ (TmcRequestKind::CurrentStepTest { .. }
+                            | TmcRequestKind::CurrentVectorStepTest { .. }),
+                        ..
+                    } => {
+                        let (
+                            oid,
+                            torque_target,
+                            flux_target,
+                            duration_ms,
+                            voltage_limit,
+                            vector_reply,
+                        ) = match current_step_kind {
                             TmcRequestKind::CurrentStepTest {
                                 oid,
                                 target,
                                 duration_ms,
                                 voltage_limit,
-                            },
-                        ..
-                    } => {
+                            } => (oid, target, 0, duration_ms, voltage_limit, false),
+                            TmcRequestKind::CurrentVectorStepTest {
+                                oid,
+                                torque_target,
+                                flux_target,
+                                duration_ms,
+                                voltage_limit,
+                            } => (
+                                oid,
+                                torque_target,
+                                flux_target,
+                                duration_ms,
+                                voltage_limit,
+                                true,
+                            ),
+                            _ => unreachable!(),
+                        };
                         let homing_active =
                             HOMING_STATE.load(core::sync::atomic::Ordering::Relaxed) != 0;
                         let stepper_active = stepper_state()
                             .timer_active_mirror
                             .load(core::sync::atomic::Ordering::Relaxed);
                         if !motor_enabled || !calibrated || homing_active || stepper_active {
-                            current_step_reply(CurrentStepReport {
-                                oid,
-                                status: CURRENT_STEP_STATUS_NOT_READY,
-                                target,
-                                duration_ms,
-                                voltage_limit,
-                                torque_before: 0,
-                                torque_during: 0,
-                                torque_after: 0,
-                                flux_during: 0,
-                                iq_during: 0,
-                                id_during: 0,
-                                uq_limited: 0,
-                                ud_limited: 0,
-                                encoder_before: 0,
-                                encoder_after: 0,
-                                encoder_delta: 0,
-                                adc_vm_raw: 0,
-                            });
-                            continue;
-                        }
-
-                        let saved_mode = match tmc
-                            .read_register(foci_tmc4671::registers::MODE_RAMP_MODE_MOTION)
-                            .await
-                        {
-                            Ok(value) => value,
-                            Err(_) => {
-                                current_step_reply(CurrentStepReport {
+                            send_current_step_reply(
+                                vector_reply,
+                                CurrentStepReport {
                                     oid,
-                                    status: CURRENT_STEP_STATUS_SPI,
-                                    target,
+                                    status: CURRENT_STEP_STATUS_NOT_READY,
+                                    torque_target,
+                                    flux_target,
                                     duration_ms,
                                     voltage_limit,
                                     torque_before: 0,
@@ -1267,7 +1302,40 @@ mod app {
                                     encoder_after: 0,
                                     encoder_delta: 0,
                                     adc_vm_raw: 0,
-                                });
+                                },
+                            );
+                            continue;
+                        }
+
+                        let saved_mode = match tmc
+                            .read_register(foci_tmc4671::registers::MODE_RAMP_MODE_MOTION)
+                            .await
+                        {
+                            Ok(value) => value,
+                            Err(_) => {
+                                send_current_step_reply(
+                                    vector_reply,
+                                    CurrentStepReport {
+                                        oid,
+                                        status: CURRENT_STEP_STATUS_SPI,
+                                        torque_target,
+                                        flux_target,
+                                        duration_ms,
+                                        voltage_limit,
+                                        torque_before: 0,
+                                        torque_during: 0,
+                                        torque_after: 0,
+                                        flux_during: 0,
+                                        iq_during: 0,
+                                        id_during: 0,
+                                        uq_limited: 0,
+                                        ud_limited: 0,
+                                        encoder_before: 0,
+                                        encoder_after: 0,
+                                        encoder_delta: 0,
+                                        adc_vm_raw: 0,
+                                    },
+                                );
                                 continue;
                             }
                         };
@@ -1280,25 +1348,29 @@ mod app {
                         {
                             Ok(value) => value,
                             Err(_) => {
-                                current_step_reply(CurrentStepReport {
-                                    oid,
-                                    status: CURRENT_STEP_STATUS_SPI,
-                                    target,
-                                    duration_ms,
-                                    voltage_limit,
-                                    torque_before: 0,
-                                    torque_during: 0,
-                                    torque_after: 0,
-                                    flux_during: 0,
-                                    iq_during: 0,
-                                    id_during: 0,
-                                    uq_limited: 0,
-                                    ud_limited: 0,
-                                    encoder_before: 0,
-                                    encoder_after: 0,
-                                    encoder_delta: 0,
-                                    adc_vm_raw: 0,
-                                });
+                                send_current_step_reply(
+                                    vector_reply,
+                                    CurrentStepReport {
+                                        oid,
+                                        status: CURRENT_STEP_STATUS_SPI,
+                                        torque_target,
+                                        flux_target,
+                                        duration_ms,
+                                        voltage_limit,
+                                        torque_before: 0,
+                                        torque_during: 0,
+                                        torque_after: 0,
+                                        flux_during: 0,
+                                        iq_during: 0,
+                                        id_during: 0,
+                                        uq_limited: 0,
+                                        ud_limited: 0,
+                                        encoder_before: 0,
+                                        encoder_after: 0,
+                                        encoder_delta: 0,
+                                        adc_vm_raw: 0,
+                                    },
+                                );
                                 continue;
                             }
                         };
@@ -1344,7 +1416,10 @@ mod app {
                                 .map_err(|_| ())?;
                             torque_before = foci_firmware::tmc::decode_signed_upper_half(before);
 
-                            let target_reg = foci_firmware::tmc::pack_torque_flux_target(target, 0);
+                            let target_reg = foci_firmware::tmc::pack_torque_flux_target(
+                                torque_target,
+                                flux_target,
+                            );
                             tmc.write_register(PID_TORQUE_FLUX_TARGET, target_reg)
                                 .await
                                 .map_err(|_| ())?;
@@ -1435,25 +1510,29 @@ mod app {
                             )
                             .await;
 
-                        current_step_reply(CurrentStepReport {
-                            oid,
-                            status,
-                            target,
-                            duration_ms,
-                            voltage_limit,
-                            torque_before,
-                            torque_during,
-                            torque_after,
-                            flux_during,
-                            iq_during,
-                            id_during,
-                            uq_limited,
-                            ud_limited,
-                            encoder_before,
-                            encoder_after,
-                            encoder_delta,
-                            adc_vm_raw,
-                        });
+                        send_current_step_reply(
+                            vector_reply,
+                            CurrentStepReport {
+                                oid,
+                                status,
+                                torque_target,
+                                flux_target,
+                                duration_ms,
+                                voltage_limit,
+                                torque_before,
+                                torque_during,
+                                torque_after,
+                                flux_during,
+                                iq_during,
+                                id_during,
+                                uq_limited,
+                                ud_limited,
+                                encoder_before,
+                                encoder_after,
+                                encoder_delta,
+                                adc_vm_raw,
+                            },
+                        );
                     }
                     req @ TmcRequest {
                         kind: TmcRequestKind::SetEncoder { .. },
