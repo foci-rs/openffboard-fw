@@ -16,6 +16,9 @@ use crate::state::usb_trace::{
 /// Product string used by trace builds.
 pub(crate) const TRACE_PRODUCT: &str = "FOCI OpenFFBoard (trace)";
 
+/// Enable the lower-rate raw current-path diagnostic frame.
+const CURRENT_PATH_DIAGNOSTIC_ENABLED: bool = cfg!(feature = "trace-current-path");
+
 pub(crate) const EVENT_LEVEL_INFO: u8 = 1;
 #[allow(dead_code)]
 pub(crate) const EVENT_LEVEL_WARN: u8 = 2;
@@ -815,7 +818,12 @@ pub(crate) async fn sample_tick<B>(
         .copy_from_slice(&payload);
     enqueue_motion(frame);
 
-    if current_path_due(false, control_tick, motion_queue_len(), MOTION_QUEUE_DEPTH) {
+    if current_path_due(
+        CURRENT_PATH_DIAGNOSTIC_ENABLED,
+        control_tick,
+        motion_queue_len(),
+        MOTION_QUEUE_DEPTH,
+    ) {
         let mut current_path_flags = 0u8;
         let interim_foc_iq_id =
             read_sub_register_trace(tmc, INTERIM_FOC_IQ_ID, &mut current_path_flags).await;
