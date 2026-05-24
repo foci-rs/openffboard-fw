@@ -1304,14 +1304,17 @@ mod app {
                         kind:
                             TmcRequestKind::SetAccelFeedforward {
                                 enable,
-                                gain_permille,
+                                accel_gain_permille,
+                                decel_gain_permille,
                             },
                         ..
                     } => {
                         defmt::info!(
-                            "Acceleration feedforward: {} gain_permille={} (via queue)",
+                            "Acceleration feedforward: {} accel_gain_permille={} \
+                            decel_gain_permille={} (via queue)",
                             enable,
-                            gain_permille
+                            accel_gain_permille,
+                            decel_gain_permille
                         );
                         // Feedforward flag is already set by the atomic in the
                         // command handler; this arm exists for exhaustiveness.
@@ -2777,33 +2780,46 @@ mod app {
             feedforward_was_active = ff_active;
 
             if accel_ff_active {
-                let gain_permille = tmc_state()
-                    .accel_feedforward_gain_permille
+                let accel_gain_permille = tmc_state()
+                    .accel_feedforward_accel_gain_permille
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let decel_gain_permille = tmc_state()
+                    .accel_feedforward_decel_gain_permille
                     .load(core::sync::atomic::Ordering::Relaxed);
                 let torque_limit = tmc_state()
                     .current_limit_reg
                     .load(core::sync::atomic::Ordering::Relaxed);
+                let interval = stepper_state()
+                    .interval
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let interval_add = stepper_state()
+                    .interval_add
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    .clamp(i16::MIN as i32, i16::MAX as i32)
+                    as i16;
+                let selected_gain_permille = if interval_add < 0 {
+                    accel_gain_permille
+                } else if interval_add > 0 {
+                    decel_gain_permille
+                } else {
+                    0
+                };
                 let offset = if homing_active || reset {
                     0i16
                 } else {
-                    let interval = stepper_state()
-                        .interval
-                        .load(core::sync::atomic::Ordering::Relaxed);
-                    let interval_add = stepper_state()
-                        .interval_add
-                        .load(core::sync::atomic::Ordering::Relaxed)
-                        .clamp(i16::MIN as i32, i16::MAX as i32)
-                        as i16;
                     let forward = stepper_state()
                         .direction
                         .load(core::sync::atomic::Ordering::Relaxed);
-                    foci_firmware::tmc::compute_accel_torque_offset(
+                    foci_firmware::tmc::compute_accel_torque_offset_split(
                         velocity_scale,
                         CLOCK_FREQ,
                         interval,
                         interval_add,
                         forward,
-                        gain_permille,
+                        foci_firmware::tmc::AccelFeedforwardGains {
+                            accel_permille: accel_gain_permille,
+                            decel_permille: decel_gain_permille,
+                        },
                         torque_limit,
                     )
                 };
@@ -2823,7 +2839,11 @@ mod app {
                         flags |= foci_firmware::trace_stream::ACCEL_FF_FLAG_CLAMPED;
                     }
                     cached_trace_accel_torque_offset = offset as i32;
-                    cached_trace_accel_gain_permille = gain_permille;
+                    cached_trace_accel_gain_permille = if homing_active || reset {
+                        0
+                    } else {
+                        selected_gain_permille
+                    };
                     cached_trace_accel_flags = flags;
                 }
                 let offset_reg = u32::from(offset as u16) << 16;
