@@ -2711,6 +2711,31 @@ mod app {
                 .feedforward_reset
                 .swap(false, core::sync::atomic::Ordering::Relaxed);
 
+            #[cfg(feature = "trace")]
+            let cached_trace_velocity_reference = {
+                let velocity_trace_inputs_active =
+                    motor_enabled && velocity_scale != 0 && commission_engine.is_none();
+                if velocity_trace_inputs_active {
+                    if homing_active || reset {
+                        0
+                    } else {
+                        let interval = stepper_state()
+                            .interval
+                            .load(core::sync::atomic::Ordering::Relaxed);
+                        let forward = stepper_state()
+                            .direction
+                            .load(core::sync::atomic::Ordering::Relaxed);
+                        foci_firmware::tmc::compute_command_velocity_reference(
+                            velocity_scale,
+                            interval,
+                            forward,
+                        )
+                    }
+                } else {
+                    0
+                }
+            };
+
             if ff_active {
                 let offset = if homing_active || reset {
                     0i32
@@ -2840,6 +2865,7 @@ mod app {
                 crate::usb_trace::sample_tick(
                     tmc,
                     motor_enabled,
+                    cached_trace_velocity_reference,
                     cached_trace_velocity_offset,
                     cached_trace_accel_torque_offset,
                     cached_trace_accel_gain_permille,

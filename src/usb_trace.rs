@@ -744,6 +744,7 @@ where
 pub(crate) async fn sample_tick<B>(
     tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
     motor_enabled: bool,
+    command_velocity_reference: i32,
     cached_velocity_offset: i32,
     cached_accel_torque_offset: i32,
     accel_feedforward_gain_permille: u16,
@@ -782,7 +783,7 @@ pub(crate) async fn sample_tick<B>(
         step_position,
         tmc_position_actual: position_actual,
         position_error: step_position.wrapping_sub(position_actual),
-        target_velocity: 0,
+        target_velocity: command_velocity_reference,
         pid_velocity_actual: 0,
         cached_pid_velocity_offset: cached_velocity_offset,
         velocity_error: 0,
