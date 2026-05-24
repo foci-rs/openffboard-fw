@@ -866,7 +866,7 @@ mod app {
         // can zero offset registers on the deactivation edge.
         let mut feedforward_was_active = false;
         let mut accel_feedforward_was_active = false;
-        let mut position_lead_was_active = false;
+        let mut position_lead_applied_scaled = 0i32;
         let mut pid_error_clear_countdown_ms: u8 = 0;
 
         // Main loop: wait for channel message or 1ms timeout.
@@ -2889,7 +2889,7 @@ mod app {
                     .load(core::sync::atomic::Ordering::Relaxed)
                 && commission_engine.is_none()
                 && !homing_active;
-            if position_lead_active {
+            if position_lead_active || position_lead_applied_scaled != 0 {
                 let interval = stepper_state()
                     .interval
                     .load(core::sync::atomic::Ordering::Relaxed);
@@ -2902,7 +2902,7 @@ mod app {
                 let max_counts = tmc_state()
                     .position_lead_max_counts
                     .load(core::sync::atomic::Ordering::Relaxed);
-                let lead_counts = if reset {
+                let lead_counts = if !position_lead_active || reset || interval == 0 {
                     0
                 } else {
                     foci_firmware::tmc::compute_position_lead_counts(
@@ -2917,30 +2917,37 @@ mod app {
                     .step_width_value
                     .load(core::sync::atomic::Ordering::Relaxed);
                 if step_width > 0 {
-                    let step_position = stepper_state()
-                        .position
-                        .load(core::sync::atomic::Ordering::Relaxed);
-                    let target_steps = step_position.wrapping_add(lead_counts as i32);
-                    let target = target_steps.wrapping_mul(step_width);
-                    let _ = tmc
-                        .write_register(foci_tmc4671::registers::PID_POSITION_TARGET, target as u32)
-                        .await;
-                }
-            } else if position_lead_was_active && motor_enabled && commission_engine.is_none() {
-                let step_width = tmc_state()
-                    .step_width_value
-                    .load(core::sync::atomic::Ordering::Relaxed);
-                if step_width > 0 {
-                    let step_position = stepper_state()
-                        .position
-                        .load(core::sync::atomic::Ordering::Relaxed);
-                    let target = step_position.wrapping_mul(step_width);
-                    let _ = tmc
-                        .write_register(foci_tmc4671::registers::PID_POSITION_TARGET, target as u32)
-                        .await;
+                    match tmc
+                        .read_register(foci_tmc4671::registers::PID_POSITION_TARGET)
+                        .await
+                    {
+                        Ok(current_target) => {
+                            let (target, applied_scaled) =
+                                foci_firmware::tmc::compute_position_lead_target(
+                                    current_target,
+                                    position_lead_applied_scaled,
+                                    lead_counts,
+                                    step_width as u32,
+                                );
+                            if applied_scaled != position_lead_applied_scaled {
+                                if tmc
+                                    .write_register(
+                                        foci_tmc4671::registers::PID_POSITION_TARGET,
+                                        target,
+                                    )
+                                    .await
+                                    .is_ok()
+                                {
+                                    position_lead_applied_scaled = applied_scaled;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            defmt::warn!("position lead: PID_POSITION_TARGET read failed");
+                        }
+                    }
                 }
             }
-            position_lead_was_active = position_lead_active;
 
             // Trace capture: read registers and store sample.
             // Deadline = tick start + 1ms. Budget check inside ensures
