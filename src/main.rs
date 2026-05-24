@@ -84,6 +84,7 @@ mod app {
     const HOLD_SETTLE_DELAY_MS: u8 = 100;
     const CURRENT_STEP_TORQUE_MODE: u32 = 0x8000_0001;
     const CURRENT_STEP_POSITION_MODE: u32 = 0x8000_0003;
+    const CURRENT_STEP_OPEN_LOOP_VOLTAGE_MODE: u32 = 0x0000_0008;
     const CURRENT_STEP_SETTLE_MS: u64 = 20;
     const CURRENT_STEP_STATUS_NOT_READY: u8 = 1;
     const CURRENT_STEP_STATUS_SPI: u8 = 2;
@@ -107,6 +108,75 @@ mod app {
         encoder_after: u32,
         encoder_delta: i32,
         adc_vm_raw: u16,
+    }
+
+    struct CurrentTorqueSampleReport {
+        oid: u8,
+        status: u8,
+        target: i16,
+        flux_target: i16,
+        sample_delay_ms: u16,
+        voltage_limit: u16,
+        torque_before: i16,
+        torque_sample: i16,
+        torque_after: i16,
+        flux_sample: i16,
+        iq_sample: i16,
+        id_sample: i16,
+        uq_limited: i16,
+        ud_limited: i16,
+        encoder_before: u32,
+        encoder_sample: u32,
+        encoder_after: u32,
+        encoder_delta_sample: i32,
+        encoder_delta_after: i32,
+        adc_vm_raw: u16,
+        pidin_target_torque: i32,
+        pidin_target_flux: i32,
+        pidout_target_torque: i32,
+        pidout_target_flux: i32,
+        pid_torque_target_monitor: i16,
+        torque_error: i32,
+        flux_error: i32,
+        torque_error_sum: i32,
+        flux_error_sum: i32,
+        uq_prelimit: i16,
+        ud_prelimit: i16,
+        ff_velocity: i32,
+        ff_torque: i16,
+        status_flags: u32,
+    }
+
+    struct VoltageStepReport {
+        oid: u8,
+        status: u8,
+        uq_ext: i16,
+        ud_ext: i16,
+        sample_delay_ms: u16,
+        torque_before: i16,
+        torque_sample: i16,
+        torque_after: i16,
+        flux_sample: i16,
+        iq_sample: i16,
+        id_sample: i16,
+        uq_limited: i16,
+        ud_limited: i16,
+        uux_sample: i16,
+        uwy_sample: i16,
+        pwm_ux_sample: i16,
+        pwm_wy_sample: i16,
+        pwm_sv_chop: u32,
+        pwm_bbm: u32,
+        pwm_maxcnt: u32,
+        phi_e_sample: i16,
+        phi_m_sample: i16,
+        encoder_before: u32,
+        encoder_sample: u32,
+        encoder_after: u32,
+        encoder_delta_sample: i32,
+        encoder_delta_after: i32,
+        adc_vm_raw: u16,
+        status_flags: u32,
     }
 
     fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
@@ -204,6 +274,185 @@ mod app {
         } else {
             current_step_reply(report);
         }
+    }
+
+    fn current_torque_sample_reply(report: CurrentTorqueSampleReport) {
+        ::ankyra::klipper_reply_from!(
+            &mut crate::_ankyra_config::Sender,
+            foci_firmware::ankyra::replies::FociCurrentTorqueSampleResult,
+            oid: u8 = report.oid,
+            status: u8 = report.status,
+            target: i16 = report.target,
+            flux_target: i16 = report.flux_target,
+            sample_delay_ms: u16 = report.sample_delay_ms,
+            voltage_limit: u16 = report.voltage_limit,
+            torque_before: i16 = report.torque_before,
+            torque_sample: i16 = report.torque_sample,
+            torque_after: i16 = report.torque_after,
+            flux_sample: i16 = report.flux_sample,
+            iq_sample: i16 = report.iq_sample,
+            id_sample: i16 = report.id_sample,
+            uq_limited: i16 = report.uq_limited,
+            ud_limited: i16 = report.ud_limited,
+            encoder_before: u32 = report.encoder_before,
+            encoder_sample: u32 = report.encoder_sample,
+            encoder_after: u32 = report.encoder_after,
+            encoder_delta_sample: i32 = report.encoder_delta_sample,
+            encoder_delta_after: i32 = report.encoder_delta_after,
+            adc_vm_raw: u16 = report.adc_vm_raw,
+            pidin_target_torque: i32 = report.pidin_target_torque,
+            pidin_target_flux: i32 = report.pidin_target_flux,
+            pidout_target_torque: i32 = report.pidout_target_torque,
+            pidout_target_flux: i32 = report.pidout_target_flux,
+            pid_torque_target_monitor: i16 = report.pid_torque_target_monitor,
+            status_flags: u32 = report.status_flags,
+        );
+    }
+
+    fn current_torque_sample_detail_reply(report: &CurrentTorqueSampleReport) {
+        ::ankyra::klipper_reply_from!(
+            &mut crate::_ankyra_config::Sender,
+            foci_firmware::ankyra::replies::FociCurrentTorqueSampleDetailResult,
+            oid: u8 = report.oid,
+            target: i16 = report.target,
+            flux_target: i16 = report.flux_target,
+            sample_delay_ms: u16 = report.sample_delay_ms,
+            voltage_limit: u16 = report.voltage_limit,
+            torque_error: i32 = report.torque_error,
+            flux_error: i32 = report.flux_error,
+            torque_error_sum: i32 = report.torque_error_sum,
+            flux_error_sum: i32 = report.flux_error_sum,
+            uq_prelimit: i16 = report.uq_prelimit,
+            ud_prelimit: i16 = report.ud_prelimit,
+            ff_velocity: i32 = report.ff_velocity,
+            ff_torque: i16 = report.ff_torque,
+        );
+    }
+
+    fn voltage_step_reply(report: VoltageStepReport) {
+        ::ankyra::klipper_reply_from!(
+            &mut crate::_ankyra_config::Sender,
+            foci_firmware::ankyra::replies::FociVoltageStepResult,
+            oid: u8 = report.oid,
+            status: u8 = report.status,
+            uq_ext: i16 = report.uq_ext,
+            ud_ext: i16 = report.ud_ext,
+            sample_delay_ms: u16 = report.sample_delay_ms,
+            torque_before: i16 = report.torque_before,
+            torque_sample: i16 = report.torque_sample,
+            torque_after: i16 = report.torque_after,
+            flux_sample: i16 = report.flux_sample,
+            iq_sample: i16 = report.iq_sample,
+            id_sample: i16 = report.id_sample,
+            uq_limited: i16 = report.uq_limited,
+            ud_limited: i16 = report.ud_limited,
+            uux_sample: i16 = report.uux_sample,
+            uwy_sample: i16 = report.uwy_sample,
+            pwm_ux_sample: i16 = report.pwm_ux_sample,
+            pwm_wy_sample: i16 = report.pwm_wy_sample,
+            pwm_sv_chop: u32 = report.pwm_sv_chop,
+            pwm_bbm: u32 = report.pwm_bbm,
+            pwm_maxcnt: u32 = report.pwm_maxcnt,
+            phi_e_sample: i16 = report.phi_e_sample,
+            phi_m_sample: i16 = report.phi_m_sample,
+            encoder_before: u32 = report.encoder_before,
+            encoder_sample: u32 = report.encoder_sample,
+            encoder_after: u32 = report.encoder_after,
+            encoder_delta_sample: i32 = report.encoder_delta_sample,
+            encoder_delta_after: i32 = report.encoder_delta_after,
+            adc_vm_raw: u16 = report.adc_vm_raw,
+            status_flags: u32 = report.status_flags,
+        );
+    }
+
+    fn empty_current_torque_sample_report(
+        oid: u8,
+        status: u8,
+        target: i16,
+        flux_target: i16,
+        sample_delay_ms: u16,
+        voltage_limit: u16,
+    ) -> CurrentTorqueSampleReport {
+        CurrentTorqueSampleReport {
+            oid,
+            status,
+            target,
+            flux_target,
+            sample_delay_ms,
+            voltage_limit,
+            torque_before: 0,
+            torque_sample: 0,
+            torque_after: 0,
+            flux_sample: 0,
+            iq_sample: 0,
+            id_sample: 0,
+            uq_limited: 0,
+            ud_limited: 0,
+            encoder_before: 0,
+            encoder_sample: 0,
+            encoder_after: 0,
+            encoder_delta_sample: 0,
+            encoder_delta_after: 0,
+            adc_vm_raw: 0,
+            pidin_target_torque: 0,
+            pidin_target_flux: 0,
+            pidout_target_torque: 0,
+            pidout_target_flux: 0,
+            pid_torque_target_monitor: 0,
+            torque_error: 0,
+            flux_error: 0,
+            torque_error_sum: 0,
+            flux_error_sum: 0,
+            uq_prelimit: 0,
+            ud_prelimit: 0,
+            ff_velocity: 0,
+            ff_torque: 0,
+            status_flags: 0,
+        }
+    }
+
+    fn empty_voltage_step_report(
+        oid: u8,
+        status: u8,
+        uq_ext: i16,
+        ud_ext: i16,
+        sample_delay_ms: u16,
+    ) -> VoltageStepReport {
+        VoltageStepReport {
+            oid,
+            status,
+            uq_ext,
+            ud_ext,
+            sample_delay_ms,
+            torque_before: 0,
+            torque_sample: 0,
+            torque_after: 0,
+            flux_sample: 0,
+            iq_sample: 0,
+            id_sample: 0,
+            uq_limited: 0,
+            ud_limited: 0,
+            uux_sample: 0,
+            uwy_sample: 0,
+            pwm_ux_sample: 0,
+            pwm_wy_sample: 0,
+            pwm_sv_chop: 0,
+            pwm_bbm: 0,
+            pwm_maxcnt: 0,
+            phi_e_sample: 0,
+            phi_m_sample: 0,
+            encoder_before: 0,
+            encoder_sample: 0,
+            encoder_after: 0,
+            encoder_delta_sample: 0,
+            encoder_delta_after: 0,
+            adc_vm_raw: 0,
+            status_flags: 0,
+        }
+    }
+
+    fn pack_voltage_ext(uq_ext: i16, ud_ext: i16) -> u32 {
+        (u32::from(uq_ext as u16) << 16) | u32::from(ud_ext as u16)
     }
 
     fn current_step_encoder_delta(before: u32, after: u32, counts_per_rev: u32) -> i32 {
@@ -1533,6 +1782,795 @@ mod app {
                                 adc_vm_raw,
                             },
                         );
+                    }
+                    TmcRequest {
+                        kind:
+                            TmcRequestKind::CurrentTorqueSampleTest {
+                                oid,
+                                target,
+                                flux_target,
+                                sample_delay_ms,
+                                voltage_limit,
+                            },
+                        ..
+                    } => {
+                        let homing_active =
+                            HOMING_STATE.load(core::sync::atomic::Ordering::Relaxed) != 0;
+                        let stepper_active = stepper_state()
+                            .timer_active_mirror
+                            .load(core::sync::atomic::Ordering::Relaxed);
+                        if !motor_enabled || !calibrated || homing_active || stepper_active {
+                            current_torque_sample_reply(empty_current_torque_sample_report(
+                                oid,
+                                CURRENT_STEP_STATUS_NOT_READY,
+                                target,
+                                flux_target,
+                                sample_delay_ms,
+                                voltage_limit,
+                            ));
+                            continue;
+                        }
+
+                        let saved_mode = match tmc
+                            .read_register(foci_tmc4671::registers::MODE_RAMP_MODE_MOTION)
+                            .await
+                        {
+                            Ok(value) => value,
+                            Err(_) => {
+                                current_torque_sample_reply(empty_current_torque_sample_report(
+                                    oid,
+                                    CURRENT_STEP_STATUS_SPI,
+                                    target,
+                                    flux_target,
+                                    sample_delay_ms,
+                                    voltage_limit,
+                                ));
+                                continue;
+                            }
+                        };
+                        let saved_voltage_limit = tmc_state()
+                            .voltage_limit_cfg
+                            .load(core::sync::atomic::Ordering::Relaxed);
+                        let position_actual = match tmc
+                            .read_register(foci_tmc4671::registers::PID_POSITION_ACTUAL)
+                            .await
+                        {
+                            Ok(value) => value,
+                            Err(_) => {
+                                current_torque_sample_reply(empty_current_torque_sample_report(
+                                    oid,
+                                    CURRENT_STEP_STATUS_SPI,
+                                    target,
+                                    flux_target,
+                                    sample_delay_ms,
+                                    voltage_limit,
+                                ));
+                                continue;
+                            }
+                        };
+
+                        let mut status = 0u8;
+                        let mut torque_before = 0i16;
+                        let mut torque_sample = 0i16;
+                        let mut torque_after = 0i16;
+                        let mut flux_sample = 0i16;
+                        let mut iq_sample = 0i16;
+                        let mut id_sample = 0i16;
+                        let mut uq_limited = 0i16;
+                        let mut ud_limited = 0i16;
+                        let mut encoder_before = 0u32;
+                        let mut encoder_sample = 0u32;
+                        let mut encoder_after = 0u32;
+                        let mut encoder_delta_sample = 0i32;
+                        let mut encoder_delta_after = 0i32;
+                        let mut adc_vm_raw = 0u16;
+                        let mut pidin_target_torque = 0i32;
+                        let mut pidin_target_flux = 0i32;
+                        let mut pidout_target_torque = 0i32;
+                        let mut pidout_target_flux = 0i32;
+                        let mut pid_torque_target_monitor = 0i16;
+                        let mut torque_error = 0i32;
+                        let mut flux_error = 0i32;
+                        let mut torque_error_sum = 0i32;
+                        let mut flux_error_sum = 0i32;
+                        let mut uq_prelimit = 0i16;
+                        let mut ud_prelimit = 0i16;
+                        let mut ff_velocity = 0i32;
+                        let mut ff_torque = 0i16;
+                        let mut status_flags = 0u32;
+
+                        let result: Result<(), ()> = async {
+                            use foci_tmc4671::registers::*;
+
+                            tmc.write_register(PID_TORQUE_FLUX_TARGET, 0)
+                                .await
+                                .map_err(|_| ())?;
+                            tmc.write_register(PIDOUT_UQ_UD_LIMITS, voltage_limit as u32)
+                                .await
+                                .map_err(|_| ())?;
+                            clear_current_step_integrators(tmc).await?;
+                            tmc.write_register(STATUS_FLAGS, 0).await.map_err(|_| ())?;
+                            tmc.write_register(MODE_RAMP_MODE_MOTION, CURRENT_STEP_TORQUE_MODE)
+                                .await
+                                .map_err(|_| ())?;
+
+                            Mono::delay(CURRENT_STEP_SETTLE_MS.millis()).await;
+
+                            encoder_before =
+                                tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
+                            let encoder_counts_per_rev =
+                                tmc.read_register(ABN_DECODER_PPR).await.map_err(|_| ())?;
+
+                            let before = tmc
+                                .read_register(PID_TORQUE_FLUX_ACTUAL)
+                                .await
+                                .map_err(|_| ())?;
+                            torque_before = foci_firmware::tmc::decode_signed_upper_half(before);
+
+                            let target_reg =
+                                foci_firmware::tmc::pack_torque_flux_target(target, flux_target);
+                            tmc.write_register(PID_TORQUE_FLUX_TARGET, target_reg)
+                                .await
+                                .map_err(|_| ())?;
+                            Mono::delay((sample_delay_ms as u64).millis()).await;
+
+                            pidin_target_torque =
+                                tmc.read_sub_register(INTERIM_PIDIN_TARGET_TORQUE)
+                                    .await
+                                    .map_err(|_| ())? as i32;
+                            pidin_target_flux =
+                                tmc.read_sub_register(INTERIM_PIDIN_TARGET_FLUX)
+                                    .await
+                                    .map_err(|_| ())? as i32;
+                            pidout_target_torque =
+                                tmc.read_sub_register(INTERIM_PIDOUT_TARGET_TORQUE)
+                                    .await
+                                    .map_err(|_| ())? as i32;
+                            pidout_target_flux =
+                                tmc.read_sub_register(INTERIM_PIDOUT_TARGET_FLUX)
+                                    .await
+                                    .map_err(|_| ())? as i32;
+                            let torque_target_actual = tmc
+                                .read_sub_register(INTERIM_PID_TORQUE_TARGET_TORQUE_ACTUAL)
+                                .await
+                                .map_err(|_| ())?;
+                            pid_torque_target_monitor =
+                                foci_firmware::tmc::decode_signed_upper_half(torque_target_actual);
+                            torque_error = tmc
+                                .read_sub_register(PID_ERROR_PID_TORQUE_ERROR)
+                                .await
+                                .map_err(|_| ())? as i32;
+                            flux_error = tmc
+                                .read_sub_register(PID_ERROR_PID_FLUX_ERROR)
+                                .await
+                                .map_err(|_| ())? as i32;
+                            torque_error_sum =
+                                tmc.read_sub_register(PID_ERROR_PID_TORQUE_ERROR_SUM)
+                                    .await
+                                    .map_err(|_| ())? as i32;
+                            flux_error_sum =
+                                tmc.read_sub_register(PID_ERROR_PID_FLUX_ERROR_SUM)
+                                    .await
+                                    .map_err(|_| ())? as i32;
+                            status_flags = tmc.read_register(STATUS_FLAGS).await.map_err(|_| ())?;
+
+                            encoder_sample =
+                                tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
+                            encoder_delta_sample = current_step_encoder_delta(
+                                encoder_before,
+                                encoder_sample,
+                                encoder_counts_per_rev,
+                            );
+
+                            let actual = tmc
+                                .read_register(PID_TORQUE_FLUX_ACTUAL)
+                                .await
+                                .map_err(|_| ())?;
+                            let (torque, flux) = split_signed_halves(actual);
+                            torque_sample = torque;
+                            flux_sample = flux;
+
+                            let iq_id = tmc
+                                .read_sub_register(INTERIM_FOC_IQ_ID)
+                                .await
+                                .map_err(|_| ())?;
+                            let (iq, id) = split_signed_halves(iq_id);
+                            iq_sample = iq;
+                            id_sample = id;
+
+                            let uq_ud_prelimit = tmc
+                                .read_sub_register(INTERIM_FOC_UQ_UD)
+                                .await
+                                .map_err(|_| ())?;
+                            let (uq, ud) = split_signed_halves(uq_ud_prelimit);
+                            uq_prelimit = uq;
+                            ud_prelimit = ud;
+                            ff_velocity = tmc
+                                .read_sub_register(INTERIM_FF_VELOCITY)
+                                .await
+                                .map_err(|_| ())? as i32;
+                            ff_torque = tmc
+                                .read_sub_register(INTERIM_FF_TORQUE)
+                                .await
+                                .map_err(|_| ())? as i16;
+
+                            let uq_ud = tmc
+                                .read_sub_register(INTERIM_FOC_UQ_UD_LIMITED)
+                                .await
+                                .map_err(|_| ())?;
+                            let (uq, ud) = split_signed_halves(uq_ud);
+                            uq_limited = uq;
+                            ud_limited = ud;
+
+                            // TMC4671-LA Rev 1, 02/2024, ADC_RAW_DATA 0x02 selected by
+                            // ADC_RAW_ADDR 0x03: selector 1 packs ADC_AGPI_A_RAW in
+                            // bits 31:16 and ADC_VM_RAW in bits 15:0.
+                            adc_vm_raw = tmc
+                                .read_sub_register(ADC_AGPI_A_RAW_ADC_VM_RAW)
+                                .await
+                                .map_err(|_| ())? as u16;
+
+                            tmc.write_register(PID_TORQUE_FLUX_TARGET, 0)
+                                .await
+                                .map_err(|_| ())?;
+                            Mono::delay(CURRENT_STEP_SETTLE_MS.millis()).await;
+
+                            encoder_after =
+                                tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
+                            encoder_delta_after = current_step_encoder_delta(
+                                encoder_before,
+                                encoder_after,
+                                encoder_counts_per_rev,
+                            );
+
+                            let after = tmc
+                                .read_register(PID_TORQUE_FLUX_ACTUAL)
+                                .await
+                                .map_err(|_| ())?;
+                            torque_after = foci_firmware::tmc::decode_signed_upper_half(after);
+                            Ok(())
+                        }
+                        .await;
+
+                        if result.is_err() {
+                            status = CURRENT_STEP_STATUS_SPI;
+                        }
+
+                        let _ = tmc
+                            .write_register(foci_tmc4671::registers::PID_TORQUE_FLUX_TARGET, 0)
+                            .await;
+                        let _ = tmc
+                            .write_register(
+                                foci_tmc4671::registers::PIDOUT_UQ_UD_LIMITS,
+                                saved_voltage_limit,
+                            )
+                            .await;
+                        let _ = tmc
+                            .write_register(
+                                foci_tmc4671::registers::PID_POSITION_TARGET,
+                                position_actual,
+                            )
+                            .await;
+                        let restore_mode = if saved_mode == 0 {
+                            CURRENT_STEP_POSITION_MODE
+                        } else {
+                            saved_mode
+                        };
+                        let _ = tmc
+                            .write_register(
+                                foci_tmc4671::registers::MODE_RAMP_MODE_MOTION,
+                                restore_mode,
+                            )
+                            .await;
+
+                        let report = CurrentTorqueSampleReport {
+                            oid,
+                            status,
+                            target,
+                            flux_target,
+                            sample_delay_ms,
+                            voltage_limit,
+                            torque_before,
+                            torque_sample,
+                            torque_after,
+                            flux_sample,
+                            iq_sample,
+                            id_sample,
+                            uq_limited,
+                            ud_limited,
+                            encoder_before,
+                            encoder_sample,
+                            encoder_after,
+                            encoder_delta_sample,
+                            encoder_delta_after,
+                            adc_vm_raw,
+                            pidin_target_torque,
+                            pidin_target_flux,
+                            pidout_target_torque,
+                            pidout_target_flux,
+                            pid_torque_target_monitor,
+                            torque_error,
+                            flux_error,
+                            torque_error_sum,
+                            flux_error_sum,
+                            uq_prelimit,
+                            ud_prelimit,
+                            ff_velocity,
+                            ff_torque,
+                            status_flags,
+                        };
+                        if status == 0 {
+                            current_torque_sample_detail_reply(&report);
+                        }
+                        current_torque_sample_reply(report);
+                    }
+                    TmcRequest {
+                        kind:
+                            TmcRequestKind::PositionTorqueOffsetSampleTest {
+                                oid,
+                                target,
+                                sample_delay_ms,
+                                voltage_limit,
+                            },
+                        ..
+                    } => {
+                        let homing_active =
+                            HOMING_STATE.load(core::sync::atomic::Ordering::Relaxed) != 0;
+                        let stepper_active = stepper_state()
+                            .timer_active_mirror
+                            .load(core::sync::atomic::Ordering::Relaxed);
+                        if !motor_enabled || !calibrated || homing_active || stepper_active {
+                            current_torque_sample_reply(empty_current_torque_sample_report(
+                                oid,
+                                CURRENT_STEP_STATUS_NOT_READY,
+                                target,
+                                0,
+                                sample_delay_ms,
+                                voltage_limit,
+                            ));
+                            continue;
+                        }
+
+                        let saved_mode = match tmc
+                            .read_register(foci_tmc4671::registers::MODE_RAMP_MODE_MOTION)
+                            .await
+                        {
+                            Ok(value) => value,
+                            Err(_) => {
+                                current_torque_sample_reply(empty_current_torque_sample_report(
+                                    oid,
+                                    CURRENT_STEP_STATUS_SPI,
+                                    target,
+                                    0,
+                                    sample_delay_ms,
+                                    voltage_limit,
+                                ));
+                                continue;
+                            }
+                        };
+                        if saved_mode != CURRENT_STEP_POSITION_MODE {
+                            current_torque_sample_reply(empty_current_torque_sample_report(
+                                oid,
+                                CURRENT_STEP_STATUS_NOT_READY,
+                                target,
+                                0,
+                                sample_delay_ms,
+                                voltage_limit,
+                            ));
+                            continue;
+                        }
+
+                        let saved_voltage_limit = tmc_state()
+                            .voltage_limit_cfg
+                            .load(core::sync::atomic::Ordering::Relaxed);
+                        let saved_offset = match tmc
+                            .read_register(foci_tmc4671::registers::PID_TORQUE_FLUX_OFFSET)
+                            .await
+                        {
+                            Ok(value) => value,
+                            Err(_) => {
+                                current_torque_sample_reply(empty_current_torque_sample_report(
+                                    oid,
+                                    CURRENT_STEP_STATUS_SPI,
+                                    target,
+                                    0,
+                                    sample_delay_ms,
+                                    voltage_limit,
+                                ));
+                                continue;
+                            }
+                        };
+
+                        let mut report = empty_current_torque_sample_report(
+                            oid,
+                            0,
+                            target,
+                            0,
+                            sample_delay_ms,
+                            voltage_limit,
+                        );
+
+                        let result: Result<(), ()> = async {
+                            use foci_tmc4671::registers::*;
+
+                            tmc.write_register(PIDOUT_UQ_UD_LIMITS, voltage_limit as u32)
+                                .await
+                                .map_err(|_| ())?;
+                            tmc.write_register(STATUS_FLAGS, 0).await.map_err(|_| ())?;
+
+                            report.encoder_before =
+                                tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
+                            let encoder_counts_per_rev =
+                                tmc.read_register(ABN_DECODER_PPR).await.map_err(|_| ())?;
+
+                            let before = tmc
+                                .read_register(PID_TORQUE_FLUX_ACTUAL)
+                                .await
+                                .map_err(|_| ())?;
+                            report.torque_before =
+                                foci_firmware::tmc::decode_signed_upper_half(before);
+
+                            let offset_reg = u32::from(target as u16) << 16;
+                            tmc.write_register(PID_TORQUE_FLUX_OFFSET, offset_reg)
+                                .await
+                                .map_err(|_| ())?;
+                            Mono::delay((sample_delay_ms as u64).millis()).await;
+
+                            report.pidin_target_torque =
+                                tmc.read_sub_register(INTERIM_PIDIN_TARGET_TORQUE)
+                                    .await
+                                    .map_err(|_| ())? as i32;
+                            report.pidin_target_flux =
+                                tmc.read_sub_register(INTERIM_PIDIN_TARGET_FLUX)
+                                    .await
+                                    .map_err(|_| ())? as i32;
+                            report.pidout_target_torque =
+                                tmc.read_sub_register(INTERIM_PIDOUT_TARGET_TORQUE)
+                                    .await
+                                    .map_err(|_| ())? as i32;
+                            report.pidout_target_flux =
+                                tmc.read_sub_register(INTERIM_PIDOUT_TARGET_FLUX)
+                                    .await
+                                    .map_err(|_| ())? as i32;
+                            let torque_target_actual = tmc
+                                .read_sub_register(INTERIM_PID_TORQUE_TARGET_TORQUE_ACTUAL)
+                                .await
+                                .map_err(|_| ())?;
+                            report.pid_torque_target_monitor =
+                                foci_firmware::tmc::decode_signed_upper_half(torque_target_actual);
+                            report.torque_error =
+                                tmc.read_sub_register(PID_ERROR_PID_TORQUE_ERROR)
+                                    .await
+                                    .map_err(|_| ())? as i32;
+                            report.flux_error =
+                                tmc.read_sub_register(PID_ERROR_PID_FLUX_ERROR)
+                                    .await
+                                    .map_err(|_| ())? as i32;
+                            report.torque_error_sum =
+                                tmc.read_sub_register(PID_ERROR_PID_TORQUE_ERROR_SUM)
+                                    .await
+                                    .map_err(|_| ())? as i32;
+                            report.flux_error_sum =
+                                tmc.read_sub_register(PID_ERROR_PID_FLUX_ERROR_SUM)
+                                    .await
+                                    .map_err(|_| ())? as i32;
+                            report.status_flags =
+                                tmc.read_register(STATUS_FLAGS).await.map_err(|_| ())?;
+
+                            report.encoder_sample =
+                                tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
+                            report.encoder_delta_sample = current_step_encoder_delta(
+                                report.encoder_before,
+                                report.encoder_sample,
+                                encoder_counts_per_rev,
+                            );
+
+                            let actual = tmc
+                                .read_register(PID_TORQUE_FLUX_ACTUAL)
+                                .await
+                                .map_err(|_| ())?;
+                            let (torque, flux) = split_signed_halves(actual);
+                            report.torque_sample = torque;
+                            report.flux_sample = flux;
+
+                            let iq_id = tmc
+                                .read_sub_register(INTERIM_FOC_IQ_ID)
+                                .await
+                                .map_err(|_| ())?;
+                            let (iq, id) = split_signed_halves(iq_id);
+                            report.iq_sample = iq;
+                            report.id_sample = id;
+
+                            let uq_ud_prelimit = tmc
+                                .read_sub_register(INTERIM_FOC_UQ_UD)
+                                .await
+                                .map_err(|_| ())?;
+                            let (uq, ud) = split_signed_halves(uq_ud_prelimit);
+                            report.uq_prelimit = uq;
+                            report.ud_prelimit = ud;
+                            report.ff_velocity =
+                                tmc.read_sub_register(INTERIM_FF_VELOCITY)
+                                    .await
+                                    .map_err(|_| ())? as i32;
+                            report.ff_torque =
+                                tmc.read_sub_register(INTERIM_FF_TORQUE)
+                                    .await
+                                    .map_err(|_| ())? as i16;
+
+                            let uq_ud = tmc
+                                .read_sub_register(INTERIM_FOC_UQ_UD_LIMITED)
+                                .await
+                                .map_err(|_| ())?;
+                            let (uq, ud) = split_signed_halves(uq_ud);
+                            report.uq_limited = uq;
+                            report.ud_limited = ud;
+
+                            // TMC4671-LA Rev 1, 02/2024, ADC_RAW_DATA 0x02 selected by
+                            // ADC_RAW_ADDR 0x03: selector 1 packs ADC_AGPI_A_RAW in
+                            // bits 31:16 and ADC_VM_RAW in bits 15:0.
+                            report.adc_vm_raw =
+                                tmc.read_sub_register(ADC_AGPI_A_RAW_ADC_VM_RAW)
+                                    .await
+                                    .map_err(|_| ())? as u16;
+
+                            tmc.write_register(PID_TORQUE_FLUX_OFFSET, saved_offset)
+                                .await
+                                .map_err(|_| ())?;
+                            Mono::delay(CURRENT_STEP_SETTLE_MS.millis()).await;
+
+                            report.encoder_after =
+                                tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
+                            report.encoder_delta_after = current_step_encoder_delta(
+                                report.encoder_before,
+                                report.encoder_after,
+                                encoder_counts_per_rev,
+                            );
+
+                            let after = tmc
+                                .read_register(PID_TORQUE_FLUX_ACTUAL)
+                                .await
+                                .map_err(|_| ())?;
+                            report.torque_after =
+                                foci_firmware::tmc::decode_signed_upper_half(after);
+                            Ok(())
+                        }
+                        .await;
+
+                        if result.is_err() {
+                            report.status = CURRENT_STEP_STATUS_SPI;
+                        }
+
+                        let _ = tmc
+                            .write_register(
+                                foci_tmc4671::registers::PID_TORQUE_FLUX_OFFSET,
+                                saved_offset,
+                            )
+                            .await;
+                        let _ = tmc
+                            .write_register(
+                                foci_tmc4671::registers::PIDOUT_UQ_UD_LIMITS,
+                                saved_voltage_limit,
+                            )
+                            .await;
+                        let _ = tmc
+                            .write_register(
+                                foci_tmc4671::registers::MODE_RAMP_MODE_MOTION,
+                                saved_mode,
+                            )
+                            .await;
+
+                        if report.status == 0 {
+                            current_torque_sample_detail_reply(&report);
+                        }
+                        current_torque_sample_reply(report);
+                    }
+                    TmcRequest {
+                        kind:
+                            TmcRequestKind::VoltageStepTest {
+                                oid,
+                                uq_ext,
+                                ud_ext,
+                                sample_delay_ms,
+                            },
+                        ..
+                    } => {
+                        let homing_active =
+                            HOMING_STATE.load(core::sync::atomic::Ordering::Relaxed) != 0;
+                        let stepper_active = stepper_state()
+                            .timer_active_mirror
+                            .load(core::sync::atomic::Ordering::Relaxed);
+                        if !motor_enabled || !calibrated || homing_active || stepper_active {
+                            voltage_step_reply(empty_voltage_step_report(
+                                oid,
+                                CURRENT_STEP_STATUS_NOT_READY,
+                                uq_ext,
+                                ud_ext,
+                                sample_delay_ms,
+                            ));
+                            continue;
+                        }
+
+                        let saved_mode = match tmc
+                            .read_register(foci_tmc4671::registers::MODE_RAMP_MODE_MOTION)
+                            .await
+                        {
+                            Ok(value) => value,
+                            Err(_) => {
+                                voltage_step_reply(empty_voltage_step_report(
+                                    oid,
+                                    CURRENT_STEP_STATUS_SPI,
+                                    uq_ext,
+                                    ud_ext,
+                                    sample_delay_ms,
+                                ));
+                                continue;
+                            }
+                        };
+                        if saved_mode != CURRENT_STEP_POSITION_MODE {
+                            voltage_step_reply(empty_voltage_step_report(
+                                oid,
+                                CURRENT_STEP_STATUS_NOT_READY,
+                                uq_ext,
+                                ud_ext,
+                                sample_delay_ms,
+                            ));
+                            continue;
+                        }
+
+                        let mut report =
+                            empty_voltage_step_report(oid, 0, uq_ext, ud_ext, sample_delay_ms);
+
+                        let result: Result<(), ()> = async {
+                            use foci_tmc4671::registers::*;
+
+                            report.encoder_before =
+                                tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
+                            let encoder_counts_per_rev =
+                                tmc.read_register(ABN_DECODER_PPR).await.map_err(|_| ())?;
+
+                            let before = tmc
+                                .read_register(PID_TORQUE_FLUX_ACTUAL)
+                                .await
+                                .map_err(|_| ())?;
+                            report.torque_before =
+                                foci_firmware::tmc::decode_signed_upper_half(before);
+
+                            tmc.write_register(STATUS_FLAGS, 0).await.map_err(|_| ())?;
+                            tmc.write_register(UQ_UD_EXT, pack_voltage_ext(uq_ext, ud_ext))
+                                .await
+                                .map_err(|_| ())?;
+                            tmc.write_register(
+                                MODE_RAMP_MODE_MOTION,
+                                CURRENT_STEP_OPEN_LOOP_VOLTAGE_MODE,
+                            )
+                            .await
+                            .map_err(|_| ())?;
+
+                            Mono::delay((sample_delay_ms as u64).millis()).await;
+
+                            report.encoder_sample =
+                                tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
+                            report.encoder_delta_sample = current_step_encoder_delta(
+                                report.encoder_before,
+                                report.encoder_sample,
+                                encoder_counts_per_rev,
+                            );
+
+                            let actual = tmc
+                                .read_register(PID_TORQUE_FLUX_ACTUAL)
+                                .await
+                                .map_err(|_| ())?;
+                            let (torque, flux) = split_signed_halves(actual);
+                            report.torque_sample = torque;
+                            report.flux_sample = flux;
+
+                            let iq_id = tmc
+                                .read_sub_register(INTERIM_FOC_IQ_ID)
+                                .await
+                                .map_err(|_| ())?;
+                            let (iq, id) = split_signed_halves(iq_id);
+                            report.iq_sample = iq;
+                            report.id_sample = id;
+
+                            let uq_ud = tmc
+                                .read_sub_register(INTERIM_FOC_UQ_UD_LIMITED)
+                                .await
+                                .map_err(|_| ())?;
+                            let (uq, ud) = split_signed_halves(uq_ud);
+                            report.uq_limited = uq;
+                            report.ud_limited = ud;
+
+                            // TMC4671-LA Rev 1, 02/2024, INTERIM_DATA selector 15 packs
+                            // FOC_UWY in bits 31:16 and FOC_UUX in bits 15:0.
+                            let uwy_uux = tmc
+                                .read_sub_register(INTERIM_FOC_UWY_UUX)
+                                .await
+                                .map_err(|_| ())?;
+                            let (uwy, uux) = split_signed_halves(uwy_uux);
+                            report.uwy_sample = uwy;
+                            report.uux_sample = uux;
+
+                            // INTERIM_DATA selector 17 packs PWM_WY in bits 31:16 and
+                            // PWM_UX in bits 15:0.
+                            let pwm_wy_ux = tmc
+                                .read_sub_register(INTERIM_PWM_WY_UX)
+                                .await
+                                .map_err(|_| ())?;
+                            let (pwm_wy, pwm_ux) = split_signed_halves(pwm_wy_ux);
+                            report.pwm_wy_sample = pwm_wy;
+                            report.pwm_ux_sample = pwm_ux;
+
+                            report.pwm_sv_chop =
+                                tmc.read_register(PWM_SV_CHOP).await.map_err(|_| ())?;
+                            report.pwm_bbm =
+                                tmc.read_register(PWM_BBM_H_BBM_L).await.map_err(|_| ())?;
+                            report.pwm_maxcnt =
+                                tmc.read_register(PWM_MAXCNT).await.map_err(|_| ())?;
+
+                            // ABN_DECODER_PHI_E_PHI_M packs PHI_E in bits 31:16 and
+                            // PHI_M in bits 15:0.
+                            let phi_e_phi_m = tmc
+                                .read_register(ABN_DECODER_PHI_E_PHI_M)
+                                .await
+                                .map_err(|_| ())?;
+                            let (phi_e, phi_m) = split_signed_halves(phi_e_phi_m);
+                            report.phi_e_sample = phi_e;
+                            report.phi_m_sample = phi_m;
+
+                            // TMC4671-LA Rev 1, 02/2024, ADC_RAW_DATA 0x02 selected by
+                            // ADC_RAW_ADDR 0x03: selector 1 packs ADC_AGPI_A_RAW in
+                            // bits 31:16 and ADC_VM_RAW in bits 15:0.
+                            report.adc_vm_raw =
+                                tmc.read_sub_register(ADC_AGPI_A_RAW_ADC_VM_RAW)
+                                    .await
+                                    .map_err(|_| ())? as u16;
+                            report.status_flags =
+                                tmc.read_register(STATUS_FLAGS).await.map_err(|_| ())?;
+
+                            tmc.write_register(MODE_RAMP_MODE_MOTION, 0)
+                                .await
+                                .map_err(|_| ())?;
+                            tmc.write_register(UQ_UD_EXT, 0).await.map_err(|_| ())?;
+                            tmc.write_register(MODE_RAMP_MODE_MOTION, saved_mode)
+                                .await
+                                .map_err(|_| ())?;
+                            Mono::delay(CURRENT_STEP_SETTLE_MS.millis()).await;
+
+                            report.encoder_after =
+                                tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
+                            report.encoder_delta_after = current_step_encoder_delta(
+                                report.encoder_before,
+                                report.encoder_after,
+                                encoder_counts_per_rev,
+                            );
+
+                            let after = tmc
+                                .read_register(PID_TORQUE_FLUX_ACTUAL)
+                                .await
+                                .map_err(|_| ())?;
+                            report.torque_after =
+                                foci_firmware::tmc::decode_signed_upper_half(after);
+                            Ok(())
+                        }
+                        .await;
+
+                        if result.is_err() {
+                            report.status = CURRENT_STEP_STATUS_SPI;
+                            let _ = tmc
+                                .write_register(foci_tmc4671::registers::MODE_RAMP_MODE_MOTION, 0)
+                                .await;
+                            let _ = tmc
+                                .write_register(foci_tmc4671::registers::UQ_UD_EXT, 0)
+                                .await;
+                            let _ = tmc
+                                .write_register(
+                                    foci_tmc4671::registers::MODE_RAMP_MODE_MOTION,
+                                    saved_mode,
+                                )
+                                .await;
+                        }
+
+                        voltage_step_reply(report);
                     }
                     req @ TmcRequest {
                         kind: TmcRequestKind::SetEncoder { .. },

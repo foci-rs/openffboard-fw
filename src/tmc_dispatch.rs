@@ -83,6 +83,15 @@ pub(crate) async fn handle_tmc_request(
         TmcRequestKind::CurrentVectorStepTest { .. } => {
             defmt::warn!("handle_tmc_request: CurrentVectorStepTest handled by main loop");
         }
+        TmcRequestKind::CurrentTorqueSampleTest { .. } => {
+            defmt::warn!("handle_tmc_request: CurrentTorqueSampleTest handled by main loop");
+        }
+        TmcRequestKind::PositionTorqueOffsetSampleTest { .. } => {
+            defmt::warn!("handle_tmc_request: PositionTorqueOffsetSampleTest handled by main loop");
+        }
+        TmcRequestKind::VoltageStepTest { .. } => {
+            defmt::warn!("handle_tmc_request: VoltageStepTest handled by main loop");
+        }
         TmcRequestKind::SelfTest { .. } => {
             defmt::warn!("handle_tmc_request: SelfTest handled by main loop");
         }
