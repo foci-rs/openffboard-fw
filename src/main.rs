@@ -866,6 +866,7 @@ mod app {
         // can zero offset registers on the deactivation edge.
         let mut feedforward_was_active = false;
         let mut accel_feedforward_was_active = false;
+        let mut position_lead_was_active = false;
         let mut pid_error_clear_countdown_ms: u8 = 0;
 
         // Main loop: wait for channel message or 1ms timeout.
@@ -1318,6 +1319,24 @@ mod app {
                         );
                         // Feedforward flag is already set by the atomic in the
                         // command handler; this arm exists for exhaustiveness.
+                    }
+                    TmcRequest {
+                        kind:
+                            TmcRequestKind::SetPositionLead {
+                                enable,
+                                gain_permille,
+                                max_counts,
+                            },
+                        ..
+                    } => {
+                        defmt::info!(
+                            "Position lead: {} gain_permille={} max_counts={} (via queue)",
+                            enable,
+                            gain_permille,
+                            max_counts
+                        );
+                        // Position-lead atomics are set by the command handler;
+                        // this arm exists for exhaustiveness.
                     }
                     TmcRequest {
                         kind: TmcRequestKind::Commission { oid, profile },
@@ -2862,6 +2881,66 @@ mod app {
                 }
             }
             accel_feedforward_was_active = accel_ff_active;
+
+            let position_lead_active = motor_enabled
+                && velocity_scale != 0
+                && tmc_state()
+                    .position_lead
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                && commission_engine.is_none()
+                && !homing_active;
+            if position_lead_active {
+                let interval = stepper_state()
+                    .interval
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let forward = stepper_state()
+                    .direction
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let gain_permille = tmc_state()
+                    .position_lead_gain_permille
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let max_counts = tmc_state()
+                    .position_lead_max_counts
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let lead_counts = if reset {
+                    0
+                } else {
+                    foci_firmware::tmc::compute_position_lead_counts(
+                        velocity_scale,
+                        interval,
+                        forward,
+                        gain_permille,
+                        max_counts,
+                    )
+                };
+                let step_width = tmc_state()
+                    .step_width_value
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                if step_width > 0 {
+                    let step_position = stepper_state()
+                        .position
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    let target_steps = step_position.wrapping_add(lead_counts as i32);
+                    let target = target_steps.wrapping_mul(step_width);
+                    let _ = tmc
+                        .write_register(foci_tmc4671::registers::PID_POSITION_TARGET, target as u32)
+                        .await;
+                }
+            } else if position_lead_was_active && motor_enabled && commission_engine.is_none() {
+                let step_width = tmc_state()
+                    .step_width_value
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                if step_width > 0 {
+                    let step_position = stepper_state()
+                        .position
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    let target = step_position.wrapping_mul(step_width);
+                    let _ = tmc
+                        .write_register(foci_tmc4671::registers::PID_POSITION_TARGET, target as u32)
+                        .await;
+                }
+            }
+            position_lead_was_active = position_lead_active;
 
             // Trace capture: read registers and store sample.
             // Deadline = tick start + 1ms. Budget check inside ensures
