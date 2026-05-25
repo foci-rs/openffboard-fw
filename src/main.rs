@@ -3489,26 +3489,24 @@ mod app {
                         );
                         td.set_timer_active(0, false);
                         TMC_DISABLE_SIGNAL.signal(());
-                        defmt::error!("Stepper too far in past");
                         return;
                     }
                 }
             }
 
-            {
-                use embassy_stm32::pac::gpio::vals::Idr;
-                let is_high = gpio_b.idr().read().idr(11) == Idr::HIGH;
-                gpio_b.bsrr().write(|w| {
-                    if is_high {
-                        w.set_br(11, true);
-                    } else {
-                        w.set_bs(11, true);
-                    }
-                });
-            }
+            let Some(event_phase) = stepper.next_event_phase() else {
+                stepper.mark_idle();
+                td.set_timer_active(0, false);
+                return;
+            };
+            gpio_b.bsrr().write(|w| match event_phase {
+                StepPhase::Step => w.set_bs(11, true),
+                StepPhase::Unstep => w.set_br(11, true),
+            });
 
             match stepper.step_event() {
                 StepEventResult::ScheduleNext { clock, phase } => {
+                    let now = read_tim5();
                     let is_step = matches!(phase, StepPhase::Step);
                     if is_step {
                         let dir = if stepper.dir_state() { 1i32 } else { -1i32 };
@@ -3516,40 +3514,21 @@ mod app {
                         crate::state::stepper_diag::record_executed_step(
                             0,
                             stepper.dir_state(),
-                            read_tim5(),
+                            now,
                         );
                     }
                     stepper_state()
                         .interval
                         .store(stepper.current_interval(), Relaxed);
-                    let now = read_tim5();
                     #[cfg(feature = "trace")]
                     crate::usb_trace::record_step_timing(clock, now);
-                    match stepper.check_deadline(clock, now, CLOCK_FREQ) {
-                        Ok(compare) => {
-                            schedule_stepper_timer(td, 0, compare);
-                            return;
-                        }
-                        Err(_) => {
-                            crate::state::stepper_diag::record_missed_deadline(0);
-                            #[cfg(feature = "trace")]
-                            crate::usb_trace::TRACE_TIMING
-                                .missed_or_deferred_steps
-                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                            record_stepper_event(
-                                StepperEventReason::MissedDeadlineStep,
-                                0,
-                                now,
-                                UNKNOWN_QUEUE_LEN,
-                                clock,
-                                now,
-                            );
-                            td.set_timer_active(0, false);
-                            TMC_DISABLE_SIGNAL.signal(());
-                            defmt::error!("Stepper too far in past");
-                            return;
-                        }
-                    }
+                    let compare = stepper.clamp_event_deadline(
+                        clock,
+                        now,
+                        foci_klipper::stepper::STEP_PULSE_TICKS,
+                    );
+                    schedule_stepper_timer(td, 0, compare);
+                    return;
                 }
                 StepEventResult::NeedMove => {
                     // Final unstep already drove STEP low; load the next segment
