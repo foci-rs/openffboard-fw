@@ -832,10 +832,8 @@ mod app {
         let mut status_poll_counter: u16 = 0;
         #[cfg(feature = "trace")]
         let mut trace_control_tick: u32 = 0;
-        #[cfg(feature = "trace")]
-        let trace_control_period = fugit::Duration::<u64, 1, 1_000_000>::millis(1);
-        #[cfg(feature = "trace")]
-        let mut trace_next_control_tick = Mono::now() + trace_control_period;
+        let mut next_control_tick = Mono::now() + 1.millis();
+        let mut slow_control_accum_us: u16 = 0;
         #[cfg(feature = "trace")]
         let mut cached_trace_velocity_offset: i32 = 0;
         #[cfg(feature = "trace")]
@@ -1033,13 +1031,24 @@ mod app {
                 // For Terminal cases, fall through to normal channel-receive processing.
             }
 
-            #[cfg(feature = "trace")]
-            let control_sleep = Mono::delay_until(trace_next_control_tick);
-            #[cfg(not(feature = "trace"))]
-            let control_sleep = Mono::delay(1.millis());
+            let fast_transient_scheduler_active = motor_enabled
+                && velocity_scale != 0
+                && commission_engine.is_none()
+                && tmc_state()
+                    .velocity_transient_feedforward
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            let requested_transient_rate_hz = if fast_transient_scheduler_active {
+                tmc_state()
+                    .velocity_transient_rate_hz
+                    .load(core::sync::atomic::Ordering::Relaxed)
+            } else {
+                foci_firmware::tmc::VELOCITY_TRANSIENT_DEFAULT_RATE_HZ
+            };
+            let control_period_us =
+                foci_firmware::tmc::velocity_transient_period_us(requested_transient_rate_hz);
+            let control_sleep = Mono::delay_until(next_control_tick);
 
             let selected = select(rx.recv(), control_sleep).await;
-            #[cfg(feature = "trace")]
             let control_tick_due = selected.is_second();
 
             match selected {
@@ -1310,16 +1319,18 @@ mod app {
                                 lead_time_us,
                                 gain_permille,
                                 max_offset,
+                                rate_hz,
                             },
                         ..
                     } => {
                         defmt::info!(
                             "Velocity transient feedforward: {} lead_time_us={} \
-                            gain_permille={} max_offset={} (via queue)",
+                            gain_permille={} max_offset={} rate_hz={} (via queue)",
                             enable,
                             lead_time_us,
                             gain_permille,
-                            max_offset
+                            max_offset,
+                            rate_hz
                         );
                         // Feedforward atomics are set by the command handler;
                         // this arm exists for exhaustiveness.
@@ -2657,16 +2668,26 @@ mod app {
                     }
                 },
                 Either::First(Err(_)) => {}
-                // 1ms timeout — write position target via SPI
+                // Control timeout — run fast FF or the decimated 1 kHz maintenance tick.
                 Either::Second(()) => {}
             }
-            #[cfg(feature = "trace")]
-            {
-                if !control_tick_due {
-                    continue;
-                }
-                trace_next_control_tick = Mono::now() + trace_control_period;
+            if !control_tick_due {
+                continue;
             }
+            next_control_tick = Mono::now() + u64::from(control_period_us).micros();
+            let slow_control_tick = if control_period_us >= 1_000 {
+                slow_control_accum_us = 0;
+                true
+            } else {
+                slow_control_accum_us = slow_control_accum_us
+                    .saturating_add(u16::try_from(control_period_us).unwrap_or(u16::MAX));
+                if slow_control_accum_us >= 1_000 {
+                    slow_control_accum_us -= 1_000;
+                    true
+                } else {
+                    false
+                }
+            };
 
             // Capture tick start for deadline computation. Must be after
             // select() resolves — placing it before would include the 1ms
@@ -2860,6 +2881,10 @@ mod app {
             }
             feedforward_was_active = velocity_offset_active;
 
+            if !slow_control_tick {
+                continue;
+            }
+
             if accel_ff_active {
                 let accel_gain_permille = tmc_state()
                     .accel_feedforward_accel_gain_permille
@@ -2878,6 +2903,7 @@ mod app {
                     .load(core::sync::atomic::Ordering::Relaxed)
                     .clamp(i16::MIN as i32, i16::MAX as i32)
                     as i16;
+                #[cfg(feature = "trace")]
                 let selected_gain_permille = if interval_add < 0 {
                     accel_gain_permille
                 } else if interval_add > 0 {
