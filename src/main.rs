@@ -865,10 +865,9 @@ mod app {
         // Track whether feedforward was active on the previous tick, so we
         // can zero offset registers on the deactivation edge.
         let mut feedforward_was_active = false;
-        let mut accel_feedforward_was_active = false;
+        let mut torque_flux_offset_was_active = false;
         let mut position_lead_applied_scaled = 0i32;
         let mut pid_error_clear_countdown_ms: u8 = 0;
-
         // Main loop: wait for channel message or 1ms timeout.
         // On message: handle request. On timeout: write position target.
         // Position is read from stepper_state().position_target atomic (updated
@@ -1353,6 +1352,33 @@ mod app {
                         );
                         // Feedforward flag is already set by the atomic in the
                         // command handler; this arm exists for exhaustiveness.
+                    }
+                    TmcRequest {
+                        kind:
+                            TmcRequestKind::SetDecouplingFeedforward {
+                                enable,
+                                r_int,
+                                l_int,
+                                pole_pairs,
+                                position_units_per_rev,
+                                f_pwm_hz,
+                                max_offset,
+                            },
+                        ..
+                    } => {
+                        defmt::info!(
+                            "Decoupling feedforward: {} r_int={} l_int={} pole_pairs={} \
+                            position_units_per_rev={} f_pwm_hz={} max_offset={} (via queue)",
+                            enable,
+                            r_int,
+                            l_int,
+                            pole_pairs,
+                            position_units_per_rev,
+                            f_pwm_hz,
+                            max_offset
+                        );
+                        // Feedforward atomics are set by the command handler;
+                        // this arm exists for exhaustiveness.
                     }
                     TmcRequest {
                         kind:
@@ -2778,35 +2804,42 @@ mod app {
                     .accel_feedforward
                     .load(core::sync::atomic::Ordering::Relaxed)
                 && commission_engine.is_none();
+            let decoupling_ff_active = motor_enabled
+                && velocity_scale != 0
+                && tmc_state()
+                    .decoupling_feedforward
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                && commission_engine.is_none();
             let homing_active = HOMING_STATE.load(core::sync::atomic::Ordering::Relaxed) != 0;
             let reset = tmc_state()
                 .feedforward_reset
                 .swap(false, core::sync::atomic::Ordering::Relaxed);
 
             #[cfg(feature = "trace")]
-            let cached_trace_velocity_reference = {
-                let velocity_trace_inputs_active =
-                    motor_enabled && velocity_scale != 0 && commission_engine.is_none();
-                if velocity_trace_inputs_active {
-                    if homing_active || reset {
-                        0
-                    } else {
-                        let interval = stepper_state()
-                            .interval
-                            .load(core::sync::atomic::Ordering::Relaxed);
-                        let forward = stepper_state()
-                            .direction
-                            .load(core::sync::atomic::Ordering::Relaxed);
-                        foci_firmware::tmc::compute_command_velocity_reference(
-                            velocity_scale,
-                            interval,
-                            forward,
-                        )
-                    }
-                } else {
+            let velocity_trace_inputs_active =
+                motor_enabled && velocity_scale != 0 && commission_engine.is_none();
+            #[cfg(feature = "trace")]
+            let command_velocity_reference = if velocity_trace_inputs_active {
+                if homing_active || reset {
                     0
+                } else {
+                    let interval = stepper_state()
+                        .interval
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    let forward = stepper_state()
+                        .direction
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    foci_firmware::tmc::compute_command_velocity_reference(
+                        velocity_scale,
+                        interval,
+                        forward,
+                    )
                 }
+            } else {
+                0
             };
+            #[cfg(feature = "trace")]
+            let cached_trace_velocity_reference = command_velocity_reference;
 
             let velocity_offset_active = ff_active || velocity_transient_active;
             if velocity_offset_active {
@@ -2885,7 +2918,88 @@ mod app {
                 continue;
             }
 
-            if accel_ff_active {
+            if decoupling_ff_active {
+                let max_offset = tmc_state()
+                    .decoupling_max_offset
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let (torque_offset, flux_offset) = if homing_active || reset {
+                    (0, 0)
+                } else {
+                    let interval = stepper_state()
+                        .interval
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    let forward = stepper_state()
+                        .direction
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    let target_velocity = foci_firmware::tmc::compute_command_velocity_reference(
+                        velocity_scale,
+                        interval,
+                        forward,
+                    );
+                    let iq_id = if target_velocity == 0 {
+                        None
+                    } else {
+                        tmc.read_sub_register(foci_tmc4671::registers::INTERIM_FOC_IQ_ID)
+                            .await
+                            .ok()
+                    };
+                    if let Some(iq_id) = iq_id {
+                        let (foc_iq, foc_id) = split_signed_halves(iq_id);
+                        foci_firmware::tmc::compute_decoupling_current_offsets(
+                            foci_firmware::tmc::DecouplingFeedforwardInput {
+                                target_velocity,
+                                foc_iq,
+                                foc_id,
+                            },
+                            foci_firmware::tmc::DecouplingFeedforwardConfig {
+                                r_int: tmc_state()
+                                    .decoupling_r_int
+                                    .load(core::sync::atomic::Ordering::Relaxed),
+                                l_int: tmc_state()
+                                    .decoupling_l_int
+                                    .load(core::sync::atomic::Ordering::Relaxed),
+                                pole_pairs: tmc_state()
+                                    .decoupling_pole_pairs
+                                    .load(core::sync::atomic::Ordering::Relaxed),
+                                position_units_per_rev: tmc_state()
+                                    .decoupling_position_units_per_rev
+                                    .load(core::sync::atomic::Ordering::Relaxed),
+                                f_pwm_hz: tmc_state()
+                                    .decoupling_f_pwm_hz
+                                    .load(core::sync::atomic::Ordering::Relaxed),
+                                max_offset,
+                            },
+                        )
+                    } else {
+                        (0, 0)
+                    }
+                };
+                #[cfg(feature = "trace")]
+                {
+                    let mut flags = if homing_active || reset {
+                        0
+                    } else {
+                        foci_firmware::trace_stream::ACCEL_FF_FLAG_ENABLED
+                    };
+                    if torque_offset != 0 || flux_offset != 0 {
+                        flags |= foci_firmware::trace_stream::ACCEL_FF_FLAG_NONZERO;
+                    }
+                    if max_offset != 0
+                        && (torque_offset.unsigned_abs() >= max_offset
+                            || flux_offset.unsigned_abs() >= max_offset)
+                    {
+                        flags |= foci_firmware::trace_stream::ACCEL_FF_FLAG_CLAMPED;
+                    }
+                    cached_trace_accel_torque_offset = torque_offset as i32;
+                    cached_trace_accel_gain_permille = 0;
+                    cached_trace_accel_flags = flags;
+                }
+                let offset_reg =
+                    foci_firmware::tmc::pack_torque_flux_target(torque_offset, flux_offset);
+                let _ = tmc
+                    .write_register(foci_tmc4671::registers::PID_TORQUE_FLUX_OFFSET, offset_reg)
+                    .await;
+            } else if accel_ff_active {
                 let accel_gain_permille = tmc_state()
                     .accel_feedforward_accel_gain_permille
                     .load(core::sync::atomic::Ordering::Relaxed);
@@ -2957,7 +3071,7 @@ mod app {
                 let _ = tmc
                     .write_register(foci_tmc4671::registers::PID_TORQUE_FLUX_OFFSET, offset_reg)
                     .await;
-            } else if accel_feedforward_was_active {
+            } else if torque_flux_offset_was_active {
                 let _ = tmc
                     .write_register(foci_tmc4671::registers::PID_TORQUE_FLUX_OFFSET, 0)
                     .await;
@@ -2968,7 +3082,7 @@ mod app {
                     cached_trace_accel_flags = 0;
                 }
             }
-            accel_feedforward_was_active = accel_ff_active;
+            torque_flux_offset_was_active = accel_ff_active || decoupling_ff_active;
 
             let position_lead_active = motor_enabled
                 && velocity_scale != 0
