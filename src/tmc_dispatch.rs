@@ -162,6 +162,7 @@ pub(crate) async fn handle_tmc_request(
             defmt::warn!("handle_tmc_request: SetPositionGains handled by main loop");
         }
         TmcRequestKind::SetVelocityFeedforward { .. } => {}
+        TmcRequestKind::SetVelocityTransientFeedforward { .. } => {}
         TmcRequestKind::SetAccelFeedforward { .. } => {}
         TmcRequestKind::SetPositionLead { .. } => {}
         TmcRequestKind::TraceStart { oid, preset } => {

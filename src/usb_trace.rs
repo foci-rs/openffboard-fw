@@ -746,6 +746,7 @@ pub(crate) async fn sample_tick<B>(
     motor_enabled: bool,
     command_velocity_reference: i32,
     cached_velocity_offset: i32,
+    cached_velocity_transient_offset: i32,
     cached_accel_torque_offset: i32,
     accel_feedforward_gain_permille: u16,
     accel_feedforward_flags: u8,
@@ -803,6 +804,7 @@ pub(crate) async fn sample_tick<B>(
         cached_accel_torque_offset,
         accel_feedforward_gain_permille,
         accel_feedforward_flags,
+        cached_velocity_transient_offset,
     };
     let mut payload = [0u8; CRITICAL_PAYLOAD_LEN];
     encode_critical_payload(&sample, &mut payload);

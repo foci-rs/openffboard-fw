@@ -839,6 +839,8 @@ mod app {
         #[cfg(feature = "trace")]
         let mut cached_trace_velocity_offset: i32 = 0;
         #[cfg(feature = "trace")]
+        let mut cached_trace_velocity_transient_offset: i32 = 0;
+        #[cfg(feature = "trace")]
         let mut cached_trace_accel_torque_offset: i32 = 0;
         #[cfg(feature = "trace")]
         let mut cached_trace_accel_gain_permille: u16 = 0;
@@ -1300,6 +1302,27 @@ mod app {
                         );
                         // Feedforward flag is already set by the atomic in the
                         // command handler; this arm exists for exhaustiveness.
+                    }
+                    TmcRequest {
+                        kind:
+                            TmcRequestKind::SetVelocityTransientFeedforward {
+                                enable,
+                                lead_time_us,
+                                gain_permille,
+                                max_offset,
+                            },
+                        ..
+                    } => {
+                        defmt::info!(
+                            "Velocity transient feedforward: {} lead_time_us={} \
+                            gain_permille={} max_offset={} (via queue)",
+                            enable,
+                            lead_time_us,
+                            gain_permille,
+                            max_offset
+                        );
+                        // Feedforward atomics are set by the command handler;
+                        // this arm exists for exhaustiveness.
                     }
                     TmcRequest {
                         kind:
@@ -2722,6 +2745,12 @@ mod app {
                     .velocity_feedforward
                     .load(core::sync::atomic::Ordering::Relaxed)
                 && commission_engine.is_none();
+            let velocity_transient_active = motor_enabled
+                && velocity_scale != 0
+                && tmc_state()
+                    .velocity_transient_feedforward
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                && commission_engine.is_none();
             let accel_ff_active = motor_enabled
                 && velocity_scale != 0
                 && tmc_state()
@@ -2758,16 +2787,20 @@ mod app {
                 }
             };
 
-            if ff_active {
-                let offset = if homing_active || reset {
-                    0i32
-                } else {
-                    let interval = stepper_state()
-                        .interval
-                        .load(core::sync::atomic::Ordering::Relaxed);
-                    let forward = stepper_state()
-                        .direction
-                        .load(core::sync::atomic::Ordering::Relaxed);
+            let velocity_offset_active = ff_active || velocity_transient_active;
+            if velocity_offset_active {
+                let interval = stepper_state()
+                    .interval
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let interval_add = stepper_state()
+                    .interval_add
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    .clamp(i16::MIN as i32, i16::MAX as i32)
+                    as i16;
+                let forward = stepper_state()
+                    .direction
+                    .load(core::sync::atomic::Ordering::Relaxed);
+                let base_offset = if ff_active && !homing_active && !reset {
                     let multiplier = tmc_state()
                         .velocity_feedforward_multiplier
                         .load(core::sync::atomic::Ordering::Relaxed);
@@ -2777,7 +2810,34 @@ mod app {
                         forward,
                         multiplier,
                     )
+                } else {
+                    0
                 };
+                let transient_offset = if velocity_transient_active && !homing_active && !reset {
+                    foci_firmware::tmc::compute_velocity_transient_offset(
+                        foci_firmware::tmc::VelocityTransientFeedforwardInput {
+                            scale_factor: velocity_scale,
+                            clock_freq: CLOCK_FREQ,
+                            step_interval: interval,
+                            interval_add,
+                            dir_high: forward,
+                        },
+                        foci_firmware::tmc::VelocityTransientFeedforwardConfig {
+                            lead_time_us: tmc_state()
+                                .velocity_transient_lead_time_us
+                                .load(core::sync::atomic::Ordering::Relaxed),
+                            gain_permille: tmc_state()
+                                .velocity_transient_gain_permille
+                                .load(core::sync::atomic::Ordering::Relaxed),
+                            max_offset: tmc_state()
+                                .velocity_transient_max_offset
+                                .load(core::sync::atomic::Ordering::Relaxed),
+                        },
+                    )
+                } else {
+                    0
+                };
+                let offset = base_offset.saturating_add(transient_offset);
 
                 let _ = tmc
                     .write_register(foci_tmc4671::registers::PID_VELOCITY_OFFSET, offset as u32)
@@ -2785,6 +2845,7 @@ mod app {
                 #[cfg(feature = "trace")]
                 {
                     cached_trace_velocity_offset = offset;
+                    cached_trace_velocity_transient_offset = transient_offset;
                 }
             } else if feedforward_was_active {
                 // Feedforward just deactivated — clear stale offset
@@ -2794,9 +2855,10 @@ mod app {
                 #[cfg(feature = "trace")]
                 {
                     cached_trace_velocity_offset = 0;
+                    cached_trace_velocity_transient_offset = 0;
                 }
             }
-            feedforward_was_active = ff_active;
+            feedforward_was_active = velocity_offset_active;
 
             if accel_ff_active {
                 let accel_gain_permille = tmc_state()
@@ -2973,6 +3035,7 @@ mod app {
                     motor_enabled,
                     cached_trace_velocity_reference,
                     cached_trace_velocity_offset,
+                    cached_trace_velocity_transient_offset,
                     cached_trace_accel_torque_offset,
                     cached_trace_accel_gain_permille,
                     cached_trace_accel_flags,
