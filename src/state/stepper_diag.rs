@@ -98,6 +98,7 @@ struct StepperPerfCounters {
     tim5_burst_cycles_per_event_floor3_max: AtomicU32,
     tim5_entry_latency_max_ticks: AtomicU32,
     tim5_pop_lateness_max_ticks: AtomicU32,
+    scheduler_full_count: AtomicU32,
     stepper_load_lateness_max_ticks: AtomicU32,
     stepper_load_lateness_last_ticks: AtomicI32,
 }
@@ -169,6 +170,7 @@ impl StepperPerfCounters {
             tim5_burst_cycles_per_event_floor3_max: AtomicU32::new(0),
             tim5_entry_latency_max_ticks: AtomicU32::new(0),
             tim5_pop_lateness_max_ticks: AtomicU32::new(0),
+            scheduler_full_count: AtomicU32::new(0),
             stepper_load_lateness_max_ticks: AtomicU32::new(0),
             stepper_load_lateness_last_ticks: AtomicI32::new(0),
         }
@@ -203,6 +205,7 @@ impl StepperPerfCounters {
             .store(0, Relaxed);
         self.tim5_entry_latency_max_ticks.store(0, Relaxed);
         self.tim5_pop_lateness_max_ticks.store(0, Relaxed);
+        self.scheduler_full_count.store(0, Relaxed);
         self.stepper_load_lateness_max_ticks.store(0, Relaxed);
         self.stepper_load_lateness_last_ticks.store(0, Relaxed);
     }
@@ -530,6 +533,13 @@ pub(crate) fn record_scheduler_pop_lateness(lateness_ticks: u32) {
         &STEPPER_PERF_COUNTERS.tim5_pop_lateness_max_ticks,
         lateness_ticks,
     );
+}
+
+/// Record a failed scheduler insertion caused by a full event table.
+pub(crate) fn record_scheduler_full() {
+    STEPPER_PERF_COUNTERS
+        .scheduler_full_count
+        .fetch_add(1, Relaxed);
 }
 
 /// Record one TIM5 IRQ dispatch sample.

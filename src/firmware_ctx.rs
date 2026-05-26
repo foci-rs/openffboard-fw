@@ -21,6 +21,7 @@ use foci_firmware::diagnostic::StepperEventReason;
 use foci_firmware::state::trsync::ENDSTOP_PIN_IDS;
 use foci_firmware::tmc::TmcRequest;
 use foci_klipper::commands::CommandError;
+use foci_klipper::scheduler::{ScheduleResult, SchedulerEvent, SchedulerEventKind};
 use foci_klipper::state::State;
 
 use crate::helpers::lifecycle::{KATAPULT_BYPASS, katapult_reset, read_tim5};
@@ -34,6 +35,16 @@ use crate::trigger_domain::{
 
 fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
     foci_firmware::state::tmc::tmc_channel0()
+}
+
+fn record_schedule_result(result: ScheduleResult) -> bool {
+    match result {
+        ScheduleResult::Inserted { new_earliest } => new_earliest,
+        ScheduleResult::Full => {
+            crate::state::stepper_diag::record_scheduler_full();
+            false
+        }
+    }
 }
 
 /// Full shutdown: Klipper-level transition, board-local trigger-domain
@@ -263,11 +274,10 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
                                 foci_klipper::scheduler::SchedulerEventKind::Stepper(0)
                             )
                         });
-                        td.scheduler
-                            .schedule(foci_klipper::scheduler::SchedulerEvent {
-                                wake_clock: now.wrapping_add(1),
-                                kind: foci_klipper::scheduler::SchedulerEventKind::Stepper(0),
-                            });
+                        record_schedule_result(td.scheduler.try_schedule(SchedulerEvent {
+                            wake_clock: now.wrapping_add(1),
+                            kind: SchedulerEventKind::Stepper(0),
+                        }));
                         td.set_timer_active(0, true);
                         td.reprogram_timer();
                     }
@@ -411,11 +421,10 @@ impl<'a> TrsyncHost for FirmwareCtx<'a> {
             });
             td.trsync[idx].arm(report_clock, report_ticks, expire_reason);
             if report_ticks > 0 {
-                td.scheduler
-                    .schedule(foci_klipper::scheduler::SchedulerEvent {
-                        wake_clock: report_clock,
-                        kind: foci_klipper::scheduler::SchedulerEventKind::TrSyncReport(idx),
-                    });
+                record_schedule_result(td.scheduler.try_schedule(SchedulerEvent {
+                    wake_clock: report_clock,
+                    kind: SchedulerEventKind::TrSyncReport(idx),
+                }));
             }
             td.reprogram_timer();
             Ok(())
@@ -435,11 +444,10 @@ impl<'a> TrsyncHost for FirmwareCtx<'a> {
                         foci_klipper::scheduler::SchedulerEventKind::TrSyncExpire(i) if *i == idx
                     )
                 });
-                td.scheduler
-                    .schedule(foci_klipper::scheduler::SchedulerEvent {
-                        wake_clock: clock,
-                        kind: foci_klipper::scheduler::SchedulerEventKind::TrSyncExpire(idx),
-                    });
+                record_schedule_result(td.scheduler.try_schedule(SchedulerEvent {
+                    wake_clock: clock,
+                    kind: SchedulerEventKind::TrSyncExpire(idx),
+                }));
                 td.reprogram_timer();
             }
             Ok(())
@@ -539,11 +547,10 @@ impl<'a> TrsyncHost for FirmwareCtx<'a> {
                 pin_id,
             );
             if sample_count > 0 {
-                td.scheduler
-                    .schedule(foci_klipper::scheduler::SchedulerEvent {
-                        wake_clock: clock,
-                        kind: foci_klipper::scheduler::SchedulerEventKind::EndstopSample(idx),
-                    });
+                record_schedule_result(td.scheduler.try_schedule(SchedulerEvent {
+                    wake_clock: clock,
+                    kind: SchedulerEventKind::EndstopSample(idx),
+                }));
             }
             td.reprogram_timer();
             Ok(())

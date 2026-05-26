@@ -3684,11 +3684,13 @@ mod app {
                         foci_klipper::scheduler::SchedulerEventKind::Stepper(0)
                     )
                 });
-                td.scheduler
-                    .schedule(foci_klipper::scheduler::SchedulerEvent {
+                schedule_trigger_event(
+                    td,
+                    foci_klipper::scheduler::SchedulerEvent {
                         wake_clock: now.wrapping_add(1),
                         kind: foci_klipper::scheduler::SchedulerEventKind::Stepper(0),
-                    });
+                    },
+                );
                 td.set_timer_active(0, true);
                 td.reprogram_timer();
             }
@@ -3706,12 +3708,27 @@ mod app {
     /// On OpenFFBoard TIM5 runs at 84 MHz, so this is 420 timer ticks.
     const TIM5_SCHEDULER_DEFER_TICKS: u32 = CLOCK_FREQ / 200_000;
 
+    fn schedule_trigger_event(
+        td: &mut TriggerDomain,
+        event: foci_klipper::scheduler::SchedulerEvent,
+    ) -> bool {
+        match td.scheduler.try_schedule(event) {
+            foci_klipper::scheduler::ScheduleResult::Inserted { new_earliest } => new_earliest,
+            foci_klipper::scheduler::ScheduleResult::Full => {
+                crate::state::stepper_diag::record_scheduler_full();
+                false
+            }
+        }
+    }
+
     fn schedule_stepper_timer(td: &mut TriggerDomain, stepper_idx: usize, clock: u32) {
-        td.scheduler
-            .schedule(foci_klipper::scheduler::SchedulerEvent {
+        schedule_trigger_event(
+            td,
+            foci_klipper::scheduler::SchedulerEvent {
                 wake_clock: clock,
                 kind: foci_klipper::scheduler::SchedulerEventKind::Stepper(stepper_idx),
-            });
+            },
+        );
     }
 
     fn process_stepper_timer(td: &mut TriggerDomain, stepper_idx: usize) {
@@ -3916,11 +3933,13 @@ mod app {
                                 *need_report = true;
                             }
                             EndstopSampleResult::Reschedule { next_clock } => {
-                                td.scheduler
-                                    .schedule(foci_klipper::scheduler::SchedulerEvent {
+                                schedule_trigger_event(
+                                    td,
+                                    foci_klipper::scheduler::SchedulerEvent {
                                         wake_clock: next_clock,
                                         kind: SchedulerEventKind::EndstopSample(endstop_idx),
-                                    });
+                                    },
+                                );
                             }
                             _ => {}
                         }
@@ -3930,11 +3949,13 @@ mod app {
                         *need_report = true;
                     }
                     EndstopSampleResult::Reschedule { next_clock } => {
-                        td.scheduler
-                            .schedule(foci_klipper::scheduler::SchedulerEvent {
+                        schedule_trigger_event(
+                            td,
+                            foci_klipper::scheduler::SchedulerEvent {
                                 wake_clock: next_clock,
                                 kind: SchedulerEventKind::EndstopSample(endstop_idx),
-                            });
+                            },
+                        );
                     }
                     EndstopSampleResult::Inactive => {}
                 }
@@ -3969,11 +3990,13 @@ mod app {
                             .report_clock()
                             .wrapping_add(report_ticks);
                         td.trsync[trsync_idx].set_report_clock(next_report);
-                        td.scheduler
-                            .schedule(foci_klipper::scheduler::SchedulerEvent {
+                        schedule_trigger_event(
+                            td,
+                            foci_klipper::scheduler::SchedulerEvent {
                                 wake_clock: next_report,
                                 kind: SchedulerEventKind::TrSyncReport(trsync_idx),
-                            });
+                            },
+                        );
                     }
                 }
             }
