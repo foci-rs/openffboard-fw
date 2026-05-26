@@ -868,7 +868,56 @@ mod app {
         let mut feedforward_was_active = false;
         let mut torque_flux_offset_was_active = false;
         let mut position_lead_applied_scaled = 0i32;
+        let mut phase_advance_was_active = false;
+        let mut phase_advance_base_register = 0u32;
+        let mut phase_advance_last_register = 0u32;
+        #[cfg(feature = "trace")]
+        let mut phase_advance_last_counts = 0i16;
+        #[cfg(feature = "trace")]
+        let mut phase_advance_last_flags = 0u8;
+        #[cfg(feature = "trace")]
+        let mut phase_advance_emit_once = false;
+        #[cfg(feature = "trace")]
+        let mut phase_advance_write_failed = false;
         let mut pid_error_clear_countdown_ms: u8 = 0;
+
+        macro_rules! restore_phase_advance_now {
+            ($context:literal) => {{
+                if phase_advance_was_active {
+                    match tmc
+                        .write_register(
+                            foci_tmc4671::registers::ABN_DECODER_PHI_E_PHI_M_OFFSET,
+                            phase_advance_base_register,
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            phase_advance_was_active = false;
+                            phase_advance_last_register = phase_advance_base_register;
+                            #[cfg(feature = "trace")]
+                            {
+                                phase_advance_last_counts = 0;
+                                phase_advance_write_failed = false;
+                                phase_advance_emit_once = true;
+                            }
+                            true
+                        }
+                        Err(_) => {
+                            #[cfg(feature = "trace")]
+                            {
+                                phase_advance_write_failed = true;
+                                phase_advance_emit_once = true;
+                            }
+                            defmt::warn!($context);
+                            false
+                        }
+                    }
+                } else {
+                    true
+                }
+            }};
+        }
+
         // Main loop: wait for channel message or 1ms timeout.
         // On message: handle request. On timeout: write position target.
         // Position is read from stepper_state().position_target atomic (updated
@@ -882,6 +931,9 @@ mod app {
             if SHUTDOWN_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
                 if !shutdown_handled {
                     commission_engine.take();
+                    let phase_advance_restored = restore_phase_advance_now!(
+                        "phase advance: failed to restore ABN offset on shutdown"
+                    );
                     {
                         let mut backend = openffboard_backend(tmc, enable_pin);
                         let mut state =
@@ -894,7 +946,7 @@ mod app {
                         .commission_in_flight
                         .store(false, core::sync::atomic::Ordering::Relaxed);
                     stepper_stop_from_p1(0);
-                    shutdown_handled = true;
+                    shutdown_handled = phase_advance_restored;
                 }
                 Mono::delay(1.millis()).await;
                 continue;
@@ -1111,6 +1163,11 @@ mod app {
                                 defmt::info!("Motor enable sync (already armed)");
                                 continue;
                             }
+                            if !restore_phase_advance_now!(
+                                "phase advance: failed to restore ABN offset before arm"
+                            ) {
+                                continue;
+                            }
                             {
                                 let mut backend = openffboard_backend(tmc, enable_pin);
                                 let mut state = dispatch_state(
@@ -1140,6 +1197,9 @@ mod app {
                         } else {
                             // Disable: stop stepping first, then kill motor electrically.
                             stepper_stop_from_p1(0);
+                            let phase_advance_restored = restore_phase_advance_now!(
+                                "phase advance: failed to restore ABN offset before disarm"
+                            );
                             {
                                 let mut backend = openffboard_backend(tmc, enable_pin);
                                 let mut state = dispatch_state(
@@ -1149,6 +1209,9 @@ mod app {
                                 );
                                 foci_firmware::tmc_ops::disarm_motor(&mut backend, &mut state)
                                     .await;
+                            }
+                            if !phase_advance_restored {
+                                continue;
                             }
 
                             defmt::info!("TMC4671 motor disabled");
@@ -1400,6 +1463,27 @@ mod app {
                         // this arm exists for exhaustiveness.
                     }
                     TmcRequest {
+                        kind:
+                            TmcRequestKind::SetPhaseAdvance {
+                                enable,
+                                gain_ppm,
+                                max_counts,
+                                deadband,
+                            },
+                        ..
+                    } => {
+                        defmt::info!(
+                            "Phase advance: {} gain_ppm={} max_counts={} deadband={} \
+                            (via queue)",
+                            enable,
+                            gain_ppm,
+                            max_counts,
+                            deadband
+                        );
+                        // Phase-advance atomics are set by the command handler;
+                        // this arm exists for exhaustiveness.
+                    }
+                    TmcRequest {
                         kind: TmcRequestKind::Commission { oid, profile },
                         ..
                     } => {
@@ -1498,6 +1582,23 @@ mod app {
                                 phase: u8 = 0,
                                 status: u8 =
                                     foci_firmware::autotune::CommissionError::NoCurrent
+                                        .status_code(),
+                            );
+                            continue;
+                        }
+                        if !restore_phase_advance_now!(
+                            "phase advance: failed to restore ABN offset before tune"
+                        ) {
+                            tmc_state()
+                                .commission_in_flight
+                                .store(false, core::sync::atomic::Ordering::Relaxed);
+                            ::ankyra::klipper_reply_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                foci_firmware::ankyra::replies::FociCommissionPhase,
+                                oid: u8 = oid,
+                                phase: u8 = 0,
+                                status: u8 =
+                                    foci_firmware::autotune::CommissionError::Spi
                                         .status_code(),
                             );
                             continue;
@@ -1720,6 +1821,35 @@ mod app {
                         let mut encoder_after = 0u32;
                         let mut encoder_delta = 0i32;
                         let mut adc_vm_raw = 0u16;
+
+                        if !restore_phase_advance_now!(
+                            "phase advance: failed to restore ABN offset before current step"
+                        ) {
+                            send_current_step_reply(
+                                vector_reply,
+                                CurrentStepReport {
+                                    oid,
+                                    status: CURRENT_STEP_STATUS_SPI,
+                                    torque_target,
+                                    flux_target,
+                                    duration_ms,
+                                    voltage_limit,
+                                    torque_before,
+                                    torque_during,
+                                    torque_after,
+                                    flux_during,
+                                    iq_during,
+                                    id_during,
+                                    uq_limited,
+                                    ud_limited,
+                                    encoder_before,
+                                    encoder_after,
+                                    encoder_delta,
+                                    adc_vm_raw,
+                                },
+                            );
+                            continue;
+                        }
 
                         let result: Result<(), ()> = async {
                             use foci_tmc4671::registers::*;
@@ -1961,6 +2091,20 @@ mod app {
                         let mut ff_velocity = 0i32;
                         let mut ff_torque = 0i16;
                         let mut status_flags = 0u32;
+
+                        if !restore_phase_advance_now!(
+                            "phase advance: failed to restore ABN offset before torque sample"
+                        ) {
+                            current_torque_sample_reply(empty_current_torque_sample_report(
+                                oid,
+                                CURRENT_STEP_STATUS_SPI,
+                                target,
+                                flux_target,
+                                sample_delay_ms,
+                                voltage_limit,
+                            ));
+                            continue;
+                        }
 
                         let result: Result<(), ()> = async {
                             use foci_tmc4671::registers::*;
@@ -2503,6 +2647,19 @@ mod app {
                         let mut report =
                             empty_voltage_step_report(oid, 0, uq_ext, ud_ext, sample_delay_ms);
 
+                        if !restore_phase_advance_now!(
+                            "phase advance: failed to restore ABN offset before voltage step"
+                        ) {
+                            voltage_step_reply(empty_voltage_step_report(
+                                oid,
+                                CURRENT_STEP_STATUS_SPI,
+                                uq_ext,
+                                ud_ext,
+                                sample_delay_ms,
+                            ));
+                            continue;
+                        }
+
                         let result: Result<(), ()> = async {
                             use foci_tmc4671::registers::*;
 
@@ -2811,15 +2968,19 @@ mod app {
                     .decoupling_feedforward
                     .load(core::sync::atomic::Ordering::Relaxed)
                 && commission_engine.is_none();
+            let phase_advance_requested = motor_enabled
+                && velocity_scale != 0
+                && tmc_state()
+                    .phase_advance
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                && commission_engine.is_none();
             let homing_active = HOMING_STATE.load(core::sync::atomic::Ordering::Relaxed) != 0;
             let reset = tmc_state()
                 .feedforward_reset
                 .swap(false, core::sync::atomic::Ordering::Relaxed);
 
-            #[cfg(feature = "trace")]
             let velocity_trace_inputs_active =
                 motor_enabled && velocity_scale != 0 && commission_engine.is_none();
-            #[cfg(feature = "trace")]
             let command_velocity_reference = if velocity_trace_inputs_active {
                 if homing_active || reset {
                     0
@@ -2918,6 +3079,11 @@ mod app {
             if !slow_control_tick {
                 continue;
             }
+
+            #[cfg(feature = "trace")]
+            let cached_trace_phase_advance_counts: i16;
+            #[cfg(feature = "trace")]
+            let cached_trace_phase_advance_flags: u8;
 
             if decoupling_ff_active {
                 let max_offset = tmc_state()
@@ -3085,6 +3251,147 @@ mod app {
             }
             torque_flux_offset_was_active = accel_ff_active || decoupling_ff_active;
 
+            let phase_advance_active = phase_advance_requested && !homing_active && !reset;
+            if phase_advance_active && !phase_advance_was_active {
+                match tmc
+                    .read_register(foci_tmc4671::registers::ABN_DECODER_PHI_E_PHI_M_OFFSET)
+                    .await
+                {
+                    Ok(base) => {
+                        phase_advance_base_register = base;
+                        phase_advance_last_register = base;
+                        phase_advance_was_active = true;
+                        #[cfg(feature = "trace")]
+                        {
+                            phase_advance_emit_once = true;
+                        }
+                    }
+                    Err(_) => {
+                        defmt::warn!("phase advance: failed to snapshot ABN offset");
+                        phase_advance_was_active = false;
+                    }
+                }
+            }
+
+            #[cfg(feature = "trace")]
+            let mut trace_phase_output = foci_firmware::tmc::PhaseAdvanceOutput {
+                counts: 0,
+                enabled: phase_advance_requested,
+                deadbanded: false,
+                clamped: false,
+            };
+
+            if phase_advance_active && phase_advance_was_active {
+                let phase_output = foci_firmware::tmc::compute_phase_advance_counts(
+                    command_velocity_reference,
+                    foci_firmware::tmc::PhaseAdvanceConfig {
+                        enable: true,
+                        gain_ppm: tmc_state()
+                            .phase_advance_gain_ppm
+                            .load(core::sync::atomic::Ordering::Relaxed),
+                        max_counts: tmc_state()
+                            .phase_advance_max_counts
+                            .load(core::sync::atomic::Ordering::Relaxed),
+                        deadband_velocity: tmc_state()
+                            .phase_advance_deadband
+                            .load(core::sync::atomic::Ordering::Relaxed),
+                    },
+                );
+                #[cfg(feature = "trace")]
+                {
+                    trace_phase_output = phase_output;
+                }
+                let next_register = foci_firmware::tmc::pack_abn_phi_offset(
+                    phase_advance_base_register,
+                    phase_output.counts,
+                );
+                if next_register != phase_advance_last_register {
+                    if tmc
+                        .write_register(
+                            foci_tmc4671::registers::ABN_DECODER_PHI_E_PHI_M_OFFSET,
+                            next_register,
+                        )
+                        .await
+                        .is_ok()
+                    {
+                        #[cfg(feature = "trace")]
+                        {
+                            if phase_output.counts != phase_advance_last_counts {
+                                phase_advance_emit_once = true;
+                            }
+                            phase_advance_write_failed = false;
+                        }
+                        phase_advance_last_register = next_register;
+                        #[cfg(feature = "trace")]
+                        {
+                            phase_advance_last_counts = phase_output.counts;
+                        }
+                    } else {
+                        #[cfg(feature = "trace")]
+                        {
+                            phase_advance_write_failed = true;
+                            phase_advance_emit_once = true;
+                        }
+                    }
+                }
+            } else if phase_advance_was_active {
+                match tmc
+                    .write_register(
+                        foci_tmc4671::registers::ABN_DECODER_PHI_E_PHI_M_OFFSET,
+                        phase_advance_base_register,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        phase_advance_was_active = false;
+                        phase_advance_last_register = phase_advance_base_register;
+                        #[cfg(feature = "trace")]
+                        {
+                            phase_advance_last_counts = 0;
+                            phase_advance_write_failed = false;
+                            phase_advance_emit_once = true;
+                        }
+                    }
+                    Err(_) => {
+                        #[cfg(feature = "trace")]
+                        {
+                            phase_advance_write_failed = true;
+                            phase_advance_emit_once = true;
+                        }
+                        defmt::warn!("phase advance: failed to restore ABN offset; retrying");
+                    }
+                }
+            }
+
+            #[cfg(feature = "trace")]
+            {
+                let mut flags = if phase_advance_active && phase_advance_was_active {
+                    foci_firmware::trace_stream::PHASE_ADVANCE_FLAG_ENABLED
+                } else if phase_advance_requested {
+                    foci_firmware::trace_stream::PHASE_ADVANCE_FLAG_GATED
+                } else {
+                    0
+                };
+                if trace_phase_output.counts != 0 {
+                    flags |= foci_firmware::trace_stream::PHASE_ADVANCE_FLAG_NONZERO;
+                }
+                if trace_phase_output.clamped {
+                    flags |= foci_firmware::trace_stream::PHASE_ADVANCE_FLAG_CLAMPED;
+                }
+                if trace_phase_output.deadbanded {
+                    flags |= foci_firmware::trace_stream::PHASE_ADVANCE_FLAG_DEADBAND;
+                }
+                if phase_advance_write_failed {
+                    flags |= foci_firmware::trace_stream::PHASE_ADVANCE_FLAG_WRITE_FAILED;
+                }
+                if flags != phase_advance_last_flags {
+                    phase_advance_emit_once = true;
+                }
+                cached_trace_phase_advance_counts = trace_phase_output.counts;
+                cached_trace_phase_advance_flags = flags;
+                phase_advance_last_flags = flags;
+            }
+
             let position_lead_active = motor_enabled
                 && velocity_scale != 0
                 && tmc_state()
@@ -3184,6 +3491,25 @@ mod app {
                 )
                 .await;
                 trace_control_tick = trace_control_tick.wrapping_add(1);
+                let phase_advance_periodic = trace_control_tick.is_multiple_of(10)
+                    && (cached_trace_phase_advance_flags != 0
+                        || cached_trace_phase_advance_counts != 0);
+                if phase_advance_emit_once || phase_advance_periodic {
+                    crate::usb_trace::emit_phase_advance(
+                        cached_trace_phase_advance_counts,
+                        cached_trace_phase_advance_flags,
+                        tmc_state()
+                            .phase_advance_gain_ppm
+                            .load(core::sync::atomic::Ordering::Relaxed),
+                        tmc_state()
+                            .phase_advance_max_counts
+                            .load(core::sync::atomic::Ordering::Relaxed),
+                        tmc_state()
+                            .phase_advance_deadband
+                            .load(core::sync::atomic::Ordering::Relaxed),
+                    );
+                    phase_advance_emit_once = false;
+                }
                 crate::usb_trace::emit_status_frames(
                     tmc,
                     trace_control_tick,
@@ -3238,6 +3564,11 @@ mod app {
                 let homing = HOMING_STATE.load(Relaxed);
                 match homing {
                     1 => {
+                        if !restore_phase_advance_now!(
+                            "phase advance: failed to restore ABN offset before homing"
+                        ) {
+                            continue;
+                        }
                         // SuppressPending: write position P with I=0
                         let pos_p = tmc_state().position_p_value.load(Relaxed);
                         let reg = (pos_p as u32) << 16; // P in upper half, I=0
@@ -3395,6 +3726,14 @@ mod app {
             stepper_state().interval.store(0, Relaxed);
             stepper_state().interval_add.store(0, Relaxed);
             tmc_state().pid_error_sums_clear.store(true, Relaxed);
+            return;
+        }
+        if HOMING_STATE.load(Relaxed) == 1 {
+            // P1 has not yet performed homing preparation. Defer the first
+            // step so it can restore phase advance and suppress position I.
+            schedule_stepper_timer(td, 0, read_tim5().wrapping_add(CLOCK_FREQ / 1000));
+            td.set_timer_active(0, true);
+            td.reprogram_timer();
             return;
         }
 
