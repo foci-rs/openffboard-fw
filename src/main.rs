@@ -3747,21 +3747,32 @@ mod app {
         stepper_idx: usize,
         clock: u32,
         scheduler_cycles: &mut u32,
+        slot: Option<foci_klipper::scheduler::ScheduledSlot>,
     ) {
-        schedule_trigger_event(
-            td,
-            foci_klipper::scheduler::SchedulerEvent {
-                wake_clock: clock,
-                kind: foci_klipper::scheduler::SchedulerEventKind::Stepper(stepper_idx),
-            },
-            scheduler_cycles,
-        );
+        if let Some(slot) = slot {
+            let start = cortex_m::peripheral::DWT::cycle_count();
+            let result = td.scheduler.requeue_slot(slot, clock);
+            add_scheduler_cycles(scheduler_cycles, start);
+            if matches!(result, foci_klipper::scheduler::ScheduleResult::Full) {
+                crate::state::stepper_diag::record_scheduler_full();
+            }
+        } else {
+            schedule_trigger_event(
+                td,
+                foci_klipper::scheduler::SchedulerEvent {
+                    wake_clock: clock,
+                    kind: foci_klipper::scheduler::SchedulerEventKind::Stepper(stepper_idx),
+                },
+                scheduler_cycles,
+            );
+        }
     }
 
     fn process_stepper_timer(
         td: &mut TriggerDomain,
         stepper_idx: usize,
         scheduler_cycles: &mut u32,
+        slot: Option<foci_klipper::scheduler::ScheduledSlot>,
     ) {
         use core::sync::atomic::Ordering::Relaxed;
         use foci_klipper::stepper::{StepEventResult, StepPhase};
@@ -3769,6 +3780,7 @@ mod app {
         if stepper_idx != 0 {
             return;
         }
+        let mut stepper_slot = slot;
         if FAULT_ACTIVE.load(Relaxed) || !tmc_state().motor_armed.load(Relaxed) {
             td.set_timer_active(0, false);
             stepper_state().interval.store(0, Relaxed);
@@ -3784,6 +3796,7 @@ mod app {
                 0,
                 read_tim5().wrapping_add(CLOCK_FREQ / 1000),
                 scheduler_cycles,
+                stepper_slot.take(),
             );
             td.set_timer_active(0, true);
             td.reprogram_timer();
@@ -3862,7 +3875,13 @@ mod app {
                             scheduled,
                             compare,
                         );
-                        schedule_stepper_timer(td, 0, compare, scheduler_cycles);
+                        schedule_stepper_timer(
+                            td,
+                            0,
+                            compare,
+                            scheduler_cycles,
+                            stepper_slot.take(),
+                        );
                         return;
                     }
                     Err(_) => {
@@ -3920,7 +3939,7 @@ mod app {
                         now,
                         foci_klipper::stepper::STEP_PULSE_TICKS,
                     );
-                    schedule_stepper_timer(td, 0, compare, scheduler_cycles);
+                    schedule_stepper_timer(td, 0, compare, scheduler_cycles, stepper_slot.take());
                     return;
                 }
                 StepEventResult::NeedMove => {
@@ -3937,13 +3956,14 @@ mod app {
         wake_clock: u32,
         need_report: &mut bool,
         scheduler_cycles: &mut u32,
+        stepper_slot: Option<foci_klipper::scheduler::ScheduledSlot>,
     ) {
         use core::sync::atomic::Ordering::Relaxed;
         use foci_klipper::scheduler::SchedulerEventKind;
 
         match kind {
             SchedulerEventKind::Stepper(stepper_idx) => {
-                process_stepper_timer(td, stepper_idx, scheduler_cycles);
+                process_stepper_timer(td, stepper_idx, scheduler_cycles, stepper_slot);
             }
             SchedulerEventKind::EndstopSample(endstop_idx) => {
                 use foci_klipper::endstop::{EndstopPhase, EndstopSampleResult};
@@ -4068,9 +4088,14 @@ mod app {
         loop {
             let now = read_tim5();
             let start = cortex_m::peripheral::DWT::cycle_count();
-            let event = td.scheduler.pop_due(now);
+            let slot = td.scheduler.pop_due_slot(now);
             add_scheduler_cycles(scheduler_cycles, start);
-            if let Some(event) = event {
+            if let Some(slot) = slot {
+                let event = slot.event();
+                let stepper_slot = match event.kind {
+                    foci_klipper::scheduler::SchedulerEventKind::Stepper(_) => Some(slot),
+                    _ => None,
+                };
                 // Record before the callback so dispatch work is not folded
                 // into scheduler-pop lateness.
                 let lateness = now.wrapping_sub(event.wake_clock) as i32;
@@ -4084,6 +4109,7 @@ mod app {
                     event.wake_clock,
                     need_report,
                     scheduler_cycles,
+                    stepper_slot,
                 );
                 let elapsed = read_tim5().wrapping_sub(dispatch_start) as i32;
                 if elapsed >= TIM5_SCHEDULER_REPEAT_TICKS as i32 {
