@@ -3684,7 +3684,7 @@ mod app {
                         foci_klipper::scheduler::SchedulerEventKind::Stepper(0)
                     )
                 });
-                schedule_trigger_event(
+                schedule_trigger_event_unmeasured(
                     td,
                     foci_klipper::scheduler::SchedulerEvent {
                         wake_clock: now.wrapping_add(1),
@@ -3708,11 +3708,14 @@ mod app {
     /// On OpenFFBoard TIM5 runs at 84 MHz, so this is 420 timer ticks.
     const TIM5_SCHEDULER_DEFER_TICKS: u32 = CLOCK_FREQ / 200_000;
 
-    fn schedule_trigger_event(
-        td: &mut TriggerDomain,
-        event: foci_klipper::scheduler::SchedulerEvent,
-    ) -> bool {
-        match td.scheduler.try_schedule(event) {
+    #[inline(always)]
+    fn add_scheduler_cycles(accumulator: &mut u32, start: u32) {
+        *accumulator = (*accumulator)
+            .wrapping_add(cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start));
+    }
+
+    fn record_schedule_result(result: foci_klipper::scheduler::ScheduleResult) -> bool {
+        match result {
             foci_klipper::scheduler::ScheduleResult::Inserted { new_earliest } => new_earliest,
             foci_klipper::scheduler::ScheduleResult::Full => {
                 crate::state::stepper_diag::record_scheduler_full();
@@ -3721,17 +3724,45 @@ mod app {
         }
     }
 
-    fn schedule_stepper_timer(td: &mut TriggerDomain, stepper_idx: usize, clock: u32) {
+    fn schedule_trigger_event_unmeasured(
+        td: &mut TriggerDomain,
+        event: foci_klipper::scheduler::SchedulerEvent,
+    ) -> bool {
+        record_schedule_result(td.scheduler.try_schedule(event))
+    }
+
+    fn schedule_trigger_event(
+        td: &mut TriggerDomain,
+        event: foci_klipper::scheduler::SchedulerEvent,
+        scheduler_cycles: &mut u32,
+    ) -> bool {
+        let start = cortex_m::peripheral::DWT::cycle_count();
+        let result = td.scheduler.try_schedule(event);
+        add_scheduler_cycles(scheduler_cycles, start);
+        record_schedule_result(result)
+    }
+
+    fn schedule_stepper_timer(
+        td: &mut TriggerDomain,
+        stepper_idx: usize,
+        clock: u32,
+        scheduler_cycles: &mut u32,
+    ) {
         schedule_trigger_event(
             td,
             foci_klipper::scheduler::SchedulerEvent {
                 wake_clock: clock,
                 kind: foci_klipper::scheduler::SchedulerEventKind::Stepper(stepper_idx),
             },
+            scheduler_cycles,
         );
     }
 
-    fn process_stepper_timer(td: &mut TriggerDomain, stepper_idx: usize) {
+    fn process_stepper_timer(
+        td: &mut TriggerDomain,
+        stepper_idx: usize,
+        scheduler_cycles: &mut u32,
+    ) {
         use core::sync::atomic::Ordering::Relaxed;
         use foci_klipper::stepper::{StepEventResult, StepPhase};
 
@@ -3748,7 +3779,12 @@ mod app {
         if HOMING_STATE.load(Relaxed) == 1 {
             // P1 has not yet performed homing preparation. Defer the first
             // step so it can restore phase advance and suppress position I.
-            schedule_stepper_timer(td, 0, read_tim5().wrapping_add(CLOCK_FREQ / 1000));
+            schedule_stepper_timer(
+                td,
+                0,
+                read_tim5().wrapping_add(CLOCK_FREQ / 1000),
+                scheduler_cycles,
+            );
             td.set_timer_active(0, true);
             td.reprogram_timer();
             return;
@@ -3826,7 +3862,7 @@ mod app {
                             scheduled,
                             compare,
                         );
-                        schedule_stepper_timer(td, 0, compare);
+                        schedule_stepper_timer(td, 0, compare, scheduler_cycles);
                         return;
                     }
                     Err(_) => {
@@ -3884,7 +3920,7 @@ mod app {
                         now,
                         foci_klipper::stepper::STEP_PULSE_TICKS,
                     );
-                    schedule_stepper_timer(td, 0, compare);
+                    schedule_stepper_timer(td, 0, compare, scheduler_cycles);
                     return;
                 }
                 StepEventResult::NeedMove => {
@@ -3900,12 +3936,15 @@ mod app {
         kind: foci_klipper::scheduler::SchedulerEventKind,
         wake_clock: u32,
         need_report: &mut bool,
+        scheduler_cycles: &mut u32,
     ) {
         use core::sync::atomic::Ordering::Relaxed;
         use foci_klipper::scheduler::SchedulerEventKind;
 
         match kind {
-            SchedulerEventKind::Stepper(stepper_idx) => process_stepper_timer(td, stepper_idx),
+            SchedulerEventKind::Stepper(stepper_idx) => {
+                process_stepper_timer(td, stepper_idx, scheduler_cycles);
+            }
             SchedulerEventKind::EndstopSample(endstop_idx) => {
                 use foci_klipper::endstop::{EndstopPhase, EndstopSampleResult};
                 let pin_id = ENDSTOP_PIN_IDS[endstop_idx].load(Relaxed);
@@ -3939,6 +3978,7 @@ mod app {
                                         wake_clock: next_clock,
                                         kind: SchedulerEventKind::EndstopSample(endstop_idx),
                                     },
+                                    scheduler_cycles,
                                 );
                             }
                             _ => {}
@@ -3955,6 +3995,7 @@ mod app {
                                 wake_clock: next_clock,
                                 kind: SchedulerEventKind::EndstopSample(endstop_idx),
                             },
+                            scheduler_cycles,
                         );
                     }
                     EndstopSampleResult::Inactive => {}
@@ -3996,6 +4037,7 @@ mod app {
                                 wake_clock: next_report,
                                 kind: SchedulerEventKind::TrSyncReport(trsync_idx),
                             },
+                            scheduler_cycles,
                         );
                     }
                 }
@@ -4016,12 +4058,19 @@ mod app {
         td.arm_timer_at(read_tim5().wrapping_add(TIM5_SCHEDULER_DEFER_TICKS));
     }
 
-    fn dispatch_tim5_scheduler(td: &mut TriggerDomain, need_report: &mut bool) -> u32 {
+    fn dispatch_tim5_scheduler(
+        td: &mut TriggerDomain,
+        need_report: &mut bool,
+        scheduler_cycles: &mut u32,
+    ) -> u32 {
         let dispatch_start = read_tim5();
         let mut processed_events = 0;
         loop {
             let now = read_tim5();
-            if let Some(event) = td.scheduler.pop_due(now) {
+            let start = cortex_m::peripheral::DWT::cycle_count();
+            let event = td.scheduler.pop_due(now);
+            add_scheduler_cycles(scheduler_cycles, start);
+            if let Some(event) = event {
                 // Record before the callback so dispatch work is not folded
                 // into scheduler-pop lateness.
                 let lateness = now.wrapping_sub(event.wake_clock) as i32;
@@ -4029,7 +4078,13 @@ mod app {
                     crate::state::stepper_diag::record_scheduler_pop_lateness(lateness as u32);
                 }
                 processed_events += 1;
-                process_trigger_timer(td, event.kind, event.wake_clock, need_report);
+                process_trigger_timer(
+                    td,
+                    event.kind,
+                    event.wake_clock,
+                    need_report,
+                    scheduler_cycles,
+                );
                 let elapsed = read_tim5().wrapping_sub(dispatch_start) as i32;
                 if elapsed >= TIM5_SCHEDULER_REPEAT_TICKS as i32 {
                     defer_tim5_scheduler(td);
@@ -4038,7 +4093,10 @@ mod app {
                 continue;
             }
 
-            let Some(next_clock) = td.scheduler.earliest_deadline() else {
+            let start = cortex_m::peripheral::DWT::cycle_count();
+            let next_clock = td.scheduler.earliest_deadline();
+            add_scheduler_cycles(scheduler_cycles, start);
+            let Some(next_clock) = next_clock else {
                 td.disarm_timer();
                 return processed_events;
             };
@@ -4097,13 +4155,15 @@ mod app {
         let mut need_report = false;
         let mut dispatch_cycles = 0;
         let mut processed_events = 0;
+        let mut scheduler_cycles = 0;
         with_trigger_domain_site(crate::state::stepper_diag::PERF_SITE_TIM5, |td| {
             let dispatch_start = cortex_m::peripheral::DWT::cycle_count();
-            processed_events = dispatch_tim5_scheduler(td, &mut need_report);
+            processed_events = dispatch_tim5_scheduler(td, &mut need_report, &mut scheduler_cycles);
             dispatch_cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(dispatch_start);
         });
         let irq_cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(irq_start);
         crate::state::stepper_diag::record_tim5_irq(irq_cycles, dispatch_cycles, processed_events);
+        crate::state::stepper_diag::record_scheduler_cycles(scheduler_cycles, processed_events);
         if need_report {
             REPORT_PENDING.store(true, Relaxed);
             report_task::spawn().ok();

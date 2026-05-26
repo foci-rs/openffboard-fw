@@ -98,6 +98,12 @@ struct StepperPerfCounters {
     tim5_burst_cycles_per_event_floor3_max: AtomicU32,
     tim5_entry_latency_max_ticks: AtomicU32,
     tim5_pop_lateness_max_ticks: AtomicU32,
+    scheduler_cycles_max: AtomicU32,
+    scheduler_cycles_events_at_max: AtomicU32,
+    scheduler_cycles_per_event_max: AtomicU32,
+    scheduler_cycles_per_event_max_cycles: AtomicU32,
+    scheduler_cycles_per_event_max_events: AtomicU32,
+    scheduler_cycles_per_event_floor3_max: AtomicU32,
     scheduler_full_count: AtomicU32,
     stepper_load_lateness_max_ticks: AtomicU32,
     stepper_load_lateness_last_ticks: AtomicI32,
@@ -170,6 +176,12 @@ impl StepperPerfCounters {
             tim5_burst_cycles_per_event_floor3_max: AtomicU32::new(0),
             tim5_entry_latency_max_ticks: AtomicU32::new(0),
             tim5_pop_lateness_max_ticks: AtomicU32::new(0),
+            scheduler_cycles_max: AtomicU32::new(0),
+            scheduler_cycles_events_at_max: AtomicU32::new(0),
+            scheduler_cycles_per_event_max: AtomicU32::new(0),
+            scheduler_cycles_per_event_max_cycles: AtomicU32::new(0),
+            scheduler_cycles_per_event_max_events: AtomicU32::new(0),
+            scheduler_cycles_per_event_floor3_max: AtomicU32::new(0),
             scheduler_full_count: AtomicU32::new(0),
             stepper_load_lateness_max_ticks: AtomicU32::new(0),
             stepper_load_lateness_last_ticks: AtomicI32::new(0),
@@ -205,6 +217,12 @@ impl StepperPerfCounters {
             .store(0, Relaxed);
         self.tim5_entry_latency_max_ticks.store(0, Relaxed);
         self.tim5_pop_lateness_max_ticks.store(0, Relaxed);
+        self.scheduler_cycles_max.store(0, Relaxed);
+        self.scheduler_cycles_events_at_max.store(0, Relaxed);
+        self.scheduler_cycles_per_event_max.store(0, Relaxed);
+        self.scheduler_cycles_per_event_max_cycles.store(0, Relaxed);
+        self.scheduler_cycles_per_event_max_events.store(0, Relaxed);
+        self.scheduler_cycles_per_event_floor3_max.store(0, Relaxed);
         self.scheduler_full_count.store(0, Relaxed);
         self.stepper_load_lateness_max_ticks.store(0, Relaxed);
         self.stepper_load_lateness_last_ticks.store(0, Relaxed);
@@ -542,6 +560,34 @@ pub(crate) fn record_scheduler_full() {
         .fetch_add(1, Relaxed);
 }
 
+/// Record TIM5-dispatch scheduler bookkeeping cycles.
+pub(crate) fn record_scheduler_cycles(scheduler_cycles: u32, event_count: u32) {
+    let counters = &STEPPER_PERF_COUNTERS;
+    record_max_with_event_count(
+        &counters.scheduler_cycles_max,
+        &counters.scheduler_cycles_events_at_max,
+        scheduler_cycles,
+        event_count,
+    );
+    if event_count > 0 {
+        let cycles_per_event = scheduler_cycles / event_count;
+        record_max_burst_ratio(
+            &counters.scheduler_cycles_per_event_max,
+            &counters.scheduler_cycles_per_event_max_cycles,
+            &counters.scheduler_cycles_per_event_max_events,
+            cycles_per_event,
+            scheduler_cycles,
+            event_count,
+        );
+        if event_count >= 3 {
+            record_max(
+                &counters.scheduler_cycles_per_event_floor3_max,
+                cycles_per_event,
+            );
+        }
+    }
+}
+
 /// Record one TIM5 IRQ dispatch sample.
 pub(crate) fn record_tim5_irq(irq_cycles: u32, dispatch_cycles: u32, event_count: u32) {
     let counters = &STEPPER_PERF_COUNTERS;
@@ -621,6 +667,19 @@ pub(crate) fn perf_snapshot(
             .load(Relaxed),
         tim5_entry_latency_max_ticks: counters.tim5_entry_latency_max_ticks.load(Relaxed),
         tim5_pop_lateness_max_ticks: counters.tim5_pop_lateness_max_ticks.load(Relaxed),
+        scheduler_cycles_max: counters.scheduler_cycles_max.load(Relaxed),
+        scheduler_cycles_events_at_max: counters.scheduler_cycles_events_at_max.load(Relaxed),
+        scheduler_cycles_per_event_max: counters.scheduler_cycles_per_event_max.load(Relaxed),
+        scheduler_cycles_per_event_max_cycles: counters
+            .scheduler_cycles_per_event_max_cycles
+            .load(Relaxed),
+        scheduler_cycles_per_event_max_events: counters
+            .scheduler_cycles_per_event_max_events
+            .load(Relaxed),
+        scheduler_cycles_per_event_floor3_max: counters
+            .scheduler_cycles_per_event_floor3_max
+            .load(Relaxed),
+        scheduler_full_count: counters.scheduler_full_count.load(Relaxed),
         stepper_load_lateness_max_ticks: counters.stepper_load_lateness_max_ticks.load(Relaxed),
         stepper_load_lateness_last_ticks: counters.stepper_load_lateness_last_ticks.load(Relaxed),
         build_trace_enabled: cfg!(feature = "trace"),
