@@ -3684,7 +3684,7 @@ mod app {
                         foci_klipper::scheduler::SchedulerEventKind::Stepper(0)
                     )
                 });
-                schedule_trigger_event_unmeasured(
+                insert_trigger_event_unmeasured(
                     td,
                     foci_klipper::scheduler::SchedulerEvent {
                         wake_clock: now.wrapping_add(1),
@@ -3724,14 +3724,14 @@ mod app {
         }
     }
 
-    fn schedule_trigger_event_unmeasured(
+    fn insert_trigger_event_unmeasured(
         td: &mut TriggerDomain,
         event: foci_klipper::scheduler::SchedulerEvent,
     ) -> bool {
         record_schedule_result(td.scheduler.try_schedule(event))
     }
 
-    fn schedule_trigger_event(
+    fn insert_trigger_event(
         td: &mut TriggerDomain,
         event: foci_klipper::scheduler::SchedulerEvent,
         scheduler_cycles: &mut u32,
@@ -3742,7 +3742,7 @@ mod app {
         record_schedule_result(result)
     }
 
-    fn schedule_stepper_timer(
+    fn arm_stepper_timer_event(
         td: &mut TriggerDomain,
         stepper_idx: usize,
         clock: u32,
@@ -3757,7 +3757,7 @@ mod app {
                 crate::state::stepper_diag::record_scheduler_full();
             }
         } else {
-            schedule_trigger_event(
+            insert_trigger_event(
                 td,
                 foci_klipper::scheduler::SchedulerEvent {
                     wake_clock: clock,
@@ -3791,7 +3791,7 @@ mod app {
         if HOMING_STATE.load(Relaxed) == 1 {
             // P1 has not yet performed homing preparation. Defer the first
             // step so it can restore phase advance and suppress position I.
-            schedule_stepper_timer(
+            arm_stepper_timer_event(
                 td,
                 0,
                 read_tim5().wrapping_add(CLOCK_FREQ / 1000),
@@ -3875,7 +3875,7 @@ mod app {
                             scheduled,
                             compare,
                         );
-                        schedule_stepper_timer(
+                        arm_stepper_timer_event(
                             td,
                             0,
                             compare,
@@ -3939,7 +3939,7 @@ mod app {
                         now,
                         foci_klipper::stepper::STEP_PULSE_TICKS,
                     );
-                    schedule_stepper_timer(td, 0, compare, scheduler_cycles, stepper_slot.take());
+                    arm_stepper_timer_event(td, 0, compare, scheduler_cycles, stepper_slot.take());
                     return;
                 }
                 StepEventResult::NeedMove => {
@@ -3992,7 +3992,7 @@ mod app {
                                 *need_report = true;
                             }
                             EndstopSampleResult::Reschedule { next_clock } => {
-                                schedule_trigger_event(
+                                insert_trigger_event(
                                     td,
                                     foci_klipper::scheduler::SchedulerEvent {
                                         wake_clock: next_clock,
@@ -4009,7 +4009,7 @@ mod app {
                         *need_report = true;
                     }
                     EndstopSampleResult::Reschedule { next_clock } => {
-                        schedule_trigger_event(
+                        insert_trigger_event(
                             td,
                             foci_klipper::scheduler::SchedulerEvent {
                                 wake_clock: next_clock,
@@ -4051,7 +4051,7 @@ mod app {
                             .report_clock()
                             .wrapping_add(report_ticks);
                         td.trsync[trsync_idx].set_report_clock(next_report);
-                        schedule_trigger_event(
+                        insert_trigger_event(
                             td,
                             foci_klipper::scheduler::SchedulerEvent {
                                 wake_clock: next_report,
