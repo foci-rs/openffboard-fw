@@ -212,12 +212,28 @@ pub(crate) fn with_trigger_domain<F, R>(f: F) -> R
 where
     F: FnOnce(&mut TriggerDomain) -> R,
 {
-    cortex_m::interrupt::free(|_| {
+    with_trigger_domain_site(crate::state::stepper_diag::PERF_SITE_TRIGGER_DOMAIN, f)
+}
+
+/// Lock TriggerDomain and attribute the measured critical section to a site.
+#[inline]
+pub(crate) fn with_trigger_domain_site<F, R>(site: u8, f: F) -> R
+where
+    F: FnOnce(&mut TriggerDomain) -> R,
+{
+    let mut cycles = 0;
+    let result = cortex_m::interrupt::free(|_| {
+        let start = cortex_m::peripheral::DWT::cycle_count();
         // SAFETY: All access to TRIGGER_DOMAIN goes through this function.
         // interrupt::free ensures exclusive access across all priorities.
         // addr_of_mut! avoids creating a reference to the static mut.
-        unsafe { f(&mut *core::ptr::addr_of_mut!(TRIGGER_DOMAIN).cast::<TriggerDomain>()) }
-    })
+        let result =
+            unsafe { f(&mut *core::ptr::addr_of_mut!(TRIGGER_DOMAIN).cast::<TriggerDomain>()) };
+        cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start);
+        result
+    });
+    crate::state::stepper_diag::record_critical_section(site, cycles);
+    result
 }
 
 /// Stop a physical stepper without locking TriggerDomain.

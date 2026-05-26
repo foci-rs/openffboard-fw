@@ -29,6 +29,7 @@ use crate::state::stepper::{isr_stepper, p2_stepper, step_queue};
 use crate::state::tmc::TMC_REQUEST_SENDER;
 use crate::trigger_domain::{
     PHYSICAL_STEPPER_INDICES, stop_physical_stepper_no_lock, with_trigger_domain,
+    with_trigger_domain_site,
 };
 
 fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
@@ -208,7 +209,7 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
 
         use foci_klipper::commands::stepper::{QueueStepResult, queue_step_hw};
 
-        with_trigger_domain(|td| {
+        with_trigger_domain_site(crate::state::stepper_diag::PERF_SITE_QUEUE_STEP, |td| {
             let need_reset = td.stepper_stop[0].need_reset;
 
             // SAFETY: P2 is the sole producer. Queue len read is safe from P2.

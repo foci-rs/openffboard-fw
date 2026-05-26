@@ -32,5 +32,11 @@ pub(crate) fn record_stepper_event(
         data0,
         data1,
     });
+    if matches!(
+        reason,
+        StepperEventReason::MissedDeadlineLoad | StepperEventReason::MissedDeadlineStep
+    ) {
+        crate::state::stepper_diag::record_perf_event(reason, channel, clock);
+    }
     crate::app::stepper_diag_task::spawn().ok();
 }

@@ -7,7 +7,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use embassy_stm32::gpio::Output;
 use embassy_stm32::peripherals;
 use embassy_stm32::wdg::IndependentWatchdog;
-use foci_firmware::ankyra::replies::{FociStepperEvent, Stats, TrsyncState};
+use foci_firmware::ankyra::replies::{FociStepperEvent, FociStepperPerfEvent, Stats, TrsyncState};
 
 /// SumSq base used by `stats`. Must match `STATS_SUMSQ_BASE` advertised
 /// to Klipper via `klipper_constant`.
@@ -127,6 +127,30 @@ pub fn emit_stepper_diagnostics() {
             direction: u8 = event.direction as u8,
             data0: u32 = event.data0,
             data1: u32 = event.data1,
+        );
+    }
+    while let Some(event) = crate::state::stepper_diag::pop_perf_event() {
+        let snapshot = event.snapshot;
+        ::ankyra::klipper_reply_from!(
+            &mut crate::_ankyra_config::Sender,
+            FociStepperPerfEvent,
+            reason: u8 = event.reason as u8,
+            channel: u8 = snapshot.channel,
+            clock: u32 = event.clock,
+            sample_count: u32 = snapshot.sample_count,
+            crit_count: u32 = snapshot.crit_count,
+            crit_max_cycles: u32 = snapshot.crit_max_cycles,
+            crit_max_site: u8 = snapshot.crit_max_site,
+            crit_over_10us: u32 = snapshot.crit_over_10us,
+            crit_over_50us: u32 = snapshot.crit_over_50us,
+            crit_over_100us: u32 = snapshot.crit_over_100us,
+            crit_over_1000us: u32 = snapshot.crit_over_1000us,
+            queue_step_count: u32 = snapshot.queue_step_count,
+            queue_step_max_cycles: u32 = snapshot.queue_step_max_cycles,
+            tim5_irq_count: u32 = snapshot.tim5_irq_count,
+            tim5_irq_max_cycles: u32 = snapshot.tim5_irq_max_cycles,
+            tim5_dispatch_max_cycles: u32 = snapshot.tim5_dispatch_max_cycles,
+            tim5_events_max_per_irq: u32 = snapshot.tim5_events_max_per_irq,
         );
     }
 }

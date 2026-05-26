@@ -53,6 +53,7 @@ mod app {
     use crate::state::trace::*;
     use crate::trigger_domain::{
         TRIGGER_DOMAIN, TRIGGER_TIMER_MIN_LEAD_TICKS, TriggerDomain, with_trigger_domain,
+        with_trigger_domain_site,
     };
     use foci_firmware::diagnostic::StepperEventReason;
     use foci_firmware::state::lifecycle::*;
@@ -3652,23 +3653,25 @@ mod app {
         td.arm_timer_at(read_tim5().wrapping_add(TIM5_SCHEDULER_DEFER_TICKS));
     }
 
-    fn dispatch_tim5_scheduler(td: &mut TriggerDomain, need_report: &mut bool) {
+    fn dispatch_tim5_scheduler(td: &mut TriggerDomain, need_report: &mut bool) -> u32 {
         let dispatch_start = read_tim5();
+        let mut processed_events = 0;
         loop {
             let now = read_tim5();
             if let Some(event) = td.scheduler.pop_due(now) {
+                processed_events += 1;
                 process_trigger_timer(td, event.kind, event.wake_clock, need_report);
                 let elapsed = read_tim5().wrapping_sub(dispatch_start) as i32;
                 if elapsed >= TIM5_SCHEDULER_REPEAT_TICKS as i32 {
                     defer_tim5_scheduler(td);
-                    return;
+                    return processed_events;
                 }
                 continue;
             }
 
             let Some(next_clock) = td.scheduler.earliest_deadline() else {
                 td.disarm_timer();
-                return;
+                return processed_events;
             };
             let now = read_tim5();
             let compare = foci_klipper::scheduler::timer_arm_clock(
@@ -3677,7 +3680,7 @@ mod app {
                 TRIGGER_TIMER_MIN_LEAD_TICKS,
             );
             td.arm_timer_at(compare);
-            return;
+            return processed_events;
         }
     }
 
@@ -3697,15 +3700,22 @@ mod app {
         if !cc1_pending && !cc2_pending {
             return;
         }
+        let irq_start = cortex_m::peripheral::DWT::cycle_count();
         tim5.sr().modify(|w| {
             w.set_ccif(0, false);
             w.set_ccif(1, false);
         });
 
         let mut need_report = false;
-        with_trigger_domain(|td| {
-            dispatch_tim5_scheduler(td, &mut need_report);
+        let mut dispatch_cycles = 0;
+        let mut processed_events = 0;
+        with_trigger_domain_site(crate::state::stepper_diag::PERF_SITE_TIM5, |td| {
+            let dispatch_start = cortex_m::peripheral::DWT::cycle_count();
+            processed_events = dispatch_tim5_scheduler(td, &mut need_report);
+            dispatch_cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(dispatch_start);
         });
+        let irq_cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(irq_start);
+        crate::state::stepper_diag::record_tim5_irq(irq_cycles, dispatch_cycles, processed_events);
         if need_report {
             REPORT_PENDING.store(true, Relaxed);
             report_task::spawn().ok();
