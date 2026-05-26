@@ -83,10 +83,19 @@ struct StepperPerfCounters {
     crit_over_1000us: AtomicU32,
     queue_step_count: AtomicU32,
     queue_step_max_cycles: AtomicU32,
-    tim5_irq_count: AtomicU32,
+    tim5_activation_count: AtomicU32,
     tim5_irq_max_cycles: AtomicU32,
     tim5_dispatch_max_cycles: AtomicU32,
     tim5_events_max_per_irq: AtomicU32,
+    tim5_event_count_total: AtomicU32,
+    tim5_defer_count: AtomicU32,
+    tim5_empty_count: AtomicU32,
+    tim5_events_last_activation: AtomicU32,
+    tim5_burst_cycles_per_event_max: AtomicU32,
+    tim5_entry_latency_max_ticks: AtomicU32,
+    tim5_pop_lateness_max_ticks: AtomicU32,
+    stepper_load_lateness_max_ticks: AtomicU32,
+    stepper_load_lateness_last_ticks: AtomicI32,
 }
 
 impl StepperExecutionCounters {
@@ -141,10 +150,19 @@ impl StepperPerfCounters {
             crit_over_1000us: AtomicU32::new(0),
             queue_step_count: AtomicU32::new(0),
             queue_step_max_cycles: AtomicU32::new(0),
-            tim5_irq_count: AtomicU32::new(0),
+            tim5_activation_count: AtomicU32::new(0),
             tim5_irq_max_cycles: AtomicU32::new(0),
             tim5_dispatch_max_cycles: AtomicU32::new(0),
             tim5_events_max_per_irq: AtomicU32::new(0),
+            tim5_event_count_total: AtomicU32::new(0),
+            tim5_defer_count: AtomicU32::new(0),
+            tim5_empty_count: AtomicU32::new(0),
+            tim5_events_last_activation: AtomicU32::new(0),
+            tim5_burst_cycles_per_event_max: AtomicU32::new(0),
+            tim5_entry_latency_max_ticks: AtomicU32::new(0),
+            tim5_pop_lateness_max_ticks: AtomicU32::new(0),
+            stepper_load_lateness_max_ticks: AtomicU32::new(0),
+            stepper_load_lateness_last_ticks: AtomicI32::new(0),
         }
     }
 
@@ -159,10 +177,19 @@ impl StepperPerfCounters {
         self.crit_over_1000us.store(0, Relaxed);
         self.queue_step_count.store(0, Relaxed);
         self.queue_step_max_cycles.store(0, Relaxed);
-        self.tim5_irq_count.store(0, Relaxed);
+        self.tim5_activation_count.store(0, Relaxed);
         self.tim5_irq_max_cycles.store(0, Relaxed);
         self.tim5_dispatch_max_cycles.store(0, Relaxed);
         self.tim5_events_max_per_irq.store(0, Relaxed);
+        self.tim5_event_count_total.store(0, Relaxed);
+        self.tim5_defer_count.store(0, Relaxed);
+        self.tim5_empty_count.store(0, Relaxed);
+        self.tim5_events_last_activation.store(0, Relaxed);
+        self.tim5_burst_cycles_per_event_max.store(0, Relaxed);
+        self.tim5_entry_latency_max_ticks.store(0, Relaxed);
+        self.tim5_pop_lateness_max_ticks.store(0, Relaxed);
+        self.stepper_load_lateness_max_ticks.store(0, Relaxed);
+        self.stepper_load_lateness_last_ticks.store(0, Relaxed);
     }
 }
 
@@ -293,6 +320,13 @@ pub(crate) fn record_loaded_segment_timing(
     compare: u32,
 ) {
     record_loaded_segment(channel, steps);
+    let lateness = now.wrapping_sub(scheduled) as i32;
+    let perf = &STEPPER_PERF_COUNTERS;
+    perf.stepper_load_lateness_last_ticks
+        .store(lateness, Relaxed);
+    if lateness > 0 {
+        record_max(&perf.stepper_load_lateness_max_ticks, lateness as u32);
+    }
     if let Some(counters) = counters(channel)
         && counters.activation_loaded_segments.fetch_add(1, Relaxed) == 0
     {
@@ -423,11 +457,46 @@ pub(crate) fn record_critical_section(site: u8, cycles: u32) {
     }
 }
 
+/// Record lateness observed at TIM5 ISR body entry before dispatch starts.
+pub(crate) fn record_tim5_entry_latency(lateness_ticks: u32) {
+    record_max(
+        &STEPPER_PERF_COUNTERS.tim5_entry_latency_max_ticks,
+        lateness_ticks,
+    );
+}
+
+/// Record that TIM5 dispatch deferred after hitting the repeat guard.
+pub(crate) fn record_tim5_defer() {
+    STEPPER_PERF_COUNTERS.tim5_defer_count.fetch_add(1, Relaxed);
+}
+
+/// Record scheduler pop lateness measured before event callback work.
+pub(crate) fn record_scheduler_pop_lateness(lateness_ticks: u32) {
+    record_max(
+        &STEPPER_PERF_COUNTERS.tim5_pop_lateness_max_ticks,
+        lateness_ticks,
+    );
+}
+
 /// Record one TIM5 IRQ dispatch sample.
 pub(crate) fn record_tim5_irq(irq_cycles: u32, dispatch_cycles: u32, event_count: u32) {
     let counters = &STEPPER_PERF_COUNTERS;
     counters.sample_count.fetch_add(1, Relaxed);
-    counters.tim5_irq_count.fetch_add(1, Relaxed);
+    counters.tim5_activation_count.fetch_add(1, Relaxed);
+    counters
+        .tim5_event_count_total
+        .fetch_add(event_count, Relaxed);
+    counters
+        .tim5_events_last_activation
+        .store(event_count, Relaxed);
+    if event_count == 0 {
+        counters.tim5_empty_count.fetch_add(1, Relaxed);
+    } else {
+        record_max(
+            &counters.tim5_burst_cycles_per_event_max,
+            dispatch_cycles / event_count,
+        );
+    }
     record_max(&counters.tim5_irq_max_cycles, irq_cycles);
     record_max(&counters.tim5_dispatch_max_cycles, dispatch_cycles);
     record_max(&counters.tim5_events_max_per_irq, event_count);
@@ -451,10 +520,20 @@ pub(crate) fn perf_snapshot(
         crit_over_1000us: counters.crit_over_1000us.load(Relaxed),
         queue_step_count: counters.queue_step_count.load(Relaxed),
         queue_step_max_cycles: counters.queue_step_max_cycles.load(Relaxed),
-        tim5_irq_count: counters.tim5_irq_count.load(Relaxed),
+        tim5_activation_count: counters.tim5_activation_count.load(Relaxed),
         tim5_irq_max_cycles: counters.tim5_irq_max_cycles.load(Relaxed),
         tim5_dispatch_max_cycles: counters.tim5_dispatch_max_cycles.load(Relaxed),
         tim5_events_max_per_irq: counters.tim5_events_max_per_irq.load(Relaxed),
+        tim5_event_count_total: counters.tim5_event_count_total.load(Relaxed),
+        tim5_defer_count: counters.tim5_defer_count.load(Relaxed),
+        tim5_empty_count: counters.tim5_empty_count.load(Relaxed),
+        tim5_events_last_activation: counters.tim5_events_last_activation.load(Relaxed),
+        tim5_burst_cycles_per_event_max: counters.tim5_burst_cycles_per_event_max.load(Relaxed),
+        tim5_entry_latency_max_ticks: counters.tim5_entry_latency_max_ticks.load(Relaxed),
+        tim5_pop_lateness_max_ticks: counters.tim5_pop_lateness_max_ticks.load(Relaxed),
+        stepper_load_lateness_max_ticks: counters.stepper_load_lateness_max_ticks.load(Relaxed),
+        stepper_load_lateness_last_ticks: counters.stepper_load_lateness_last_ticks.load(Relaxed),
+        build_trace_enabled: cfg!(feature = "trace"),
     };
     if clear {
         counters.reset();

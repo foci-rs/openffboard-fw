@@ -147,10 +147,20 @@ pub fn emit_stepper_diagnostics() {
             crit_over_1000us: u32 = snapshot.crit_over_1000us,
             queue_step_count: u32 = snapshot.queue_step_count,
             queue_step_max_cycles: u32 = snapshot.queue_step_max_cycles,
-            tim5_irq_count: u32 = snapshot.tim5_irq_count,
+            tim5_activation_count: u32 = snapshot.tim5_activation_count,
             tim5_irq_max_cycles: u32 = snapshot.tim5_irq_max_cycles,
             tim5_dispatch_max_cycles: u32 = snapshot.tim5_dispatch_max_cycles,
             tim5_events_max_per_irq: u32 = snapshot.tim5_events_max_per_irq,
+            tim5_event_count_total: u32 = snapshot.tim5_event_count_total,
+            tim5_defer_count: u32 = snapshot.tim5_defer_count,
+            tim5_empty_count: u32 = snapshot.tim5_empty_count,
+            tim5_events_last_activation: u32 = snapshot.tim5_events_last_activation,
+            tim5_burst_cycles_per_event_max: u32 = snapshot.tim5_burst_cycles_per_event_max,
+            tim5_entry_latency_max_ticks: u32 = snapshot.tim5_entry_latency_max_ticks,
+            tim5_pop_lateness_max_ticks: u32 = snapshot.tim5_pop_lateness_max_ticks,
+            stepper_load_lateness_max_ticks: u32 = snapshot.stepper_load_lateness_max_ticks,
+            stepper_load_lateness_last_ticks: i32 = snapshot.stepper_load_lateness_last_ticks,
+            build_trace_enabled: u8 = snapshot.build_trace_enabled as u8,
         );
     }
 }

@@ -3989,6 +3989,7 @@ mod app {
         crate::usb_trace::TRACE_TIMING
             .missed_or_deferred_steps
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        crate::state::stepper_diag::record_tim5_defer();
         td.arm_timer_at(read_tim5().wrapping_add(TIM5_SCHEDULER_DEFER_TICKS));
     }
 
@@ -3998,6 +3999,12 @@ mod app {
         loop {
             let now = read_tim5();
             if let Some(event) = td.scheduler.pop_due(now) {
+                // Record before the callback so dispatch work is not folded
+                // into scheduler-pop lateness.
+                let lateness = now.wrapping_sub(event.wake_clock) as i32;
+                if lateness > 0 {
+                    crate::state::stepper_diag::record_scheduler_pop_lateness(lateness as u32);
+                }
                 processed_events += 1;
                 process_trigger_timer(td, event.kind, event.wake_clock, need_report);
                 let elapsed = read_tim5().wrapping_sub(dispatch_start) as i32;
@@ -4038,6 +4045,25 @@ mod app {
         let cc2_pending = sr.ccif(1) && dier.ccie(1);
         if !cc1_pending && !cc2_pending {
             return;
+        }
+        let entry_now = tim5.cnt().read();
+        let mut entry_lateness = 0i32;
+        if cc1_pending {
+            let ccr = tim5.ccr(0).read();
+            let delta = entry_now.wrapping_sub(ccr) as i32;
+            if delta > entry_lateness {
+                entry_lateness = delta;
+            }
+        }
+        if cc2_pending {
+            let ccr = tim5.ccr(1).read();
+            let delta = entry_now.wrapping_sub(ccr) as i32;
+            if delta > entry_lateness {
+                entry_lateness = delta;
+            }
+        }
+        if entry_lateness > 0 {
+            crate::state::stepper_diag::record_tim5_entry_latency(entry_lateness as u32);
         }
         let irq_start = cortex_m::peripheral::DWT::cycle_count();
         tim5.sr().modify(|w| {
