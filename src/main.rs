@@ -1176,10 +1176,20 @@ mod app {
                                     &mut motor_enabled,
                                     &mut stored_gains,
                                 );
-                                foci_firmware::tmc_ops::arm_motor_electrical(
+                                if let Err(error) = foci_firmware::tmc_ops::arm_motor_electrical(
                                     &mut backend,
                                     &mut state,
-                                );
+                                )
+                                .await
+                                {
+                                    defmt::error!(
+                                        "Motor enable rejected by sentinel verify: {}",
+                                        error
+                                    );
+                                    foci_firmware::tmc_ops::disarm_motor(&mut backend, &mut state)
+                                        .await;
+                                    continue;
+                                }
                                 apply_stepper_post_action(
                                     foci_firmware::commission_dispatch::StepperPostAction::ArmPreservePosition,
                                     &mut state,
