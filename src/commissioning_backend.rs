@@ -104,6 +104,10 @@ impl<'a> foci_firmware::commission::CommissioningBackend for OpenFFBoardBackend<
         self.tmc_state.step_width_value.load(Relaxed).max(0) as u32
     }
 
+    fn encoder_quadrature_ppr(&self) -> u32 {
+        self.tmc_state.encoder_ppr.load(Relaxed).saturating_mul(4)
+    }
+
     fn operational_velocity_limit(&self) -> u32 {
         self.tmc_state.velocity_limit_cfg.load(Relaxed)
     }
