@@ -580,7 +580,8 @@ mod app {
         let spi_cs = Output::new(p.PA4, Level::High, Speed::VeryHigh);
         let spi_dev = ExclusiveDevice::new(spi1, spi_cs, CycleDelay)
             .expect("ExclusiveDevice::new is infallible");
-        let tmc = Tmc4671Spi::new(spi_dev);
+        let tmc = Tmc4671Spi::new(spi_dev)
+            .with_retry_policy(foci_tmc4671::spi::RetryPolicy::production());
 
         // TMC register request channel
         let (tmc_tx, tmc_rx) = ctx.local.tmc_channel.split();
