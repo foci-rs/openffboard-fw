@@ -50,7 +50,6 @@ mod app {
     use crate::helpers::trsync::*;
     use crate::state::stepper::*;
     use crate::state::tmc::*;
-    use crate::state::trace::*;
     use crate::trigger_domain::{
         TRIGGER_DOMAIN, TRIGGER_TIMER_MIN_LEAD_TICKS, TriggerDomain, with_trigger_domain,
         with_trigger_domain_site,
@@ -627,34 +626,6 @@ mod app {
 
         crate::board_init::enable_dwt_cyccnt();
 
-        // Initialize trace buffers in CCM RAM
-        unsafe {
-            // Use addr_of_mut! to avoid creating a reference to the mutable static
-            let ptr =
-                core::ptr::addr_of_mut!(TRACE_BUFS).cast::<foci_firmware::trace::TraceBuffer>();
-            // Validate address is in CCM range
-            let addr = ptr as usize;
-            defmt::assert!(
-                (0x1000_0000..0x1001_0000).contains(&addr),
-                "TRACE_BUFS not in CCM RAM: {:#010x}",
-                addr
-            );
-            defmt::info!(
-                "trace: buffers at {:#010x}, size {} bytes",
-                addr,
-                core::mem::size_of::<foci_firmware::trace::TraceBuffer>()
-                    * crate::board_config::TMC_CHANNEL_COUNT as usize
-            );
-            for channel in 0..crate::board_config::TMC_CHANNEL_COUNT as usize {
-                core::ptr::write(ptr.add(channel), {
-                    let mut buf = core::mem::zeroed::<foci_firmware::trace::TraceBuffer>();
-                    // reset() sets magic and all fields to valid initial state
-                    buf.reset();
-                    buf
-                });
-            }
-        }
-
         // Initialize TriggerDomain
         // SAFETY: init runs once before any task starts. No concurrent access.
         unsafe {
@@ -1021,6 +992,7 @@ mod app {
             if commission_engine.is_some() {
                 // Capture deadline before engine.step() so SPI time consumed
                 // by the engine reduces the remaining trace budget.
+                #[cfg(feature = "trace")]
                 let engine_tick_deadline =
                     Mono::now() + fugit::Duration::<u64, 1, 1_000_000>::millis(1);
 
@@ -1054,20 +1026,6 @@ mod app {
                 use foci_firmware::commission_dispatch::CommissionOutcome;
                 match outcome {
                     CommissionOutcome::Continue => {
-                        // Trace capture during Continue tick — engine.step's
-                        // SPI eats into the 1ms trace budget.
-                        foci_firmware::trace::sample_tick(
-                            tmc,
-                            unsafe { trace_buf0() },
-                            || {
-                                engine_tick_deadline
-                                    .checked_duration_since(Mono::now())
-                                    .map(|d| d.to_micros())
-                            },
-                            || Mono::now() > engine_tick_deadline,
-                            168,
-                        )
-                        .await;
                         #[cfg(feature = "trace")]
                         if commission_trace_phase
                             == Some((
@@ -1098,23 +1056,12 @@ mod app {
                         phase_id,
                         engine_kind,
                     } => {
-                        use foci_firmware::commissioning::types::EngineKind;
+                        #[cfg(not(feature = "trace"))]
+                        let _ = engine_kind;
                         #[cfg(feature = "trace")]
                         {
                             commission_trace_phase = Some((engine_kind, phase_id));
                         }
-                        // Start fast trace on ClosedLoopEntry for Stage 1
-                        // commission only (not Calibrate, not Selftest, not
-                        // OuterTune).
-                        if phase_id == foci_firmware::autotune::PhaseId::ClosedLoopEntry
-                            && engine_kind == EngineKind::Commission
-                            && !unsafe { trace_buf0() }.is_capturing()
-                        {
-                            unsafe {
-                                trace_buf0().start(oid, foci_firmware::trace::PRESET_FAST);
-                            }
-                        }
-                        unsafe { trace_buf0().set_phase(phase_id.to_u8()) };
                         emit_phase_reply(oid, phase_id);
                         Mono::delay(1.millis()).await;
                         continue;
@@ -1123,9 +1070,6 @@ mod app {
                         #[cfg(feature = "trace")]
                         {
                             commission_trace_phase = None;
-                        }
-                        if actions.stop_trace {
-                            unsafe { trace_buf0().stop() };
                         }
                         {
                             let mut state = dispatch_state(
@@ -1599,10 +1543,6 @@ mod app {
                                 next_commission_trace_seq!(),
                             ),
                         );
-                        // Trace start deferred to ClosedLoopEntry phase transition
-                        // (see PhaseChanged handler). Spec scopes Stage 1 trace to
-                        // ClosedLoopEntry only — starting here would add SPI reads
-                        // throughout inner diagnostics/electrical ID phases.
                     }
                     TmcRequest {
                         kind:
@@ -1710,11 +1650,6 @@ mod app {
                                 next_commission_trace_seq!(),
                             ),
                         );
-                        unsafe {
-                            trace_buf0().start(oid, foci_firmware::trace::PRESET_FULL);
-                            trace_buf0()
-                                .set_phase(foci_firmware::autotune::PhaseId::MechanicalId.to_u8());
-                        }
                     }
                     TmcRequest {
                         kind: TmcRequestKind::SelfTest { oid },
@@ -2946,11 +2881,6 @@ mod app {
                 }
             };
 
-            // Capture tick start for deadline computation. Must be after
-            // select() resolves — placing it before would include the 1ms
-            // idle wait, making deadline checks ineffective.
-            let tick_start = Mono::now();
-
             // Check emergency disable (non-blocking). Triggered by EXTI
             // STATUS interrupt or enter_shutdown. Disables motor and reports
             // the fault to Klipper so the host knows the MCU is down.
@@ -3530,23 +3460,6 @@ mod app {
                     }
                 }
             }
-
-            // Trace capture: read registers and store sample.
-            // Deadline = tick start + 1ms. Budget check inside ensures
-            // trace SPI reads don't overrun the tick period.
-            let tick_deadline = tick_start + fugit::Duration::<u64, 1, 1_000_000>::millis(1);
-            foci_firmware::trace::sample_tick(
-                tmc,
-                unsafe { trace_buf0() },
-                || {
-                    tick_deadline
-                        .checked_duration_since(Mono::now())
-                        .map(|d| d.to_micros())
-                },
-                || Mono::now() > tick_deadline,
-                168,
-            )
-            .await;
 
             #[cfg(feature = "trace")]
             {
