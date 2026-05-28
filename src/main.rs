@@ -207,6 +207,7 @@ mod app {
         enable_pin: &'a mut Output<'static>,
     ) -> OpenFFBoardBackend<'a> {
         OpenFFBoardBackend {
+            channel: 0,
             tmc,
             enable_pin,
             tmc_state: tmc_state(),
@@ -855,6 +856,20 @@ mod app {
         // Active commissioning engine. Set when a Commission/Tune
         // request arrives, cleared when the engine finishes or fails.
         let mut commission_engine: Option<foci_firmware::commission::CommissioningEngine> = None;
+        let mut commission_trace_engine_seq: u32 = 0;
+        #[cfg(feature = "trace")]
+        let mut commission_trace_phase: Option<(
+            foci_firmware::commissioning::types::EngineKind,
+            foci_firmware::autotune::PhaseId,
+        )> = None;
+
+        macro_rules! next_commission_trace_seq {
+            () => {{
+                let seq = commission_trace_engine_seq;
+                commission_trace_engine_seq = commission_trace_engine_seq.wrapping_add(1);
+                seq
+            }};
+        }
 
         // Whether the shutdown safe-state has already been applied this
         // shutdown cycle. Reset when shutdown clears.
@@ -932,6 +947,10 @@ mod app {
             if SHUTDOWN_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
                 if !shutdown_handled {
                     commission_engine.take();
+                    #[cfg(feature = "trace")]
+                    {
+                        commission_trace_phase = None;
+                    }
                     let phase_advance_restored = restore_phase_advance_now!(
                         "phase advance: failed to restore ABN offset on shutdown"
                     );
@@ -964,6 +983,10 @@ mod app {
                 // hardware state (zero targets, disable outputs) so the motor
                 // is not left energized in whatever mode the engine last set.
                 if commission_engine.take().is_some() {
+                    #[cfg(feature = "trace")]
+                    {
+                        commission_trace_phase = None;
+                    }
                     let mut backend = openffboard_backend(tmc, enable_pin);
                     let mut state =
                         dispatch_state(&mut calibrated, &mut motor_enabled, &mut stored_gains);
@@ -1041,6 +1064,28 @@ mod app {
                             168,
                         )
                         .await;
+                        #[cfg(feature = "trace")]
+                        if commission_trace_phase
+                            == Some((
+                                foci_firmware::commissioning::types::EngineKind::Commission,
+                                foci_firmware::autotune::PhaseId::ClosedLoopEntry,
+                            ))
+                        {
+                            crate::usb_trace::sample_commission_closed_loop_entry(
+                                tmc,
+                                motor_enabled,
+                                trace_control_tick,
+                                || {
+                                    engine_tick_deadline
+                                        .checked_duration_since(Mono::now())
+                                        .map(|d| d.to_micros())
+                                        .unwrap_or(0)
+                                },
+                                || Mono::now() > engine_tick_deadline,
+                            )
+                            .await;
+                            trace_control_tick = trace_control_tick.wrapping_add(1);
+                        }
                         Mono::delay(1.millis()).await;
                         continue;
                     }
@@ -1050,6 +1095,10 @@ mod app {
                         engine_kind,
                     } => {
                         use foci_firmware::commissioning::types::EngineKind;
+                        #[cfg(feature = "trace")]
+                        {
+                            commission_trace_phase = Some((engine_kind, phase_id));
+                        }
                         // Start fast trace on ClosedLoopEntry for Stage 1
                         // commission only (not Calibrate, not Selftest, not
                         // OuterTune).
@@ -1067,6 +1116,10 @@ mod app {
                         continue;
                     }
                     CommissionOutcome::Terminal { reply, actions } => {
+                        #[cfg(feature = "trace")]
+                        {
+                            commission_trace_phase = None;
+                        }
                         if actions.stop_trace {
                             unsafe { trace_buf0().stop() };
                         }
@@ -1146,10 +1199,11 @@ mod app {
                                 // OpenFFBoard but needs OID routing for multi-motor boards.
                                 defmt::info!("Auto-calibrating on enable");
                                 commission_engine = Some(
-                                    foci_firmware::commission::CommissioningEngine::new_calibrate_for_tmc_with_gains(
+                                    foci_firmware::commission::CommissioningEngine::new_calibrate_for_tmc_with_gains_and_trace_seq(
                                         0,
                                         tmc_state(),
                                         stored_gains,
+                                        next_commission_trace_seq!(),
                                     ),
                                 );
                                 // Don't set motor_enabled/tmc_state().motor_armed yet --
@@ -1260,10 +1314,11 @@ mod app {
                         // performs encoder alignment and closed-loop entry.
                         calibrated = false;
                         commission_engine = Some(
-                            foci_firmware::commission::CommissioningEngine::new_calibrate_for_tmc_with_gains(
+                            foci_firmware::commission::CommissioningEngine::new_calibrate_for_tmc_with_gains_and_trace_seq(
                                 oid,
                                 tmc_state(),
                                 stored_gains,
+                                next_commission_trace_seq!(),
                             ),
                         );
                     }
@@ -1533,10 +1588,11 @@ mod app {
                         }
                         calibrated = false;
                         commission_engine = Some(
-                            foci_firmware::commission::CommissioningEngine::new_commission_for_tmc(
+                            foci_firmware::commission::CommissioningEngine::new_commission_for_tmc_with_trace_seq(
                                 oid,
                                 tmc_state(),
                                 foci_firmware::autotune::CommissionProfile::from_u8(profile),
+                                next_commission_trace_seq!(),
                             ),
                         );
                         // Trace start deferred to ClosedLoopEntry phase transition
@@ -1642,11 +1698,12 @@ mod app {
                             inner_warning_flags,
                         };
                         commission_engine = Some(
-                            foci_firmware::commission::CommissioningEngine::new_outer_for_tmc(
+                            foci_firmware::commission::CommissioningEngine::new_outer_for_tmc_with_trace_seq(
                                 oid,
                                 tmc_state(),
                                 outer_params,
                                 entry_snapshot,
+                                next_commission_trace_seq!(),
                             ),
                         );
                         unsafe {
@@ -1677,9 +1734,10 @@ mod app {
                         // Engine tick drives selftest phases; SelftestDone
                         // handler sends the completion signal.
                         commission_engine = Some(
-                            foci_firmware::commission::CommissioningEngine::new_selftest_for_tmc(
+                            foci_firmware::commission::CommissioningEngine::new_selftest_for_tmc_with_trace_seq(
                                 oid,
                                 tmc_state(),
+                                next_commission_trace_seq!(),
                             ),
                         );
                     }

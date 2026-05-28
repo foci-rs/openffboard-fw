@@ -4,6 +4,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU16, AtomicU32, Ordering};
 
+use foci_firmware::trace_events::TraceClockExt;
 use foci_firmware::trace_stream::{
     FrameBuf, METADATA_PAYLOAD_MAX, frame_sequence, sequence_before_or_equal,
 };
@@ -53,20 +54,11 @@ pub(crate) const EVENT_STATUS_INTERRUPT: u16 = 9;
 pub(crate) const EVENT_SHUTDOWN: u16 = 10;
 pub(crate) const EVENT_SPI_SAMPLE_DURATION: u16 = 11;
 
-struct TraceClockExt {
-    last_low: u32,
-    high: u64,
-}
-
-const TIM5_WRAP_DISAMBIGUATION_THRESHOLD: u32 = 1 << 31;
 const CRITICAL_HZ: u32 = 1000;
 const CONTROL_DETAIL_HZ: u32 = 500;
 const STATUS_HZ: u32 = 10;
 
-static mut TRACE_CLOCK_EXT: TraceClockExt = TraceClockExt {
-    last_low: 0,
-    high: 0,
-};
+static mut TRACE_CLOCK_EXT: TraceClockExt = TraceClockExt::new();
 
 static TRACE_SERIAL_LEN: AtomicU8 = AtomicU8::new(0);
 static mut TRACE_SERIAL: [u8; 31] = [0; 31];
@@ -138,14 +130,7 @@ pub(crate) fn trace_now_ticks() -> u64 {
 pub(crate) fn extend_tim5_low(low: u32) -> u64 {
     cortex_m::interrupt::free(|_| unsafe {
         let ext = &mut *core::ptr::addr_of_mut!(TRACE_CLOCK_EXT);
-        let last_low = ext.last_low;
-        if low < last_low && last_low.wrapping_sub(low) > TIM5_WRAP_DISAMBIGUATION_THRESHOLD {
-            ext.high = ext.high.wrapping_add(1u64 << 32);
-            ext.last_low = low;
-        } else if low >= last_low {
-            ext.last_low = low;
-        }
-        ext.high | u64::from(low)
+        ext.extend_low(low)
     })
 }
 
@@ -220,6 +205,24 @@ fn header(
     source_index: u8,
     flags: u8,
 ) -> foci_firmware::trace_stream::FrameHeader {
+    header_at_timestamp(
+        frame_type,
+        payload_len,
+        source_kind,
+        source_index,
+        flags,
+        trace_now_ticks(),
+    )
+}
+
+fn header_at_timestamp(
+    frame_type: u8,
+    payload_len: usize,
+    source_kind: u8,
+    source_index: u8,
+    flags: u8,
+    timestamp_ticks: u64,
+) -> foci_firmware::trace_stream::FrameHeader {
     foci_firmware::trace_stream::FrameHeader {
         frame_type,
         flags,
@@ -227,7 +230,7 @@ fn header(
         source_kind,
         source_index,
         sequence: TRACE_COUNTERS.next_sequence(),
-        timestamp_ticks: trace_now_ticks(),
+        timestamp_ticks,
         boot_id: TRACE_COUNTERS.boot_id.load(Ordering::Relaxed),
     }
 }
@@ -254,7 +257,9 @@ pub(crate) fn request_event(
     if !is_configured() {
         return;
     }
+    let timestamp_ticks = trace_now_ticks();
     let event = PendingEvent {
+        timestamp_ticks,
         level,
         subsystem_id,
         event_id,
@@ -269,6 +274,26 @@ pub(crate) fn request_event(
             TRACE_COUNTERS.event_drop_gap.store(true, Ordering::Relaxed);
         }
     });
+}
+
+pub(crate) fn request_commission_event(
+    source_index: u8,
+    event: foci_firmware::trace_events::CommissionTraceEvent,
+) {
+    request_event(
+        event.level as u8,
+        foci_firmware::trace_events::SUBSYSTEM_COMMISSIONING,
+        event.event_id,
+        [
+            i32::from(source_index),
+            i32::from(foci_firmware::trace_events::engine_kind_wire_code(
+                event.engine_kind,
+            )),
+            event.payload[0],
+            event.payload[1],
+        ],
+        2 + event.payload_count.min(2),
+    );
 }
 
 fn enqueue_event_frame(event: PendingEvent) {
@@ -289,12 +314,13 @@ fn enqueue_event_frame(event: PendingEvent) {
         0
     };
     let mut frame = FrameBuf::new();
-    frame.write_header(header(
+    frame.write_header(header_at_timestamp(
         FRAME_TYPE_EVENT,
         EVENT_PAYLOAD_LEN,
         SOURCE_KIND_BOARD,
         SOURCE_INDEX_NA,
         flags,
+        event.timestamp_ticks,
     ));
     frame
         .payload_mut(EVENT_PAYLOAD_LEN)
@@ -933,6 +959,32 @@ pub(crate) async fn sample_tick<B>(
 
     let spi_sample_cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(spi_sample_start);
     record_spi_sample_cycles(spi_sample_cycles);
+}
+
+const COMMISSION_USB_SAMPLE_MIN_BUDGET_US: u64 = 250;
+
+pub(crate) async fn sample_commission_closed_loop_entry<B, R, D>(
+    tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
+    motor_enabled: bool,
+    control_tick: u32,
+    remaining_budget_us: R,
+    past_deadline: D,
+) where
+    B: embedded_hal_async::spi::SpiDevice<u8>,
+    R: Fn() -> u64,
+    D: Fn() -> bool,
+{
+    if !is_configured() {
+        return;
+    }
+    if past_deadline() || remaining_budget_us() < COMMISSION_USB_SAMPLE_MIN_BUDGET_US {
+        TRACE_COUNTERS.motion_drops.fetch_add(1, Ordering::Relaxed);
+        TRACE_COUNTERS
+            .motion_drop_gap
+            .store(true, Ordering::Relaxed);
+        return;
+    }
+    sample_tick(tmc, motor_enabled, 0, 0, 0, 0, 0, 0, control_tick).await;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -23,6 +23,7 @@ pub(crate) const PENDING_EVENT_DEPTH: usize = 16;
 /// Structured event request safe to create from any RTIC context.
 #[derive(Clone, Copy)]
 pub(crate) struct PendingEvent {
+    pub(crate) timestamp_ticks: u64,
     pub(crate) level: u8,
     pub(crate) subsystem_id: u8,
     pub(crate) event_id: u16,

@@ -17,6 +17,8 @@ use crate::board_config::TMC_CONFIG;
 use foci_firmware::state::tmc::{TMC_DISABLE_SIGNAL, TmcChannelState};
 
 pub(crate) struct OpenFFBoardBackend<'a> {
+    #[cfg_attr(not(feature = "trace"), allow(dead_code))]
+    pub(crate) channel: u8,
     pub(crate) tmc: &'a mut Tmc4671Spi<TmcSpiDevice>,
     pub(crate) enable_pin: &'a mut Output<'static>,
     pub(crate) tmc_state: &'static TmcChannelState,
@@ -64,6 +66,14 @@ impl<'a> foci_firmware::commission::CommissioningBackend for OpenFFBoardBackend<
 
     fn store_motor_sentinel(&self, value: u32) {
         self.tmc_state.motor_sentinel.store(value, Relaxed);
+    }
+
+    #[cfg(feature = "trace")]
+    fn record_commission_trace_event(
+        &mut self,
+        event: foci_firmware::trace_events::CommissionTraceEvent,
+    ) {
+        crate::usb_trace::request_commission_event(self.channel, event);
     }
 
     fn set_enable_pin(&mut self, state: bool) {
