@@ -1032,6 +1032,8 @@ mod app {
                     let mut backend = openffboard_backend(tmc, enable_pin);
                     commission_engine.as_mut().unwrap().step(&mut backend).await
                 };
+                #[cfg(feature = "trace")]
+                crate::usb_trace::drain_pending_events();
 
                 let outcome = {
                     let mut backend = openffboard_backend(tmc, enable_pin);
@@ -1046,6 +1048,8 @@ mod app {
                     )
                     .await
                 };
+                #[cfg(feature = "trace")]
+                crate::usb_trace::drain_pending_events();
 
                 use foci_firmware::commission_dispatch::CommissionOutcome;
                 match outcome {

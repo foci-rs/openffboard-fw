@@ -67,5 +67,7 @@ pub async fn pump(
     // Final poll to flush any remaining TX.
     foci_usb_stm32::poll();
     #[cfg(feature = "trace")]
+    crate::usb_trace::drain_pending_events();
+    #[cfg(feature = "trace")]
     crate::usb_trace::drain_once();
 }
