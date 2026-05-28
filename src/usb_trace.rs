@@ -805,6 +805,7 @@ where
 }
 
 /// Sample critical and control-detail trace frames from the 1 ms control tick.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn sample_tick<B>(
     tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
     motor_enabled: bool,

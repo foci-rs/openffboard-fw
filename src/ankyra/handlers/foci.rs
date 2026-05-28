@@ -100,11 +100,9 @@ fn stepper_execution_snapshot(
         .map(|state| state.position.load(Relaxed))
         .unwrap_or(0);
     let snapshot = crate::state::stepper_diag::snapshot(channel, position, timer_active, queue_len);
-    if snapshot.is_none() {
-        if ctx.enter_shutdown() {
-            let clock = ctx.now();
-            ctx.send_shutdown(ShutdownReason::InvalidTmcChannel, clock);
-        }
+    if snapshot.is_none() && ctx.enter_shutdown() {
+        let clock = ctx.now();
+        ctx.send_shutdown(ShutdownReason::InvalidTmcChannel, clock);
     }
     snapshot
 }

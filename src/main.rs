@@ -3512,17 +3512,16 @@ mod app {
                                     lead_counts,
                                     step_width as u32,
                                 );
-                            if applied_scaled != position_lead_applied_scaled {
-                                if tmc
+                            if applied_scaled != position_lead_applied_scaled
+                                && tmc
                                     .write_register(
                                         foci_tmc4671::registers::PID_POSITION_TARGET,
                                         target,
                                     )
                                     .await
                                     .is_ok()
-                                {
-                                    position_lead_applied_scaled = applied_scaled;
-                                }
+                            {
+                                position_lead_applied_scaled = applied_scaled;
                             }
                         }
                         Err(_) => {
