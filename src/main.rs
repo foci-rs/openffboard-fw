@@ -80,7 +80,7 @@ mod app {
 
     use foci_firmware::tmc::{TmcRequest, TmcRequestKind};
 
-    use crate::board_config::TMC_CONFIG;
+    use crate::board_config::{CURRENT_SCALE_MA_PER_LSB, TMC_CONFIG};
     use crate::commissioning_backend::OpenFFBoardBackend;
 
     const HOLD_SETTLE_DELAY_MS: u8 = 100;
@@ -424,6 +424,14 @@ mod app {
         // them through a single consistent API.
         let mut runtime = foci_firmware::tmc_control::TmcControlRuntime::new_for_channel(0);
 
+        // Board constants bundled once and passed to runtime commissioning tick.
+        let tmc_control_config = foci_firmware::tmc_control::TmcControlConfig::new(
+            CLOCK_FREQ,
+            TMC_CONFIG.pwm_freq_hz(),
+            CURRENT_SCALE_MA_PER_LSB,
+            TMC_CONFIG,
+        );
+
         // Counter for 1s STATUS_FLAGS poll (1000 * 1ms ticks).
         let mut status_poll_counter: u16 = 0;
         #[cfg(feature = "trace")]
@@ -441,9 +449,8 @@ mod app {
         #[cfg(feature = "trace")]
         let mut cached_trace_accel_flags: u8 = 0;
 
-        // Active commissioning engine. Set when a Commission/Tune
-        // request arrives, cleared when the engine finishes or fails.
-        let mut commission_engine: Option<foci_firmware::commission::CommissioningEngine> = None;
+        // Commission trace sequence counter. Incremented each time a new engine
+        // is installed so trace frames can be correlated per commissioning run.
         let mut commission_trace_engine_seq: u32 = 0;
         #[cfg(feature = "trace")]
         let mut commission_trace_phase: Option<(
@@ -534,7 +541,7 @@ mod app {
             // no further commands arrive but the TMC4671 remains energized.
             if SHUTDOWN_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
                 if !shutdown_handled {
-                    commission_engine.take();
+                    runtime.take_commission_engine();
                     #[cfg(feature = "trace")]
                     {
                         commission_trace_phase = None;
@@ -572,7 +579,7 @@ mod app {
                 // Clear any in-flight commissioning engine and restore safe
                 // hardware state (zero targets, disable outputs) so the motor
                 // is not left energized in whatever mode the engine last set.
-                if commission_engine.take().is_some() {
+                if runtime.take_commission_engine().is_some() {
                     #[cfg(feature = "trace")]
                     {
                         commission_trace_phase = None;
@@ -606,93 +613,84 @@ mod app {
             }
 
             // Tick the commissioning engine if one is active.
-            // Each step() does at most 1ms of work, then returns.
-            if commission_engine.is_some() {
-                // Capture deadline before engine.step() so SPI time consumed
-                // by the engine reduces the remaining trace budget.
+            // Each tick_commissioning() call does at most 1ms of work, then returns.
+            if runtime.is_commission_active() {
+                // Capture deadline before the tick so SPI time consumed by the
+                // engine reduces the remaining trace budget.
                 #[cfg(feature = "trace")]
                 let engine_tick_deadline =
                     Mono::now() + fugit::Duration::<u64, 1, 1_000_000>::millis(1);
 
-                // Sequential borrows: engine.step() consumes the backend
-                // first, then drive_commission_result re-borrows it for
-                // post-processing. Two scoped constructions keep the
-                // borrows non-overlapping.
-                let result = {
+                let action = {
                     let mut backend = openffboard_backend(tmc, enable_pin);
-                    commission_engine.as_mut().unwrap().step(&mut backend).await
+                    runtime
+                        .tick_commissioning(
+                            &mut backend,
+                            tmc_state(),
+                            stepper_state(),
+                            &tmc_control_config,
+                        )
+                        .await
                 };
                 #[cfg(feature = "trace")]
                 crate::usb_trace::drain_pending_events();
 
-                let outcome = {
-                    let mut backend = openffboard_backend(tmc, enable_pin);
-                    let mut state = runtime.dispatch_state(tmc_state(), stepper_state());
-                    foci_firmware::commission_dispatch::drive_commission_result(
-                        result,
-                        &mut commission_engine,
-                        &mut backend,
-                        &mut state,
-                        TMC_CONFIG.pwm_maxcnt,
-                    )
-                    .await
-                };
-                #[cfg(feature = "trace")]
-                crate::usb_trace::drain_pending_events();
-
-                use foci_firmware::commission_dispatch::CommissionOutcome;
-                match outcome {
-                    CommissionOutcome::Continue => {
-                        #[cfg(feature = "trace")]
-                        if commission_trace_phase
-                            == Some((
-                                foci_firmware::commissioning::types::EngineKind::Commission,
-                                foci_firmware::autotune::PhaseId::ClosedLoopEntry,
-                            ))
-                        {
-                            crate::usb_trace::sample_commission_closed_loop_entry(
-                                tmc,
-                                runtime.is_motor_enabled(),
-                                trace_control_tick,
-                                || {
-                                    engine_tick_deadline
-                                        .checked_duration_since(Mono::now())
-                                        .map(|d| d.to_micros())
-                                        .unwrap_or(0)
-                                },
-                                || Mono::now() > engine_tick_deadline,
-                            )
-                            .await;
-                            trace_control_tick = trace_control_tick.wrapping_add(1);
+                if let Some(action) = action {
+                    use foci_firmware::tmc_control::CommissionTickAction;
+                    match action {
+                        CommissionTickAction::Continue => {
+                            #[cfg(feature = "trace")]
+                            if commission_trace_phase
+                                == Some((
+                                    foci_firmware::commissioning::types::EngineKind::Commission,
+                                    foci_firmware::autotune::PhaseId::ClosedLoopEntry,
+                                ))
+                            {
+                                crate::usb_trace::sample_commission_closed_loop_entry(
+                                    tmc,
+                                    runtime.is_motor_enabled(),
+                                    trace_control_tick,
+                                    || {
+                                        engine_tick_deadline
+                                            .checked_duration_since(Mono::now())
+                                            .map(|d| d.to_micros())
+                                            .unwrap_or(0)
+                                    },
+                                    || Mono::now() > engine_tick_deadline,
+                                )
+                                .await;
+                                trace_control_tick = trace_control_tick.wrapping_add(1);
+                            }
+                            Mono::delay(1.millis()).await;
+                            continue;
                         }
-                        Mono::delay(1.millis()).await;
-                        continue;
-                    }
-                    CommissionOutcome::PhaseChanged {
-                        oid,
-                        phase_id,
-                        engine_kind,
-                    } => {
-                        #[cfg(not(feature = "trace"))]
-                        let _ = engine_kind;
-                        #[cfg(feature = "trace")]
-                        {
-                            commission_trace_phase = Some((engine_kind, phase_id));
+                        CommissionTickAction::PhaseChanged {
+                            oid,
+                            phase_id,
+                            engine_kind,
+                        } => {
+                            #[cfg(not(feature = "trace"))]
+                            let _ = engine_kind;
+                            #[cfg(feature = "trace")]
+                            {
+                                commission_trace_phase = Some((engine_kind, phase_id));
+                            }
+                            emit_phase_reply(oid, phase_id);
+                            Mono::delay(1.millis()).await;
+                            continue;
                         }
-                        emit_phase_reply(oid, phase_id);
-                        Mono::delay(1.millis()).await;
-                        continue;
-                    }
-                    CommissionOutcome::Terminal { reply, actions } => {
-                        #[cfg(feature = "trace")]
-                        {
-                            commission_trace_phase = None;
+                        CommissionTickAction::Terminal { reply, actions } => {
+                            #[cfg(feature = "trace")]
+                            {
+                                commission_trace_phase = None;
+                            }
+                            {
+                                let mut state =
+                                    runtime.dispatch_state(tmc_state(), stepper_state());
+                                apply_stepper_post_action(actions.stepper, &mut state);
+                            }
+                            emit_terminal_reply(reply);
                         }
-                        {
-                            let mut state = runtime.dispatch_state(tmc_state(), stepper_state());
-                            apply_stepper_post_action(actions.stepper, &mut state);
-                        }
-                        emit_terminal_reply(reply);
                     }
                 }
                 // For Terminal cases, fall through to normal channel-receive processing.
@@ -700,7 +698,7 @@ mod app {
 
             let fast_transient_scheduler_active = runtime.is_motor_enabled()
                 && velocity_scale != 0
-                && commission_engine.is_none()
+                && !runtime.is_commission_active()
                 && tmc_state()
                     .velocity_transient_feedforward
                     .load(core::sync::atomic::Ordering::Relaxed);
@@ -759,7 +757,7 @@ mod app {
                                 // TODO: hardcoded OID 0 — correct for single-motor
                                 // OpenFFBoard but needs OID routing for multi-motor boards.
                                 defmt::info!("Auto-calibrating on enable");
-                                commission_engine = Some(
+                                runtime.set_commission_engine(
                                     foci_firmware::commission::CommissioningEngine::new_calibrate_for_tmc_with_gains_and_trace_seq(
                                         0,
                                         tmc_state(),
@@ -888,7 +886,7 @@ mod app {
                         // Engine tick will drive ADC cal; CalibrateDone handler
                         // performs encoder alignment and closed-loop entry.
                         runtime.clear_calibrated();
-                        commission_engine = Some(
+                        runtime.set_commission_engine(
                             foci_firmware::commission::CommissioningEngine::new_calibrate_for_tmc_with_gains_and_trace_seq(
                                 oid,
                                 tmc_state(),
@@ -1162,7 +1160,7 @@ mod app {
                             continue;
                         }
                         runtime.clear_calibrated();
-                        commission_engine = Some(
+                        runtime.set_commission_engine(
                             foci_firmware::commission::CommissioningEngine::new_commission_for_tmc_with_trace_seq(
                                 oid,
                                 tmc_state(),
@@ -1268,7 +1266,7 @@ mod app {
                             tau_residual_permille,
                             inner_warning_flags,
                         };
-                        commission_engine = Some(
+                        runtime.set_commission_engine(
                             foci_firmware::commission::CommissioningEngine::new_outer_for_tmc_with_trace_seq(
                                 oid,
                                 tmc_state(),
@@ -1299,7 +1297,7 @@ mod app {
                         }
                         // Engine tick drives selftest phases; SelftestDone
                         // handler sends the completion signal.
-                        commission_engine = Some(
+                        runtime.set_commission_engine(
                             foci_firmware::commission::CommissioningEngine::new_selftest_for_tmc_with_trace_seq(
                                 oid,
                                 tmc_state(),
@@ -2629,45 +2627,46 @@ mod app {
             // - motor_enabled (closedloop active, safe to write 0x67)
             // - velocity_scale != 0 (encoder configured)
             // - tmc_state().velocity_feedforward enabled (host config)
-            // - commission_engine is None (not commissioning)
+            // - commission not active (not commissioning)
             // - homing not active
             let ff_active = runtime.is_motor_enabled()
                 && velocity_scale != 0
                 && tmc_state()
                     .velocity_feedforward
                     .load(core::sync::atomic::Ordering::Relaxed)
-                && commission_engine.is_none();
+                && !runtime.is_commission_active();
             let velocity_transient_active = runtime.is_motor_enabled()
                 && velocity_scale != 0
                 && tmc_state()
                     .velocity_transient_feedforward
                     .load(core::sync::atomic::Ordering::Relaxed)
-                && commission_engine.is_none();
+                && !runtime.is_commission_active();
             let accel_ff_active = runtime.is_motor_enabled()
                 && velocity_scale != 0
                 && tmc_state()
                     .accel_feedforward
                     .load(core::sync::atomic::Ordering::Relaxed)
-                && commission_engine.is_none();
+                && !runtime.is_commission_active();
             let decoupling_ff_active = runtime.is_motor_enabled()
                 && velocity_scale != 0
                 && tmc_state()
                     .decoupling_feedforward
                     .load(core::sync::atomic::Ordering::Relaxed)
-                && commission_engine.is_none();
+                && !runtime.is_commission_active();
             let phase_advance_requested = runtime.is_motor_enabled()
                 && velocity_scale != 0
                 && tmc_state()
                     .phase_advance
                     .load(core::sync::atomic::Ordering::Relaxed)
-                && commission_engine.is_none();
+                && !runtime.is_commission_active();
             let homing_active = HOMING_STATE.load(core::sync::atomic::Ordering::Relaxed) != 0;
             let reset = tmc_state()
                 .feedforward_reset
                 .swap(false, core::sync::atomic::Ordering::Relaxed);
 
-            let velocity_trace_inputs_active =
-                runtime.is_motor_enabled() && velocity_scale != 0 && commission_engine.is_none();
+            let velocity_trace_inputs_active = runtime.is_motor_enabled()
+                && velocity_scale != 0
+                && !runtime.is_commission_active();
             let command_velocity_reference = if velocity_trace_inputs_active {
                 if homing_active || reset {
                     0
@@ -3084,7 +3083,7 @@ mod app {
                 && tmc_state()
                     .position_lead
                     .load(core::sync::atomic::Ordering::Relaxed)
-                && commission_engine.is_none()
+                && !runtime.is_commission_active()
                 && !homing_active;
             if position_lead_active || position_lead_applied_scaled != 0 {
                 let interval = stepper_state()
@@ -3202,7 +3201,7 @@ mod app {
                 .timer_active_mirror
                 .load(core::sync::atomic::Ordering::Relaxed);
             if runtime.is_motor_enabled()
-                && commission_engine.is_none()
+                && !runtime.is_commission_active()
                 && !timer_active
                 && pid_error_clear_countdown_ms > 0
             {
