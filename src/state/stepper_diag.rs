@@ -569,8 +569,7 @@ pub(crate) fn record_scheduler_cycles(scheduler_cycles: u32, event_count: u32) {
         scheduler_cycles,
         event_count,
     );
-    if event_count > 0 {
-        let cycles_per_event = scheduler_cycles / event_count;
+    if let Some(cycles_per_event) = scheduler_cycles.checked_div(event_count) {
         record_max_burst_ratio(
             &counters.scheduler_cycles_per_event_max,
             &counters.scheduler_cycles_per_event_max_cycles,
@@ -599,10 +598,7 @@ pub(crate) fn record_tim5_irq(irq_cycles: u32, dispatch_cycles: u32, event_count
     counters
         .tim5_events_last_activation
         .store(event_count, Relaxed);
-    if event_count == 0 {
-        counters.tim5_empty_count.fetch_add(1, Relaxed);
-    } else {
-        let cycles_per_event = dispatch_cycles / event_count;
+    if let Some(cycles_per_event) = dispatch_cycles.checked_div(event_count) {
         record_max_burst_ratio(
             &counters.tim5_burst_cycles_per_event_max,
             &counters.tim5_burst_cycles_per_event_max_cycles,
@@ -617,6 +613,8 @@ pub(crate) fn record_tim5_irq(irq_cycles: u32, dispatch_cycles: u32, event_count
                 cycles_per_event,
             );
         }
+    } else {
+        counters.tim5_empty_count.fetch_add(1, Relaxed);
     }
     record_max(&counters.tim5_irq_max_cycles, irq_cycles);
     record_max_with_event_count(
