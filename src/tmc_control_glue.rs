@@ -1,8 +1,6 @@
 //! OpenFFBoard glue for applying shared TMC control runtime actions.
 
-use foci_firmware::tmc_control::{
-    BoardAction, BoardActions, DelegatedDiagnostic, ShutdownReason, StepperAction,
-};
+use foci_firmware::tmc_control::{BoardAction, BoardActions, ShutdownReason, StepperAction};
 
 use crate::helpers::lifecycle::read_tim5;
 use crate::helpers::stepper::stepper_stop_from_p1;
@@ -35,10 +33,10 @@ where
             defmt::warn!("TMC runtime post-action requires dispatch state; handled inline")
         }
         BoardAction::Reply(reply) => emit_reply(reply),
-        BoardAction::DelegatedDiagnostic(DelegatedDiagnostic { request }) => {
+        BoardAction::DelegatedDiagnostic(delegated) => {
             defmt::warn!(
                 "diagnostic request delegated before board handler: {}",
-                request.channel,
+                delegated.request.channel,
             );
         }
     }
