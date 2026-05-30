@@ -409,6 +409,12 @@ mod app {
         // Migrated from three board-local bools/Option so later steps can read
         // them through a single consistent API.
         let mut runtime = foci_firmware::tmc_control::TmcControlRuntime::new_for_channel(0);
+        let signals = foci_firmware::tmc_control::TmcControlSignals::new(
+            &SHUTDOWN_ACTIVE,
+            &TMC_QUEUE_FLUSH,
+            &FAULT_ACTIVE,
+            &TMC_DISABLE_SIGNAL,
+        );
 
         // Board constants bundled once and passed to runtime commissioning tick.
         let tmc_control_config = foci_firmware::tmc_control::TmcControlConfig::new(
@@ -486,18 +492,23 @@ mod app {
             shutdown_handled = false;
 
             // Drain stale requests after config_reset
-            if TMC_QUEUE_FLUSH.swap(false, core::sync::atomic::Ordering::Relaxed) {
+            if TMC_QUEUE_FLUSH.load(core::sync::atomic::Ordering::Relaxed) {
                 while rx.try_recv().is_ok() {}
-                {
-                    let s = runtime.dispatch_state(tmc_state(), stepper_state());
-                    *s.motor_enabled = false;
-                    *s.calibrated = false;
-                    *s.stored_gains = None;
-                }
+                let commission_was_active = runtime.is_commission_active();
+                crate::tmc_control_glue::apply_actions(
+                    runtime.poll_queue_flush(&signals, tmc_state(), stepper_state()),
+                    |reason| {
+                        ctx.shared.app_state.lock(|state| {
+                            if crate::firmware_ctx::enter_shutdown(state) {
+                                crate::tmc_control_glue::emit_shutdown(reason);
+                            }
+                        });
+                    },
+                );
                 // Clear any in-flight commissioning engine and restore safe
                 // hardware state (zero targets, disable outputs) so the motor
                 // is not left energized in whatever mode the engine last set.
-                if runtime.take_commission_engine().is_some() {
+                if commission_was_active {
                     #[cfg(feature = "trace")]
                     {
                         commission_trace_phase = None;
@@ -509,24 +520,6 @@ mod app {
                 tmc_state()
                     .commission_in_flight
                     .store(false, core::sync::atomic::Ordering::Relaxed);
-                // Clear commissioned outer configuration so the next closed-
-                // loop entry uses defaults, not stale commissioned values.
-                use core::sync::atomic::Ordering::Relaxed as R;
-                tmc_state().velocity_limit_cfg.store(500_000, R);
-                tmc_state().position_p_value.store(640, R);
-                tmc_state().position_i_value.store(0, R);
-                tmc_state().velocity_p_value.store(1152, R);
-                tmc_state().velocity_i_value.store(0, R);
-                tmc_state().velocity_filter_hz.store(0, R);
-                tmc_state().position_filter_hz.store(0, R);
-                tmc_state().flux_filter_hz.store(0, R);
-                tmc_state().torque_filter_hz.store(0, R);
-                // Reset hardware stepper state.
-                stepper_stop_from_p1(0);
-                stepper_state()
-                    .position
-                    .store(0, core::sync::atomic::Ordering::Relaxed);
-                FAULT_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
                 defmt::info!("TMC request queue flushed after config_reset");
             }
 
