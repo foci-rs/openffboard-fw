@@ -779,47 +779,67 @@ mod app {
                                 defmt::info!("Motor enable sync (already armed)");
                                 continue;
                             }
-                            if !restore_phase_advance_now!(
-                                "phase advance: failed to restore ABN offset before arm"
-                            ) {
-                                continue;
-                            }
-                            {
-                                let mut backend = openffboard_backend(tmc, enable_pin);
-                                let mut state =
-                                    runtime.dispatch_state(tmc_state(), stepper_state());
-                                if let Err(error) = foci_firmware::tmc_ops::arm_motor_electrical(
-                                    &mut backend,
-                                    &mut state,
-                                )
-                                .await
+                            let actions = runtime.prepare_enable_request(tmc_state());
+                            for action in actions {
+                                if let foci_firmware::tmc_control::BoardAction::Stepper(
+                                    foci_firmware::tmc_control::StepperAction::ArmCheck {
+                                        post_action,
+                                    },
+                                ) = action
                                 {
-                                    defmt::error!(
-                                        "Motor enable rejected by sentinel verify: {}",
-                                        error
-                                    );
-                                    foci_firmware::tmc_ops::disarm_motor(&mut backend, &mut state)
-                                        .await;
-                                    continue;
-                                }
-                                apply_stepper_post_action(
-                                    foci_firmware::commission_dispatch::StepperPostAction::ArmPreservePosition,
-                                    &mut state,
-                                );
-                            }
+                                    if !restore_phase_advance_now!(
+                                        "phase advance: failed to restore ABN offset before arm"
+                                    ) {
+                                        continue;
+                                    }
+                                    {
+                                        let mut backend = openffboard_backend(tmc, enable_pin);
+                                        let mut state =
+                                            runtime.dispatch_state(tmc_state(), stepper_state());
+                                        if let Err(error) =
+                                            foci_firmware::tmc_ops::arm_motor_electrical(
+                                                &mut backend,
+                                                &mut state,
+                                            )
+                                            .await
+                                        {
+                                            defmt::error!(
+                                                "Motor enable rejected by sentinel verify: {}",
+                                                error
+                                            );
+                                            foci_firmware::tmc_ops::disarm_motor(
+                                                &mut backend,
+                                                &mut state,
+                                            )
+                                            .await;
+                                            continue;
+                                        }
+                                        apply_stepper_post_action(post_action, &mut state);
+                                    }
 
-                            defmt::info!("Motor enabled (calibrated, step/dir armed)");
-                            #[cfg(feature = "trace")]
-                            crate::usb_trace::request_event(
-                                crate::usb_trace::EVENT_LEVEL_INFO,
-                                crate::usb_trace::SUBSYSTEM_TMC_CONTROL,
-                                crate::usb_trace::EVENT_MOTOR_ARM,
-                                [0; 4],
-                                0,
-                            );
+                                    defmt::info!("Motor enabled (calibrated, step/dir armed)");
+                                    #[cfg(feature = "trace")]
+                                    crate::usb_trace::request_event(
+                                        crate::usb_trace::EVENT_LEVEL_INFO,
+                                        crate::usb_trace::SUBSYSTEM_TMC_CONTROL,
+                                        crate::usb_trace::EVENT_MOTOR_ARM,
+                                        [0; 4],
+                                        0,
+                                    );
+                                }
+                            }
                         } else {
                             // Disable: stop stepping first, then kill motor electrically.
-                            stepper_stop_from_p1(0);
+                            crate::tmc_control_glue::apply_actions(
+                                runtime.prepare_disable_request(),
+                                |reason| {
+                                    ctx.shared.app_state.lock(|state| {
+                                        if crate::firmware_ctx::enter_shutdown(state) {
+                                            crate::tmc_control_glue::emit_shutdown(reason);
+                                        }
+                                    });
+                                },
+                            );
                             let phase_advance_restored = restore_phase_advance_now!(
                                 "phase advance: failed to restore ABN offset before disarm"
                             );
