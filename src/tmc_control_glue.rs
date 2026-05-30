@@ -23,6 +23,9 @@ where
 {
     match action {
         BoardAction::Shutdown(reason) => enter_shutdown(reason),
+        BoardAction::SignalEmergencyDisable => {
+            foci_firmware::state::tmc::TMC_DISABLE_SIGNAL.signal(());
+        }
         BoardAction::Stepper(StepperAction::None) => {}
         BoardAction::Stepper(StepperAction::StopNow) => stepper_stop_from_p1(0),
         BoardAction::Stepper(StepperAction::ArmCheck { .. }) => {

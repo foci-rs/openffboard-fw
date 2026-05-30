@@ -83,7 +83,6 @@ mod app {
     use crate::board_config::{CURRENT_SCALE_MA_PER_LSB, TMC_CONFIG};
     use crate::commissioning_backend::OpenFFBoardBackend;
 
-    const HOLD_SETTLE_DELAY_MS: u8 = 100;
     fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
         foci_firmware::state::tmc::tmc_channel0()
     }
@@ -424,10 +423,6 @@ mod app {
             TMC_CONFIG,
         );
 
-        // Counter for 1s STATUS_FLAGS poll (1000 * 1ms ticks).
-        let mut status_poll_counter: u16 = 0;
-        #[cfg(feature = "trace")]
-        let mut trace_control_tick: u32 = 0;
         let mut next_control_tick = Mono::now() + 1.millis();
         // Commission trace sequence counter. Incremented each time a new engine
         // is installed so trace frames can be correlated per commissioning run.
@@ -449,8 +444,6 @@ mod app {
         // Whether the shutdown safe-state has already been applied this
         // shutdown cycle. Reset when shutdown clears.
         let mut shutdown_handled = false;
-
-        let mut pid_error_clear_countdown_ms: u8 = 0;
 
         // Main loop: wait for channel message or 1ms timeout.
         // On message: handle request. On timeout: write position target.
@@ -557,10 +550,11 @@ mod app {
                                     foci_firmware::autotune::PhaseId::ClosedLoopEntry,
                                 ))
                             {
+                                let trace_tick = runtime.advance_trace_sample_tick();
                                 crate::usb_trace::sample_commission_closed_loop_entry(
                                     tmc,
                                     runtime.is_motor_enabled(),
-                                    trace_control_tick,
+                                    trace_tick,
                                     || {
                                         engine_tick_deadline
                                             .checked_duration_since(Mono::now())
@@ -570,7 +564,6 @@ mod app {
                                     || Mono::now() > engine_tick_deadline,
                                 )
                                 .await;
-                                trace_control_tick = trace_control_tick.wrapping_add(1);
                             }
                             Mono::delay(1.millis()).await;
                             continue;
@@ -1398,21 +1391,8 @@ mod app {
                 .await;
 
             #[cfg(feature = "trace")]
-            let (
-                cached_trace_phase_advance_counts,
-                cached_trace_phase_advance_flags,
-                phase_advance_emit_once,
-            ) = {
-                let trace_state = runtime.trace_state();
-                (
-                    trace_state.phase_advance_last_counts,
-                    trace_state.phase_advance_last_flags,
-                    trace_state.phase_advance_emit_once,
-                )
-            };
-
-            #[cfg(feature = "trace")]
             {
+                let trace_tick = runtime.advance_trace_tick();
                 let trace_state = runtime.trace_state();
                 crate::usb_trace::sample_tick(
                     tmc,
@@ -1423,17 +1403,13 @@ mod app {
                     trace_state.cached_accel_torque_offset,
                     trace_state.cached_accel_gain_permille,
                     trace_state.cached_accel_flags,
-                    trace_control_tick,
+                    trace_tick.sample_tick,
                 )
                 .await;
-                trace_control_tick = trace_control_tick.wrapping_add(1);
-                let phase_advance_periodic = trace_control_tick.is_multiple_of(10)
-                    && (cached_trace_phase_advance_flags != 0
-                        || cached_trace_phase_advance_counts != 0);
-                if phase_advance_emit_once || phase_advance_periodic {
+                if trace_tick.phase_advance_due {
                     crate::usb_trace::emit_phase_advance(
-                        cached_trace_phase_advance_counts,
-                        cached_trace_phase_advance_flags,
+                        trace_tick.phase_advance_counts,
+                        trace_tick.phase_advance_flags,
                         tmc_state()
                             .phase_advance_gain_ppm
                             .load(core::sync::atomic::Ordering::Relaxed),
@@ -1444,132 +1420,43 @@ mod app {
                             .phase_advance_deadband
                             .load(core::sync::atomic::Ordering::Relaxed),
                     );
-                    runtime.trace_state_mut().phase_advance_emit_once = false;
                 }
                 crate::usb_trace::emit_status_frames(
                     tmc,
-                    trace_control_tick,
-                    trace_control_tick.is_multiple_of(100),
+                    trace_tick.control_tick,
+                    trace_tick.status_detail_due,
                 )
                 .await;
                 crate::usb_trace::request_spi_duration_event_if_ready();
                 crate::usb_trace::drain_pending_events();
-                if trace_control_tick.is_multiple_of(1000) {
+                if trace_tick.metadata_due {
                     crate::usb_trace::emit_metadata();
-                }
-            }
-
-            if tmc_state()
-                .pid_error_sums_clear
-                .swap(false, core::sync::atomic::Ordering::Relaxed)
-            {
-                pid_error_clear_countdown_ms = HOLD_SETTLE_DELAY_MS;
-            }
-            let timer_active = stepper_state()
-                .timer_active_mirror
-                .load(core::sync::atomic::Ordering::Relaxed);
-            if runtime.is_motor_enabled()
-                && !runtime.is_commission_active()
-                && !timer_active
-                && pid_error_clear_countdown_ms > 0
-            {
-                pid_error_clear_countdown_ms -= 1;
-                if pid_error_clear_countdown_ms == 0 {
-                    if foci_firmware::tmc_ops::settle_hold_and_clear_pid_errors(tmc, tmc_state())
-                        .await
-                        .is_err()
-                    {
-                        defmt::warn!("TMC4671 PID settle/clear failed");
-                    } else {
-                        defmt::info!("TMC4671 PID settled and cleared after motion");
-                    }
                 }
             }
 
             // TrSync and endstop polling have been replaced by the TIM5 CC2
             // trigger scheduler. See step_timer_irq CC2 dispatch above.
 
-            // Homing I-suppression state machine.
-            //
-            // During homing the motor hits a physical constraint (endstop or
-            // bed). The position I integrator accumulates error, causing
-            // overshoot when the motor releases. Fix: zero position I gain
-            // while homing, restore + clear integrator when TrSync resolves.
-            {
-                use core::sync::atomic::Ordering::Relaxed;
-                let homing = HOMING_STATE.load(Relaxed);
-                match homing {
-                    1 => {
-                        if !runtime.restore_phase_advance_now(tmc).await {
-                            defmt::warn!(
-                                "phase advance: failed to restore ABN offset before homing"
-                            );
-                            continue;
+            crate::tmc_control_glue::apply_actions(
+                runtime
+                    .apply_slow_maintenance_tick(
+                        tmc,
+                        refs,
+                        &tmc_control_config,
+                        foci_firmware::tmc_control::TmcControlHomingRefs::new(
+                            &HOMING_STATE,
+                            &HOMING_TRIGGERED,
+                        ),
+                    )
+                    .await,
+                |reason| {
+                    ctx.shared.app_state.lock(|state| {
+                        if crate::firmware_ctx::enter_shutdown(state) {
+                            crate::tmc_control_glue::emit_shutdown(reason);
                         }
-                        // SuppressPending: write position P with I=0
-                        let pos_p = tmc_state().position_p_value.load(Relaxed);
-                        let reg = (pos_p as u32) << 16; // P in upper half, I=0
-                        let _ = tmc
-                            .write_register(foci_tmc4671::registers::PID_POSITION_P_POSITION_I, reg)
-                            .await;
-                        HOMING_STATE.store(2, Relaxed);
-                        defmt::info!("homing: position I suppressed");
-                    }
-                    // Suppressing: advance to RestorePending once a trigger
-                    // has fired via the HOMING_TRIGGERED sentinel (set by
-                    // TriggerDomain on first trigger, 0xFF = no trigger
-                    // pending). P1 never enters TriggerDomain per spec. If
-                    // host's trsync_trigger runs before P1 polls,
-                    // trsync_trigger advances HOMING_STATE 2->3 directly.
-                    2 if HOMING_TRIGGERED.load(Relaxed) != 0xFF => {
-                        HOMING_STATE.store(3, Relaxed);
-                    }
-                    3 => {
-                        // RestorePending: restore position I and clear integrator
-                        let pos_p = tmc_state().position_p_value.load(Relaxed);
-                        let pos_i = tmc_state().position_i_value.load(Relaxed);
-                        let reg = ((pos_p as u32) << 16) | pos_i as u32;
-                        let _ = tmc
-                            .write_register(foci_tmc4671::registers::PID_POSITION_P_POSITION_I, reg)
-                            .await;
-                        // Clear position error integrator
-                        let _ = tmc
-                            .write_sub_register(
-                                foci_tmc4671::registers::PID_ERROR_PID_POSITION_ERROR_SUM,
-                                0,
-                            )
-                            .await;
-                        HOMING_STATE.store(0, Relaxed);
-                        defmt::info!("homing: position I restored, integrator cleared");
-                    }
-                    _ => {} // Idle, nothing to do
-                }
-            }
-
-            // Poll STATUS_FLAGS every ~1 second for warning-level flags.
-            // Critical ADC clipping faults are handled by EXTI.
-            status_poll_counter += 1;
-            if status_poll_counter >= 1000 {
-                status_poll_counter = 0;
-                if let Ok(flags) = tmc
-                    .read_register(foci_tmc4671::registers::STATUS_FLAGS)
-                    .await
-                {
-                    // Warning flags: PID output limits (position, velocity, current)
-                    const PID_LIMIT_MASK: u32 = 0x0000_FFFF; // bits 0-15
-                    const PWM_LIMIT_MASK: u32 = (1 << 24) | (1 << 25); // pwm_min, pwm_max
-                    const FAULT_MASK: u32 = 1 << 26; // adc_i_clipped
-
-                    if flags & FAULT_MASK != 0 {
-                        defmt::error!("TMC4671 STATUS fault: {:#010x}", flags);
-                        TMC_DISABLE_SIGNAL.signal(());
-                    } else if runtime.is_motor_enabled()
-                        && flags & (PID_LIMIT_MASK | PWM_LIMIT_MASK) != 0
-                    {
-                        defmt::warn!("TMC4671 STATUS: {:#010x}", flags);
-                    }
-                }
-            }
+                    });
+                },
+            );
         }
     }
 
