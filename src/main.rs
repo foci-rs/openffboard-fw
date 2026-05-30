@@ -23,6 +23,7 @@ mod interrupts;
 mod platform_impl;
 mod state;
 mod tmc_control_glue;
+mod tmc_diagnostics;
 mod tmc_dispatch;
 mod transport;
 mod trigger_domain;
@@ -90,96 +91,6 @@ mod app {
     const CURRENT_STEP_STATUS_NOT_READY: u8 = 1;
     const CURRENT_STEP_STATUS_SPI: u8 = 2;
 
-    struct CurrentStepReport {
-        oid: u8,
-        status: u8,
-        torque_target: i16,
-        flux_target: i16,
-        duration_ms: u16,
-        voltage_limit: u16,
-        torque_before: i16,
-        torque_during: i16,
-        torque_after: i16,
-        flux_during: i16,
-        iq_during: i16,
-        id_during: i16,
-        uq_limited: i16,
-        ud_limited: i16,
-        encoder_before: u32,
-        encoder_after: u32,
-        encoder_delta: i32,
-        adc_vm_raw: u16,
-    }
-
-    struct CurrentTorqueSampleReport {
-        oid: u8,
-        status: u8,
-        target: i16,
-        flux_target: i16,
-        sample_delay_ms: u16,
-        voltage_limit: u16,
-        torque_before: i16,
-        torque_sample: i16,
-        torque_after: i16,
-        flux_sample: i16,
-        iq_sample: i16,
-        id_sample: i16,
-        uq_limited: i16,
-        ud_limited: i16,
-        encoder_before: u32,
-        encoder_sample: u32,
-        encoder_after: u32,
-        encoder_delta_sample: i32,
-        encoder_delta_after: i32,
-        adc_vm_raw: u16,
-        pidin_target_torque: i32,
-        pidin_target_flux: i32,
-        pidout_target_torque: i32,
-        pidout_target_flux: i32,
-        pid_torque_target_monitor: i16,
-        torque_error: i32,
-        flux_error: i32,
-        torque_error_sum: i32,
-        flux_error_sum: i32,
-        uq_prelimit: i16,
-        ud_prelimit: i16,
-        ff_velocity: i32,
-        ff_torque: i16,
-        status_flags: u32,
-    }
-
-    struct VoltageStepReport {
-        oid: u8,
-        status: u8,
-        uq_ext: i16,
-        ud_ext: i16,
-        sample_delay_ms: u16,
-        torque_before: i16,
-        torque_sample: i16,
-        torque_after: i16,
-        flux_sample: i16,
-        iq_sample: i16,
-        id_sample: i16,
-        uq_limited: i16,
-        ud_limited: i16,
-        uux_sample: i16,
-        uwy_sample: i16,
-        pwm_ux_sample: i16,
-        pwm_wy_sample: i16,
-        pwm_sv_chop: u32,
-        pwm_bbm: u32,
-        pwm_maxcnt: u32,
-        phi_e_sample: i16,
-        phi_m_sample: i16,
-        encoder_before: u32,
-        encoder_sample: u32,
-        encoder_after: u32,
-        encoder_delta_sample: i32,
-        encoder_delta_after: i32,
-        adc_vm_raw: u16,
-        status_flags: u32,
-    }
-
     fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
         foci_firmware::state::tmc::tmc_channel0()
     }
@@ -214,284 +125,11 @@ mod app {
         }
     }
 
-    fn split_signed_halves(value: u32) -> (i16, i16) {
+    pub(crate) fn split_signed_halves(value: u32) -> (i16, i16) {
         (
             foci_firmware::tmc::decode_signed_upper_half(value),
             foci_firmware::tmc::decode_signed_lower_half(value),
         )
-    }
-
-    fn current_step_reply(report: CurrentStepReport) {
-        ::ankyra::klipper_reply_from!(
-            &mut crate::_ankyra_config::Sender,
-            foci_firmware::ankyra::replies::FociCurrentStepResult,
-            oid: u8 = report.oid,
-            status: u8 = report.status,
-            target: i16 = report.torque_target,
-            duration_ms: u16 = report.duration_ms,
-            voltage_limit: u16 = report.voltage_limit,
-            torque_before: i16 = report.torque_before,
-            torque_during: i16 = report.torque_during,
-            torque_after: i16 = report.torque_after,
-            flux_during: i16 = report.flux_during,
-            iq_during: i16 = report.iq_during,
-            id_during: i16 = report.id_during,
-            uq_limited: i16 = report.uq_limited,
-            ud_limited: i16 = report.ud_limited,
-            encoder_before: u32 = report.encoder_before,
-            encoder_after: u32 = report.encoder_after,
-            encoder_delta: i32 = report.encoder_delta,
-            adc_vm_raw: u16 = report.adc_vm_raw,
-        );
-    }
-
-    fn current_vector_step_reply(report: CurrentStepReport) {
-        ::ankyra::klipper_reply_from!(
-            &mut crate::_ankyra_config::Sender,
-            foci_firmware::ankyra::replies::FociCurrentVectorStepResult,
-            oid: u8 = report.oid,
-            status: u8 = report.status,
-            torque_target: i16 = report.torque_target,
-            flux_target: i16 = report.flux_target,
-            duration_ms: u16 = report.duration_ms,
-            voltage_limit: u16 = report.voltage_limit,
-            torque_before: i16 = report.torque_before,
-            torque_during: i16 = report.torque_during,
-            torque_after: i16 = report.torque_after,
-            flux_during: i16 = report.flux_during,
-            iq_during: i16 = report.iq_during,
-            id_during: i16 = report.id_during,
-            uq_limited: i16 = report.uq_limited,
-            ud_limited: i16 = report.ud_limited,
-            encoder_before: u32 = report.encoder_before,
-            encoder_after: u32 = report.encoder_after,
-            encoder_delta: i32 = report.encoder_delta,
-            adc_vm_raw: u16 = report.adc_vm_raw,
-        );
-    }
-
-    fn send_current_step_reply(vector_reply: bool, report: CurrentStepReport) {
-        if vector_reply {
-            current_vector_step_reply(report);
-        } else {
-            current_step_reply(report);
-        }
-    }
-
-    fn current_torque_sample_reply(report: CurrentTorqueSampleReport) {
-        ::ankyra::klipper_reply_from!(
-            &mut crate::_ankyra_config::Sender,
-            foci_firmware::ankyra::replies::FociCurrentTorqueSampleResult,
-            oid: u8 = report.oid,
-            status: u8 = report.status,
-            target: i16 = report.target,
-            flux_target: i16 = report.flux_target,
-            sample_delay_ms: u16 = report.sample_delay_ms,
-            voltage_limit: u16 = report.voltage_limit,
-            torque_before: i16 = report.torque_before,
-            torque_sample: i16 = report.torque_sample,
-            torque_after: i16 = report.torque_after,
-            flux_sample: i16 = report.flux_sample,
-            iq_sample: i16 = report.iq_sample,
-            id_sample: i16 = report.id_sample,
-            uq_limited: i16 = report.uq_limited,
-            ud_limited: i16 = report.ud_limited,
-            encoder_before: u32 = report.encoder_before,
-            encoder_sample: u32 = report.encoder_sample,
-            encoder_after: u32 = report.encoder_after,
-            encoder_delta_sample: i32 = report.encoder_delta_sample,
-            encoder_delta_after: i32 = report.encoder_delta_after,
-            adc_vm_raw: u16 = report.adc_vm_raw,
-            pidin_target_torque: i32 = report.pidin_target_torque,
-            pidin_target_flux: i32 = report.pidin_target_flux,
-            pidout_target_torque: i32 = report.pidout_target_torque,
-            pidout_target_flux: i32 = report.pidout_target_flux,
-            pid_torque_target_monitor: i16 = report.pid_torque_target_monitor,
-            status_flags: u32 = report.status_flags,
-        );
-    }
-
-    fn current_torque_sample_detail_reply(report: &CurrentTorqueSampleReport) {
-        ::ankyra::klipper_reply_from!(
-            &mut crate::_ankyra_config::Sender,
-            foci_firmware::ankyra::replies::FociCurrentTorqueSampleDetailResult,
-            oid: u8 = report.oid,
-            target: i16 = report.target,
-            flux_target: i16 = report.flux_target,
-            sample_delay_ms: u16 = report.sample_delay_ms,
-            voltage_limit: u16 = report.voltage_limit,
-            torque_error: i32 = report.torque_error,
-            flux_error: i32 = report.flux_error,
-            torque_error_sum: i32 = report.torque_error_sum,
-            flux_error_sum: i32 = report.flux_error_sum,
-            uq_prelimit: i16 = report.uq_prelimit,
-            ud_prelimit: i16 = report.ud_prelimit,
-            ff_velocity: i32 = report.ff_velocity,
-            ff_torque: i16 = report.ff_torque,
-        );
-    }
-
-    fn voltage_step_reply(report: VoltageStepReport) {
-        ::ankyra::klipper_reply_from!(
-            &mut crate::_ankyra_config::Sender,
-            foci_firmware::ankyra::replies::FociVoltageStepResult,
-            oid: u8 = report.oid,
-            status: u8 = report.status,
-            uq_ext: i16 = report.uq_ext,
-            ud_ext: i16 = report.ud_ext,
-            sample_delay_ms: u16 = report.sample_delay_ms,
-            torque_before: i16 = report.torque_before,
-            torque_sample: i16 = report.torque_sample,
-            torque_after: i16 = report.torque_after,
-            flux_sample: i16 = report.flux_sample,
-            iq_sample: i16 = report.iq_sample,
-            id_sample: i16 = report.id_sample,
-            uq_limited: i16 = report.uq_limited,
-            ud_limited: i16 = report.ud_limited,
-            uux_sample: i16 = report.uux_sample,
-            uwy_sample: i16 = report.uwy_sample,
-            pwm_ux_sample: i16 = report.pwm_ux_sample,
-            pwm_wy_sample: i16 = report.pwm_wy_sample,
-            pwm_sv_chop: u32 = report.pwm_sv_chop,
-            pwm_bbm: u32 = report.pwm_bbm,
-            pwm_maxcnt: u32 = report.pwm_maxcnt,
-            phi_e_sample: i16 = report.phi_e_sample,
-            phi_m_sample: i16 = report.phi_m_sample,
-            encoder_before: u32 = report.encoder_before,
-            encoder_sample: u32 = report.encoder_sample,
-            encoder_after: u32 = report.encoder_after,
-            encoder_delta_sample: i32 = report.encoder_delta_sample,
-            encoder_delta_after: i32 = report.encoder_delta_after,
-            adc_vm_raw: u16 = report.adc_vm_raw,
-            status_flags: u32 = report.status_flags,
-        );
-    }
-
-    fn empty_current_torque_sample_report(
-        oid: u8,
-        status: u8,
-        target: i16,
-        flux_target: i16,
-        sample_delay_ms: u16,
-        voltage_limit: u16,
-    ) -> CurrentTorqueSampleReport {
-        CurrentTorqueSampleReport {
-            oid,
-            status,
-            target,
-            flux_target,
-            sample_delay_ms,
-            voltage_limit,
-            torque_before: 0,
-            torque_sample: 0,
-            torque_after: 0,
-            flux_sample: 0,
-            iq_sample: 0,
-            id_sample: 0,
-            uq_limited: 0,
-            ud_limited: 0,
-            encoder_before: 0,
-            encoder_sample: 0,
-            encoder_after: 0,
-            encoder_delta_sample: 0,
-            encoder_delta_after: 0,
-            adc_vm_raw: 0,
-            pidin_target_torque: 0,
-            pidin_target_flux: 0,
-            pidout_target_torque: 0,
-            pidout_target_flux: 0,
-            pid_torque_target_monitor: 0,
-            torque_error: 0,
-            flux_error: 0,
-            torque_error_sum: 0,
-            flux_error_sum: 0,
-            uq_prelimit: 0,
-            ud_prelimit: 0,
-            ff_velocity: 0,
-            ff_torque: 0,
-            status_flags: 0,
-        }
-    }
-
-    fn empty_voltage_step_report(
-        oid: u8,
-        status: u8,
-        uq_ext: i16,
-        ud_ext: i16,
-        sample_delay_ms: u16,
-    ) -> VoltageStepReport {
-        VoltageStepReport {
-            oid,
-            status,
-            uq_ext,
-            ud_ext,
-            sample_delay_ms,
-            torque_before: 0,
-            torque_sample: 0,
-            torque_after: 0,
-            flux_sample: 0,
-            iq_sample: 0,
-            id_sample: 0,
-            uq_limited: 0,
-            ud_limited: 0,
-            uux_sample: 0,
-            uwy_sample: 0,
-            pwm_ux_sample: 0,
-            pwm_wy_sample: 0,
-            pwm_sv_chop: 0,
-            pwm_bbm: 0,
-            pwm_maxcnt: 0,
-            phi_e_sample: 0,
-            phi_m_sample: 0,
-            encoder_before: 0,
-            encoder_sample: 0,
-            encoder_after: 0,
-            encoder_delta_sample: 0,
-            encoder_delta_after: 0,
-            adc_vm_raw: 0,
-            status_flags: 0,
-        }
-    }
-
-    fn pack_voltage_ext(uq_ext: i16, ud_ext: i16) -> u32 {
-        (u32::from(uq_ext as u16) << 16) | u32::from(ud_ext as u16)
-    }
-
-    fn current_step_encoder_delta(before: u32, after: u32, counts_per_rev: u32) -> i32 {
-        let raw = (after as i32).wrapping_sub(before as i32);
-        let counts_per_rev = counts_per_rev as i32;
-        if counts_per_rev <= 0 {
-            return raw;
-        }
-
-        let half = counts_per_rev / 2;
-        if raw > half {
-            raw - counts_per_rev
-        } else if raw < -half {
-            raw + counts_per_rev
-        } else {
-            raw
-        }
-    }
-
-    async fn write_current_step_sub_register(
-        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
-        sub: foci_tmc4671::registers::SubRegister,
-        value: u32,
-    ) -> Result<(), ()> {
-        tmc.write_register(sub.addr, sub.sub_addr as u32)
-            .await
-            .map_err(|_| ())?;
-        tmc.write_register(sub.data, value).await.map_err(|_| ())
-    }
-
-    async fn clear_current_step_integrators(tmc: &mut Tmc4671Spi<TmcSpiDevice>) -> Result<(), ()> {
-        use foci_tmc4671::registers::{
-            PID_ERROR_PID_FLUX_ERROR_SUM, PID_ERROR_PID_TORQUE_ERROR_SUM,
-        };
-
-        write_current_step_sub_register(tmc, PID_ERROR_PID_TORQUE_ERROR_SUM, 0).await?;
-        write_current_step_sub_register(tmc, PID_ERROR_PID_FLUX_ERROR_SUM, 0).await
     }
 
     // TriggerDomain, PHYSICAL_STEPPER_INDICES, TRIGGER_TIMER_MIN_LEAD_TICKS,
@@ -1723,9 +1361,9 @@ mod app {
                             .timer_active_mirror
                             .load(core::sync::atomic::Ordering::Relaxed);
                         if !motor_enabled || !calibrated || homing_active || stepper_active {
-                            send_current_step_reply(
+                            crate::tmc_diagnostics::send_current_step_reply(
                                 vector_reply,
-                                CurrentStepReport {
+                                crate::tmc_diagnostics::CurrentStepReport {
                                     oid,
                                     status: CURRENT_STEP_STATUS_NOT_READY,
                                     torque_target,
@@ -1755,9 +1393,9 @@ mod app {
                         {
                             Ok(value) => value,
                             Err(_) => {
-                                send_current_step_reply(
+                                crate::tmc_diagnostics::send_current_step_reply(
                                     vector_reply,
-                                    CurrentStepReport {
+                                    crate::tmc_diagnostics::CurrentStepReport {
                                         oid,
                                         status: CURRENT_STEP_STATUS_SPI,
                                         torque_target,
@@ -1790,9 +1428,9 @@ mod app {
                         {
                             Ok(value) => value,
                             Err(_) => {
-                                send_current_step_reply(
+                                crate::tmc_diagnostics::send_current_step_reply(
                                     vector_reply,
-                                    CurrentStepReport {
+                                    crate::tmc_diagnostics::CurrentStepReport {
                                         oid,
                                         status: CURRENT_STEP_STATUS_SPI,
                                         torque_target,
@@ -1834,9 +1472,9 @@ mod app {
                         if !restore_phase_advance_now!(
                             "phase advance: failed to restore ABN offset before current step"
                         ) {
-                            send_current_step_reply(
+                            crate::tmc_diagnostics::send_current_step_reply(
                                 vector_reply,
-                                CurrentStepReport {
+                                crate::tmc_diagnostics::CurrentStepReport {
                                     oid,
                                     status: CURRENT_STEP_STATUS_SPI,
                                     torque_target,
@@ -1869,7 +1507,7 @@ mod app {
                             tmc.write_register(PIDOUT_UQ_UD_LIMITS, voltage_limit as u32)
                                 .await
                                 .map_err(|_| ())?;
-                            clear_current_step_integrators(tmc).await?;
+                            crate::tmc_diagnostics::clear_current_step_integrators(tmc).await?;
                             tmc.write_register(MODE_RAMP_MODE_MOTION, CURRENT_STEP_TORQUE_MODE)
                                 .await
                                 .map_err(|_| ())?;
@@ -1935,7 +1573,7 @@ mod app {
 
                             encoder_after =
                                 tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
-                            encoder_delta = current_step_encoder_delta(
+                            encoder_delta = crate::tmc_diagnostics::current_step_encoder_delta(
                                 encoder_before,
                                 encoder_after,
                                 encoder_counts_per_rev,
@@ -1981,9 +1619,9 @@ mod app {
                             )
                             .await;
 
-                        send_current_step_reply(
+                        crate::tmc_diagnostics::send_current_step_reply(
                             vector_reply,
-                            CurrentStepReport {
+                            crate::tmc_diagnostics::CurrentStepReport {
                                 oid,
                                 status,
                                 torque_target,
@@ -2022,14 +1660,16 @@ mod app {
                             .timer_active_mirror
                             .load(core::sync::atomic::Ordering::Relaxed);
                         if !motor_enabled || !calibrated || homing_active || stepper_active {
-                            current_torque_sample_reply(empty_current_torque_sample_report(
-                                oid,
-                                CURRENT_STEP_STATUS_NOT_READY,
-                                target,
-                                flux_target,
-                                sample_delay_ms,
-                                voltage_limit,
-                            ));
+                            crate::tmc_diagnostics::current_torque_sample_reply(
+                                crate::tmc_diagnostics::empty_current_torque_sample_report(
+                                    oid,
+                                    CURRENT_STEP_STATUS_NOT_READY,
+                                    target,
+                                    flux_target,
+                                    sample_delay_ms,
+                                    voltage_limit,
+                                ),
+                            );
                             continue;
                         }
 
@@ -2039,14 +1679,16 @@ mod app {
                         {
                             Ok(value) => value,
                             Err(_) => {
-                                current_torque_sample_reply(empty_current_torque_sample_report(
-                                    oid,
-                                    CURRENT_STEP_STATUS_SPI,
-                                    target,
-                                    flux_target,
-                                    sample_delay_ms,
-                                    voltage_limit,
-                                ));
+                                crate::tmc_diagnostics::current_torque_sample_reply(
+                                    crate::tmc_diagnostics::empty_current_torque_sample_report(
+                                        oid,
+                                        CURRENT_STEP_STATUS_SPI,
+                                        target,
+                                        flux_target,
+                                        sample_delay_ms,
+                                        voltage_limit,
+                                    ),
+                                );
                                 continue;
                             }
                         };
@@ -2059,14 +1701,16 @@ mod app {
                         {
                             Ok(value) => value,
                             Err(_) => {
-                                current_torque_sample_reply(empty_current_torque_sample_report(
-                                    oid,
-                                    CURRENT_STEP_STATUS_SPI,
-                                    target,
-                                    flux_target,
-                                    sample_delay_ms,
-                                    voltage_limit,
-                                ));
+                                crate::tmc_diagnostics::current_torque_sample_reply(
+                                    crate::tmc_diagnostics::empty_current_torque_sample_report(
+                                        oid,
+                                        CURRENT_STEP_STATUS_SPI,
+                                        target,
+                                        flux_target,
+                                        sample_delay_ms,
+                                        voltage_limit,
+                                    ),
+                                );
                                 continue;
                             }
                         };
@@ -2104,14 +1748,16 @@ mod app {
                         if !restore_phase_advance_now!(
                             "phase advance: failed to restore ABN offset before torque sample"
                         ) {
-                            current_torque_sample_reply(empty_current_torque_sample_report(
-                                oid,
-                                CURRENT_STEP_STATUS_SPI,
-                                target,
-                                flux_target,
-                                sample_delay_ms,
-                                voltage_limit,
-                            ));
+                            crate::tmc_diagnostics::current_torque_sample_reply(
+                                crate::tmc_diagnostics::empty_current_torque_sample_report(
+                                    oid,
+                                    CURRENT_STEP_STATUS_SPI,
+                                    target,
+                                    flux_target,
+                                    sample_delay_ms,
+                                    voltage_limit,
+                                ),
+                            );
                             continue;
                         }
 
@@ -2124,7 +1770,7 @@ mod app {
                             tmc.write_register(PIDOUT_UQ_UD_LIMITS, voltage_limit as u32)
                                 .await
                                 .map_err(|_| ())?;
-                            clear_current_step_integrators(tmc).await?;
+                            crate::tmc_diagnostics::clear_current_step_integrators(tmc).await?;
                             tmc.write_register(STATUS_FLAGS, 0).await.map_err(|_| ())?;
                             tmc.write_register(MODE_RAMP_MODE_MOTION, CURRENT_STEP_TORQUE_MODE)
                                 .await
@@ -2192,11 +1838,12 @@ mod app {
 
                             encoder_sample =
                                 tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
-                            encoder_delta_sample = current_step_encoder_delta(
-                                encoder_before,
-                                encoder_sample,
-                                encoder_counts_per_rev,
-                            );
+                            encoder_delta_sample =
+                                crate::tmc_diagnostics::current_step_encoder_delta(
+                                    encoder_before,
+                                    encoder_sample,
+                                    encoder_counts_per_rev,
+                                );
 
                             let actual = tmc
                                 .read_register(PID_TORQUE_FLUX_ACTUAL)
@@ -2253,11 +1900,12 @@ mod app {
 
                             encoder_after =
                                 tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
-                            encoder_delta_after = current_step_encoder_delta(
-                                encoder_before,
-                                encoder_after,
-                                encoder_counts_per_rev,
-                            );
+                            encoder_delta_after =
+                                crate::tmc_diagnostics::current_step_encoder_delta(
+                                    encoder_before,
+                                    encoder_after,
+                                    encoder_counts_per_rev,
+                                );
 
                             let after = tmc
                                 .read_register(PID_TORQUE_FLUX_ACTUAL)
@@ -2299,7 +1947,7 @@ mod app {
                             )
                             .await;
 
-                        let report = CurrentTorqueSampleReport {
+                        let report = crate::tmc_diagnostics::CurrentTorqueSampleReport {
                             oid,
                             status,
                             target,
@@ -2336,9 +1984,9 @@ mod app {
                             status_flags,
                         };
                         if status == 0 {
-                            current_torque_sample_detail_reply(&report);
+                            crate::tmc_diagnostics::current_torque_sample_detail_reply(&report);
                         }
-                        current_torque_sample_reply(report);
+                        crate::tmc_diagnostics::current_torque_sample_reply(report);
                     }
                     TmcRequest {
                         kind:
@@ -2356,14 +2004,16 @@ mod app {
                             .timer_active_mirror
                             .load(core::sync::atomic::Ordering::Relaxed);
                         if !motor_enabled || !calibrated || homing_active || stepper_active {
-                            current_torque_sample_reply(empty_current_torque_sample_report(
-                                oid,
-                                CURRENT_STEP_STATUS_NOT_READY,
-                                target,
-                                0,
-                                sample_delay_ms,
-                                voltage_limit,
-                            ));
+                            crate::tmc_diagnostics::current_torque_sample_reply(
+                                crate::tmc_diagnostics::empty_current_torque_sample_report(
+                                    oid,
+                                    CURRENT_STEP_STATUS_NOT_READY,
+                                    target,
+                                    0,
+                                    sample_delay_ms,
+                                    voltage_limit,
+                                ),
+                            );
                             continue;
                         }
 
@@ -2373,26 +2023,30 @@ mod app {
                         {
                             Ok(value) => value,
                             Err(_) => {
-                                current_torque_sample_reply(empty_current_torque_sample_report(
-                                    oid,
-                                    CURRENT_STEP_STATUS_SPI,
-                                    target,
-                                    0,
-                                    sample_delay_ms,
-                                    voltage_limit,
-                                ));
+                                crate::tmc_diagnostics::current_torque_sample_reply(
+                                    crate::tmc_diagnostics::empty_current_torque_sample_report(
+                                        oid,
+                                        CURRENT_STEP_STATUS_SPI,
+                                        target,
+                                        0,
+                                        sample_delay_ms,
+                                        voltage_limit,
+                                    ),
+                                );
                                 continue;
                             }
                         };
                         if saved_mode != CURRENT_STEP_POSITION_MODE {
-                            current_torque_sample_reply(empty_current_torque_sample_report(
-                                oid,
-                                CURRENT_STEP_STATUS_NOT_READY,
-                                target,
-                                0,
-                                sample_delay_ms,
-                                voltage_limit,
-                            ));
+                            crate::tmc_diagnostics::current_torque_sample_reply(
+                                crate::tmc_diagnostics::empty_current_torque_sample_report(
+                                    oid,
+                                    CURRENT_STEP_STATUS_NOT_READY,
+                                    target,
+                                    0,
+                                    sample_delay_ms,
+                                    voltage_limit,
+                                ),
+                            );
                             continue;
                         }
 
@@ -2405,19 +2059,21 @@ mod app {
                         {
                             Ok(value) => value,
                             Err(_) => {
-                                current_torque_sample_reply(empty_current_torque_sample_report(
-                                    oid,
-                                    CURRENT_STEP_STATUS_SPI,
-                                    target,
-                                    0,
-                                    sample_delay_ms,
-                                    voltage_limit,
-                                ));
+                                crate::tmc_diagnostics::current_torque_sample_reply(
+                                    crate::tmc_diagnostics::empty_current_torque_sample_report(
+                                        oid,
+                                        CURRENT_STEP_STATUS_SPI,
+                                        target,
+                                        0,
+                                        sample_delay_ms,
+                                        voltage_limit,
+                                    ),
+                                );
                                 continue;
                             }
                         };
 
-                        let mut report = empty_current_torque_sample_report(
+                        let mut report = crate::tmc_diagnostics::empty_current_torque_sample_report(
                             oid,
                             0,
                             target,
@@ -2495,11 +2151,12 @@ mod app {
 
                             report.encoder_sample =
                                 tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
-                            report.encoder_delta_sample = current_step_encoder_delta(
-                                report.encoder_before,
-                                report.encoder_sample,
-                                encoder_counts_per_rev,
-                            );
+                            report.encoder_delta_sample =
+                                crate::tmc_diagnostics::current_step_encoder_delta(
+                                    report.encoder_before,
+                                    report.encoder_sample,
+                                    encoder_counts_per_rev,
+                                );
 
                             let actual = tmc
                                 .read_register(PID_TORQUE_FLUX_ACTUAL)
@@ -2556,11 +2213,12 @@ mod app {
 
                             report.encoder_after =
                                 tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
-                            report.encoder_delta_after = current_step_encoder_delta(
-                                report.encoder_before,
-                                report.encoder_after,
-                                encoder_counts_per_rev,
-                            );
+                            report.encoder_delta_after =
+                                crate::tmc_diagnostics::current_step_encoder_delta(
+                                    report.encoder_before,
+                                    report.encoder_after,
+                                    encoder_counts_per_rev,
+                                );
 
                             let after = tmc
                                 .read_register(PID_TORQUE_FLUX_ACTUAL)
@@ -2596,9 +2254,9 @@ mod app {
                             .await;
 
                         if report.status == 0 {
-                            current_torque_sample_detail_reply(&report);
+                            crate::tmc_diagnostics::current_torque_sample_detail_reply(&report);
                         }
-                        current_torque_sample_reply(report);
+                        crate::tmc_diagnostics::current_torque_sample_reply(report);
                     }
                     TmcRequest {
                         kind:
@@ -2616,13 +2274,15 @@ mod app {
                             .timer_active_mirror
                             .load(core::sync::atomic::Ordering::Relaxed);
                         if !motor_enabled || !calibrated || homing_active || stepper_active {
-                            voltage_step_reply(empty_voltage_step_report(
-                                oid,
-                                CURRENT_STEP_STATUS_NOT_READY,
-                                uq_ext,
-                                ud_ext,
-                                sample_delay_ms,
-                            ));
+                            crate::tmc_diagnostics::voltage_step_reply(
+                                crate::tmc_diagnostics::empty_voltage_step_report(
+                                    oid,
+                                    CURRENT_STEP_STATUS_NOT_READY,
+                                    uq_ext,
+                                    ud_ext,
+                                    sample_delay_ms,
+                                ),
+                            );
                             continue;
                         }
 
@@ -2632,40 +2292,51 @@ mod app {
                         {
                             Ok(value) => value,
                             Err(_) => {
-                                voltage_step_reply(empty_voltage_step_report(
+                                crate::tmc_diagnostics::voltage_step_reply(
+                                    crate::tmc_diagnostics::empty_voltage_step_report(
+                                        oid,
+                                        CURRENT_STEP_STATUS_SPI,
+                                        uq_ext,
+                                        ud_ext,
+                                        sample_delay_ms,
+                                    ),
+                                );
+                                continue;
+                            }
+                        };
+                        if saved_mode != CURRENT_STEP_POSITION_MODE {
+                            crate::tmc_diagnostics::voltage_step_reply(
+                                crate::tmc_diagnostics::empty_voltage_step_report(
+                                    oid,
+                                    CURRENT_STEP_STATUS_NOT_READY,
+                                    uq_ext,
+                                    ud_ext,
+                                    sample_delay_ms,
+                                ),
+                            );
+                            continue;
+                        }
+
+                        let mut report = crate::tmc_diagnostics::empty_voltage_step_report(
+                            oid,
+                            0,
+                            uq_ext,
+                            ud_ext,
+                            sample_delay_ms,
+                        );
+
+                        if !restore_phase_advance_now!(
+                            "phase advance: failed to restore ABN offset before voltage step"
+                        ) {
+                            crate::tmc_diagnostics::voltage_step_reply(
+                                crate::tmc_diagnostics::empty_voltage_step_report(
                                     oid,
                                     CURRENT_STEP_STATUS_SPI,
                                     uq_ext,
                                     ud_ext,
                                     sample_delay_ms,
-                                ));
-                                continue;
-                            }
-                        };
-                        if saved_mode != CURRENT_STEP_POSITION_MODE {
-                            voltage_step_reply(empty_voltage_step_report(
-                                oid,
-                                CURRENT_STEP_STATUS_NOT_READY,
-                                uq_ext,
-                                ud_ext,
-                                sample_delay_ms,
-                            ));
-                            continue;
-                        }
-
-                        let mut report =
-                            empty_voltage_step_report(oid, 0, uq_ext, ud_ext, sample_delay_ms);
-
-                        if !restore_phase_advance_now!(
-                            "phase advance: failed to restore ABN offset before voltage step"
-                        ) {
-                            voltage_step_reply(empty_voltage_step_report(
-                                oid,
-                                CURRENT_STEP_STATUS_SPI,
-                                uq_ext,
-                                ud_ext,
-                                sample_delay_ms,
-                            ));
+                                ),
+                            );
                             continue;
                         }
 
@@ -2685,9 +2356,12 @@ mod app {
                                 foci_firmware::tmc::decode_signed_upper_half(before);
 
                             tmc.write_register(STATUS_FLAGS, 0).await.map_err(|_| ())?;
-                            tmc.write_register(UQ_UD_EXT, pack_voltage_ext(uq_ext, ud_ext))
-                                .await
-                                .map_err(|_| ())?;
+                            tmc.write_register(
+                                UQ_UD_EXT,
+                                crate::tmc_diagnostics::pack_voltage_ext(uq_ext, ud_ext),
+                            )
+                            .await
+                            .map_err(|_| ())?;
                             tmc.write_register(
                                 MODE_RAMP_MODE_MOTION,
                                 CURRENT_STEP_OPEN_LOOP_VOLTAGE_MODE,
@@ -2699,11 +2373,12 @@ mod app {
 
                             report.encoder_sample =
                                 tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
-                            report.encoder_delta_sample = current_step_encoder_delta(
-                                report.encoder_before,
-                                report.encoder_sample,
-                                encoder_counts_per_rev,
-                            );
+                            report.encoder_delta_sample =
+                                crate::tmc_diagnostics::current_step_encoder_delta(
+                                    report.encoder_before,
+                                    report.encoder_sample,
+                                    encoder_counts_per_rev,
+                                );
 
                             let actual = tmc
                                 .read_register(PID_TORQUE_FLUX_ACTUAL)
@@ -2787,11 +2462,12 @@ mod app {
 
                             report.encoder_after =
                                 tmc.read_register(ABN_DECODER_COUNT).await.map_err(|_| ())?;
-                            report.encoder_delta_after = current_step_encoder_delta(
-                                report.encoder_before,
-                                report.encoder_after,
-                                encoder_counts_per_rev,
-                            );
+                            report.encoder_delta_after =
+                                crate::tmc_diagnostics::current_step_encoder_delta(
+                                    report.encoder_before,
+                                    report.encoder_after,
+                                    encoder_counts_per_rev,
+                                );
 
                             let after = tmc
                                 .read_register(PID_TORQUE_FLUX_ACTUAL)
@@ -2819,7 +2495,7 @@ mod app {
                                 .await;
                         }
 
-                        voltage_step_reply(report);
+                        crate::tmc_diagnostics::voltage_step_reply(report);
                     }
                     req @ TmcRequest {
                         kind: TmcRequestKind::SetEncoder { .. },
