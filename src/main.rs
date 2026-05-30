@@ -22,6 +22,7 @@ mod helpers;
 mod interrupts;
 mod platform_impl;
 mod state;
+mod tmc_control_glue;
 mod tmc_dispatch;
 mod transport;
 mod trigger_domain;
