@@ -437,7 +437,6 @@ mod app {
         #[cfg(feature = "trace")]
         let mut trace_control_tick: u32 = 0;
         let mut next_control_tick = Mono::now() + 1.millis();
-        let mut slow_control_accum_us: u16 = 0;
         #[cfg(feature = "trace")]
         let mut cached_trace_velocity_offset: i32 = 0;
         #[cfg(feature = "trace")]
@@ -469,10 +468,6 @@ mod app {
         // Whether the shutdown safe-state has already been applied this
         // shutdown cycle. Reset when shutdown clears.
         let mut shutdown_handled = false;
-
-        // Velocity feedforward scale factor, computed when encoder PPR arrives.
-        // velocity_tmc = velocity_scale / step_interval
-        let mut velocity_scale: u32 = 0;
 
         // Track whether feedforward was active on the previous tick, so we
         // can zero offset registers on the deactivation edge.
@@ -696,21 +691,9 @@ mod app {
                 // For Terminal cases, fall through to normal channel-receive processing.
             }
 
-            let fast_transient_scheduler_active = runtime.is_motor_enabled()
-                && velocity_scale != 0
-                && !runtime.is_commission_active()
-                && tmc_state()
-                    .velocity_transient_feedforward
-                    .load(core::sync::atomic::Ordering::Relaxed);
-            let requested_transient_rate_hz = if fast_transient_scheduler_active {
-                tmc_state()
-                    .velocity_transient_rate_hz
-                    .load(core::sync::atomic::Ordering::Relaxed)
-            } else {
-                foci_firmware::tmc::VELOCITY_TRANSIENT_DEFAULT_RATE_HZ
-            };
-            let control_period_us =
-                foci_firmware::tmc::velocity_transient_period_us(requested_transient_rate_hz);
+            let control_period_us = runtime.control_period_us(
+                foci_firmware::tmc_control::TmcControlStateRefs::new(tmc_state(), stepper_state()),
+            );
             let control_sleep = Mono::delay_until(next_control_tick);
 
             let selected = select(rx.recv(), control_sleep).await;
@@ -2515,13 +2498,15 @@ mod app {
                             });
                         }
                         // Compute feedforward scale factor from step_width and PWM config
-                        velocity_scale = foci_firmware::tmc::compute_velocity_scale_factor(
-                            tmc_state()
-                                .step_width_value
-                                .load(core::sync::atomic::Ordering::Relaxed)
-                                .unsigned_abs(),
-                            CLOCK_FREQ,
-                            TMC_CONFIG.pwm_freq_hz(),
+                        runtime.set_velocity_scale(
+                            foci_firmware::tmc::compute_velocity_scale_factor(
+                                tmc_state()
+                                    .step_width_value
+                                    .load(core::sync::atomic::Ordering::Relaxed)
+                                    .unsigned_abs(),
+                                CLOCK_FREQ,
+                                TMC_CONFIG.pwm_freq_hz(),
+                            ),
                         );
                     }
                     other => {
@@ -2546,19 +2531,7 @@ mod app {
                 continue;
             }
             next_control_tick = Mono::now() + u64::from(control_period_us).micros();
-            let slow_control_tick = if control_period_us >= 1_000 {
-                slow_control_accum_us = 0;
-                true
-            } else {
-                slow_control_accum_us = slow_control_accum_us
-                    .saturating_add(u16::try_from(control_period_us).unwrap_or(u16::MAX));
-                if slow_control_accum_us >= 1_000 {
-                    slow_control_accum_us -= 1_000;
-                    true
-                } else {
-                    false
-                }
-            };
+            let slow_control_tick = runtime.update_slow_control(control_period_us);
 
             // Check emergency disable (non-blocking). Triggered by EXTI
             // STATUS interrupt or enter_shutdown. Disables motor and reports
@@ -2625,36 +2598,36 @@ mod app {
             // Velocity feedforward: compute offset from live step interval
             // and write to PID_VELOCITY_OFFSET. Gated on:
             // - motor_enabled (closedloop active, safe to write 0x67)
-            // - velocity_scale != 0 (encoder configured)
+            // - runtime.velocity_scale() != 0 (encoder configured)
             // - tmc_state().velocity_feedforward enabled (host config)
             // - commission not active (not commissioning)
             // - homing not active
             let ff_active = runtime.is_motor_enabled()
-                && velocity_scale != 0
+                && runtime.velocity_scale() != 0
                 && tmc_state()
                     .velocity_feedforward
                     .load(core::sync::atomic::Ordering::Relaxed)
                 && !runtime.is_commission_active();
             let velocity_transient_active = runtime.is_motor_enabled()
-                && velocity_scale != 0
+                && runtime.velocity_scale() != 0
                 && tmc_state()
                     .velocity_transient_feedforward
                     .load(core::sync::atomic::Ordering::Relaxed)
                 && !runtime.is_commission_active();
             let accel_ff_active = runtime.is_motor_enabled()
-                && velocity_scale != 0
+                && runtime.velocity_scale() != 0
                 && tmc_state()
                     .accel_feedforward
                     .load(core::sync::atomic::Ordering::Relaxed)
                 && !runtime.is_commission_active();
             let decoupling_ff_active = runtime.is_motor_enabled()
-                && velocity_scale != 0
+                && runtime.velocity_scale() != 0
                 && tmc_state()
                     .decoupling_feedforward
                     .load(core::sync::atomic::Ordering::Relaxed)
                 && !runtime.is_commission_active();
             let phase_advance_requested = runtime.is_motor_enabled()
-                && velocity_scale != 0
+                && runtime.velocity_scale() != 0
                 && tmc_state()
                     .phase_advance
                     .load(core::sync::atomic::Ordering::Relaxed)
@@ -2665,7 +2638,7 @@ mod app {
                 .swap(false, core::sync::atomic::Ordering::Relaxed);
 
             let velocity_trace_inputs_active = runtime.is_motor_enabled()
-                && velocity_scale != 0
+                && runtime.velocity_scale() != 0
                 && !runtime.is_commission_active();
             let command_velocity_reference = if velocity_trace_inputs_active {
                 if homing_active || reset {
@@ -2678,7 +2651,7 @@ mod app {
                         .direction
                         .load(core::sync::atomic::Ordering::Relaxed);
                     foci_firmware::tmc::compute_command_velocity_reference(
-                        velocity_scale,
+                        runtime.velocity_scale(),
                         interval,
                         forward,
                     )
@@ -2707,7 +2680,7 @@ mod app {
                         .velocity_feedforward_multiplier
                         .load(core::sync::atomic::Ordering::Relaxed);
                     foci_firmware::tmc::compute_velocity_offset_scaled(
-                        velocity_scale,
+                        runtime.velocity_scale(),
                         interval,
                         forward,
                         multiplier,
@@ -2718,7 +2691,7 @@ mod app {
                 let transient_offset = if velocity_transient_active && !homing_active && !reset {
                     foci_firmware::tmc::compute_velocity_transient_offset(
                         foci_firmware::tmc::VelocityTransientFeedforwardInput {
-                            scale_factor: velocity_scale,
+                            scale_factor: runtime.velocity_scale(),
                             clock_freq: CLOCK_FREQ,
                             step_interval: interval,
                             interval_add,
@@ -2785,7 +2758,7 @@ mod app {
                         .direction
                         .load(core::sync::atomic::Ordering::Relaxed);
                     let target_velocity = foci_firmware::tmc::compute_command_velocity_reference(
-                        velocity_scale,
+                        runtime.velocity_scale(),
                         interval,
                         forward,
                     );
@@ -2885,7 +2858,7 @@ mod app {
                         .direction
                         .load(core::sync::atomic::Ordering::Relaxed);
                     foci_firmware::tmc::compute_accel_torque_offset_split(
-                        velocity_scale,
+                        runtime.velocity_scale(),
                         CLOCK_FREQ,
                         interval,
                         interval_add,
@@ -3079,7 +3052,7 @@ mod app {
             }
 
             let position_lead_active = runtime.is_motor_enabled()
-                && velocity_scale != 0
+                && runtime.velocity_scale() != 0
                 && tmc_state()
                     .position_lead
                     .load(core::sync::atomic::Ordering::Relaxed)
@@ -3102,7 +3075,7 @@ mod app {
                     0
                 } else {
                     foci_firmware::tmc::compute_position_lead_counts(
-                        velocity_scale,
+                        runtime.velocity_scale(),
                         interval,
                         forward,
                         gain_permille,
