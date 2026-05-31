@@ -13,6 +13,10 @@
 //! the handler bodies into `foci-firmware`; this file is what they
 //! bind against.
 
+use foci_firmware::context::stepper::{
+    self, StepperDrainStats, StepperEnqueueError, StepperQueueBoard, StepperResetBoard,
+    StepperTimerStateBoard,
+};
 use foci_firmware::context::trsync::{self, TriggerDispatchBoard, TriggerDomainState, TrsyncBoard};
 use foci_firmware::context::{
     BoardChannels, ClockSource, EndstopHost, QueueFull, ShutdownRecovery, StateAccess, StepperHost,
@@ -45,6 +49,151 @@ fn record_schedule_result(result: ScheduleResult) -> bool {
             crate::state::stepper_diag::record_scheduler_full();
             false
         }
+    }
+}
+
+pub(crate) struct OpenFfboardStepperBoard;
+
+impl StepperTimerStateBoard for OpenFfboardStepperBoard {
+    fn set_timer_active(
+        &mut self,
+        state: &mut TriggerDomainState,
+        stepper_idx: usize,
+        active: bool,
+    ) {
+        set_timer_active(state, stepper_idx, active);
+    }
+}
+
+impl StepperQueueBoard for OpenFfboardStepperBoard {
+    fn queue_stepper_index(&self, channel: u8) -> Result<usize, CommandError> {
+        if channel == 0 {
+            Ok(0)
+        } else {
+            Err(CommandError::InvalidChannel(channel))
+        }
+    }
+
+    fn queue_was_empty(&self, channel: u8) -> Result<bool, CommandError> {
+        // SAFETY: P2 is the sole producer. Queue len read is safe from P2.
+        let queue = unsafe { step_queue(channel).ok_or(CommandError::InvalidChannel(channel))? };
+        Ok(queue.is_empty())
+    }
+
+    fn prepare_and_enqueue(
+        &mut self,
+        channel: u8,
+        move_: foci_klipper::stepper::StepMove,
+    ) -> Result<usize, StepperEnqueueError> {
+        // SAFETY: P2 stepper state is only accessed from P2 command handlers.
+        let prepared = unsafe {
+            let Some(stepper) = p2_stepper(channel) else {
+                return Err(StepperEnqueueError { queue_len: 0 });
+            };
+            stepper.prepare_move(move_)
+        };
+
+        // SAFETY: P2 is the sole producer.
+        let queue = unsafe {
+            let Some(queue) = step_queue(channel) else {
+                return Err(StepperEnqueueError { queue_len: 0 });
+            };
+            queue
+        };
+        if queue.enqueue(prepared).is_err() {
+            return Err(StepperEnqueueError {
+                queue_len: queue.len(),
+            });
+        }
+        Ok(queue.len())
+    }
+
+    fn motor_armed(&self, _channel: u8) -> bool {
+        tmc_state()
+            .motor_armed
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn record_discarded_segment(&mut self, channel: u8, steps: u32) {
+        crate::state::stepper_diag::record_discarded_segment(channel, steps);
+    }
+
+    fn record_queued_segment(&mut self, channel: u8, steps: u32, queue_len: usize) {
+        #[cfg(feature = "trace")]
+        crate::usb_trace::TRACE_TIMING
+            .klipper_rx_queue_depth
+            .store(queue_len as u16, core::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "trace"))]
+        let _ = queue_len;
+        crate::state::stepper_diag::record_queued_segment(channel, steps);
+    }
+
+    fn arm_queue_step_timer(
+        &mut self,
+        state: &mut TriggerDomainState,
+        stepper_idx: usize,
+        channel: u8,
+    ) {
+        let now = read_tim5();
+        crate::state::stepper_diag::record_timer_activation(channel, now);
+        state.scheduler.cancel(|kind| {
+            matches!(
+                kind,
+                foci_klipper::scheduler::SchedulerEventKind::Stepper(0)
+            )
+        });
+        record_schedule_result(state.scheduler.try_schedule(SchedulerEvent {
+            wake_clock: now.wrapping_add(1),
+            kind: SchedulerEventKind::Stepper(0),
+        }));
+        self.set_timer_active(state, stepper_idx, true);
+        reprogram_timer(state);
+    }
+}
+
+impl StepperResetBoard for OpenFfboardStepperBoard {
+    fn reset_stepper_index(&self, channel: u8) -> Result<usize, CommandError> {
+        if channel == 0 {
+            Ok(0)
+        } else {
+            Err(CommandError::InvalidChannel(channel))
+        }
+    }
+
+    fn drain_step_queue(&mut self, channel: u8) -> Result<StepperDrainStats, CommandError> {
+        // SAFETY: Timer is not active (checked by shared policy), P3 is quiesced.
+        let queue = unsafe { step_queue(channel).ok_or(CommandError::InvalidChannel(channel))? };
+        let mut stats = StepperDrainStats::ZERO;
+        while let Some(m) = queue.dequeue() {
+            stats.segments = stats.segments.saturating_add(1);
+            stats.steps = stats.steps.saturating_add(u32::from(m.count));
+        }
+        Ok(stats)
+    }
+
+    fn reset_stepper_clocks(&mut self, channel: u8, clock: u32) -> Result<(), CommandError> {
+        // SAFETY: Shared policy accepted only because the timer is inactive, so
+        // P3 is not using the ISR stepper. P2 stepper is only accessed from P2.
+        unsafe {
+            foci_klipper::commands::stepper::reset_stepper_clocks(
+                p2_stepper(channel).ok_or(CommandError::InvalidChannel(channel))?,
+                isr_stepper(channel).ok_or(CommandError::InvalidChannel(channel))?,
+                clock,
+            );
+        }
+        Ok(())
+    }
+
+    fn record_reset_step_clock(&mut self, channel: u8, clock: u32, stats: StepperDrainStats) {
+        crate::state::stepper_diag::record_reset(channel, stats.segments, stats.steps);
+        crate::helpers::stepper_diag::record_stepper_event(
+            StepperEventReason::ResetStepClock,
+            channel,
+            read_tim5(),
+            0,
+            clock,
+            0,
+        );
     }
 }
 
@@ -241,72 +390,9 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
             return Err(CommandError::InvalidChannel(channel));
         }
 
-        use foci_klipper::commands::stepper::{QueueStepResult, queue_step_hw};
-
         with_trigger_domain_site(crate::state::stepper_diag::PERF_SITE_QUEUE_STEP, |td| {
-            let need_reset = td.stepper_stop[0].need_reset;
-
-            // SAFETY: P2 is the sole producer. Queue len read is safe from P2.
-            let queue =
-                unsafe { step_queue(channel).ok_or(CommandError::InvalidChannel(channel))? };
-            let queue_was_empty = queue.is_empty();
-
-            // `queue_step_hw` takes the move's step count — the
-            // caller-provided `count` field on `StepMove`.
-            match queue_step_hw(need_reset, move_.count, queue_was_empty) {
-                Ok(QueueStepResult::Discarded) => {
-                    crate::state::stepper_diag::record_discarded_segment(
-                        channel,
-                        u32::from(move_.count),
-                    );
-                    Ok(())
-                }
-                Err(e) => Err(e),
-                Ok(_result) => {
-                    // SAFETY: P2 stepper state is only accessed from P2 command handlers.
-                    let prepared = unsafe {
-                        p2_stepper(channel)
-                            .ok_or(CommandError::InvalidChannel(channel))?
-                            .prepare_move(move_)
-                    };
-
-                    // SAFETY: P2 is the sole producer.
-                    let ok = queue.enqueue(prepared).is_ok();
-                    if !ok {
-                        return Err(CommandError::QueueFull);
-                    }
-                    #[cfg(feature = "trace")]
-                    crate::usb_trace::TRACE_TIMING
-                        .klipper_rx_queue_depth
-                        .store(queue.len() as u16, core::sync::atomic::Ordering::Relaxed);
-                    crate::state::stepper_diag::record_queued_segment(
-                        channel,
-                        u32::from(move_.count),
-                    );
-
-                    if !td.timer_active(0)
-                        && tmc_state()
-                            .motor_armed
-                            .load(core::sync::atomic::Ordering::Relaxed)
-                    {
-                        let now = read_tim5();
-                        crate::state::stepper_diag::record_timer_activation(channel, now);
-                        td.scheduler.cancel(|kind| {
-                            matches!(
-                                kind,
-                                foci_klipper::scheduler::SchedulerEventKind::Stepper(0)
-                            )
-                        });
-                        record_schedule_result(td.scheduler.try_schedule(SchedulerEvent {
-                            wake_clock: now.wrapping_add(1),
-                            kind: SchedulerEventKind::Stepper(0),
-                        }));
-                        td.set_timer_active(0, true);
-                        td.reprogram_timer();
-                    }
-                    Ok(())
-                }
-            }
+            let mut board = OpenFfboardStepperBoard;
+            stepper::queue_step_move(td.state_mut(), &mut board, channel, move_)
         })
     }
 
@@ -316,46 +402,8 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
         }
 
         with_trigger_domain(|td| {
-            foci_klipper::commands::stepper::reset_step_clock_hw(td.stepper_stop[0].timer_active)?;
-
-            // Drain any stale items from a previous stop.
-            // SAFETY: Timer is not active (checked above), P3 is quiesced.
-            let (drained_segments, drained_steps) = unsafe {
-                let queue = step_queue(channel).ok_or(CommandError::InvalidChannel(channel))?;
-                let mut drained_segments = 0u32;
-                let mut drained_steps = 0u32;
-                while let Some(m) = queue.dequeue() {
-                    drained_segments = drained_segments.saturating_add(1);
-                    drained_steps = drained_steps.saturating_add(u32::from(m.count));
-                }
-                (drained_segments, drained_steps)
-            };
-
-            // SAFETY: reset_step_clock_hw accepted only because the timer is
-            // inactive, so P3 is not using the ISR stepper. P2 stepper is only
-            // accessed from P2 command handlers.
-            unsafe {
-                foci_klipper::commands::stepper::reset_stepper_clocks(
-                    p2_stepper(channel).ok_or(CommandError::InvalidChannel(channel))?,
-                    isr_stepper(channel).ok_or(CommandError::InvalidChannel(channel))?,
-                    clock,
-                );
-            }
-            crate::state::stepper_diag::record_reset(channel, drained_segments, drained_steps);
-
-            crate::helpers::stepper_diag::record_stepper_event(
-                StepperEventReason::ResetStepClock,
-                channel,
-                read_tim5(),
-                0,
-                clock,
-                0,
-            );
-
-            if !td.stepper_stop[0].blocked_by_trigger {
-                td.stepper_stop[0].need_reset = false;
-            }
-            Ok(())
+            let mut board = OpenFfboardStepperBoard;
+            stepper::reset_step_clock(td.state_mut(), &mut board, channel, clock)
         })
     }
 }
