@@ -56,6 +56,9 @@ mod app {
         TRIGGER_DOMAIN, TRIGGER_TIMER_MIN_LEAD_TICKS, TriggerDomain, with_trigger_domain,
         with_trigger_domain_site,
     };
+    use foci_firmware::context::stepper::{
+        StepperArmCheckBoard, StepperStopCheckBoard, StepperTimerStateBoard,
+    };
     use foci_firmware::diagnostic::StepperEventReason;
     use foci_firmware::state::lifecycle::*;
     use foci_firmware::state::tmc::{TMC_DISABLE_SIGNAL, TMC_QUEUE_FLUSH};
@@ -1455,6 +1458,74 @@ mod app {
         }
     }
 
+    impl StepperStopCheckBoard for crate::firmware_ctx::OpenFfboardStepperBoard {
+        fn stop_check_index(&self, channel: u8) -> Option<usize> {
+            (channel == 0).then_some(0)
+        }
+
+        fn clear_step_timer(
+            &mut self,
+            state: &mut foci_firmware::context::trsync::TriggerDomainState,
+            stepper_idx: usize,
+            _channel: u8,
+        ) {
+            state.scheduler.cancel(|kind| {
+                matches!(
+                    kind,
+                    foci_klipper::scheduler::SchedulerEventKind::Stepper(0)
+                )
+            });
+            self.set_timer_active(state, stepper_idx, false);
+            crate::trigger_domain::reprogram_timer(state);
+        }
+    }
+
+    impl StepperArmCheckBoard for crate::firmware_ctx::OpenFfboardStepperBoard {
+        fn arm_check_index(&self, channel: u8) -> Option<usize> {
+            (channel == 0).then_some(0)
+        }
+
+        fn motor_armed(&self, _channel: u8) -> bool {
+            tmc_state()
+                .motor_armed
+                .load(core::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn queue_has_moves(&self, channel: u8) -> bool {
+            // SAFETY: P2 is the sole producer while the timer is inactive.
+            unsafe {
+                step_queue(channel)
+                    .map(|queue| !queue.is_empty())
+                    .unwrap_or(false)
+            }
+        }
+
+        fn arm_check_timer(
+            &mut self,
+            state: &mut foci_firmware::context::trsync::TriggerDomainState,
+            stepper_idx: usize,
+            channel: u8,
+        ) {
+            let now = read_tim5();
+            crate::state::stepper_diag::record_timer_activation(channel, now);
+            state.scheduler.cancel(|kind| {
+                matches!(
+                    kind,
+                    foci_klipper::scheduler::SchedulerEventKind::Stepper(0)
+                )
+            });
+            insert_trigger_event_unmeasured(
+                state,
+                foci_klipper::scheduler::SchedulerEvent {
+                    wake_clock: now.wrapping_add(1),
+                    kind: foci_klipper::scheduler::SchedulerEventKind::Stepper(0),
+                },
+            );
+            self.set_timer_active(state, stepper_idx, true);
+            crate::trigger_domain::reprogram_timer(state);
+        }
+    }
+
     /// P2 software task: clear TriggerDomain timer_active after P1 stop.
     ///
     /// Spawned by `stepper_stop_from_p1()`. P1 performs the physical
@@ -1464,14 +1535,8 @@ mod app {
     #[task(priority = 2)]
     async fn stop_check(_ctx: stop_check::Context) {
         with_trigger_domain(|td| {
-            td.scheduler.cancel(|kind| {
-                matches!(
-                    kind,
-                    foci_klipper::scheduler::SchedulerEventKind::Stepper(0)
-                )
-            });
-            td.set_timer_active(0, false);
-            td.reprogram_timer();
+            let mut board = crate::firmware_ctx::OpenFfboardStepperBoard;
+            foci_firmware::context::stepper::stop_check(td.state_mut(), &mut board, 0);
         });
     }
 
@@ -1482,39 +1547,8 @@ mod app {
     #[task(priority = 2)]
     async fn arm_check(_ctx: arm_check::Context) {
         with_trigger_domain(|td| {
-            if !tmc_state()
-                .motor_armed
-                .load(core::sync::atomic::Ordering::Relaxed)
-                || td.timer_active(0)
-            {
-                return;
-            }
-
-            // SAFETY: P2 is the sole producer while the timer is inactive.
-            let queue_has_moves = unsafe {
-                !step_queue(0)
-                    .expect("OpenFFBoard channel 0 exists")
-                    .is_empty()
-            };
-            if queue_has_moves {
-                let now = read_tim5();
-                crate::state::stepper_diag::record_timer_activation(0, now);
-                td.scheduler.cancel(|kind| {
-                    matches!(
-                        kind,
-                        foci_klipper::scheduler::SchedulerEventKind::Stepper(0)
-                    )
-                });
-                insert_trigger_event_unmeasured(
-                    td,
-                    foci_klipper::scheduler::SchedulerEvent {
-                        wake_clock: now.wrapping_add(1),
-                        kind: foci_klipper::scheduler::SchedulerEventKind::Stepper(0),
-                    },
-                );
-                td.set_timer_active(0, true);
-                td.reprogram_timer();
-            }
+            let mut board = crate::firmware_ctx::OpenFfboardStepperBoard;
+            foci_firmware::context::stepper::arm_check(td.state_mut(), &mut board, 0);
         });
     }
 
@@ -1546,10 +1580,10 @@ mod app {
     }
 
     fn insert_trigger_event_unmeasured(
-        td: &mut TriggerDomain,
+        state: &mut foci_firmware::context::trsync::TriggerDomainState,
         event: foci_klipper::scheduler::SchedulerEvent,
     ) -> bool {
-        record_schedule_result(td.scheduler.try_schedule(event))
+        record_schedule_result(state.scheduler.try_schedule(event))
     }
 
     fn insert_trigger_event(
