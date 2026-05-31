@@ -13,6 +13,7 @@
 //! the handler bodies into `foci-firmware`; this file is what they
 //! bind against.
 
+use foci_firmware::context::trsync::{self, TriggerDispatchBoard, TriggerDomainState, TrsyncBoard};
 use foci_firmware::context::{
     BoardChannels, ClockSource, EndstopHost, QueueFull, ShutdownRecovery, StateAccess, StepperHost,
     TmcHost, TrsyncHost,
@@ -29,8 +30,8 @@ use crate::helpers::trsync::{gpio_configure_input, gpio_read_pin};
 use crate::state::stepper::{isr_stepper, p2_stepper, step_queue};
 use crate::state::tmc::TMC_REQUEST_SENDER;
 use crate::trigger_domain::{
-    PHYSICAL_STEPPER_INDICES, stop_physical_stepper_no_lock, with_trigger_domain,
-    with_trigger_domain_site,
+    OpenFfboardDispatchBoard, PHYSICAL_STEPPER_INDICES, disarm_timer, reprogram_timer,
+    set_timer_active, stop_physical_stepper_no_lock, with_trigger_domain, with_trigger_domain_site,
 };
 
 fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
@@ -44,6 +45,62 @@ fn record_schedule_result(result: ScheduleResult) -> bool {
             crate::state::stepper_diag::record_scheduler_full();
             false
         }
+    }
+}
+
+struct OpenFfboardTrsyncBoard;
+
+impl TriggerDispatchBoard for OpenFfboardTrsyncBoard {
+    fn stop_physical_stepper(
+        &mut self,
+        state: &TriggerDomainState,
+        stepper_idx: usize,
+        reason: StepperEventReason,
+    ) {
+        let mut dispatch = OpenFfboardDispatchBoard;
+        dispatch.stop_physical_stepper(state, stepper_idx, reason);
+    }
+
+    fn record_trsync_stop(&mut self, stepper_idx: usize, clock: u32, trsync_oid: u8, reason: u8) {
+        let mut dispatch = OpenFfboardDispatchBoard;
+        dispatch.record_trsync_stop(stepper_idx, clock, trsync_oid, reason);
+    }
+
+    fn set_timer_active(
+        &mut self,
+        state: &mut TriggerDomainState,
+        stepper_idx: usize,
+        active: bool,
+    ) {
+        set_timer_active(state, stepper_idx, active);
+    }
+}
+
+impl TrsyncBoard for OpenFfboardTrsyncBoard {
+    fn physical_steppers(&self) -> &'static [usize] {
+        PHYSICAL_STEPPER_INDICES
+    }
+
+    fn map_physical_stepper(&self, klipper_stepper_idx: usize) -> Option<usize> {
+        PHYSICAL_STEPPER_INDICES
+            .contains(&klipper_stepper_idx)
+            .then_some(klipper_stepper_idx)
+    }
+
+    fn endstop_pin_id(&self, endstop_idx: usize) -> u8 {
+        ENDSTOP_PIN_IDS[endstop_idx].load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn record_schedule_result(&mut self, result: ScheduleResult) {
+        let _ = record_schedule_result(result);
+    }
+
+    fn reprogram_trigger_timer(&mut self, state: &mut TriggerDomainState) {
+        reprogram_timer(state);
+    }
+
+    fn disarm_trigger_timer(&mut self, state: &mut TriggerDomainState) {
+        disarm_timer(state);
     }
 }
 
@@ -82,7 +139,7 @@ pub(crate) fn enter_shutdown(state: &mut State) -> bool {
             // Clear transient trsync state (preserve OID maps).
             // Trigger each trsync to clear can_trigger per spec,
             // then cancel timers and pending reports.
-            for (trsync_idx, ts) in td.trsync.iter_mut().enumerate() {
+            for trsync_idx in 0..td.trsync.len() {
                 // Find OID for this index (if configured)
                 let oid = td
                     .trsync_by_oid
@@ -90,6 +147,7 @@ pub(crate) fn enter_shutdown(state: &mut State) -> bool {
                     .find(|&(_, &idx)| idx == trsync_idx)
                     .map(|(&oid, _)| oid)
                     .unwrap_or(0);
+                let ts = &mut td.trsync[trsync_idx];
                 ts.trigger(oid, 0, 0); // Sets can_trigger=false
                 ts.cancel_timers();
                 ts.clear_pending_report();
@@ -350,41 +408,13 @@ impl<'a> EndstopHost for FirmwareCtx<'a> {
 impl<'a> TrsyncHost for FirmwareCtx<'a> {
     fn reset_all(&mut self) {
         with_trigger_domain(|td| {
-            td.scheduler.clear();
-            td.disarm_timer();
-            for ts in td.trsync.iter_mut() {
-                ts.reset();
-            }
-            for es in td.endstops.iter_mut() {
-                es.reset();
-            }
-            for sig in td.stop_signals.iter_mut() {
-                *sig = None;
-            }
-            td.trsync_by_oid.clear();
-            td.endstop_by_oid.clear();
-            for &idx in PHYSICAL_STEPPER_INDICES {
-                stop_physical_stepper_no_lock(idx, StepperEventReason::TmcDisableSignal);
-                td.set_timer_active(idx, false);
-            }
-            for ss in td.stepper_stop.iter_mut() {
-                *ss = foci_klipper::trigger::StepperStopRuntime::new();
-            }
+            let mut board = OpenFfboardTrsyncBoard;
+            trsync::reset_all(td.state_mut(), &mut board);
         });
     }
 
     fn register_trsync(&mut self, oid: u8) -> Result<(), ()> {
-        with_trigger_domain(|td| {
-            if td.trsync_by_oid.contains_key(&oid) {
-                return Err(());
-            }
-            let idx = td.trsync_by_oid.len();
-            if idx >= foci_klipper::state::NUM_TRSYNC {
-                return Err(());
-            }
-            td.trsync_by_oid.insert(oid, idx).map_err(|_| ())?;
-            Ok(())
-        })
+        with_trigger_domain(|td| trsync::register_trsync(td.state_mut(), oid).map_err(|_| ()))
     }
 
     fn trsync_arm(
@@ -395,116 +425,35 @@ impl<'a> TrsyncHost for FirmwareCtx<'a> {
         expire_reason: u8,
     ) -> Result<(), ()> {
         with_trigger_domain(|td| {
-            let idx = match td.trsync_by_oid.get(&oid) {
-                Some(&idx) => idx,
-                None => return Err(()),
-            };
-            for slot in td.stop_signals.iter_mut() {
-                if let Some(signal) = slot
-                    && signal.trsync_oid == oid
-                {
-                    *slot = None;
-                }
-            }
-            for stepper in td.stepper_stop.iter_mut() {
-                if stepper.blocked_by_trsync == Some(oid) {
-                    stepper.blocked_by_trigger = false;
-                    stepper.blocked_by_trsync = None;
-                }
-            }
-            td.scheduler.cancel(|k| {
-                matches!(k,
-                    foci_klipper::scheduler::SchedulerEventKind::TrSyncExpire(i)
-                    | foci_klipper::scheduler::SchedulerEventKind::TrSyncReport(i)
-                    if *i == idx
-                )
-            });
-            td.trsync[idx].arm(report_clock, report_ticks, expire_reason);
-            if report_ticks > 0 {
-                record_schedule_result(td.scheduler.try_schedule(SchedulerEvent {
-                    wake_clock: report_clock,
-                    kind: SchedulerEventKind::TrSyncReport(idx),
-                }));
-            }
-            td.reprogram_timer();
-            Ok(())
+            let mut board = OpenFfboardTrsyncBoard;
+            trsync::trsync_arm(
+                td.state_mut(),
+                &mut board,
+                oid,
+                report_clock,
+                report_ticks,
+                expire_reason,
+            )
+            .map_err(|_| ())
         })
     }
 
     fn trsync_set_timeout(&mut self, oid: u8, clock: u32) -> Result<(), ()> {
         with_trigger_domain(|td| {
-            let idx = match td.trsync_by_oid.get(&oid) {
-                Some(&idx) => idx,
-                None => return Err(()),
-            };
-            if td.trsync[idx].can_trigger() {
-                td.trsync[idx].set_timeout(clock);
-                td.scheduler.cancel(|k| {
-                    matches!(k,
-                        foci_klipper::scheduler::SchedulerEventKind::TrSyncExpire(i) if *i == idx
-                    )
-                });
-                record_schedule_result(td.scheduler.try_schedule(SchedulerEvent {
-                    wake_clock: clock,
-                    kind: SchedulerEventKind::TrSyncExpire(idx),
-                }));
-                td.reprogram_timer();
-            }
-            Ok(())
+            let mut board = OpenFfboardTrsyncBoard;
+            trsync::trsync_set_timeout(td.state_mut(), &mut board, oid, clock).map_err(|_| ())
         })
     }
 
     fn trsync_trigger(&mut self, oid: u8, reason: u8) -> Result<u8, ()> {
         with_trigger_domain(|td| {
-            let idx = match td.trsync_by_oid.get(&oid) {
-                Some(&idx) => idx,
-                None => return Err(()),
-            };
-            let _result = td.trigger(oid, reason, 0);
-            let trigger_reason = td.trsync[idx].trigger_reason();
-
-            td.scheduler.cancel(|k| {
-                matches!(k,
-                    foci_klipper::scheduler::SchedulerEventKind::TrSyncExpire(i)
-                    | foci_klipper::scheduler::SchedulerEventKind::TrSyncReport(i)
-                    if *i == idx
-                )
-            });
-            td.trsync[idx].clear_pending_report();
-            td.trsync[idx].cancel_timers();
-
-            for slot in td.stop_signals.iter_mut() {
-                if let Some(signal) = slot
-                    && signal.trsync_oid == oid
-                {
-                    *slot = None;
-                }
-            }
-
-            for stepper in td.stepper_stop.iter_mut() {
-                if stepper.blocked_by_trsync == Some(oid) {
-                    stepper.blocked_by_trigger = false;
-                    stepper.blocked_by_trsync = None;
-                }
-            }
-
-            td.reprogram_timer();
-            Ok(trigger_reason)
+            let mut board = OpenFfboardTrsyncBoard;
+            trsync::trsync_trigger(td.state_mut(), &mut board, oid, reason).map_err(|_| ())
         })
     }
 
     fn register_endstop(&mut self, oid: u8) -> Result<usize, ()> {
-        with_trigger_domain(|td| {
-            if td.endstop_by_oid.contains_key(&oid) {
-                return Err(());
-            }
-            let idx = td.endstop_by_oid.len();
-            if idx >= foci_klipper::state::NUM_ENDSTOPS {
-                return Err(());
-            }
-            td.endstop_by_oid.insert(oid, idx).map_err(|_| ())?;
-            Ok(idx)
-        })
+        with_trigger_domain(|td| trsync::register_endstop(td.state_mut(), oid).map_err(|_| ()))
     }
 
     fn endstop_start_homing(
@@ -519,24 +468,11 @@ impl<'a> TrsyncHost for FirmwareCtx<'a> {
         trigger_reason: u8,
     ) -> Result<(), ()> {
         with_trigger_domain(|td| {
-            let idx = match td.endstop_by_oid.get(&oid) {
-                Some(&idx) => idx,
-                None => return Err(()),
-            };
-            // Zero sample_count is a disarm request — no trsync needed.
-            if sample_count != 0 && !td.trsync_by_oid.contains_key(&trsync_oid) {
-                return Err(());
-            }
-            // Retrieve pin_id from config-time storage inside the
-            // critical section so the endstop runtime gets the correct
-            // physical pin without an extra atomic read by the handler.
-            let pin_id = ENDSTOP_PIN_IDS[idx].load(core::sync::atomic::Ordering::Relaxed);
-            td.scheduler.cancel(|k| {
-                matches!(k,
-                    foci_klipper::scheduler::SchedulerEventKind::EndstopSample(i) if *i == idx
-                )
-            });
-            td.endstops[idx].start_homing(
+            let mut board = OpenFfboardTrsyncBoard;
+            trsync::endstop_start_homing(
+                td.state_mut(),
+                &mut board,
+                oid,
                 clock,
                 sample_ticks,
                 sample_count,
@@ -544,51 +480,23 @@ impl<'a> TrsyncHost for FirmwareCtx<'a> {
                 pin_value_expected,
                 trsync_oid,
                 trigger_reason,
-                pin_id,
-            );
-            if sample_count > 0 {
-                record_schedule_result(td.scheduler.try_schedule(SchedulerEvent {
-                    wake_clock: clock,
-                    kind: SchedulerEventKind::EndstopSample(idx),
-                }));
-            }
-            td.reprogram_timer();
-            Ok(())
+            )
+            .map_err(|_| ())
         })
     }
 
     fn endstop_query(&mut self, oid: u8) -> Result<(bool, u32, u8), ()> {
         with_trigger_domain(|td| {
-            let idx = match td.endstop_by_oid.get(&oid) {
-                Some(&idx) => idx,
-                None => return Err(()),
-            };
-            let (homing, next_clock) = td.endstops[idx].query_state();
-            let pin_id = ENDSTOP_PIN_IDS[idx].load(core::sync::atomic::Ordering::Relaxed);
-            Ok((homing, next_clock, pin_id))
+            let board = OpenFfboardTrsyncBoard;
+            trsync::endstop_query(td.state(), &board, oid).map_err(|_| ())
         })
     }
 
     fn link_stepper_stop(&mut self, stepper_idx: usize, trsync_oid: u8) -> Result<(), ()> {
         with_trigger_domain(|td| {
-            if !td.trsync_by_oid.contains_key(&trsync_oid) {
-                return Err(());
-            }
-            for signal in td.stop_signals.iter().flatten() {
-                if signal.stepper_idx == stepper_idx {
-                    return Err(());
-                }
-            }
-            for slot in td.stop_signals.iter_mut() {
-                if slot.is_none() {
-                    *slot = Some(foci_klipper::trigger::StopSignal {
-                        trsync_oid,
-                        stepper_idx,
-                    });
-                    return Ok(());
-                }
-            }
-            Err(())
+            let board = OpenFfboardTrsyncBoard;
+            trsync::link_stepper_stop(td.state_mut(), &board, stepper_idx, trsync_oid)
+                .map_err(|_| ())
         })
     }
 }

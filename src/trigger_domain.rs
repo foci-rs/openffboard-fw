@@ -7,9 +7,11 @@
 //! the subsystem `state/*` modules makes the coordination surface
 //! inspectable independently of RTIC's macro expansion.
 
+use core::ops::{Deref, DerefMut};
+
 use crate::state::stepper::{isr_stepper, step_queue};
+use foci_firmware::context::trsync::{self, TriggerDispatchBoard, TriggerDomainState};
 use foci_firmware::diagnostic::StepperEventReason;
-use foci_firmware::state::trsync::HOMING_TRIGGERED;
 
 // ---- TriggerDomain: unified trsync/endstop/stepper-stop resource ----
 
@@ -32,48 +34,33 @@ fn stepper_state() -> &'static foci_firmware::state::stepper::StepperChannelStat
 /// section, equivalent to RTIC P3 ceiling. This is NOT an RTIC shared
 /// resource — it is a `static mut` with manual locking.
 pub(crate) struct TriggerDomain {
-    pub(crate) trsync: [foci_klipper::trigger::TrSyncRuntime; foci_klipper::state::NUM_TRSYNC],
-    pub(crate) trsync_by_oid: heapless::LinearMap<u8, usize, { foci_klipper::state::NUM_TRSYNC }>,
-    pub(crate) stop_signals: [Option<foci_klipper::trigger::StopSignal>; 8],
-    pub(crate) stepper_stop:
-        [foci_klipper::trigger::StepperStopRuntime; foci_klipper::state::NUM_STEPPERS],
-    pub(crate) endstops: [foci_klipper::endstop::EndstopRuntime; foci_klipper::state::NUM_ENDSTOPS],
-    pub(crate) endstop_by_oid:
-        heapless::LinearMap<u8, usize, { foci_klipper::state::NUM_ENDSTOPS }>,
-    pub(crate) scheduler: foci_klipper::scheduler::TriggerScheduler,
+    state: TriggerDomainState,
 }
 
 impl TriggerDomain {
     pub(crate) const fn new() -> Self {
         Self {
-            trsync: [const { foci_klipper::trigger::TrSyncRuntime::new() };
-                foci_klipper::state::NUM_TRSYNC],
-            trsync_by_oid: heapless::LinearMap::new(),
-            stop_signals: [None; 8],
-            stepper_stop: [const { foci_klipper::trigger::StepperStopRuntime::new() };
-                foci_klipper::state::NUM_STEPPERS],
-            endstops: [const { foci_klipper::endstop::EndstopRuntime::new() };
-                foci_klipper::state::NUM_ENDSTOPS],
-            endstop_by_oid: heapless::LinearMap::new(),
-            scheduler: foci_klipper::scheduler::TriggerScheduler::new(),
+            state: TriggerDomainState::new(),
         }
+    }
+
+    pub(crate) fn state_mut(&mut self) -> &mut TriggerDomainState {
+        &mut self.state
+    }
+
+    pub(crate) fn state(&self) -> &TriggerDomainState {
+        &self.state
     }
 
     /// Set `timer_active` for a stepper, updating the P1 mirror
     /// for physical steppers.
     pub(crate) fn set_timer_active(&mut self, stepper_idx: usize, active: bool) {
-        self.stepper_stop[stepper_idx].timer_active = active;
-        // Mirror to P1-readable atomic for physical steppers
-        if stepper_idx == 0 {
-            stepper_state()
-                .timer_active_mirror
-                .store(active, core::sync::atomic::Ordering::Relaxed);
-        }
+        set_timer_active(&mut self.state, stepper_idx, active);
     }
 
     /// Read `timer_active` for a stepper.
     pub(crate) fn timer_active(&self, stepper_idx: usize) -> bool {
-        self.stepper_stop[stepper_idx].timer_active
+        timer_active(&self.state, stepper_idx)
     }
 
     /// Attempt to trigger a trsync, dispatching stop signals to all
@@ -86,53 +73,8 @@ impl TriggerDomain {
         reason: u8,
         clock: u32,
     ) -> foci_klipper::trigger::TriggerResult {
-        let idx = match self.trsync_by_oid.get(&trsync_oid) {
-            Some(&idx) => idx,
-            None => {
-                return foci_klipper::trigger::TriggerResult::UnknownOid;
-            }
-        };
-        let result = self.trsync[idx].trigger(trsync_oid, reason, clock);
-        if matches!(result, foci_klipper::trigger::TriggerResult::First { .. }) {
-            // Collect stepper indices from matching stop signals, then
-            // clear the slots. Two-pass avoids borrow conflict between
-            // stop_signals iteration and set_timer_active(&mut self).
-            let mut stopped_indices: heapless::Vec<usize, 8> = heapless::Vec::new();
-            for slot in self.stop_signals.iter_mut() {
-                if let Some(signal) = slot
-                    && signal.trsync_oid == trsync_oid
-                {
-                    let _ = stopped_indices.push(signal.stepper_idx);
-                    *slot = None;
-                }
-            }
-            // Dispatch physical stops and update stepper state
-            for &stepper_idx in &stopped_indices {
-                self.scheduler.cancel(|kind| {
-                    matches!(kind, foci_klipper::scheduler::SchedulerEventKind::Stepper(i) if *i == stepper_idx)
-                });
-                stop_physical_stepper_no_lock(stepper_idx, StepperEventReason::TrsyncStop);
-                crate::helpers::stepper_diag::record_stepper_event(
-                    StepperEventReason::TrsyncStop,
-                    stepper_idx as u8,
-                    clock,
-                    0,
-                    trsync_oid as u32,
-                    reason as u32,
-                );
-                self.stepper_stop[stepper_idx].need_reset = true;
-                self.stepper_stop[stepper_idx].blocked_by_trigger = true;
-                self.stepper_stop[stepper_idx].blocked_by_trsync = Some(trsync_oid);
-                self.set_timer_active(stepper_idx, false);
-            }
-            // Signal homing I-suppression only when a stop signal
-            // actually fired — prevents unrelated trsync triggers
-            // from advancing the suppression state machine.
-            if !stopped_indices.is_empty() {
-                HOMING_TRIGGERED.store(trsync_oid, core::sync::atomic::Ordering::Relaxed);
-            }
-        }
-        result
+        let mut board = OpenFfboardDispatchBoard;
+        trsync::dispatch_trigger(&mut self.state, &mut board, trsync_oid, reason, clock)
     }
 
     /// Arm TIM5 CC1 for the next unified scheduler deadline.
@@ -140,35 +82,12 @@ impl TriggerDomain {
     /// Called inside the TriggerDomain lock from both P2 command handlers and
     /// the P3 ISR after processing events.
     pub(crate) fn arm_timer_at(&mut self, clock: u32) {
-        let tim5 = embassy_stm32::pac::TIM5;
-        tim5.ccr(0).write_value(clock);
-        tim5.sr().modify(|w| {
-            w.set_ccif(0, false);
-            w.set_ccif(1, false);
-        });
-        tim5.dier().modify(|w| {
-            w.set_ccie(0, true);
-            w.set_ccie(1, false);
-        });
-        // Ensure NVIC is unmasked (idempotent)
-        unsafe {
-            cortex_m::peripheral::NVIC::unmask(embassy_stm32::pac::Interrupt::TIM5);
-        }
-        self.scheduler.set_cc2_active(true);
+        arm_timer_at(&mut self.state, clock);
     }
 
     /// Disable the unified TIM5 scheduler compare.
     pub(crate) fn disarm_timer(&mut self) {
-        let tim5 = embassy_stm32::pac::TIM5;
-        tim5.dier().modify(|w| {
-            w.set_ccie(0, false);
-            w.set_ccie(1, false);
-        });
-        tim5.sr().modify(|w| {
-            w.set_ccif(0, false);
-            w.set_ccif(1, false);
-        });
-        self.scheduler.set_cc2_active(false);
+        disarm_timer(&mut self.state);
     }
 
     /// Reprogram TIM5 CC1 from the scheduler's earliest deadline.
@@ -177,18 +96,111 @@ impl TriggerDomain {
     /// that are too close to arm reliably are clamped forward instead of
     /// forcing the TIM5 ISR to busy-wait with interrupts disabled.
     pub(crate) fn reprogram_timer(&mut self) {
-        if let Some(earliest) = self.scheduler.earliest_deadline() {
-            let tim5 = embassy_stm32::pac::TIM5;
-            let now = tim5.cnt().read();
-            let clamped = foci_klipper::scheduler::timer_arm_clock(
-                now,
-                earliest,
-                TRIGGER_TIMER_MIN_LEAD_TICKS,
-            );
-            self.arm_timer_at(clamped);
-        } else {
-            self.disarm_timer();
-        }
+        reprogram_timer(&mut self.state);
+    }
+}
+
+impl Deref for TriggerDomain {
+    type Target = TriggerDomainState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl DerefMut for TriggerDomain {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
+pub(crate) struct OpenFfboardDispatchBoard;
+
+impl TriggerDispatchBoard for OpenFfboardDispatchBoard {
+    fn stop_physical_stepper(
+        &mut self,
+        _state: &TriggerDomainState,
+        stepper_idx: usize,
+        reason: StepperEventReason,
+    ) {
+        stop_physical_stepper_no_lock(stepper_idx, reason);
+    }
+
+    fn record_trsync_stop(&mut self, stepper_idx: usize, clock: u32, trsync_oid: u8, reason: u8) {
+        crate::helpers::stepper_diag::record_stepper_event(
+            StepperEventReason::TrsyncStop,
+            stepper_idx as u8,
+            clock,
+            0,
+            trsync_oid as u32,
+            reason as u32,
+        );
+    }
+
+    fn set_timer_active(
+        &mut self,
+        state: &mut TriggerDomainState,
+        stepper_idx: usize,
+        active: bool,
+    ) {
+        set_timer_active(state, stepper_idx, active);
+    }
+}
+
+pub(crate) fn set_timer_active(state: &mut TriggerDomainState, stepper_idx: usize, active: bool) {
+    state.stepper_stop[stepper_idx].timer_active = active;
+    // Mirror to P1-readable atomic for physical steppers
+    if stepper_idx == 0 {
+        stepper_state()
+            .timer_active_mirror
+            .store(active, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn timer_active(state: &TriggerDomainState, stepper_idx: usize) -> bool {
+    state.stepper_stop[stepper_idx].timer_active
+}
+
+pub(crate) fn arm_timer_at(state: &mut TriggerDomainState, clock: u32) {
+    let tim5 = embassy_stm32::pac::TIM5;
+    tim5.ccr(0).write_value(clock);
+    tim5.sr().modify(|w| {
+        w.set_ccif(0, false);
+        w.set_ccif(1, false);
+    });
+    tim5.dier().modify(|w| {
+        w.set_ccie(0, true);
+        w.set_ccie(1, false);
+    });
+    // Ensure NVIC is unmasked (idempotent)
+    unsafe {
+        cortex_m::peripheral::NVIC::unmask(embassy_stm32::pac::Interrupt::TIM5);
+    }
+    state.scheduler.set_cc2_active(true);
+}
+
+pub(crate) fn disarm_timer(state: &mut TriggerDomainState) {
+    let tim5 = embassy_stm32::pac::TIM5;
+    tim5.dier().modify(|w| {
+        w.set_ccie(0, false);
+        w.set_ccie(1, false);
+    });
+    tim5.sr().modify(|w| {
+        w.set_ccif(0, false);
+        w.set_ccif(1, false);
+    });
+    state.scheduler.set_cc2_active(false);
+}
+
+pub(crate) fn reprogram_timer(state: &mut TriggerDomainState) {
+    if let Some(earliest) = state.scheduler.earliest_deadline() {
+        let tim5 = embassy_stm32::pac::TIM5;
+        let now = tim5.cnt().read();
+        let clamped =
+            foci_klipper::scheduler::timer_arm_clock(now, earliest, TRIGGER_TIMER_MIN_LEAD_TICKS);
+        arm_timer_at(state, clamped);
+    } else {
+        disarm_timer(state);
     }
 }
 
