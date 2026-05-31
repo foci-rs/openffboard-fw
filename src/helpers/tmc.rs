@@ -3,9 +3,23 @@
 //! `main.rs` by Task 8c so handlers and background reply emitters
 //! share a single implementation.
 
+use foci_firmware::context::tmc::{self as tmc_context, TmcRequestQueueBoard};
 use foci_firmware::tmc::TmcRequest;
 
 use crate::state::tmc::TMC_REQUEST_SENDER;
+
+pub(crate) struct OpenFfboardTmcQueue;
+
+impl TmcRequestQueueBoard for OpenFfboardTmcQueue {
+    fn try_send_tmc_request(&self, req: TmcRequest) -> bool {
+        critical_section::with(|cs| {
+            if let Some(sender) = TMC_REQUEST_SENDER.borrow(cs).borrow_mut().as_mut() {
+                return sender.try_send(req).is_ok();
+            }
+            false
+        })
+    }
+}
 
 /// Parameters for `foci_tune` grouped into a struct to satisfy
 /// clippy's `too_many_arguments` lint. The `#[klipper_command]`
@@ -31,16 +45,11 @@ pub(crate) struct FociTuneParams {
 /// was full or not yet initialized. Callers with async reply contracts
 /// must send a failure reply to the host when this returns `false`.
 pub(crate) fn tmc_send(req: TmcRequest) -> bool {
-    critical_section::with(|cs| {
-        if let Some(sender) = TMC_REQUEST_SENDER.borrow(cs).borrow_mut().as_mut() {
-            if sender.try_send(req).is_err() {
-                defmt::warn!("TMC request channel full, command dropped");
-                return false;
-            }
-            return true;
-        }
-        false
-    })
+    let sent = tmc_context::enqueue_tmc_request(&OpenFfboardTmcQueue, req).is_ok();
+    if !sent {
+        defmt::warn!("TMC request channel full, command dropped");
+    }
+    sent
 }
 
 /// Inner implementation of `foci_tune`.

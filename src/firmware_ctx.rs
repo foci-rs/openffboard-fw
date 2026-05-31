@@ -17,6 +17,7 @@ use foci_firmware::context::stepper::{
     self, StepperDrainStats, StepperEnqueueError, StepperQueueBoard, StepperResetBoard,
     StepperTimerStateBoard,
 };
+use foci_firmware::context::tmc as tmc_context;
 use foci_firmware::context::trsync::{self, TriggerDispatchBoard, TriggerDomainState, TrsyncBoard};
 use foci_firmware::context::{
     BoardChannels, ClockSource, EndstopHost, QueueFull, ShutdownRecovery, StateAccess, StepperHost,
@@ -30,9 +31,9 @@ use foci_klipper::scheduler::{ScheduleResult, SchedulerEvent, SchedulerEventKind
 use foci_klipper::state::State;
 
 use crate::helpers::lifecycle::{KATAPULT_BYPASS, katapult_reset, read_tim5};
+use crate::helpers::tmc::OpenFfboardTmcQueue;
 use crate::helpers::trsync::{gpio_configure_input, gpio_read_pin};
 use crate::state::stepper::{isr_stepper, p2_stepper, step_queue};
-use crate::state::tmc::TMC_REQUEST_SENDER;
 use crate::trigger_domain::{
     OpenFfboardDispatchBoard, PHYSICAL_STEPPER_INDICES, disarm_timer, reprogram_timer,
     set_timer_active, with_trigger_domain, with_trigger_domain_site,
@@ -516,13 +517,6 @@ impl<'a> TrsyncHost for FirmwareCtx<'a> {
 
 impl<'a> TmcHost for FirmwareCtx<'a> {
     fn enqueue_request(&self, req: TmcRequest) -> Result<(), QueueFull> {
-        let sent = critical_section::with(|cs| {
-            if let Some(sender) = TMC_REQUEST_SENDER.borrow(cs).borrow_mut().as_mut() {
-                sender.try_send(req).is_ok()
-            } else {
-                false
-            }
-        });
-        if sent { Ok(()) } else { Err(QueueFull) }
+        tmc_context::enqueue_tmc_request(&OpenFfboardTmcQueue, req)
     }
 }
