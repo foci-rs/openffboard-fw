@@ -121,9 +121,7 @@ impl StepperQueueBoard for OpenFfboardStepperBoard {
 
     fn record_queued_segment(&mut self, channel: u8, steps: u32, queue_len: usize) {
         #[cfg(feature = "trace")]
-        crate::usb_trace::TRACE_TIMING
-            .klipper_rx_queue_depth
-            .store(queue_len as u16, core::sync::atomic::Ordering::Relaxed);
+        crate::usb_trace::record_step_queue_depth(queue_len);
         #[cfg(not(feature = "trace"))]
         let _ = queue_len;
         crate::state::stepper_diag::record_queued_segment(channel, steps);
