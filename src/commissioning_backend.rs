@@ -4,15 +4,14 @@
 //! board-agnostic [`foci_firmware::commission::CommissioningEngine`] can
 //! perform register I/O, pin control, and timing.
 
-use core::sync::atomic::Ordering::Relaxed;
-
 use embassy_stm32::gpio::Output;
 use foci_firmware::commissioning::backend::{
-    CommissionBoardConfig, CommissionEncoderRead, CommissionMotorControl, CommissionRegisterIo,
-    CommissionTiming, CommissionTrace,
+    CommissionConfigAccess, CommissionEnablePinAccess, CommissionTimingAccess,
+    CommissionTmcSpiAccess, CommissionTmcStateAccess, CommissionTraceAccess,
 };
+use foci_firmware::config::TmcConfig;
 use foci_firmware::state::tmc::{TMC_DISABLE_SIGNAL, TmcChannelState};
-use foci_tmc4671::{registers::ABN_DECODER_COUNT, spi::Tmc4671Spi};
+use foci_tmc4671::spi::Tmc4671Spi;
 use rtic_monotonics::Monotonic;
 use rtic_monotonics::fugit::ExtU64;
 
@@ -28,53 +27,22 @@ pub(crate) struct OpenFFBoardBackend<'a> {
     pub(crate) tmc_state: &'static TmcChannelState,
 }
 
-impl<'a> CommissionRegisterIo for OpenFFBoardBackend<'a> {
-    type Error = foci_tmc4671::spi::SpiError<
-        embedded_hal_bus::spi::DeviceError<embassy_stm32::spi::Error, core::convert::Infallible>,
-    >;
+impl<'a> CommissionTmcSpiAccess for OpenFFBoardBackend<'a> {
+    type Spi = TmcSpiDevice;
 
-    async fn read_register(
-        &mut self,
-        reg: foci_tmc4671::registers::Register,
-    ) -> Result<u32, Self::Error> {
-        self.tmc.read_register(reg).await
-    }
-
-    async fn write_register(
-        &mut self,
-        reg: foci_tmc4671::registers::Register,
-        val: u32,
-    ) -> Result<(), Self::Error> {
-        self.tmc.write_register(reg, val).await
-    }
-
-    fn synthesize_verify_error(&self, expected: u32, actual: u32) -> Self::Error {
-        foci_tmc4671::spi::SpiError::VerifyFailed { expected, actual }
-    }
-
-    async fn write_register_verified(
-        &mut self,
-        reg: foci_tmc4671::registers::Register,
-        val: u32,
-    ) -> Result<(), Self::Error> {
-        self.tmc.write_register_verified(reg, val).await
-    }
-
-    async fn read_register_verified(
-        &mut self,
-        reg: foci_tmc4671::registers::Register,
-        expected: u32,
-    ) -> Result<u32, Self::Error> {
-        self.tmc.read_register_verified(reg, expected).await
+    fn tmc_spi(&mut self) -> &mut Tmc4671Spi<Self::Spi> {
+        self.tmc
     }
 }
 
-impl<'a> CommissionMotorControl for OpenFFBoardBackend<'a> {
-    fn store_motor_sentinel(&self, value: u32) {
-        self.tmc_state.motor_sentinel.store(value, Relaxed);
+impl<'a> CommissionTmcStateAccess for OpenFFBoardBackend<'a> {
+    fn tmc_state(&self) -> &'static TmcChannelState {
+        self.tmc_state
     }
+}
 
-    fn set_enable_pin(&mut self, state: bool) {
+impl<'a> CommissionEnablePinAccess for OpenFFBoardBackend<'a> {
+    fn set_commission_enable_pin(&mut self, state: bool) {
         if state {
             self.enable_pin.set_high();
         } else {
@@ -83,28 +51,14 @@ impl<'a> CommissionMotorControl for OpenFFBoardBackend<'a> {
     }
 }
 
-impl<'a> CommissionTrace for OpenFFBoardBackend<'a> {
-    #[cfg(feature = "trace")]
-    fn record_commission_trace_event(
-        &mut self,
-        event: foci_firmware::trace_events::CommissionTraceEvent,
-    ) {
-        crate::usb_trace::request_commission_event(self.channel, event);
+impl<'a> CommissionConfigAccess for OpenFFBoardBackend<'a> {
+    fn commission_tmc_config(&self) -> &'static TmcConfig {
+        &TMC_CONFIG
     }
 }
 
-impl<'a> CommissionEncoderRead for OpenFFBoardBackend<'a> {
-    async fn read_encoder_count(&mut self) -> u32 {
-        self.tmc.read_register(ABN_DECODER_COUNT).await.unwrap_or(0)
-    }
-
-    async fn try_read_encoder_count(&mut self) -> Result<u32, Self::Error> {
-        self.tmc.read_register(ABN_DECODER_COUNT).await
-    }
-}
-
-impl<'a> CommissionTiming for OpenFFBoardBackend<'a> {
-    fn elapsed_us(&self) -> u64 {
+impl<'a> CommissionTimingAccess for OpenFFBoardBackend<'a> {
+    fn commission_elapsed_us(&self) -> u64 {
         // Microseconds since Mono start. Returned as u64 so deadline
         // comparisons in commission.rs never wrap across the 51-second
         // TIM5 boundary that previously broke the engine.
@@ -113,7 +67,7 @@ impl<'a> CommissionTiming for OpenFFBoardBackend<'a> {
         Mono::now().duration_since_epoch().to_micros()
     }
 
-    fn is_shutdown_requested(&self) -> bool {
+    fn commission_is_shutdown_requested(&self) -> bool {
         if TMC_DISABLE_SIGNAL.try_take().is_some() {
             TMC_DISABLE_SIGNAL.signal(());
             true
@@ -122,49 +76,17 @@ impl<'a> CommissionTiming for OpenFFBoardBackend<'a> {
         }
     }
 
-    async fn delay_us(&mut self, us: u32) {
+    async fn commission_delay_us(&mut self, us: u32) {
         Mono::delay((us as u64).micros()).await;
     }
 }
 
-impl<'a> CommissionBoardConfig for OpenFFBoardBackend<'a> {
-    fn current_limit(&self) -> u32 {
-        self.tmc_state.current_limit_reg.load(Relaxed)
-    }
-
-    fn pwm_maxcnt(&self) -> u16 {
-        TMC_CONFIG.pwm_maxcnt
-    }
-
-    fn bbm_register(&self) -> u32 {
-        TMC_CONFIG.bbm_register()
-    }
-
-    fn dsadc_mdec_register(&self) -> u32 {
-        TMC_CONFIG.dsadc_mdec_register()
-    }
-
-    fn excitation_voltage(&self) -> u16 {
-        TMC_CONFIG.excitation_voltage
-    }
-
-    fn tmc_config(&self) -> &foci_firmware::config::TmcConfig {
-        &TMC_CONFIG
-    }
-
-    fn step_width(&self) -> u32 {
-        self.tmc_state.step_width_value.load(Relaxed).max(0) as u32
-    }
-
-    fn encoder_quadrature_ppr(&self) -> u32 {
-        self.tmc_state.encoder_ppr.load(Relaxed).saturating_mul(4)
-    }
-
-    fn operational_velocity_limit(&self) -> u32 {
-        self.tmc_state.velocity_limit_cfg.load(Relaxed)
-    }
-
-    fn operational_voltage_limit(&self) -> u32 {
-        self.tmc_state.voltage_limit_cfg.load(Relaxed)
+impl<'a> CommissionTraceAccess for OpenFFBoardBackend<'a> {
+    #[cfg(feature = "trace")]
+    fn record_commission_trace_event_impl(
+        &mut self,
+        event: foci_firmware::trace_events::CommissionTraceEvent,
+    ) {
+        crate::usb_trace::request_commission_event(self.channel, event);
     }
 }
