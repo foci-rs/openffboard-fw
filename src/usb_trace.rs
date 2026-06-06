@@ -4,9 +4,9 @@
 
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
 
-use foci_firmware::trace_events::{SUBSYSTEM_USB_TRACE, TraceClockExt};
-use foci_firmware::trace_pressure::{TracePressureRuntime, TracePressureStatusInputs};
-use foci_firmware::trace_stream::{
+use foci_firmware::trace::events::{SUBSYSTEM_USB_TRACE, TraceClockExt};
+use foci_firmware::trace::pressure::{TracePressureRuntime, TracePressureStatusInputs};
+use foci_firmware::trace::stream::{
     FrameBuf, METADATA_PAYLOAD_MAX, frame_sequence, sequence_before_or_equal,
 };
 
@@ -168,14 +168,14 @@ pub(crate) fn note_usb_configured() {
     note_trace_usb_configured_time();
     TRACE_COUNTERS.configured.store(true, Ordering::Relaxed);
     request_event(
-        foci_firmware::trace_events::EVENT_LEVEL_INFO,
-        foci_firmware::trace_events::SUBSYSTEM_TMC_CONTROL,
+        foci_firmware::trace::events::EVENT_LEVEL_INFO,
+        foci_firmware::trace::events::SUBSYSTEM_TMC_CONTROL,
         EVENT_FIRMWARE_BOOT,
         [0; 4],
         0,
     );
     request_event(
-        foci_firmware::trace_events::EVENT_LEVEL_INFO,
+        foci_firmware::trace::events::EVENT_LEVEL_INFO,
         SUBSYSTEM_USB_TRACE,
         EVENT_USB_CONFIGURED,
         [0; 4],
@@ -189,7 +189,7 @@ fn header(
     source_kind: u8,
     source_index: u8,
     flags: u8,
-) -> foci_firmware::trace_stream::FrameHeader {
+) -> foci_firmware::trace::stream::FrameHeader {
     header_at_timestamp(
         frame_type,
         payload_len,
@@ -207,8 +207,8 @@ fn header_at_timestamp(
     source_index: u8,
     flags: u8,
     timestamp_ticks: u64,
-) -> foci_firmware::trace_stream::FrameHeader {
-    foci_firmware::trace_stream::FrameHeader {
+) -> foci_firmware::trace::stream::FrameHeader {
+    foci_firmware::trace::stream::FrameHeader {
         frame_type,
         flags,
         payload_len: payload_len as u16,
@@ -225,7 +225,7 @@ fn motion_flags() -> u8 {
         .motion_drop_gap
         .swap(false, Ordering::Relaxed)
     {
-        foci_firmware::trace_stream::FLAG_DROP_GAP_BEFORE_THIS_FRAME
+        foci_firmware::trace::stream::FLAG_DROP_GAP_BEFORE_THIS_FRAME
     } else {
         0
     }
@@ -263,15 +263,15 @@ pub(crate) fn request_event(
 
 pub(crate) fn request_commission_event(
     source_index: u8,
-    event: foci_firmware::trace_events::CommissionTraceEvent,
+    event: foci_firmware::trace::events::CommissionTraceEvent,
 ) {
     request_event(
         event.level as u8,
-        foci_firmware::trace_events::SUBSYSTEM_COMMISSIONING,
+        foci_firmware::trace::events::SUBSYSTEM_COMMISSIONING,
         event.event_id,
         [
             i32::from(source_index),
-            i32::from(foci_firmware::trace_events::engine_kind_wire_code(
+            i32::from(foci_firmware::trace::events::engine_kind_wire_code(
                 event.engine_kind,
             )),
             event.payload[0],
@@ -282,7 +282,7 @@ pub(crate) fn request_commission_event(
 }
 
 fn enqueue_event_frame(event: PendingEvent) {
-    use foci_firmware::trace_stream::*;
+    use foci_firmware::trace::stream::*;
 
     let sample = EventSample {
         level: event.level,
@@ -477,7 +477,7 @@ fn push_str(out: &mut heapless::Vec<u8, METADATA_PAYLOAD_MAX>, value: &str) {
 /// Emit stream metadata.
 pub(crate) fn emit_metadata() {
     use core::sync::atomic::Ordering::Relaxed;
-    use foci_firmware::trace_stream::*;
+    use foci_firmware::trace::stream::*;
 
     if !is_configured() {
         return;
@@ -544,7 +544,7 @@ pub(crate) fn emit_phase_advance(
     max_counts: u16,
     deadband: u16,
 ) {
-    use foci_firmware::trace_stream::*;
+    use foci_firmware::trace::stream::*;
 
     if !is_configured() {
         return;
@@ -662,7 +662,7 @@ where
         Ok(value) => value,
         Err(_) => {
             record_spi_error();
-            *sample_flags |= foci_firmware::trace_stream::SAMPLE_FLAG_SPI_ERROR;
+            *sample_flags |= foci_firmware::trace::stream::SAMPLE_FLAG_SPI_ERROR;
             0
         }
     }
@@ -680,7 +680,7 @@ where
         Ok(value) => value,
         Err(_) => {
             record_spi_error();
-            *sample_flags |= foci_firmware::trace_stream::SAMPLE_FLAG_SPI_ERROR;
+            *sample_flags |= foci_firmware::trace::stream::SAMPLE_FLAG_SPI_ERROR;
             0
         }
     }
@@ -724,7 +724,7 @@ pub(crate) async fn sample_tick<B>(
     B: embedded_hal_async::spi::SpiDevice<u8>,
 {
     use core::sync::atomic::Ordering::Relaxed;
-    use foci_firmware::trace_stream::*;
+    use foci_firmware::trace::stream::*;
     use foci_tmc4671::registers::*;
 
     if !is_configured() {
@@ -896,13 +896,13 @@ pub(crate) async fn sample_commission_closed_loop_entry<B, R, D>(
 struct StatusSnapshot {
     source_kind: u8,
     source_index: u8,
-    sample: foci_firmware::trace_stream::StatusSample,
+    sample: foci_firmware::trace::stream::StatusSample,
 }
 
 static mut LAST_STATUS: [StatusSnapshot; 4] = [StatusSnapshot {
     source_kind: 0,
     source_index: 0,
-    sample: foci_firmware::trace_stream::StatusSample {
+    sample: foci_firmware::trace::stream::StatusSample {
         status_flags: 0,
         status_interrupt_count: 0,
         clipping_flags: 0,
@@ -917,7 +917,7 @@ static mut LAST_STATUS: [StatusSnapshot; 4] = [StatusSnapshot {
     },
 }; 4];
 
-fn status_trigger_nonzero(sample: &foci_firmware::trace_stream::StatusSample) -> bool {
+fn status_trigger_nonzero(sample: &foci_firmware::trace::stream::StatusSample) -> bool {
     sample.status_flags != 0
         || sample.status_interrupt_count != 0
         || sample.clipping_flags != 0
@@ -930,8 +930,8 @@ fn status_trigger_nonzero(sample: &foci_firmware::trace_stream::StatusSample) ->
 }
 
 fn status_trigger_changed(
-    previous: &foci_firmware::trace_stream::StatusSample,
-    next: &foci_firmware::trace_stream::StatusSample,
+    previous: &foci_firmware::trace::stream::StatusSample,
+    next: &foci_firmware::trace::stream::StatusSample,
 ) -> bool {
     // Queue depth and queue high-water are intentionally omitted from the
     // change trigger so normal command traffic does not cause status spam.
@@ -950,10 +950,10 @@ fn emit_one_status(
     slot: usize,
     source_kind: u8,
     source_index: u8,
-    sample: foci_firmware::trace_stream::StatusSample,
+    sample: foci_firmware::trace::stream::StatusSample,
     force: bool,
 ) {
-    use foci_firmware::trace_stream::*;
+    use foci_firmware::trace::stream::*;
 
     let previous = unsafe {
         let ptr = core::ptr::addr_of!(LAST_STATUS).cast::<StatusSnapshot>();
@@ -1003,7 +1003,7 @@ pub(crate) async fn emit_status_frames<B>(
     B: embedded_hal_async::spi::SpiDevice<u8>,
 {
     use core::sync::atomic::Ordering::Relaxed;
-    use foci_firmware::trace_stream::*;
+    use foci_firmware::trace::stream::*;
     use foci_tmc4671::registers::STATUS_FLAGS;
 
     if !is_configured() {

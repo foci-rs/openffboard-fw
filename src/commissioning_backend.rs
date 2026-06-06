@@ -85,7 +85,7 @@ impl<'a> CommissionTraceAccess for OpenFFBoardBackend<'a> {
     #[cfg(feature = "trace")]
     fn record_commission_trace_event_impl(
         &mut self,
-        event: foci_firmware::trace_events::CommissionTraceEvent,
+        event: foci_firmware::trace::events::CommissionTraceEvent,
     ) {
         crate::usb_trace::request_commission_event(self.channel, event);
     }

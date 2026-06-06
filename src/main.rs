@@ -220,8 +220,8 @@ mod app {
                             defmt::info!("Motor enabled (calibrated, step/dir armed)");
                             #[cfg(feature = "trace")]
                             crate::usb_trace::request_event(
-                                foci_firmware::trace_events::EVENT_LEVEL_INFO,
-                                foci_firmware::trace_events::SUBSYSTEM_TMC_CONTROL,
+                                foci_firmware::trace::events::EVENT_LEVEL_INFO,
+                                foci_firmware::trace::events::SUBSYSTEM_TMC_CONTROL,
                                 crate::usb_trace::EVENT_MOTOR_ARM,
                                 [0; 4],
                                 0,
@@ -252,8 +252,8 @@ mod app {
                     defmt::info!("TMC4671 motor disabled");
                     #[cfg(feature = "trace")]
                     crate::usb_trace::request_event(
-                        foci_firmware::trace_events::EVENT_LEVEL_INFO,
-                        foci_firmware::trace_events::SUBSYSTEM_TMC_CONTROL,
+                        foci_firmware::trace::events::EVENT_LEVEL_INFO,
+                        foci_firmware::trace::events::SUBSYSTEM_TMC_CONTROL,
                         crate::usb_trace::EVENT_MOTOR_DISARM,
                         [0; 4],
                         0,
@@ -1317,8 +1317,8 @@ mod app {
                 );
                 #[cfg(feature = "trace")]
                 crate::usb_trace::request_event(
-                    foci_firmware::trace_events::EVENT_LEVEL_ERROR,
-                    foci_firmware::trace_events::SUBSYSTEM_SAFETY_SHUTDOWN,
+                    foci_firmware::trace::events::EVENT_LEVEL_ERROR,
+                    foci_firmware::trace::events::SUBSYSTEM_SAFETY_SHUTDOWN,
                     crate::usb_trace::EVENT_STATUS_INTERRUPT,
                     [flags as i32, 0, 0, 0],
                     1,
