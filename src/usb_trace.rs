@@ -6,9 +6,8 @@ use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
 
 use foci_firmware::trace::events::{SUBSYSTEM_USB_TRACE, TraceClockExt};
 use foci_firmware::trace::pressure::{TracePressureRuntime, TracePressureStatusInputs};
-use foci_firmware::trace::stream::{
-    FrameBuf, METADATA_PAYLOAD_MAX, frame_sequence, sequence_before_or_equal,
-};
+use foci_firmware::trace::stream::{FrameBuf, METADATA_PAYLOAD_MAX, frame_sequence};
+use foci_firmware::trace::transport::{self, TraceQueueSelection};
 
 use crate::state::usb_trace::{
     MOTION_QUEUE_DEPTH, PENDING_EVENTS, PendingEvent, QueuedFrame, TRACE_COUNTERS, current_tx,
@@ -291,25 +290,22 @@ fn enqueue_event_frame(event: PendingEvent) {
         arg_count: event.arg_count,
         args: event.args,
     };
-    let mut payload = [0u8; EVENT_PAYLOAD_LEN];
-    encode_event_payload(&sample, &mut payload);
     let flags = if TRACE_COUNTERS.event_drop_gap.swap(false, Ordering::Relaxed) {
         FLAG_DROP_GAP_BEFORE_THIS_FRAME
     } else {
         0
     };
-    let mut frame = FrameBuf::new();
-    frame.write_header(header_at_timestamp(
-        FRAME_TYPE_EVENT,
-        EVENT_PAYLOAD_LEN,
-        SOURCE_KIND_BOARD,
-        SOURCE_INDEX_NA,
-        flags,
-        event.timestamp_ticks,
-    ));
-    frame
-        .payload_mut(EVENT_PAYLOAD_LEN)
-        .copy_from_slice(&payload);
+    let frame = transport::build_event_frame(
+        header_at_timestamp(
+            FRAME_TYPE_EVENT,
+            EVENT_PAYLOAD_LEN,
+            SOURCE_KIND_BOARD,
+            SOURCE_INDEX_NA,
+            flags,
+            event.timestamp_ticks,
+        ),
+        sample,
+    );
     enqueue_event(frame);
 }
 
@@ -590,18 +586,7 @@ pub(crate) fn enqueue_motion(frame: FrameBuf) {
             crate::transport::USB_WAKE.signal(());
         }
         let len = queue.len() as u16;
-        let mut current = TRACE_COUNTERS.high_water.load(Ordering::Relaxed);
-        while len > current {
-            match TRACE_COUNTERS.high_water.compare_exchange_weak(
-                current,
-                len,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(next) => current = next,
-            }
-        }
+        transport::update_high_water(&TRACE_COUNTERS.high_water, len);
     }
 }
 
@@ -635,17 +620,10 @@ fn dequeue_next_frame() -> Option<QueuedFrame> {
         let motion_seq = motion.peek().map(|queued| frame_sequence(&queued.frame));
         let event_seq = event.peek().map(|queued| frame_sequence(&queued.frame));
 
-        match (motion_seq, event_seq) {
-            (Some(motion_seq), Some(event_seq)) => {
-                if sequence_before_or_equal(motion_seq, event_seq) {
-                    motion.dequeue()
-                } else {
-                    event.dequeue()
-                }
-            }
-            (Some(_), None) => motion.dequeue(),
-            (None, Some(_)) => event.dequeue(),
-            (None, None) => None,
+        match transport::select_next_queue(motion_seq, event_seq) {
+            TraceQueueSelection::Motion => motion.dequeue(),
+            TraceQueueSelection::Event => event.dequeue(),
+            TraceQueueSelection::None => None,
         }
     }
 }
@@ -892,59 +870,7 @@ pub(crate) async fn sample_commission_closed_loop_entry<B, R, D>(
     sample_tick(tmc, motor_enabled, 0, 0, 0, 0, 0, 0, control_tick).await;
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct StatusSnapshot {
-    source_kind: u8,
-    source_index: u8,
-    sample: foci_firmware::trace::stream::StatusSample,
-}
-
-static mut LAST_STATUS: [StatusSnapshot; 4] = [StatusSnapshot {
-    source_kind: 0,
-    source_index: 0,
-    sample: foci_firmware::trace::stream::StatusSample {
-        status_flags: 0,
-        status_interrupt_count: 0,
-        clipping_flags: 0,
-        spi_error_count: 0,
-        watchdog_or_step_overrun_count: 0,
-        klipper_rx_queue_depth: 0,
-        usb_trace_queue_high_water: 0,
-        dropped_motion_sample_count: 0,
-        dropped_event_log_count: 0,
-        endpoint_not_ready_count: 0,
-        suppressed_status_change_count: 0,
-    },
-}; 4];
-
-fn status_trigger_nonzero(sample: &foci_firmware::trace::stream::StatusSample) -> bool {
-    sample.status_flags != 0
-        || sample.status_interrupt_count != 0
-        || sample.clipping_flags != 0
-        || sample.spi_error_count != 0
-        || sample.watchdog_or_step_overrun_count != 0
-        || sample.dropped_motion_sample_count != 0
-        || sample.dropped_event_log_count != 0
-        || sample.endpoint_not_ready_count != 0
-        || sample.suppressed_status_change_count != 0
-}
-
-fn status_trigger_changed(
-    previous: &foci_firmware::trace::stream::StatusSample,
-    next: &foci_firmware::trace::stream::StatusSample,
-) -> bool {
-    // Queue depth and queue high-water are intentionally omitted from the
-    // change trigger so normal command traffic does not cause status spam.
-    previous.status_flags != next.status_flags
-        || previous.status_interrupt_count != next.status_interrupt_count
-        || previous.clipping_flags != next.clipping_flags
-        || previous.spi_error_count != next.spi_error_count
-        || previous.watchdog_or_step_overrun_count != next.watchdog_or_step_overrun_count
-        || previous.dropped_motion_sample_count != next.dropped_motion_sample_count
-        || previous.dropped_event_log_count != next.dropped_event_log_count
-        || previous.endpoint_not_ready_count != next.endpoint_not_ready_count
-        || previous.suppressed_status_change_count != next.suppressed_status_change_count
-}
+static mut LAST_STATUS: [transport::StatusSnapshot; 4] = [transport::StatusSnapshot::new(); 4];
 
 fn emit_one_status(
     slot: usize,
@@ -956,36 +882,29 @@ fn emit_one_status(
     use foci_firmware::trace::stream::*;
 
     let previous = unsafe {
-        let ptr = core::ptr::addr_of!(LAST_STATUS).cast::<StatusSnapshot>();
+        let ptr = core::ptr::addr_of!(LAST_STATUS).cast::<transport::StatusSnapshot>();
         core::ptr::read(ptr.add(slot))
     };
-    let changed = previous.source_kind != source_kind
-        || previous.source_index != source_index
-        || status_trigger_changed(&previous.sample, &sample);
-    let should_emit = force || status_trigger_nonzero(&sample) || changed;
-    if !should_emit {
+    if !transport::should_emit_status(&previous, source_kind, source_index, &sample, force) {
         return;
     }
 
-    let mut payload = [0u8; STATUS_PAYLOAD_LEN];
-    encode_status_payload(&sample, &mut payload);
-    let mut frame = FrameBuf::new();
-    frame.write_header(header(
-        FRAME_TYPE_STATUS,
-        STATUS_PAYLOAD_LEN,
-        source_kind,
-        source_index,
-        motion_flags(),
-    ));
-    frame
-        .payload_mut(STATUS_PAYLOAD_LEN)
-        .copy_from_slice(&payload);
+    let frame = transport::build_status_frame(
+        header(
+            FRAME_TYPE_STATUS,
+            STATUS_PAYLOAD_LEN,
+            source_kind,
+            source_index,
+            motion_flags(),
+        ),
+        sample,
+    );
     enqueue_motion(frame);
     unsafe {
-        let ptr = core::ptr::addr_of_mut!(LAST_STATUS).cast::<StatusSnapshot>();
+        let ptr = core::ptr::addr_of_mut!(LAST_STATUS).cast::<transport::StatusSnapshot>();
         core::ptr::write(
             ptr.add(slot),
-            StatusSnapshot {
+            transport::StatusSnapshot {
                 source_kind,
                 source_index,
                 sample,
