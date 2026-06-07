@@ -7,61 +7,24 @@
 use core::sync::atomic::Ordering;
 
 use embassy_stm32::gpio::Output;
+use foci_firmware::pid::{InnerLoopGains, OuterLoopGains};
 use foci_firmware::state::trsync::HOMING_STATE;
 use foci_firmware::tmc::{TmcRequest, TmcRequestKind};
+use foci_firmware::tmc_control::helpers::{apply_live_inner_gains, apply_live_outer_gains};
+use foci_firmware::tmc_control::{ShutdownReason, TmcControlRequestOutcome, TmcControlRequestTail};
 use foci_tmc4671::spi::Tmc4671Spi;
 
-use crate::ankyra::constants::CLOCK_FREQ;
 use crate::app_types::TmcSpiDevice;
-use crate::board_config::TMC_CONFIG;
-use crate::commissioning_backend::OpenFFBoardBackend;
 #[cfg(feature = "dev")]
 use crate::helpers::dev::{do_test_spin, tmc_enter_openloop};
 use crate::helpers::stepper::apply_stepper_post_action;
+use crate::tmc_control::board::{openffboard_backend, stepper_state, tmc_state};
 use crate::tmc_dispatch::handle_tmc_request;
-
-pub(crate) fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
-    foci_firmware::state::tmc::tmc_channel0()
-}
-
-pub(crate) fn stepper_state() -> &'static foci_firmware::state::stepper::StepperChannelState {
-    foci_firmware::state::stepper::stepper_channel0()
-}
-
-pub(crate) fn openffboard_backend<'a>(
-    tmc: &'a mut Tmc4671Spi<TmcSpiDevice>,
-    enable_pin: &'a mut Output<'static>,
-) -> OpenFFBoardBackend<'a> {
-    OpenFFBoardBackend {
-        channel: 0,
-        tmc,
-        enable_pin,
-        tmc_state: tmc_state(),
-    }
-}
 
 fn next_commission_trace_seq(commission_trace_engine_seq: &mut u32) -> u32 {
     let seq = *commission_trace_engine_seq;
     *commission_trace_engine_seq = (*commission_trace_engine_seq).wrapping_add(1);
     seq
-}
-
-pub(crate) enum TmcControlRequestOutcome {
-    Handled,
-    RefreshVelocityScale,
-    Shutdown(foci_firmware::tmc_control::ShutdownReason),
-    ShutdownThenRefreshVelocityScale(foci_firmware::tmc_control::ShutdownReason),
-}
-
-pub(crate) fn refresh_velocity_scale(runtime: &mut foci_firmware::tmc_control::TmcControlRuntime) {
-    runtime.set_velocity_scale(foci_firmware::tmc::compute_velocity_scale_factor(
-        tmc_state()
-            .step_width_value
-            .load(Ordering::Relaxed)
-            .unsigned_abs(),
-        CLOCK_FREQ,
-        TMC_CONFIG.pwm_freq_hz(),
-    ));
 }
 
 pub(crate) async fn handle_tmc_control_request(
@@ -73,8 +36,9 @@ pub(crate) async fn handle_tmc_control_request(
 ) -> TmcControlRequestOutcome {
     match req {
         TmcRequest { channel, .. } if channel != 0 => {
-            return TmcControlRequestOutcome::Shutdown(
-                foci_firmware::tmc_control::ShutdownReason::InvalidTmcChannel,
+            return TmcControlRequestOutcome::shutdown(
+                ShutdownReason::InvalidTmcChannel,
+                TmcControlRequestTail::SkipTickTail,
             );
         }
         TmcRequest {
@@ -87,14 +51,14 @@ pub(crate) async fn handle_tmc_control_request(
                     // foci_calibrate arrives due to queue_digital_out timing.
                     if !foci_firmware::tmc::auto_calibrate_on_enable_allowed(0) {
                         defmt::warn!("Auto-calibrate rejected: host gate closed");
-                        return TmcControlRequestOutcome::Handled;
+                        return TmcControlRequestOutcome::skip_tick_tail();
                     }
                     if tmc_state()
                         .commission_in_flight
                         .swap(true, Ordering::Relaxed)
                     {
                         defmt::warn!("Auto-calibrate skipped: commission in flight");
-                        return TmcControlRequestOutcome::Handled;
+                        return TmcControlRequestOutcome::skip_tick_tail();
                     }
                     // TODO: hardcoded OID 0 — correct for single-motor OpenFFBoard but
                     // needs OID routing for multi-motor boards.
@@ -109,14 +73,14 @@ pub(crate) async fn handle_tmc_control_request(
                     );
                     // Don't mark the motor armed yet -- the CalibrateDone handler does
                     // that after encoder alignment + closed-loop entry.
-                    return TmcControlRequestOutcome::Handled;
+                    return TmcControlRequestOutcome::skip_tick_tail();
                 }
                 // Existing precondition: this arm runs only after the runtime has
                 // recorded calibration; otherwise the auto-calibrate branch above
                 // returns before reaching this point.
                 if runtime.is_motor_enabled() {
                     defmt::info!("Motor enable sync (already armed)");
-                    return TmcControlRequestOutcome::Handled;
+                    return TmcControlRequestOutcome::skip_tick_tail();
                 }
                 let actions = runtime.prepare_enable_request(tmc_state());
                 for action in actions {
@@ -174,7 +138,7 @@ pub(crate) async fn handle_tmc_control_request(
                     foci_firmware::tmc_ops::disarm_motor(&mut backend, &mut state).await;
                 }
                 if !phase_advance_restored {
-                    return TmcControlRequestOutcome::Handled;
+                    return TmcControlRequestOutcome::skip_tick_tail();
                 }
 
                 defmt::info!("TMC4671 motor disabled");
@@ -206,7 +170,7 @@ pub(crate) async fn handle_tmc_control_request(
                     adc_i1: u16 = 0,
                     encoder_count: u32 = 0,
                 );
-                return TmcControlRequestOutcome::Handled;
+                return TmcControlRequestOutcome::skip_tick_tail();
             }
             // Engine tick will drive ADC cal; CalibrateDone handler performs encoder
             // alignment and closed-loop entry.
@@ -245,23 +209,14 @@ pub(crate) async fn handle_tmc_control_request(
                 },
             ..
         } => {
-            let gains = foci_firmware::pid::InnerLoopGains {
+            let gains = InnerLoopGains {
                 flux_p,
                 flux_i,
                 torque_p,
                 torque_i,
             };
-            runtime.set_stored_gains(gains);
-            let (flux_reg, torque_reg) = foci_firmware::tmc_ops::pack_inner_gain_registers(gains);
-            let flux_ok = tmc
-                .write_register(foci_tmc4671::registers::PID_FLUX_P_FLUX_I, flux_reg)
-                .await
-                .is_ok();
-            let torque_ok = tmc
-                .write_register(foci_tmc4671::registers::PID_TORQUE_P_TORQUE_I, torque_reg)
-                .await
-                .is_ok();
-            if !flux_ok || !torque_ok {
+            let write_status = apply_live_inner_gains(runtime, tmc, gains).await;
+            if !write_status.all_ok() {
                 defmt::warn!("PID gains live write failed");
             }
             defmt::info!(
@@ -282,36 +237,14 @@ pub(crate) async fn handle_tmc_control_request(
                 },
             ..
         } => {
-            tmc_state()
-                .position_p_value
-                .store(position_p, Ordering::Relaxed);
-            tmc_state()
-                .position_i_value
-                .store(position_i, Ordering::Relaxed);
-            tmc_state()
-                .velocity_p_value
-                .store(velocity_p, Ordering::Relaxed);
-            tmc_state()
-                .velocity_i_value
-                .store(velocity_i, Ordering::Relaxed);
-            let (velocity_reg, position_reg) = foci_firmware::tmc_ops::pack_outer_gain_registers(
-                position_p, position_i, velocity_p, velocity_i,
-            );
-            let velocity_ok = tmc
-                .write_register(
-                    foci_tmc4671::registers::PID_VELOCITY_P_VELOCITY_I,
-                    velocity_reg,
-                )
-                .await
-                .is_ok();
-            let position_ok = tmc
-                .write_register(
-                    foci_tmc4671::registers::PID_POSITION_P_POSITION_I,
-                    position_reg,
-                )
-                .await
-                .is_ok();
-            if !velocity_ok || !position_ok {
+            let gains = OuterLoopGains {
+                position_p,
+                position_i,
+                velocity_p,
+                velocity_i,
+            };
+            let write_status = apply_live_outer_gains(tmc_state(), tmc, gains).await;
+            if !write_status.all_ok() {
                 defmt::warn!("Position gains live write failed");
             }
             defmt::info!(
@@ -459,7 +392,7 @@ pub(crate) async fn handle_tmc_control_request(
                         foci_firmware::autotune::CommissionError::MotorEnabled
                             .status_code(),
                 );
-                return TmcControlRequestOutcome::Handled;
+                return TmcControlRequestOutcome::skip_tick_tail();
             }
             let current_limit = tmc_state().current_limit_reg.load(Ordering::Relaxed);
             if current_limit == 0 {
@@ -474,7 +407,7 @@ pub(crate) async fn handle_tmc_control_request(
                     status: u8 =
                         foci_firmware::autotune::CommissionError::NoCurrent.status_code(),
                 );
-                return TmcControlRequestOutcome::Handled;
+                return TmcControlRequestOutcome::skip_tick_tail();
             }
             runtime.clear_calibrated();
             runtime.set_commission_engine(
@@ -518,7 +451,7 @@ pub(crate) async fn handle_tmc_control_request(
                         foci_firmware::autotune::CommissionError::EncoderNotAligned
                             .status_code(),
                 );
-                return TmcControlRequestOutcome::Handled;
+                return TmcControlRequestOutcome::skip_tick_tail();
             }
             let current_limit = tmc_state().current_limit_reg.load(Ordering::Relaxed);
             if current_limit == 0 {
@@ -533,7 +466,7 @@ pub(crate) async fn handle_tmc_control_request(
                     status: u8 =
                         foci_firmware::autotune::CommissionError::NoCurrent.status_code(),
                 );
-                return TmcControlRequestOutcome::Handled;
+                return TmcControlRequestOutcome::skip_tick_tail();
             }
             if !runtime.restore_phase_advance_now(tmc).await {
                 defmt::warn!("phase advance: failed to restore ABN offset before tune");
@@ -547,7 +480,7 @@ pub(crate) async fn handle_tmc_control_request(
                     phase: u8 = 0,
                     status: u8 = foci_firmware::autotune::CommissionError::Spi.status_code(),
                 );
-                return TmcControlRequestOutcome::Handled;
+                return TmcControlRequestOutcome::skip_tick_tail();
             }
             let entry_snapshot = {
                 use core::sync::atomic::Ordering::Relaxed;
@@ -603,7 +536,7 @@ pub(crate) async fn handle_tmc_control_request(
                         foci_firmware::autotune::CommissionError::MotorEnabled
                             .status_code(),
                 );
-                return TmcControlRequestOutcome::Handled;
+                return TmcControlRequestOutcome::skip_tick_tail();
             }
             // Engine tick drives selftest phases; SelftestDone handler sends the completion
             // signal.
@@ -651,20 +584,24 @@ pub(crate) async fn handle_tmc_control_request(
         } => {
             let request_failed = handle_tmc_request(req, tmc).await.is_err();
             if request_failed {
-                return TmcControlRequestOutcome::ShutdownThenRefreshVelocityScale(
-                    foci_firmware::tmc_control::ShutdownReason::RequestValidationFailed,
+                return TmcControlRequestOutcome::shutdown_then_refresh_velocity_scale(
+                    ShutdownReason::RequestValidationFailed,
+                    TmcControlRequestTail::SkipTickTail,
                 );
             }
-            return TmcControlRequestOutcome::RefreshVelocityScale;
+            return TmcControlRequestOutcome::refresh_velocity_scale(
+                TmcControlRequestTail::SkipTickTail,
+            );
         }
         other => {
             if handle_tmc_request(other, tmc).await.is_err() {
-                return TmcControlRequestOutcome::Shutdown(
-                    foci_firmware::tmc_control::ShutdownReason::RequestValidationFailed,
+                return TmcControlRequestOutcome::shutdown(
+                    ShutdownReason::RequestValidationFailed,
+                    TmcControlRequestTail::SkipTickTail,
                 );
             }
         }
     }
 
-    TmcControlRequestOutcome::Handled
+    TmcControlRequestOutcome::skip_tick_tail()
 }

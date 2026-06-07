@@ -22,8 +22,8 @@ mod helpers;
 mod interrupts;
 mod platform_impl;
 mod state;
+mod tmc_control;
 mod tmc_control_glue;
-mod tmc_control_request;
 mod tmc_diagnostics;
 mod tmc_dispatch;
 mod transport;
@@ -85,10 +85,11 @@ mod app {
     use foci_firmware::tmc::TmcRequest;
 
     use crate::board_config::{CURRENT_SCALE_MA_PER_LSB, TMC_CONFIG};
-    use crate::tmc_control_request::{
-        TmcControlRequestOutcome, handle_tmc_control_request, openffboard_backend,
-        refresh_velocity_scale, stepper_state, tmc_state,
+    use crate::tmc_control::board::{
+        openffboard_backend, refresh_velocity_scale, stepper_state, tmc_state,
     };
+    use crate::tmc_control::request::handle_tmc_control_request;
+    use foci_firmware::tmc_control::TmcControlRequestTail;
 
     // TriggerDomain, PHYSICAL_STEPPER_INDICES, TRIGGER_TIMER_MIN_LEAD_TICKS,
     // TRIGGER_DOMAIN, with_trigger_domain(), and stop_physical_stepper_no_lock()
@@ -586,36 +587,31 @@ mod app {
             match selected {
                 // Channel message received
                 Either::First(Ok(req)) => {
-                    match handle_tmc_control_request(
+                    let outcome = handle_tmc_control_request(
                         req,
                         tmc,
                         enable_pin,
                         &mut runtime,
                         &mut commission_trace_engine_seq,
                     )
-                    .await
-                    {
-                        TmcControlRequestOutcome::Handled => {}
-                        TmcControlRequestOutcome::RefreshVelocityScale => {
-                            refresh_velocity_scale(&mut runtime);
-                        }
-                        TmcControlRequestOutcome::Shutdown(reason) => {
-                            ctx.shared.app_state.lock(|state| {
-                                if crate::firmware_ctx::enter_shutdown(state) {
-                                    crate::tmc_control_glue::emit_shutdown(reason);
-                                }
-                            });
-                        }
-                        TmcControlRequestOutcome::ShutdownThenRefreshVelocityScale(reason) => {
-                            ctx.shared.app_state.lock(|state| {
-                                if crate::firmware_ctx::enter_shutdown(state) {
-                                    crate::tmc_control_glue::emit_shutdown(reason);
-                                }
-                            });
-                            refresh_velocity_scale(&mut runtime);
-                        }
+                    .await;
+
+                    if let Some(reason) = outcome.shutdown {
+                        ctx.shared.app_state.lock(|state| {
+                            if crate::firmware_ctx::enter_shutdown(state) {
+                                crate::tmc_control_glue::emit_shutdown(reason);
+                            }
+                        });
                     }
-                    continue;
+
+                    if outcome.should_refresh_velocity_scale {
+                        refresh_velocity_scale(&mut runtime);
+                    }
+
+                    match outcome.tail {
+                        TmcControlRequestTail::FallThrough => {}
+                        TmcControlRequestTail::SkipTickTail => continue,
+                    }
                 }
                 Either::First(Err(_)) => continue,
                 // Control timeout - run fast FF or the decimated 1 kHz maintenance tick.
