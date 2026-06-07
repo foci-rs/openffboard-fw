@@ -6,6 +6,11 @@
 
 use crate::app::Mono;
 use foci_firmware::tmc::{TmcRequest, TmcRequestKind};
+use foci_firmware::tmc_diagnostics::{
+    CURRENT_STEP_STATUS_NOT_READY, CURRENT_STEP_STATUS_SPI, CurrentStepReport,
+    CurrentTorqueSampleReport, VoltageStepReport, current_step_encoder_delta,
+    empty_current_torque_sample_report, empty_voltage_step_report, pack_voltage_ext,
+};
 use foci_tmc4671::spi::Tmc4671Spi;
 use rtic_monotonics::{Monotonic, fugit::ExtU64};
 
@@ -15,8 +20,6 @@ const CURRENT_STEP_TORQUE_MODE: u32 = 0x8000_0001;
 const CURRENT_STEP_POSITION_MODE: u32 = 0x8000_0003;
 const CURRENT_STEP_OPEN_LOOP_VOLTAGE_MODE: u32 = 0x0000_0008;
 const CURRENT_STEP_SETTLE_MS: u64 = 20;
-const CURRENT_STEP_STATUS_NOT_READY: u8 = 1;
-const CURRENT_STEP_STATUS_SPI: u8 = 2;
 
 /// Runtime state borrowed by board-local active diagnostic handlers.
 pub(crate) struct DiagnosticContext<'a> {
@@ -38,99 +41,6 @@ fn split_signed_halves(value: u32) -> (i16, i16) {
         foci_firmware::tmc::decode_signed_upper_half(value),
         foci_firmware::tmc::decode_signed_lower_half(value),
     )
-}
-
-/// Collects the readings captured during a single current step test.
-pub(crate) struct CurrentStepReport {
-    pub(crate) oid: u8,
-    pub(crate) status: u8,
-    pub(crate) torque_target: i16,
-    pub(crate) flux_target: i16,
-    pub(crate) duration_ms: u16,
-    pub(crate) voltage_limit: u16,
-    pub(crate) torque_before: i16,
-    pub(crate) torque_during: i16,
-    pub(crate) torque_after: i16,
-    pub(crate) flux_during: i16,
-    pub(crate) iq_during: i16,
-    pub(crate) id_during: i16,
-    pub(crate) uq_limited: i16,
-    pub(crate) ud_limited: i16,
-    pub(crate) encoder_before: u32,
-    pub(crate) encoder_after: u32,
-    pub(crate) encoder_delta: i32,
-    pub(crate) adc_vm_raw: u16,
-}
-
-/// Collects the readings captured during a current torque sample test.
-pub(crate) struct CurrentTorqueSampleReport {
-    pub(crate) oid: u8,
-    pub(crate) status: u8,
-    pub(crate) target: i16,
-    pub(crate) flux_target: i16,
-    pub(crate) sample_delay_ms: u16,
-    pub(crate) voltage_limit: u16,
-    pub(crate) torque_before: i16,
-    pub(crate) torque_sample: i16,
-    pub(crate) torque_after: i16,
-    pub(crate) flux_sample: i16,
-    pub(crate) iq_sample: i16,
-    pub(crate) id_sample: i16,
-    pub(crate) uq_limited: i16,
-    pub(crate) ud_limited: i16,
-    pub(crate) encoder_before: u32,
-    pub(crate) encoder_sample: u32,
-    pub(crate) encoder_after: u32,
-    pub(crate) encoder_delta_sample: i32,
-    pub(crate) encoder_delta_after: i32,
-    pub(crate) adc_vm_raw: u16,
-    pub(crate) pidin_target_torque: i32,
-    pub(crate) pidin_target_flux: i32,
-    pub(crate) pidout_target_torque: i32,
-    pub(crate) pidout_target_flux: i32,
-    pub(crate) pid_torque_target_monitor: i16,
-    pub(crate) torque_error: i32,
-    pub(crate) flux_error: i32,
-    pub(crate) torque_error_sum: i32,
-    pub(crate) flux_error_sum: i32,
-    pub(crate) uq_prelimit: i16,
-    pub(crate) ud_prelimit: i16,
-    pub(crate) ff_velocity: i32,
-    pub(crate) ff_torque: i16,
-    pub(crate) status_flags: u32,
-}
-
-/// Collects the readings captured during a voltage step test.
-pub(crate) struct VoltageStepReport {
-    pub(crate) oid: u8,
-    pub(crate) status: u8,
-    pub(crate) uq_ext: i16,
-    pub(crate) ud_ext: i16,
-    pub(crate) sample_delay_ms: u16,
-    pub(crate) torque_before: i16,
-    pub(crate) torque_sample: i16,
-    pub(crate) torque_after: i16,
-    pub(crate) flux_sample: i16,
-    pub(crate) iq_sample: i16,
-    pub(crate) id_sample: i16,
-    pub(crate) uq_limited: i16,
-    pub(crate) ud_limited: i16,
-    pub(crate) uux_sample: i16,
-    pub(crate) uwy_sample: i16,
-    pub(crate) pwm_ux_sample: i16,
-    pub(crate) pwm_wy_sample: i16,
-    pub(crate) pwm_sv_chop: u32,
-    pub(crate) pwm_bbm: u32,
-    pub(crate) pwm_maxcnt: u32,
-    pub(crate) phi_e_sample: i16,
-    pub(crate) phi_m_sample: i16,
-    pub(crate) encoder_before: u32,
-    pub(crate) encoder_sample: u32,
-    pub(crate) encoder_after: u32,
-    pub(crate) encoder_delta_sample: i32,
-    pub(crate) encoder_delta_after: i32,
-    pub(crate) adc_vm_raw: u16,
-    pub(crate) status_flags: u32,
 }
 
 fn current_step_reply(report: CurrentStepReport) {
@@ -283,120 +193,6 @@ pub(crate) fn voltage_step_reply(report: VoltageStepReport) {
         adc_vm_raw: u16 = report.adc_vm_raw,
         status_flags: u32 = report.status_flags,
     );
-}
-
-/// Construct a zero-filled [`CurrentTorqueSampleReport`] with the given header fields.
-pub(crate) fn empty_current_torque_sample_report(
-    oid: u8,
-    status: u8,
-    target: i16,
-    flux_target: i16,
-    sample_delay_ms: u16,
-    voltage_limit: u16,
-) -> CurrentTorqueSampleReport {
-    CurrentTorqueSampleReport {
-        oid,
-        status,
-        target,
-        flux_target,
-        sample_delay_ms,
-        voltage_limit,
-        torque_before: 0,
-        torque_sample: 0,
-        torque_after: 0,
-        flux_sample: 0,
-        iq_sample: 0,
-        id_sample: 0,
-        uq_limited: 0,
-        ud_limited: 0,
-        encoder_before: 0,
-        encoder_sample: 0,
-        encoder_after: 0,
-        encoder_delta_sample: 0,
-        encoder_delta_after: 0,
-        adc_vm_raw: 0,
-        pidin_target_torque: 0,
-        pidin_target_flux: 0,
-        pidout_target_torque: 0,
-        pidout_target_flux: 0,
-        pid_torque_target_monitor: 0,
-        torque_error: 0,
-        flux_error: 0,
-        torque_error_sum: 0,
-        flux_error_sum: 0,
-        uq_prelimit: 0,
-        ud_prelimit: 0,
-        ff_velocity: 0,
-        ff_torque: 0,
-        status_flags: 0,
-    }
-}
-
-/// Construct a zero-filled [`VoltageStepReport`] with the given header fields.
-pub(crate) fn empty_voltage_step_report(
-    oid: u8,
-    status: u8,
-    uq_ext: i16,
-    ud_ext: i16,
-    sample_delay_ms: u16,
-) -> VoltageStepReport {
-    VoltageStepReport {
-        oid,
-        status,
-        uq_ext,
-        ud_ext,
-        sample_delay_ms,
-        torque_before: 0,
-        torque_sample: 0,
-        torque_after: 0,
-        flux_sample: 0,
-        iq_sample: 0,
-        id_sample: 0,
-        uq_limited: 0,
-        ud_limited: 0,
-        uux_sample: 0,
-        uwy_sample: 0,
-        pwm_ux_sample: 0,
-        pwm_wy_sample: 0,
-        pwm_sv_chop: 0,
-        pwm_bbm: 0,
-        pwm_maxcnt: 0,
-        phi_e_sample: 0,
-        phi_m_sample: 0,
-        encoder_before: 0,
-        encoder_sample: 0,
-        encoder_after: 0,
-        encoder_delta_sample: 0,
-        encoder_delta_after: 0,
-        adc_vm_raw: 0,
-        status_flags: 0,
-    }
-}
-
-/// Pack the uq and ud external voltage values into a single u32 register word.
-pub(crate) fn pack_voltage_ext(uq_ext: i16, ud_ext: i16) -> u32 {
-    (u32::from(uq_ext as u16) << 16) | u32::from(ud_ext as u16)
-}
-
-/// Compute the signed encoder delta between two raw position readings.
-///
-/// Wraps the result into the range `[-counts_per_rev/2, counts_per_rev/2]` when
-/// `counts_per_rev` is positive, returning the raw difference otherwise.
-pub(crate) fn current_step_encoder_delta(before: u32, after: u32, counts_per_rev: u32) -> i32 {
-    let raw = (after as i32).wrapping_sub(before as i32);
-    let counts_per_rev = counts_per_rev as i32;
-    if counts_per_rev <= 0 {
-        return raw;
-    }
-
-    let half = counts_per_rev / 2;
-    if raw > half {
-        raw - counts_per_rev
-    } else if raw < -half {
-        raw + counts_per_rev
-    } else {
-        raw
-    }
 }
 
 /// Write a value to a TMC4671 sub-register via the address/data register pair.
