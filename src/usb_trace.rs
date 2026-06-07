@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
 
 use foci_firmware::trace::events::{SUBSYSTEM_USB_TRACE, TraceClockExt};
 use foci_firmware::trace::pressure::{TracePressureRuntime, TracePressureStatusInputs};
-use foci_firmware::trace::stream::{FrameBuf, METADATA_PAYLOAD_MAX, frame_sequence};
+use foci_firmware::trace::stream::{FrameBuf, frame_sequence};
 use foci_firmware::trace::transport::{self, TraceQueueSelection};
 
 use crate::state::usb_trace::{
@@ -41,6 +41,8 @@ pub(crate) const EVENT_SHUTDOWN: u16 = 10;
 const CRITICAL_HZ: u32 = 1000;
 const CONTROL_DETAIL_HZ: u32 = 500;
 const STATUS_HZ: u32 = 10;
+const TRACE_CHANNEL_COUNT: usize = 1;
+const STATUS_SLOT_COUNT: usize = transport::status_slot_count(TRACE_CHANNEL_COUNT);
 
 static mut TRACE_CLOCK_EXT: TraceClockExt = TraceClockExt::new();
 
@@ -463,13 +465,6 @@ pub(crate) fn is_configured() -> bool {
     TRACE_COUNTERS.configured.load(Ordering::Relaxed) && foci_usb_stm32::is_configured()
 }
 
-fn push_str(out: &mut heapless::Vec<u8, METADATA_PAYLOAD_MAX>, value: &str) {
-    let bytes = value.as_bytes();
-    let len = bytes.len().min(31);
-    let _ = out.push(len as u8);
-    let _ = out.extend_from_slice(&bytes[..len]);
-}
-
 /// Emit stream metadata.
 pub(crate) fn emit_metadata() {
     use core::sync::atomic::Ordering::Relaxed;
@@ -479,46 +474,30 @@ pub(crate) fn emit_metadata() {
         return;
     }
 
-    let mut payload: heapless::Vec<u8, METADATA_PAYLOAD_MAX> = heapless::Vec::new();
-    let _ = payload.extend_from_slice(&[
-        1, // metadata schema
-        1, // trace feature revision
-        1, // source count
-        3, // skipped sample counter count
-    ]);
-    let _ = payload.extend_from_slice(&crate::ankyra::constants::CLOCK_FREQ.to_le_bytes());
-    let _ = payload.extend_from_slice(&1000u32.to_le_bytes());
-    let _ = payload.extend_from_slice(&100u32.to_le_bytes());
-    let _ = payload.extend_from_slice(&10u32.to_le_bytes());
-    let _ = payload.extend_from_slice(
-        &TRACE_COUNTERS
-            .pre_config_elapsed_ms
-            .load(Relaxed)
-            .to_le_bytes(),
-    );
-    let _ = payload.extend_from_slice(
-        &TRACE_COUNTERS
+    let Ok(sources) = transport::canonical_sources(TRACE_CHANNEL_COUNT as u8) else {
+        return;
+    };
+    let Ok(payload) = transport::build_metadata_payload(transport::TraceMetadataInputs {
+        skipped_sample_counter_count: 3,
+        clock_freq: crate::ankyra::constants::CLOCK_FREQ,
+        critical_hz: CRITICAL_HZ,
+        control_detail_hz: CONTROL_DETAIL_HZ,
+        status_hz: STATUS_HZ,
+        pre_configuration_elapsed_ms: TRACE_COUNTERS.pre_config_elapsed_ms.load(Relaxed),
+        pre_configuration_skipped_critical: TRACE_COUNTERS
             .pre_config_skipped_critical
-            .load(Relaxed)
-            .to_le_bytes(),
-    );
-    let _ = payload.extend_from_slice(
-        &TRACE_COUNTERS
+            .load(Relaxed),
+        pre_configuration_skipped_control_detail: TRACE_COUNTERS
             .pre_config_skipped_control_detail
-            .load(Relaxed)
-            .to_le_bytes(),
-    );
-    let _ = payload.extend_from_slice(
-        &TRACE_COUNTERS
-            .pre_config_skipped_status
-            .load(Relaxed)
-            .to_le_bytes(),
-    );
-    push_str(&mut payload, "openffboard-fw");
-    push_str(&mut payload, TRACE_PRODUCT);
-    push_str(&mut payload, trace_serial());
-    let _ = payload.extend_from_slice(&[SOURCE_KIND_FOCI, 0, 7]);
-    let _ = payload.extend_from_slice(b"channel");
+            .load(Relaxed),
+        pre_configuration_skipped_status: TRACE_COUNTERS.pre_config_skipped_status.load(Relaxed),
+        firmware_id: "openffboard-fw",
+        product: TRACE_PRODUCT,
+        serial: trace_serial(),
+        sources: sources.as_slice(),
+    }) else {
+        return;
+    };
 
     let mut frame = FrameBuf::new();
     frame.write_header(header(
@@ -870,7 +849,8 @@ pub(crate) async fn sample_commission_closed_loop_entry<B, R, D>(
     sample_tick(tmc, motor_enabled, 0, 0, 0, 0, 0, 0, control_tick).await;
 }
 
-static mut LAST_STATUS: [transport::StatusSnapshot; 4] = [transport::StatusSnapshot::new(); 4];
+static mut LAST_STATUS: [transport::StatusSnapshot; STATUS_SLOT_COUNT] =
+    [transport::StatusSnapshot::new(); STATUS_SLOT_COUNT];
 
 fn emit_one_status(
     slot: usize,
@@ -1006,10 +986,34 @@ pub(crate) async fn emit_status_frames<B>(
         ..StatusSample::default()
     };
 
-    emit_one_status(0, SOURCE_KIND_BOARD, SOURCE_INDEX_NA, board, regular_tick);
-    emit_one_status(1, SOURCE_KIND_FOCI, 0, foci, false);
-    emit_one_status(2, SOURCE_KIND_USB, SOURCE_INDEX_NA, usb, false);
-    emit_one_status(3, SOURCE_KIND_KLIPPER, SOURCE_INDEX_NA, klipper, false);
+    emit_one_status(
+        transport::board_status_slot(),
+        SOURCE_KIND_BOARD,
+        SOURCE_INDEX_NA,
+        board,
+        regular_tick,
+    );
+    emit_one_status(
+        transport::usb_status_slot(),
+        SOURCE_KIND_USB,
+        SOURCE_INDEX_NA,
+        usb,
+        false,
+    );
+    emit_one_status(
+        transport::klipper_status_slot(),
+        SOURCE_KIND_KLIPPER,
+        SOURCE_INDEX_NA,
+        klipper,
+        false,
+    );
+    emit_one_status(
+        transport::foci_status_slot(0),
+        SOURCE_KIND_FOCI,
+        0,
+        foci,
+        false,
+    );
 }
 
 /// Drain at most one 64-byte trace packet to USB.
