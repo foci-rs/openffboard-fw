@@ -3,9 +3,10 @@
 //! TIM5 scheduler ISR share a single implementation.
 
 use crate::trigger_domain::stop_physical_stepper_no_lock;
-use foci_firmware::commission_dispatch::{DispatchState, StepperPostAction};
+use foci_firmware::commission_dispatch::{
+    DispatchState, StepperPostAction, StepperTaskDirective, apply_stepper_post_action_state,
+};
 use foci_firmware::diagnostic::StepperEventReason;
-use foci_firmware::tmc_ops::StepperTaskDirective;
 
 fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
     foci_firmware::state::tmc::tmc_channel0()
@@ -55,7 +56,7 @@ pub(crate) fn stepper_stop_from_p1(channel: u8) {
 /// This is the single owner of firmware step-epoch zeroing, channel motor arming,
 /// and `arm_check` spawning. Dispatch only decides which transition is needed.
 pub(crate) fn apply_stepper_post_action(action: StepperPostAction, state: &mut DispatchState<'_>) {
-    match foci_firmware::tmc_ops::apply_stepper_post_action_state(action, state) {
+    match apply_stepper_post_action_state(action, state) {
         StepperTaskDirective::None => {}
         StepperTaskDirective::StopCheck => {
             stepper_stop_from_p1(0);
