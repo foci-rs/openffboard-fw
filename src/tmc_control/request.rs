@@ -95,18 +95,22 @@ pub(crate) async fn handle_tmc_control_request(
                         {
                             let mut backend = openffboard_backend(tmc, enable_pin);
                             let mut state = runtime.dispatch_state(tmc_state(), stepper_state());
-                            if let Err(error) = foci_firmware::tmc_ops::arm_motor_electrical(
-                                &mut backend,
-                                &mut state,
-                            )
-                            .await
+                            if let Err(error) =
+                                foci_firmware::tmc_control::lifecycle::arm_motor_electrical(
+                                    &mut backend,
+                                    &mut state,
+                                )
+                                .await
                             {
                                 defmt::error!(
                                     "Motor enable rejected by sentinel verify: {}",
                                     error
                                 );
-                                foci_firmware::tmc_ops::disarm_motor(&mut backend, &mut state)
-                                    .await;
+                                foci_firmware::tmc_control::lifecycle::disarm_motor(
+                                    &mut backend,
+                                    &mut state,
+                                )
+                                .await;
                                 continue;
                             }
                             apply_stepper_post_action(post_action, &mut state);
@@ -135,7 +139,8 @@ pub(crate) async fn handle_tmc_control_request(
                 {
                     let mut backend = openffboard_backend(tmc, enable_pin);
                     let mut state = runtime.dispatch_state(tmc_state(), stepper_state());
-                    foci_firmware::tmc_ops::disarm_motor(&mut backend, &mut state).await;
+                    foci_firmware::tmc_control::lifecycle::disarm_motor(&mut backend, &mut state)
+                        .await;
                 }
                 if !phase_advance_restored {
                     return TmcControlRequestOutcome::skip_tick_tail();

@@ -448,7 +448,11 @@ mod app {
                         let mut state = runtime.dispatch_state(tmc_state(), stepper_state());
                         // disarm_motor clears arming/calibration state through the dispatch view
                         // and runs restore_safe_state_via_backend (best-effort SPI writes).
-                        foci_firmware::tmc_ops::disarm_motor(&mut backend, &mut state).await;
+                        foci_firmware::tmc_control::lifecycle::disarm_motor(
+                            &mut backend,
+                            &mut state,
+                        )
+                        .await;
                     }
                     tmc_state()
                         .commission_in_flight
@@ -485,7 +489,8 @@ mod app {
                     }
                     let mut backend = openffboard_backend(tmc, enable_pin);
                     let mut state = runtime.dispatch_state(tmc_state(), stepper_state());
-                    foci_firmware::tmc_ops::disarm_motor(&mut backend, &mut state).await;
+                    foci_firmware::tmc_control::lifecycle::disarm_motor(&mut backend, &mut state)
+                        .await;
                 }
                 tmc_state()
                     .commission_in_flight
