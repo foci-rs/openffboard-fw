@@ -4,6 +4,9 @@
 
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
 
+use foci_firmware::trace::commissioning::{
+    CommissionTraceSampleDecision, commission_trace_sample_decision,
+};
 use foci_firmware::trace::events::{SUBSYSTEM_USB_TRACE, TraceClockExt};
 use foci_firmware::trace::pressure::{TracePressureRuntime, TracePressureStatusInputs};
 use foci_firmware::trace::stream::{FrameBuf, frame_sequence};
@@ -823,8 +826,6 @@ pub(crate) async fn sample_tick<B>(
     record_spi_sample_cycles(spi_sample_cycles);
 }
 
-const COMMISSION_USB_SAMPLE_MIN_BUDGET_US: u64 = 250;
-
 pub(crate) async fn sample_commission_closed_loop_entry<B, R, D>(
     tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
     motor_enabled: bool,
@@ -836,17 +837,26 @@ pub(crate) async fn sample_commission_closed_loop_entry<B, R, D>(
     R: Fn() -> u64,
     D: Fn() -> bool,
 {
-    if !is_configured() {
-        return;
+    let trace_configured = is_configured();
+    let past_deadline = trace_configured && past_deadline();
+    let remaining_budget_us = if trace_configured && !past_deadline {
+        remaining_budget_us()
+    } else {
+        0
+    };
+
+    match commission_trace_sample_decision(trace_configured, past_deadline, remaining_budget_us) {
+        CommissionTraceSampleDecision::SkipUnconfigured => {}
+        CommissionTraceSampleDecision::DropForBudget => {
+            TRACE_COUNTERS.motion_drops.fetch_add(1, Ordering::Relaxed);
+            TRACE_COUNTERS
+                .motion_drop_gap
+                .store(true, Ordering::Relaxed);
+        }
+        CommissionTraceSampleDecision::Sample => {
+            sample_tick(tmc, motor_enabled, 0, 0, 0, 0, 0, 0, control_tick).await;
+        }
     }
-    if past_deadline() || remaining_budget_us() < COMMISSION_USB_SAMPLE_MIN_BUDGET_US {
-        TRACE_COUNTERS.motion_drops.fetch_add(1, Ordering::Relaxed);
-        TRACE_COUNTERS
-            .motion_drop_gap
-            .store(true, Ordering::Relaxed);
-        return;
-    }
-    sample_tick(tmc, motor_enabled, 0, 0, 0, 0, 0, 0, control_tick).await;
 }
 
 static mut LAST_STATUS: [transport::StatusSnapshot; STATUS_SLOT_COUNT] =
