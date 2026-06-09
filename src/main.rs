@@ -728,17 +728,16 @@ mod app {
             #[cfg(feature = "trace")]
             {
                 let trace_tick = runtime.advance_trace_tick();
-                let trace_state = runtime.trace_state();
+                let inputs = foci_firmware::trace::sampling::TraceSampleInputs::from_runtime_trace(
+                    runtime.trace_state(),
+                    trace_tick,
+                );
                 crate::usb_trace::sample_tick(
                     tmc,
-                    runtime.is_motor_enabled(),
-                    trace_state.cached_velocity_reference,
-                    trace_state.cached_velocity_offset,
-                    trace_state.cached_velocity_transient_offset,
-                    trace_state.cached_accel_torque_offset,
-                    trace_state.cached_accel_gain_permille,
-                    trace_state.cached_accel_flags,
-                    trace_tick.sample_tick,
+                    crate::usb_trace::TraceSampleContext {
+                        motor_enabled: runtime.is_motor_enabled(),
+                    },
+                    inputs,
                 )
                 .await;
                 if trace_tick.phase_advance_due {
