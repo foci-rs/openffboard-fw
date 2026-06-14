@@ -433,31 +433,25 @@ mod app {
             // no further commands arrive but the TMC4671 remains energized.
             if SHUTDOWN_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
                 if !shutdown_safe_state_applied {
-                    runtime.take_commission_engine();
                     #[cfg(feature = "trace")]
                     {
                         commission_trace_phase = None;
                     }
-                    let phase_advance_restored = runtime.restore_phase_advance_now(tmc).await;
-                    if !phase_advance_restored {
-                        defmt::warn!("phase advance: failed to restore ABN offset on shutdown");
-                    }
-                    {
+                    let shutdown_safe_state_complete = {
                         let mut backend = openffboard_backend(tmc, enable_pin);
-                        let mut state = runtime.dispatch_state(tmc_state(), stepper_state());
-                        // disarm_motor clears arming/calibration state through the dispatch view
-                        // and runs restore_safe_state_via_backend (best-effort SPI writes).
-                        foci_firmware::tmc_control::lifecycle::disarm_motor(
+                        foci_firmware::tmc_control::lifecycle::apply_shutdown_safe_state(
+                            &mut runtime,
                             &mut backend,
-                            &mut state,
+                            tmc_state(),
+                            stepper_state(),
                         )
-                        .await;
-                    }
+                        .await
+                    };
                     tmc_state()
                         .commission_in_flight
                         .store(false, core::sync::atomic::Ordering::Relaxed);
                     stepper_stop_from_p1(0);
-                    shutdown_safe_state_applied = phase_advance_restored;
+                    shutdown_safe_state_applied = shutdown_safe_state_complete;
                 }
                 Mono::delay(1.millis()).await;
                 continue;
