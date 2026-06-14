@@ -131,7 +131,10 @@ pub(crate) async fn handle_tmc_control_request(
                 // Disable: stop stepping first, then kill motor electrically. This runtime
                 // call emits only immediate stepper actions; shutdown reporting remains in
                 // the tmc_control caller where app_state can be locked synchronously.
-                crate::tmc_control_glue::apply_actions(runtime.prepare_disable_request(), |_| {});
+                crate::tmc_control::effects::apply_actions(
+                    runtime.prepare_disable_request(),
+                    |_| {},
+                );
                 let phase_advance_restored = runtime.restore_phase_advance_now(tmc).await;
                 if !phase_advance_restored {
                     defmt::warn!("phase advance: failed to restore ABN offset before disarm");

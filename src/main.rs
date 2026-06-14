@@ -23,7 +23,6 @@ mod interrupts;
 mod platform_impl;
 mod state;
 mod tmc_control;
-mod tmc_control_glue;
 mod tmc_diagnostics;
 mod tmc_dispatch;
 mod transport;
@@ -469,12 +468,12 @@ mod app {
             if TMC_QUEUE_FLUSH.load(core::sync::atomic::Ordering::Relaxed) {
                 while rx.try_recv().is_ok() {}
                 let commission_was_active = runtime.is_commission_active();
-                crate::tmc_control_glue::apply_actions(
+                crate::tmc_control::effects::apply_actions(
                     runtime.poll_queue_flush(&signals, tmc_state(), stepper_state()),
                     |reason| {
                         ctx.shared.app_state.lock(|state| {
                             if crate::firmware_ctx::enter_shutdown(state) {
-                                crate::tmc_control_glue::emit_shutdown(reason);
+                                crate::tmc_control::effects::emit_shutdown(reason);
                             }
                         });
                     },
@@ -604,7 +603,7 @@ mod app {
                     if let Some(reason) = outcome.shutdown {
                         ctx.shared.app_state.lock(|state| {
                             if crate::firmware_ctx::enter_shutdown(state) {
-                                crate::tmc_control_glue::emit_shutdown(reason);
+                                crate::tmc_control::effects::emit_shutdown(reason);
                             }
                         });
                     }
@@ -771,7 +770,7 @@ mod app {
             // TrSync and endstop polling have been replaced by the TIM5 CC2
             // trigger scheduler. See step_timer_irq CC2 dispatch above.
 
-            crate::tmc_control_glue::apply_actions(
+            crate::tmc_control::effects::apply_actions(
                 runtime
                     .apply_slow_maintenance_tick(
                         tmc,
@@ -786,7 +785,7 @@ mod app {
                 |reason| {
                     ctx.shared.app_state.lock(|state| {
                         if crate::firmware_ctx::enter_shutdown(state) {
-                            crate::tmc_control_glue::emit_shutdown(reason);
+                            crate::tmc_control::effects::emit_shutdown(reason);
                         }
                     });
                 },
