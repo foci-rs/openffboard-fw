@@ -22,12 +22,7 @@ pub(crate) fn openffboard_backend<'a>(
     tmc: &'a mut Tmc4671Spi<TmcSpiDevice>,
     enable_pin: &'a mut Output<'static>,
 ) -> OpenFFBoardBackend<'a> {
-    OpenFFBoardBackend {
-        channel: 0,
-        tmc,
-        enable_pin,
-        tmc_state: tmc_state(),
-    }
+    OpenFFBoardBackend::new(0, tmc, enable_pin, tmc_state())
 }
 
 pub(crate) fn refresh_velocity_scale(runtime: &mut TmcControlRuntime) {
