@@ -37,9 +37,9 @@ pub(crate) fn enable_pin_channel(pin: u32) -> Option<u8> {
 /// Board-specific TMC4671 hardware configuration for OpenFFBoard v1.3 ACS724.
 ///
 /// PWM at 25 kHz (PWM_MAXCNT=3999, fCLK=25 MHz per datasheet 4.9.3),
-/// 400ns BBM dead-time matching the OpenFFBoard v1.3 ACS724 firmware config,
-/// DSADC MDEC A=660, B=331 matching the OpenFFBoard v1.3 ACS724 firmware config.
-/// The 1024-count commissioning excitation compensates for the 400ns BBM dead-time
+/// 90ns BBM dead-time for resistance-method diagnostics,
+/// symmetric DSADC MDEC derived from the PWM period.
+/// The 1024-count commissioning excitation is kept unchanged for this diagnostic test
 /// while staying within the ADC setup phase's conservative voltage clamp.
 ///
 /// Bandwidth 150 Hz determined by sweep at 8 MHz SPI (2026-04-05):
@@ -50,13 +50,17 @@ pub(crate) fn enable_pin_channel(pin: u32) -> Option<u8> {
 /// The optimal bandwidth increased from 50 Hz to 150 Hz after fixing
 /// the PWM frequency formula (datasheet: 25 kHz, not 6.25 kHz) and
 /// improving L measurement accuracy via 8 MHz SPI.
+const OPENFFBOARD_V13_PWM_MAXCNT: u16 = 3999;
+const OPENFFBOARD_V13_DSADC_MDEC: u16 =
+    foci_firmware::config::dsadc_mdec_from_pwm_maxcnt(OPENFFBOARD_V13_PWM_MAXCNT);
+
 pub(crate) const TMC_CONFIG: foci_firmware::config::TmcConfig = foci_firmware::config::TmcConfig {
-    pwm_maxcnt: 3999,
+    pwm_maxcnt: OPENFFBOARD_V13_PWM_MAXCNT,
     tmc_clock_hz: 25_000_000,
-    bbm_h: 40,
-    bbm_l: 40,
-    dsadc_mdec_a: 660,
-    dsadc_mdec_b: 331,
+    bbm_h: 9,
+    bbm_l: 9,
+    dsadc_mdec_a: OPENFFBOARD_V13_DSADC_MDEC,
+    dsadc_mdec_b: OPENFFBOARD_V13_DSADC_MDEC,
     // OpenFFBoard v1.3 ACS724 routing: UX=I0, WY=I1, V=I2.
     adc_i_select: 0x1800_0100,
     excitation_voltage: 1024,
@@ -64,9 +68,10 @@ pub(crate) const TMC_CONFIG: foci_firmware::config::TmcConfig = foci_firmware::c
     bandwidth_hz: 150.0,
 };
 
-const OPENFFBOARD_V13_BBM_REGISTER: u32 = 0x2828;
+const OPENFFBOARD_V13_BBM_REGISTER: u32 = 0x0909;
 const _: () = assert!(TMC_CONFIG.bbm_register() == OPENFFBOARD_V13_BBM_REGISTER);
-const OPENFFBOARD_V13_DSADC_MDEC_REGISTER: u32 = (331 << 16) | 660;
+const OPENFFBOARD_V13_DSADC_MDEC_REGISTER: u32 =
+    ((OPENFFBOARD_V13_DSADC_MDEC as u32) << 16) | OPENFFBOARD_V13_DSADC_MDEC as u32;
 const _: () = assert!(TMC_CONFIG.dsadc_mdec_register() == OPENFFBOARD_V13_DSADC_MDEC_REGISTER);
 const OPENFFBOARD_V13_EXCITATION_VOLTAGE: u16 = 1024;
 const _: () = assert!(TMC_CONFIG.excitation_voltage == OPENFFBOARD_V13_EXCITATION_VOLTAGE);
