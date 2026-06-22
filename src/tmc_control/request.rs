@@ -153,6 +153,7 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
                 homing_active,
                 stepper_active,
                 saved_voltage_limit,
+                tmc_config: &crate::board_config::TMC_CONFIG,
             },
         )
         .await
