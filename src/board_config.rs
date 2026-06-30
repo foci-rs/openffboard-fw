@@ -9,6 +9,26 @@ pub(crate) const TMC_CHANNEL_COUNT: u8 = 1;
 /// Derived from sense resistor value and ADC configuration.
 pub(crate) const CURRENT_SCALE_MA_PER_LSB: f32 = 1.155;
 
+/// OpenFFBoard v1.3 VM sense divider high-side resistor (R23).
+pub(crate) const VM_DIVIDER_HIGH_OHMS: u32 = 71_500;
+
+/// OpenFFBoard v1.3 VM sense divider low-side resistor (R24).
+pub(crate) const VM_DIVIDER_LOW_OHMS: u32 = 1_500;
+
+/// TMC4671 ADC_VM reference span in millivolts.
+pub(crate) const VM_ADC_REFERENCE_MILLIVOLTS: u32 = 2_500;
+
+/// Centered positive ADC_VM count span for the TMC4671 16-bit raw ADC.
+pub(crate) const VM_ADC_CENTER_COUNTS: u32 = 32_767;
+
+/// Shared OpenFFBoard v1.3 ADC_VM raw zero offset.
+///
+/// R23/R24 define the slope. This offset is the mean intercept from two live
+/// OpenFFBoard v1.3 FOCI boards measured at 4.98 V, 24.2 V, and 36.2 V on
+/// 2026-06-29. It avoids requiring per-user board calibration while keeping
+/// 24-36 V decode error within the gain-synthesis budget.
+pub(crate) const VM_ADC_OFFSET_RAW: u32 = 33_619;
+
 /// Return the motor channel represented by a virtual STEP pin.
 pub(crate) fn step_pin_channel(pin: u8) -> Option<u8> {
     match Pins::try_from(pin) {

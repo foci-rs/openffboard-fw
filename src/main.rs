@@ -346,10 +346,11 @@ mod app {
         //      insufficient margin for regen transients and PSU ripple. At
         //      24V nominal, HIGH was ~26.65V — easily crossed during any
         //      brief motor spin, causing continuous brake firing.
-        //   2. Voltage divider saturates at ~43V: the OpenFFBoard v1.2.4
-        //      voltage sense can only measure up to ~43V, so boards running
-        //      at 36V/48V/65V bus have no usable ADC_VM reading and can't
-        //      be protected by this mechanism at all.
+        //   2. ADC_VM scaling is board-specific. OpenFFBoard v1.3 now has a
+        //      schematic-derived VM model for dump/gain-synthesis evidence,
+        //      but that does not make the TMC brake threshold path a complete
+        //      protection design. Do not re-enable this comparator without a
+        //      dedicated brake-threshold validation pass.
         //
         // Proper overvoltage protection requires the Layer 2 brake (STM32
         // ADC monitoring + PE10 GPIO control) with its own voltage sense
