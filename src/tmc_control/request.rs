@@ -164,6 +164,21 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
         tmc: &mut Tmc4671Spi<TmcSpiDevice>,
     ) {
         if matches!(&req.kind, TmcRequestKind::HighRateCaptureTest { .. }) {
+            let homing_active = HOMING_STATE.load(Ordering::Relaxed) != 0;
+            let stepper_active = stepper_state().timer_active_mirror.load(Ordering::Relaxed);
+            let saved_voltage_limit = tmc_state().voltage_limit_cfg.load(Ordering::Relaxed);
+            let readiness = foci_firmware::tmc_diagnostics::DiagnosticReadiness {
+                homing_active,
+                stepper_active,
+                saved_voltage_limit,
+            };
+            let mut sink = crate::tmc_diagnostics::BoardDiagnosticReplySink;
+            let Ok(req) = foci_firmware::tmc_diagnostics::preflight_high_rate_capture_request(
+                req, readiness, &mut sink,
+            ) else {
+                return;
+            };
+
             let voltage_limit = foci_firmware::tmc_diagnostics::high_rate_capture_voltage_limit();
             let phase_advance_restored = runtime.restore_phase_advance_now(tmc).await;
             let arm_result = if phase_advance_restored {
@@ -174,22 +189,14 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
             };
 
             if arm_result.is_ok() {
-                let homing_active = HOMING_STATE.load(Ordering::Relaxed) != 0;
-                let stepper_active = stepper_state().timer_active_mirror.load(Ordering::Relaxed);
-                let saved_voltage_limit = tmc_state().voltage_limit_cfg.load(Ordering::Relaxed);
                 let mut delay = crate::tmc_diagnostics::MonoDiagnosticDelay;
                 let context = foci_firmware::tmc_diagnostics::DiagnosticContext {
                     tmc,
                     runtime,
                     delay: &mut delay,
-                    readiness: foci_firmware::tmc_diagnostics::DiagnosticReadiness {
-                        homing_active,
-                        stepper_active,
-                        saved_voltage_limit,
-                    },
+                    readiness,
                     tmc_config: &crate::board_config::TMC_CONFIG,
                 };
-                let mut sink = crate::tmc_diagnostics::BoardDiagnosticReplySink;
                 foci_firmware::tmc_diagnostics::run_high_rate_capture_request(
                     req, context, &mut sink,
                 )
@@ -197,7 +204,6 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
                 self.disarm_motor(runtime, tmc).await;
             } else {
                 self.disarm_motor(runtime, tmc).await;
-                let mut sink = crate::tmc_diagnostics::BoardDiagnosticReplySink;
                 foci_firmware::tmc_diagnostics::emit_high_rate_capture_not_ready(req, &mut sink);
             }
             return;
