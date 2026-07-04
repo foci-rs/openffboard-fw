@@ -7,17 +7,15 @@ use crate::app::Mono;
 use foci_firmware::tmc::TmcRequest;
 use foci_firmware::tmc_diagnostics::{
     CurrentStepReport, CurrentTorqueSampleReport, DiagnosticDelay, DiagnosticOutcome,
-    DiagnosticReadiness, HighRateCaptureProfileReport, HighRateCaptureRunReport,
-    HighRateCaptureSampleReport, ResistanceAxisReport, ResistanceProfileReport,
-    ResistanceRunReport, VoltageStepReport,
-    handle_diagnostic_request as handle_shared_diagnostic_request,
+    DiagnosticReadiness, ResistanceAxisReport, ResistanceProfileReport, ResistanceRunReport,
+    VoltageStepReport, handle_diagnostic_request as handle_shared_diagnostic_request,
 };
 use foci_tmc4671::spi::Tmc4671Spi;
 use rtic_monotonics::{Monotonic, fugit::ExtU64};
 
 use crate::app_types::TmcSpiDevice;
 
-pub(crate) struct MonoDiagnosticDelay;
+struct MonoDiagnosticDelay;
 
 impl DiagnosticDelay for MonoDiagnosticDelay {
     async fn delay_ms(&mut self, ms: u64) {
@@ -49,7 +47,7 @@ pub(crate) enum DiagnosticDispatch {
     NotDiagnostic(TmcRequest),
 }
 
-pub(crate) struct BoardDiagnosticReplySink;
+struct BoardDiagnosticReplySink;
 
 impl foci_firmware::tmc_diagnostics::DiagnosticReplySink for BoardDiagnosticReplySink {
     fn foci_current_step_result(&mut self, report: CurrentStepReport) {
@@ -243,68 +241,6 @@ impl foci_firmware::tmc_diagnostics::DiagnosticReplySink for BoardDiagnosticRepl
             bbm_readback: u16 = report.bbm_readback,
             dsadc_mdec_readback: u32 = report.dsadc_mdec_readback,
             pwm_sv_chop_readback: u32 = report.pwm_sv_chop_readback,
-        );
-    }
-
-    fn foci_high_rate_capture_profile(&mut self, report: HighRateCaptureProfileReport) {
-        ::ankyra::klipper_reply_from!(
-            &mut crate::_ankyra_config::Sender,
-            foci_firmware::ankyra::replies::FociHighRateCaptureProfile,
-            oid: u8 = report.oid,
-            profile_version: u16 = report.profile_version,
-            sample_capacity: u16 = report.sample_capacity,
-            requested_samples: u16 = report.requested_samples,
-            max_capture_us: u32 = report.max_capture_us,
-            uq_ext: i16 = report.uq_ext,
-            ud_ext: i16 = report.ud_ext,
-            phi_e_ext: u16 = report.phi_e_ext,
-            voltage_limit: u16 = report.voltage_limit,
-            r_count_slope_milli: i32 = report.r_count_slope_milli,
-            flags: u32 = report.flags,
-        );
-    }
-
-    fn foci_high_rate_capture_sample(&mut self, report: HighRateCaptureSampleReport) {
-        ::ankyra::klipper_reply_from!(
-            &mut crate::_ankyra_config::Sender,
-            foci_firmware::ankyra::replies::FociHighRateCaptureSample,
-            oid: u8 = report.oid,
-            sample_index: u16 = report.sample_index,
-            timestamp_us: u32 = report.timestamp_us,
-            uq_ext: i16 = report.uq_ext,
-            ud_ext: i16 = report.ud_ext,
-            current_primary: i16 = report.current_primary,
-            current_secondary: i16 = report.current_secondary,
-            encoder_count: u32 = report.encoder_count,
-            status_flags: u32 = report.status_flags,
-        );
-    }
-
-    fn foci_high_rate_capture_run(&mut self, report: HighRateCaptureRunReport) {
-        let profile_version = report.profile_version.min(u16::from(u8::MAX)) as u8;
-        let l_shift_minus_permille = report.l_shift_minus_permille.min(u16::from(u8::MAX)) as u8;
-        let l_shift_plus_permille = report.l_shift_plus_permille.min(u16::from(u8::MAX)) as u8;
-        let theta_onset_us = report.theta_onset_us.min(u32::from(u16::MAX)) as u16;
-        let max_sample_interval_us = report.max_sample_interval_us.min(u32::from(u16::MAX)) as u16;
-
-        ::ankyra::klipper_reply_from!(
-            &mut crate::_ankyra_config::Sender,
-            foci_firmware::ankyra::replies::FociHighRateCaptureRun,
-            oid: u8 = report.oid,
-            status: u8 = report.status,
-            profile_version: u8 = profile_version,
-            sample_count: u16 = report.sample_count,
-            elapsed_us: u32 = report.elapsed_us,
-            effective_frequency_hz: u32 = report.effective_frequency_hz,
-            l_nominal_us: u32 = report.l_nominal_us,
-            l_shift_minus_permille: u8 = l_shift_minus_permille,
-            l_shift_plus_permille: u8 = l_shift_plus_permille,
-            theta_onset_us: u16 = theta_onset_us,
-            residual_rms_count: u32 = report.residual_rms_count,
-            max_sample_interval_us: u16 = max_sample_interval_us,
-            encoder_delta: i32 = report.encoder_delta,
-            status_flags_or: u32 = report.status_flags_or,
-            warning_flags: u32 = report.warning_flags,
         );
     }
 }

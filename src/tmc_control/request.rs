@@ -9,11 +9,10 @@ use core::sync::atomic::Ordering;
 use embassy_stm32::gpio::Output;
 use foci_firmware::autotune::CommissionError;
 use foci_firmware::commission_dispatch::{ReplyPayload, StepperPostAction};
-use foci_firmware::commissioning::backend::CommissionRegisterIo;
 use foci_firmware::state::stepper::StepperChannelState;
 use foci_firmware::state::tmc::TmcChannelState;
 use foci_firmware::state::trsync::HOMING_STATE;
-use foci_firmware::tmc::{TmcRequest, TmcRequestKind};
+use foci_firmware::tmc::TmcRequest;
 use foci_firmware::tmc_control::request::{
     TmcPreRequestDisposition, TmcRequestBoard, handle_tmc_control_request as handle_shared_request,
 };
@@ -21,7 +20,6 @@ use foci_firmware::tmc_control::{
     BoardActions, ShutdownReason, TmcControlRequestOutcome, TmcControlRequestTail,
     TmcControlRuntime,
 };
-use foci_tmc4671::registers::PIDOUT_UQ_UD_LIMITS;
 use foci_tmc4671::spi::Tmc4671Spi;
 
 use crate::app_types::TmcSpiDevice;
@@ -120,25 +118,6 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
         Ok(())
     }
 
-    async fn arm_motor_for_voltage_vectors(
-        &mut self,
-        runtime: &mut TmcControlRuntime,
-        tmc: &mut Tmc4671Spi<TmcSpiDevice>,
-        voltage_limit: u16,
-    ) -> Result<(), CommissionError> {
-        let mut backend = openffboard_backend(tmc, self.enable_pin);
-        backend
-            .write_register(PIDOUT_UQ_UD_LIMITS, u32::from(voltage_limit))
-            .await
-            .map_err(|_| CommissionError::Spi)?;
-        let mut state = runtime.dispatch_state(tmc_state(), stepper_state());
-        foci_firmware::tmc_control::lifecycle::arm_motor_for_voltage_vectors(
-            &mut backend,
-            &mut state,
-        )
-        .await
-    }
-
     async fn disarm_motor(
         &mut self,
         runtime: &mut TmcControlRuntime,
@@ -163,58 +142,6 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
         runtime: &mut TmcControlRuntime,
         tmc: &mut Tmc4671Spi<TmcSpiDevice>,
     ) {
-        if matches!(&req.kind, TmcRequestKind::HighRateCaptureTest { .. }) {
-            let homing_active = HOMING_STATE.load(Ordering::Relaxed) != 0;
-            let stepper_active = stepper_state().timer_active_mirror.load(Ordering::Relaxed);
-            let saved_voltage_limit = tmc_state().voltage_limit_cfg.load(Ordering::Relaxed);
-            let readiness = foci_firmware::tmc_diagnostics::DiagnosticReadiness {
-                homing_active,
-                stepper_active,
-                saved_voltage_limit,
-            };
-            let mut sink = crate::tmc_diagnostics::BoardDiagnosticReplySink;
-            let Ok(req) = foci_firmware::tmc_diagnostics::preflight_high_rate_capture_request(
-                req,
-                foci_firmware::tmc_diagnostics::HighRateCapturePreflightState {
-                    readiness,
-                    runtime_calibrated: runtime.is_calibrated(),
-                    motor_enabled: runtime.is_motor_enabled(),
-                },
-                &mut sink,
-            ) else {
-                return;
-            };
-
-            let voltage_limit = foci_firmware::tmc_diagnostics::high_rate_capture_voltage_limit();
-            let phase_advance_restored = runtime.restore_phase_advance_now(tmc).await;
-            let arm_result = if phase_advance_restored {
-                self.arm_motor_for_voltage_vectors(runtime, tmc, voltage_limit)
-                    .await
-            } else {
-                Err(CommissionError::Spi)
-            };
-
-            if arm_result.is_ok() {
-                let mut delay = crate::tmc_diagnostics::MonoDiagnosticDelay;
-                let context = foci_firmware::tmc_diagnostics::DiagnosticContext {
-                    tmc,
-                    runtime,
-                    delay: &mut delay,
-                    readiness,
-                    tmc_config: &crate::board_config::TMC_CONFIG,
-                };
-                foci_firmware::tmc_diagnostics::run_high_rate_capture_request(
-                    req, context, &mut sink,
-                )
-                .await;
-                self.disarm_motor(runtime, tmc).await;
-            } else {
-                self.disarm_motor(runtime, tmc).await;
-                foci_firmware::tmc_diagnostics::emit_high_rate_capture_not_ready(req, &mut sink);
-            }
-            return;
-        }
-
         let homing_active = HOMING_STATE.load(Ordering::Relaxed) != 0;
         let stepper_active = stepper_state().timer_active_mirror.load(Ordering::Relaxed);
         let saved_voltage_limit = tmc_state().voltage_limit_cfg.load(Ordering::Relaxed);
