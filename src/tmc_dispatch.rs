@@ -16,7 +16,7 @@ use rtic_monotonics::fugit::ExtU64;
 
 use crate::app::Mono;
 use crate::app_types::TmcSpiDevice;
-use crate::board_config::CURRENT_SCALE_MA_PER_LSB;
+use crate::board_config::{CURRENT_SCALE_MA_PER_LSB, TMC_CONFIG};
 
 /// Handle a TMC request that does not require main-loop state (motor_enabled, enable_pin).
 ///
@@ -34,7 +34,15 @@ pub(crate) async fn handle_tmc_request(
     let tmc_state = foci_firmware::state::tmc::tmc_channel(channel).ok_or(())?;
 
     let kind = req.kind;
-    match apply_shared_tmc_request(&kind, tmc, tmc_state, CURRENT_SCALE_MA_PER_LSB).await? {
+    match apply_shared_tmc_request(
+        &kind,
+        tmc,
+        tmc_state,
+        CURRENT_SCALE_MA_PER_LSB,
+        TMC_CONFIG.pwm_maxcnt,
+    )
+    .await?
+    {
         SharedTmcDispatch::Handled => return Ok(()),
         SharedTmcDispatch::Unhandled => {}
     }
