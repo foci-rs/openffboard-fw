@@ -54,14 +54,9 @@ pub(crate) fn enable_pin_channel(pin: u32) -> Option<u8> {
 /// The 1024-count commissioning excitation is kept unchanged for this diagnostic test
 /// while staying within the ADC setup phase's conservative voltage clamp.
 ///
-/// Bandwidth 150 Hz determined by sweep at 8 MHz SPI (2026-04-05):
-///   50 Hz  — weak holding torque (P too low with accurate L)
-///  100 Hz  — good hold, inaudible, smooth moves
-///  150 Hz  — strong hold, inaudible, best position stiffness
-///  200 Hz  — slightly audible vibration, audible stepping during moves
-/// The optimal bandwidth increased from 50 Hz to 150 Hz after fixing
-/// the PWM frequency formula (datasheet: 25 kHz, not 6.25 kHz) and
-/// improving L measurement accuracy via 8 MHz SPI.
+/// Current-loop P uses a physical-bandwidth formula. Start the live
+/// OpenFFBoard validation ladder at 600 Hz, which is slightly below the
+/// previously hand-validated P ~= 1422 anchor (~650 Hz with L).
 const OPENFFBOARD_V13_PWM_MAXCNT: u16 = 3999;
 const OPENFFBOARD_V13_DSADC_MDEC: u16 =
     foci_firmware::config::dsadc_mdec_from_pwm_maxcnt(OPENFFBOARD_V13_PWM_MAXCNT);
@@ -77,7 +72,7 @@ pub(crate) const TMC_CONFIG: foci_firmware::config::TmcConfig = foci_firmware::c
     adc_i_select: 0x1800_0100,
     excitation_voltage: 1024,
     didt_cycles: 5000,
-    bandwidth_hz: 150.0,
+    bandwidth_hz: 600.0,
     electrical_model_theta_e_us: 160,
     current_validation_flux_max_encoder_delta_counts: 4,
     current_validation_torque_max_encoder_delta_counts: 16,
