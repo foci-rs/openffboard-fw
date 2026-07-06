@@ -70,7 +70,6 @@ pub(crate) const TMC_CONFIG: foci_firmware::config::TmcConfig = foci_firmware::c
     // OpenFFBoard v1.3 ACS724 routing: UX=I0, WY=I1, V=I2.
     adc_i_select: 0x1800_0100,
     excitation_voltage: 1024,
-    didt_cycles: 5000,
     bandwidth_hz: 1600.0,
     electrical_model_theta_e_us: 160,
     current_validation_flux_max_encoder_delta_counts: 4,
