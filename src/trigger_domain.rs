@@ -274,7 +274,7 @@ pub(crate) fn stop_physical_stepper_no_lock(stepper_idx: usize, reason: StepperE
     let remaining_events = unsafe {
         isr_stepper(0)
             .expect("OpenFFBoard channel 0 exists")
-            .active_event_count()
+            .active_step_count()
     };
     let queue_len = unsafe {
         step_queue(0)
@@ -324,7 +324,7 @@ pub(crate) fn stop_physical_stepper_no_lock(stepper_idx: usize, reason: StepperE
     crate::state::stepper_diag::record_physical_stop(
         stepper_idx as u8,
         reason,
-        remaining_events,
+        u32::from(remaining_events),
         queue_len,
         drained_segments,
         drained_steps,

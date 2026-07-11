@@ -1,0 +1,23 @@
+[package]
+name = "openffboard-host-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+foci-firmware = { path = "../../../shared/foci-firmware" }
+foci-klipper = { path = "../../../shared/foci-klipper" }
+heapless = "0.9"
+
+[patch."https://github.com/foci-rs/ankyra"]
+ankyra = { path = "../../../ankyra/ankyra" }
+ankyra-assemble = { path = "../../../ankyra/ankyra-assemble" }
+ankyra-macros = { path = "../../../ankyra/ankyra-macros" }
+
+[patch."https://github.com/foci-rs/foci-klipper"]
+foci-klipper = { path = "../../../shared/foci-klipper" }
+
+[patch."https://github.com/foci-rs/foci-tmc4671"]
+foci-tmc4671 = { path = "../../../shared/foci-tmc4671" }
+
+[workspace]

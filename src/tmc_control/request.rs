@@ -14,7 +14,8 @@ use foci_firmware::state::tmc::TmcChannelState;
 use foci_firmware::state::trsync::HOMING_STATE;
 use foci_firmware::tmc::TmcRequest;
 use foci_firmware::tmc_control::request::{
-    TmcPreRequestDisposition, TmcRequestBoard, handle_tmc_control_request as handle_shared_request,
+    MotionScaleMapperInstallError, TmcPreRequestDisposition, TmcRequestBoard,
+    handle_tmc_control_request as handle_shared_request,
 };
 use foci_firmware::tmc_control::{
     BoardActions, ShutdownReason, TmcControlRequestOutcome, TmcControlRequestTail,
@@ -26,8 +27,12 @@ use crate::app_types::TmcSpiDevice;
 #[cfg(feature = "dev")]
 use crate::helpers::dev::{do_test_spin, tmc_enter_openloop};
 use crate::helpers::stepper::apply_stepper_post_action;
+use crate::state::stepper::{
+    install_motion_scale_mapper, isr_stepper, reset_mapper_observables, step_queue,
+};
 use crate::tmc_control::board::{openffboard_backend, stepper_state, tmc_state};
 use crate::tmc_dispatch::handle_tmc_request;
+use crate::trigger_domain::with_trigger_domain;
 
 fn next_commission_trace_seq(commission_trace_engine_seq: &mut u32) -> u32 {
     let seq = *commission_trace_engine_seq;
@@ -76,6 +81,33 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
 
     fn default_current_filter_hz(&self) -> u16 {
         crate::board_config::TMC_CONFIG.default_current_filter_hz()
+    }
+
+    fn motion_scale_queue_empty(&self) -> bool {
+        // SAFETY: The TMC request runs at P1 and only observes queue state.
+        unsafe { step_queue(0).is_some_and(|queue| queue.is_empty()) }
+    }
+
+    fn install_motion_scale_mapper(
+        &mut self,
+        mapper: foci_klipper::pulse_mapper::PulseMapperConfig,
+    ) -> Result<(), MotionScaleMapperInstallError> {
+        with_trigger_domain(|td| {
+            let idle = !tmc_state().motor_armed.load(Ordering::Relaxed)
+                && unsafe { step_queue(0).is_some_and(|queue| queue.is_empty()) }
+                && !td.timer_active(0);
+            if !idle {
+                return Err(MotionScaleMapperInstallError);
+            }
+
+            // SAFETY: The trigger-domain lock excludes P2/P3, and the checked
+            // disarmed/empty/inactive state keeps the ISR quiesced afterward.
+            let stepper = unsafe { isr_stepper(0).ok_or(MotionScaleMapperInstallError)? };
+            install_motion_scale_mapper(stepper, mapper)
+                .map_err(|_| MotionScaleMapperInstallError)?;
+            reset_mapper_observables();
+            Ok(())
+        })
     }
 
     fn emit_reply(&mut self, payload: ReplyPayload) {
