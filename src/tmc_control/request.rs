@@ -28,8 +28,7 @@ use crate::app_types::TmcSpiDevice;
 use crate::helpers::dev::{do_test_spin, tmc_enter_openloop};
 use crate::helpers::stepper::apply_stepper_post_action;
 use crate::state::stepper::{
-    install_motion_scale_mapper, isr_stepper, motion_scale_install_admitted,
-    reset_mapper_observables, step_queue,
+    isr_stepper, motion_scale_install_admitted, replace_motion_scale_mapper, step_queue,
 };
 use crate::tmc_control::board::{openffboard_backend, stepper_state, tmc_state};
 use crate::tmc_dispatch::handle_tmc_request;
@@ -97,17 +96,13 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
             let motor_armed = tmc_state().motor_armed.load(Ordering::Relaxed);
             let queue_empty = unsafe { step_queue(0).is_some_and(|queue| queue.is_empty()) };
             let timer_active = td.timer_active(0);
-            if !motion_scale_install_admitted(motor_armed, queue_empty, timer_active) {
-                return Err(MotionScaleMapperInstallError);
-            }
+            let admitted = motion_scale_install_admitted(motor_armed, queue_empty, timer_active);
 
-            // SAFETY: The trigger-domain lock excludes P2/P3, and the checked
-            // disarmed/empty/inactive state keeps the ISR quiesced afterward.
+            // SAFETY: The trigger-domain lock excludes P2/P3 while replacement
+            // clears the prior mapper before applying the captured admission.
             let stepper = unsafe { isr_stepper(0).ok_or(MotionScaleMapperInstallError)? };
-            install_motion_scale_mapper(stepper, mapper)
-                .map_err(|_| MotionScaleMapperInstallError)?;
-            reset_mapper_observables();
-            Ok(())
+            replace_motion_scale_mapper(stepper, mapper, admitted)
+                .map_err(|_| MotionScaleMapperInstallError)
         })
     }
 

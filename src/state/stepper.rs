@@ -241,6 +241,30 @@ pub(crate) fn install_motion_scale_mapper(
     stepper.configure_motion_scale(config)
 }
 
+/// Failure to replace the board-local mapper while fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MotionScaleMapperReplacementError {
+    /// A board quiescence guard rejected installation.
+    NotAdmitted,
+    /// The scheduler rejected the replacement configuration.
+    InvalidState,
+}
+
+/// Clear mapper state and observables before applying admission and replacement.
+pub(crate) fn replace_motion_scale_mapper(
+    stepper: &mut HardwareStepper,
+    config: PulseMapperConfig,
+    admitted: bool,
+) -> Result<(), MotionScaleMapperReplacementError> {
+    stepper.clear_motion_scale();
+    reset_mapper_observables();
+    if !admitted {
+        return Err(MotionScaleMapperReplacementError::NotAdmitted);
+    }
+    install_motion_scale_mapper(stepper, config)
+        .map_err(|_| MotionScaleMapperReplacementError::InvalidState)
+}
+
 /// Admit mapper installation only while every board quiescence guard holds.
 pub(crate) const fn motion_scale_install_admitted(
     motor_armed: bool,
@@ -328,18 +352,26 @@ mod tests {
     }
 
     #[test]
-    fn failed_mapper_replacement_leaves_no_prior_mapper_usable() {
+    fn invalid_mapper_replacement_clears_prior_mapper_and_observables() {
         let mut stepper = foci_klipper::stepper::HardwareStepper::new();
         stepper
             .configure_motion_scale(PulseMapperConfig::new(3_200).unwrap())
             .unwrap();
         stepper.load_move(StepMove::new(100, 1, 0));
+        PHYSICAL_PULSE_COUNT.store(9, Ordering::Relaxed);
+        MAPPER_PHASE.store(17, Ordering::Relaxed);
 
         assert!(
-            install_motion_scale_mapper(&mut stepper, PulseMapperConfig::new(4_000).unwrap())
+            replace_motion_scale_mapper(
+                &mut stepper,
+                PulseMapperConfig::new(4_000).unwrap(),
+                true,
+            )
                 .is_err()
         );
         assert!(!stepper.motion_scale_configured());
+        assert_eq!(PHYSICAL_PULSE_COUNT.load(Ordering::Relaxed), 0);
+        assert_eq!(MAPPER_PHASE.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -348,6 +380,47 @@ mod tests {
         assert!(!motion_scale_install_admitted(true, true, false));
         assert!(!motion_scale_install_admitted(false, false, false));
         assert!(!motion_scale_install_admitted(false, true, true));
+    }
+
+    fn assert_busy_mapper_replacement_fail_closed(
+        motor_armed: bool,
+        queue_empty: bool,
+        timer_active: bool,
+    ) {
+        let mut stepper = foci_klipper::stepper::HardwareStepper::new();
+        stepper
+            .configure_motion_scale(PulseMapperConfig::new(3_200).unwrap())
+            .unwrap();
+        PHYSICAL_PULSE_COUNT.store(9, Ordering::Relaxed);
+        MAPPER_PHASE.store(17, Ordering::Relaxed);
+        let admitted = motion_scale_install_admitted(motor_armed, queue_empty, timer_active);
+
+        assert!(
+            replace_motion_scale_mapper(
+                &mut stepper,
+                PulseMapperConfig::new(4_000).unwrap(),
+                admitted,
+            )
+            .is_err()
+        );
+        assert!(!stepper.motion_scale_configured());
+        assert_eq!(PHYSICAL_PULSE_COUNT.load(Ordering::Relaxed), 0);
+        assert_eq!(MAPPER_PHASE.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn motor_armed_mapper_replacement_is_fail_closed() {
+        assert_busy_mapper_replacement_fail_closed(true, true, false);
+    }
+
+    #[test]
+    fn queue_nonempty_mapper_replacement_is_fail_closed() {
+        assert_busy_mapper_replacement_fail_closed(false, false, false);
+    }
+
+    #[test]
+    fn timer_active_mapper_replacement_is_fail_closed() {
+        assert_busy_mapper_replacement_fail_closed(false, true, true);
     }
 
     #[test]
