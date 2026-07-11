@@ -638,9 +638,9 @@ mod app {
             next_control_tick = Mono::now() + u64::from(control_period_us).micros();
             let slow_control_tick = runtime.update_slow_control(control_period_us);
 
-            // Check emergency disable (non-blocking). Triggered by EXTI
-            // STATUS interrupt or enter_shutdown. Disables motor and reports
-            // the fault to Klipper so the host knows the MCU is down.
+            // Check emergency disable (non-blocking). Triggered by EXTI STATUS,
+            // enter_shutdown, or fatal step-deadline signaling. Disables motor
+            // and reports the fault to Klipper so the host knows the MCU is down.
             if TMC_DISABLE_SIGNAL.try_take().is_some() {
                 let deadline_channel =
                     STEPPER_DEADLINE_MISS_CHANNEL.swap(NO_STEPPER_CHANNEL, Relaxed);
