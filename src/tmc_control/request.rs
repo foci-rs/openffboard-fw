@@ -28,7 +28,8 @@ use crate::app_types::TmcSpiDevice;
 use crate::helpers::dev::{do_test_spin, tmc_enter_openloop};
 use crate::helpers::stepper::apply_stepper_post_action;
 use crate::state::stepper::{
-    install_motion_scale_mapper, isr_stepper, reset_mapper_observables, step_queue,
+    install_motion_scale_mapper, isr_stepper, motion_scale_install_admitted,
+    reset_mapper_observables, step_queue,
 };
 use crate::tmc_control::board::{openffboard_backend, stepper_state, tmc_state};
 use crate::tmc_dispatch::handle_tmc_request;
@@ -93,10 +94,10 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
         mapper: foci_klipper::pulse_mapper::PulseMapperConfig,
     ) -> Result<(), MotionScaleMapperInstallError> {
         with_trigger_domain(|td| {
-            let idle = !tmc_state().motor_armed.load(Ordering::Relaxed)
-                && unsafe { step_queue(0).is_some_and(|queue| queue.is_empty()) }
-                && !td.timer_active(0);
-            if !idle {
+            let motor_armed = tmc_state().motor_armed.load(Ordering::Relaxed);
+            let queue_empty = unsafe { step_queue(0).is_some_and(|queue| queue.is_empty()) };
+            let timer_active = td.timer_active(0);
+            if !motion_scale_install_admitted(motor_armed, queue_empty, timer_active) {
                 return Err(MotionScaleMapperInstallError);
             }
 

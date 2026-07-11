@@ -907,7 +907,8 @@ mod app {
     ///
     /// Matches Klipper's repeat guard shape: process bursts in one IRQ, but
     /// avoid monopolizing P3 if a pathological stream stays immediately due.
-    const TIM5_SCHEDULER_REPEAT_TICKS: u32 = CLOCK_FREQ / 10_000;
+    const TIM5_SCHEDULER_REPEAT_TICKS: u32 =
+        crate::state::stepper::PROVISIONAL_DISPATCH_REPEAT_TICKS;
     /// Short defer after a saturated TIM5 dispatch burst.
     ///
     /// Klipper C uses a 5 us defer when timer dispatch keeps main tasks busy.
@@ -1003,7 +1004,7 @@ mod app {
             spin_tim5_ticks(setup_start, crate::state::stepper::STEP_DIR_SETUP_TICKS);
         }
 
-        debug_assert!(event.physical_pulses <= 2);
+        crate::state::stepper::assert_physical_pulse_budget(event.physical_pulses);
         for _ in 0..event.physical_pulses {
             gpio_b.bsrr().write(|w| w.set_bs(11, true));
             let high_start = read_tim5();

@@ -9,9 +9,9 @@ does not provide Rust's `libtest`. Run the board-pure contracts explicitly on
 the development host:
 
 ```sh
-HOST_TARGET=$(rustc -vV | sed -n 's/^host: //p')
-cargo test --manifest-path host-tests/Cargo.toml --target "$HOST_TARGET"
+cargo test -p openffboard-host-tests
 ```
 
-The manifest patches transitive git dependencies to the same local component
-checkouts used by the aggregate FOCI workspace.
+Run that command from the aggregate FOCI checkout. The host-test manifest uses
+the same git dependency URLs as the board manifest, while the aggregate
+workspace supplies local `[patch]` overrides during development.
