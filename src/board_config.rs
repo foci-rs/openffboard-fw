@@ -54,8 +54,8 @@ pub(crate) fn enable_pin_channel(pin: u32) -> Option<u8> {
 /// The 1024-count commissioning excitation is kept unchanged for this diagnostic test
 /// while staying within the ADC setup phase's conservative voltage clamp.
 ///
-/// Current-loop P uses a physical-bandwidth formula. Use the 1600 Hz OpenFFBoard
-/// baseline selected from the 400-2000 Hz validation ladder.
+/// Current-loop P uses a physical-bandwidth formula. Use the empirically supported interim
+/// 700 Hz OpenFFBoard operating point; a follow-up owns the final 600-800 Hz/I-policy matrix.
 const OPENFFBOARD_V13_PWM_MAXCNT: u16 = 3999;
 const OPENFFBOARD_V13_DSADC_MDEC: u16 =
     foci_firmware::config::dsadc_mdec_from_pwm_maxcnt(OPENFFBOARD_V13_PWM_MAXCNT);
@@ -70,7 +70,7 @@ pub(crate) const TMC_CONFIG: foci_firmware::config::TmcConfig = foci_firmware::c
     // OpenFFBoard v1.3 ACS724 routing: UX=I0, WY=I1, V=I2.
     adc_i_select: 0x1800_0100,
     excitation_voltage: 1024,
-    bandwidth_hz: 1600.0,
+    bandwidth_hz: 700.0,
     electrical_model_theta_e_us: 160,
     current_validation_flux_max_encoder_delta_counts: 4,
     current_validation_torque_max_encoder_delta_counts: 16,
