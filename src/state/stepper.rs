@@ -11,6 +11,9 @@ use foci_klipper::stepper::{HardwareStepper, LogicalStepEvent, MotionScaleConfig
 /// OpenFFBoard TIM5 input clock in hertz.
 pub(crate) const STEP_TIMER_HZ: u32 = 84_000_000;
 
+/// OpenFFBoard's software-audited P3 handler ceiling is not a measurement.
+pub(crate) const STEP_TIMING_PROVISIONAL: bool = true;
+
 /// Four TIM5 ticks provide the 40 ns minimum high/low pulse phase.
 pub(crate) const STEP_HALF_PERIOD_TICKS: u32 = 4;
 
@@ -295,6 +298,7 @@ mod tests {
     #[test]
     fn openffboard_timing_uses_provisional_wcet_and_margin() {
         let timing = step_pulse_timing();
+        assert!(STEP_TIMING_PROVISIONAL);
         assert_eq!(timing.half_period_ticks(), 4);
         assert_eq!(timing.dir_setup_ticks(), 8);
         assert_eq!(timing.waveform_worst_case_ticks(), 24);

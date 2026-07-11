@@ -109,9 +109,9 @@ pub(crate) fn record_loaded_segment_timing(
     STEPPER_PERF_COUNTERS.record_stepper_load_lateness(lateness);
 }
 
-/// Record one executed motor step.
-pub(crate) fn record_executed_step(channel: u8, forward: bool, clock: u32) {
-    STEPPER_EXECUTION_STATS.record_executed_step(channel, forward, clock);
+/// Record one executed logical motor step and its emitted physical pulses.
+pub(crate) fn record_executed_step(channel: u8, forward: bool, physical_pulses: u8, clock: u32) {
+    STEPPER_EXECUTION_STATS.record_executed_step(channel, forward, physical_pulses, clock);
 }
 
 /// Record a `queue_step` segment discarded while awaiting reset.
