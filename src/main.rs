@@ -33,6 +33,8 @@ mod usb_trace;
 
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [UART4, UART5, USART3])]
 mod app {
+    use core::sync::atomic::Ordering::Relaxed;
+
     use crate::ankyra::constants::CLOCK_FREQ;
     use embassy_stm32::gpio::{Level, Output, Speed};
     use embassy_stm32::spi::Spi;
@@ -61,8 +63,10 @@ mod app {
     };
     use foci_firmware::diagnostic::StepperEventReason;
     use foci_firmware::state::lifecycle::*;
+    use foci_firmware::state::stepper::{NO_STEPPER_CHANNEL, STEPPER_DEADLINE_MISS_CHANNEL};
     use foci_firmware::state::tmc::{TMC_DISABLE_SIGNAL, TMC_QUEUE_FLUSH};
     use foci_firmware::state::trsync::*;
+    use foci_firmware::stepper_runtime::StepDeadlineStatus;
 
     bind_interrupts!(struct Irqs {
         DMA2_STREAM2 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH2>;
@@ -135,12 +139,6 @@ mod app {
         crate::usb_trace::note_trace_boot();
         crate::board_init::init_stepdir_gpio();
         defmt::info!("TIM5 enabled for Klipper clock @ 84 MHz, STEP/DIR GPIO configured");
-        defmt::info!(
-            "STEP timing PROVISIONAL: total handler WCET={} ticks margin={} ticks",
-            crate::state::stepper::PROVISIONAL_TOTAL_HANDLER_WCET_TICKS,
-            crate::state::stepper::PROVISIONAL_HANDLER_MARGIN_TICKS,
-        );
-
         // TIM2 clock: 84 MHz (APB1 timer clock, same bus as TIM5). At the
         // 1 MHz target monotonic rate, the prescaler is 84 (integer divisor).
         // rtic-monotonics enables and configures TIM2 internally; no PAC
@@ -644,8 +642,15 @@ mod app {
             // STATUS interrupt or enter_shutdown. Disables motor and reports
             // the fault to Klipper so the host knows the MCU is down.
             if TMC_DISABLE_SIGNAL.try_take().is_some() {
+                let deadline_channel =
+                    STEPPER_DEADLINE_MISS_CHANNEL.swap(NO_STEPPER_CHANNEL, Relaxed);
                 // Stop hardware stepper immediately
-                stepper_stop_from_p1(0);
+                let stop_channel = if deadline_channel == NO_STEPPER_CHANNEL {
+                    0
+                } else {
+                    deadline_channel
+                };
+                stepper_stop_from_p1(stop_channel);
                 FAULT_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
 
                 {
@@ -654,6 +659,19 @@ mod app {
                     *s.calibrated = false;
                 }
                 enable_pin.set_low();
+                if deadline_channel != NO_STEPPER_CHANNEL {
+                    let clock = read_tim5();
+                    ctx.shared.app_state.lock(|state| {
+                        if crate::firmware_ctx::enter_shutdown(state) {
+                            foci_firmware::dispatch_shutdown!(
+                                foci_firmware::shutdown::ShutdownReason::StepperTooFarInPast,
+                                clock,
+                                &mut crate::_ankyra_config::Sender
+                            );
+                        }
+                    });
+                    continue;
+                }
                 // Read STATUS_FLAGS to identify the fault cause.
                 let flags = tmc
                     .read_register(foci_tmc4671::registers::STATUS_FLAGS)
@@ -907,8 +925,7 @@ mod app {
     ///
     /// Matches Klipper's repeat guard shape: process bursts in one IRQ, but
     /// avoid monopolizing P3 if a pathological stream stays immediately due.
-    const TIM5_SCHEDULER_REPEAT_TICKS: u32 =
-        crate::state::stepper::PROVISIONAL_DISPATCH_REPEAT_TICKS;
+    const TIM5_SCHEDULER_REPEAT_TICKS: u32 = CLOCK_FREQ / 10_000;
     /// Short defer after a saturated TIM5 dispatch burst.
     ///
     /// Klipper C uses a 5 us defer when timer dispatch keeps main tasks busy.
@@ -1147,6 +1164,7 @@ mod app {
                             now,
                         );
                         td.set_timer_active(0, false);
+                        STEPPER_DEADLINE_MISS_CHANNEL.store(0, Relaxed);
                         TMC_DISABLE_SIGNAL.signal(());
                         return;
                     }
@@ -1342,6 +1360,29 @@ mod app {
                     crate::state::stepper_diag::record_scheduler_pop_lateness(lateness as u32);
                 }
                 processed_events += 1;
+                if let Some((channel, StepDeadlineStatus::Fatal { .. })) =
+                    crate::state::stepper::scheduler_step_deadline_status(
+                        event.kind,
+                        event.wake_clock,
+                        now,
+                    )
+                {
+                    let channel = channel as u8;
+                    crate::state::stepper_diag::record_missed_deadline(channel);
+                    record_stepper_event(
+                        StepperEventReason::MissedDeadlineStep,
+                        channel,
+                        now,
+                        UNKNOWN_QUEUE_LEN,
+                        event.wake_clock,
+                        now,
+                    );
+                    STEPPER_DEADLINE_MISS_CHANNEL.store(channel, Relaxed);
+                    td.disarm_timer();
+                    td.set_timer_active(channel as usize, false);
+                    TMC_DISABLE_SIGNAL.signal(());
+                    return processed_events;
+                }
                 process_trigger_timer(
                     td,
                     event.kind,
