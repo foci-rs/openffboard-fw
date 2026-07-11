@@ -525,18 +525,43 @@ impl<'a> TmcHost for FirmwareCtx<'a> {
         tmc_context::enqueue_tmc_request(&OpenFfboardTmcQueue, req)
     }
 
-    fn motion_scale_idle(&self, channel: u8) -> bool {
-        if channel != 0
-            || tmc_state()
-                .motor_armed
-                .load(core::sync::atomic::Ordering::Relaxed)
-            || foci_firmware::state::stepper::stepper_channel0()
-                .timer_active_mirror
-                .load(core::sync::atomic::Ordering::Relaxed)
+    fn motion_scale_idle(
+        &self,
+        channel: u8,
+    ) -> Result<(), foci_firmware::motion_scale::MotionScaleRejection> {
+        if channel != 0 {
+            return Err(foci_firmware::motion_scale::MotionScaleRejection::InvalidChannel);
+        }
+        if tmc_state()
+            .motor_armed
+            .load(core::sync::atomic::Ordering::Relaxed)
         {
-            return false;
+            return Err(foci_firmware::motion_scale::MotionScaleRejection::MotorArmed);
         }
         // SAFETY: P2 is the sole producer and only observes queue emptiness.
-        unsafe { step_queue(channel).is_some_and(|queue| queue.is_empty()) }
+        if !unsafe { step_queue(channel).is_some_and(|queue| queue.is_empty()) } {
+            return Err(foci_firmware::motion_scale::MotionScaleRejection::QueueNotEmpty);
+        }
+        if foci_firmware::state::stepper::stepper_channel0()
+            .timer_active_mirror
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(foci_firmware::motion_scale::MotionScaleRejection::TimerActive);
+        }
+        Ok(())
+    }
+
+    fn report_motion_scale_rejection(
+        &mut self,
+        oid: u8,
+        rejection: foci_firmware::motion_scale::MotionScaleRejection,
+    ) {
+        ::ankyra::klipper_reply_from!(
+            &mut crate::_ankyra_config::Sender,
+            foci_firmware::ankyra::replies::FociMotionScaleRejected,
+            oid: u8 = oid,
+            stage: u8 = foci_firmware::motion_scale::MOTION_SCALE_REJECTION_STAGE_P2,
+            reason: u8 = rejection.code(),
+        );
     }
 }

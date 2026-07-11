@@ -111,6 +111,20 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
         })
     }
 
+    fn report_motion_scale_rejection(
+        &mut self,
+        oid: u8,
+        rejection: foci_firmware::motion_scale::MotionScaleRejection,
+    ) {
+        ::ankyra::klipper_reply_from!(
+            &mut crate::_ankyra_config::Sender,
+            foci_firmware::ankyra::replies::FociMotionScaleRejected,
+            oid: u8 = oid,
+            stage: u8 = foci_firmware::motion_scale::MOTION_SCALE_REJECTION_STAGE_P1,
+            reason: u8 = rejection.code(),
+        );
+    }
+
     fn emit_reply(&mut self, payload: ReplyPayload) {
         crate::ankyra::replies::emit_terminal_reply(payload);
     }
