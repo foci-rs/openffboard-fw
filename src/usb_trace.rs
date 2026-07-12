@@ -698,6 +698,10 @@ pub(crate) async fn sample_tick<B>(
 
     let position_actual =
         read_register_trace(tmc, PID_POSITION_ACTUAL, &mut sample_flags).await as i32;
+    let pid_velocity_actual =
+        read_register_trace(tmc, PID_VELOCITY_ACTUAL, &mut sample_flags).await as i32;
+    let velocity_error =
+        read_sub_register_trace(tmc, PID_ERROR_PID_VELOCITY_ERROR, &mut sample_flags).await as i32;
     let interim_pid_torque_target_actual = read_sub_register_trace(
         tmc,
         INTERIM_PID_TORQUE_TARGET_TORQUE_ACTUAL,
@@ -714,9 +718,9 @@ pub(crate) async fn sample_tick<B>(
         tmc_position_actual: position_actual,
         position_error: step_position.wrapping_sub(position_actual),
         target_velocity: inputs.command_velocity_reference,
-        pid_velocity_actual: 0,
+        pid_velocity_actual,
         cached_pid_velocity_offset: inputs.cached_velocity_offset,
-        velocity_error: 0,
+        velocity_error,
         enable_and_direction: (if context.motor_enabled { 0x80 } else { 0 })
             | (u8::from(stepper.direction.load(Relaxed)) & 0x01),
         sample_flags,
@@ -800,8 +804,16 @@ pub(crate) async fn sample_tick<B>(
             )
             .await,
             interim_pidout_target_flux: 0,
-            interim_pidin_target_velocity: 0,
-            interim_pidout_target_velocity: 0,
+            interim_pidin_target_velocity: read_sub_register_counting_errors(
+                tmc,
+                INTERIM_PIDIN_TARGET_VELOCITY,
+            )
+            .await,
+            interim_pidout_target_velocity: read_sub_register_counting_errors(
+                tmc,
+                INTERIM_PIDOUT_TARGET_VELOCITY,
+            )
+            .await,
             pidout_uq_ud_limits: state.voltage_limit_cfg.load(Relaxed),
             pid_torque_flux_limits: state.current_limit_reg.load(Relaxed),
             pid_velocity_limit: state.velocity_limit_cfg.load(Relaxed),
