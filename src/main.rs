@@ -43,7 +43,7 @@ mod app {
     use embedded_hal_bus::spi::ExclusiveDevice;
     use foci_klipper::state::State;
     use foci_tmc4671::spi::Tmc4671Spi;
-    use rtic_monotonics::fugit::ExtU64;
+    use rtic_monotonics::fugit::{self, ExtU64};
     use rtic_monotonics::stm32::prelude::*;
     use rtic_sync::channel::Receiver;
 
@@ -428,6 +428,9 @@ mod app {
         );
 
         let mut next_control_tick = Mono::now() + 1.millis();
+        let mut commission_poll_driver = foci_firmware::tmc_control::CommissionPollDriver::new();
+        let mut commission_tick_max_cycles = 0u32;
+        let mut commission_measurement_active = false;
         // Commission trace sequence counter. Incremented each time a new engine
         // is installed so trace frames can be correlated per commissioning run.
         let mut commission_trace_engine_seq: u32 = 0;
@@ -445,13 +448,14 @@ mod app {
         // On message: handle request. On timeout: write position target.
         // Position is read from stepper_state().position_target atomic (updated
         // by usb_receive at P2) — no shared resource lock needed.
-        loop {
+        'tmc_loop: loop {
             use embassy_futures::select::{Either, select};
 
             // On shutdown, perform one-shot motor safe-state then idle until
             // shutdown clears. This catches USB disconnect / host crash where
             // no further commands arrive but the TMC4671 remains energized.
             if SHUTDOWN_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+                commission_measurement_active = false;
                 if !shutdown_safe_state_applied {
                     #[cfg(feature = "trace")]
                     {
@@ -480,6 +484,7 @@ mod app {
 
             // Drain stale requests after config_reset
             if TMC_QUEUE_FLUSH.load(core::sync::atomic::Ordering::Relaxed) {
+                commission_measurement_active = false;
                 while rx.try_recv().is_ok() {}
                 let commission_was_active = runtime.is_commission_active();
                 crate::tmc_control::effects::apply_actions(
@@ -511,63 +516,158 @@ mod app {
                 defmt::info!("TMC request queue flushed after config_reset");
             }
 
-            // Tick the commissioning engine if one is active.
-            // Each tick_commissioning() call does at most 1ms of work, then returns.
+            // Process emergency-disable signals before commissioning can poll
+            // again. Absolute commissioning waits return here after lowering
+            // GPIO, so no engine or SPI work precedes fault containment.
+            if TMC_DISABLE_SIGNAL.try_take().is_some()
+                || FAULT_ACTIVE.load(core::sync::atomic::Ordering::Relaxed)
+            {
+                commission_measurement_active = false;
+                let deadline_channel =
+                    STEPPER_DEADLINE_MISS_CHANNEL.swap(NO_STEPPER_CHANNEL, Relaxed);
+                let stop_channel = if deadline_channel == NO_STEPPER_CHANNEL {
+                    0
+                } else {
+                    deadline_channel
+                };
+                stepper_stop_from_p1(stop_channel);
+                FAULT_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
+
+                {
+                    let s = runtime.dispatch_state(tmc_state(), stepper_state());
+                    *s.motor_enabled = false;
+                    *s.calibrated = false;
+                }
+                enable_pin.set_low();
+                if deadline_channel != NO_STEPPER_CHANNEL {
+                    let clock = read_tim5();
+                    ctx.shared.app_state.lock(|state| {
+                        if crate::firmware_ctx::enter_shutdown(state) {
+                            foci_firmware::dispatch_shutdown!(
+                                foci_firmware::shutdown::ShutdownReason::StepperTooFarInPast,
+                                clock,
+                                &mut crate::_ankyra_config::Sender
+                            );
+                        }
+                    });
+                    continue;
+                }
+                let flags = tmc
+                    .read_register(foci_tmc4671::registers::STATUS_FLAGS)
+                    .await
+                    .unwrap_or(0);
+                record_stepper_event(
+                    StepperEventReason::TmcDisableSignal,
+                    0,
+                    read_tim5(),
+                    UNKNOWN_QUEUE_LEN,
+                    flags,
+                    0,
+                );
+                #[cfg(feature = "trace")]
+                crate::usb_trace::request_event(
+                    foci_firmware::trace::events::EVENT_LEVEL_ERROR,
+                    foci_firmware::trace::events::SUBSYSTEM_SAFETY_SHUTDOWN,
+                    crate::usb_trace::EVENT_STATUS_INTERRUPT,
+                    [flags as i32, 0, 0, 0],
+                    1,
+                );
+                defmt::error!("TMC4671 emergency disable: STATUS={:#010x}", flags);
+                const ADC_I_CLIPPED: u32 = 1 << 26;
+                ctx.shared.app_state.lock(|state| {
+                    if flags & ADC_I_CLIPPED != 0 {
+                        if crate::firmware_ctx::enter_shutdown(state) {
+                            ::ankyra::klipper_shutdown_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                "TMC4671: ADC current clipped (overcurrent)",
+                                read_tim5(),
+                            );
+                        }
+                    } else if crate::firmware_ctx::enter_shutdown(state) {
+                        ::ankyra::klipper_shutdown_from!(
+                            &mut crate::_ankyra_config::Sender,
+                            "TMC4671 fault",
+                            read_tim5(),
+                        );
+                    }
+                });
+                continue;
+            }
+
+            // Tick the commissioning engine through the shared absolute scheduler.
             if runtime.is_commission_active() {
+                if !commission_measurement_active {
+                    commission_poll_driver =
+                        foci_firmware::tmc_control::CommissionPollDriver::new();
+                    commission_tick_max_cycles = 0;
+                    commission_measurement_active = true;
+                }
                 // Capture deadline before the tick so SPI time consumed by the
                 // engine reduces the remaining trace budget.
                 #[cfg(feature = "trace")]
                 let engine_tick_deadline =
                     Mono::now() + fugit::Duration::<u64, 1, 1_000_000>::millis(1);
 
+                let engine_kind = runtime
+                    .pending_commission_kind()
+                    .expect("active commissioning engine has a kind");
+                let tick_start = cortex_m::peripheral::DWT::cycle_count();
+                let mut poll = {
+                    let mut backend = openffboard_backend(tmc, enable_pin);
+                    runtime
+                        .step_commissioning_scheduled(&mut backend)
+                        .await
+                        .expect("active commissioning engine produces a poll")
+                };
+                let now_us = Mono::now().duration_since_epoch().to_micros();
+                let driver_action = match commission_poll_driver.classify(&poll, now_us) {
+                    Ok(action) => action,
+                    Err(error) => {
+                        poll = foci_firmware::commissioning::schedule::CommissionPoll::Terminal {
+                            result: if matches!(
+                                engine_kind,
+                                foci_firmware::commissioning::types::EngineKind::OuterTune
+                            ) {
+                                foci_firmware::commissioning::schedule::CommissionTerminal::OuterFailed(
+                                    error,
+                                )
+                            } else {
+                                foci_firmware::commissioning::schedule::CommissionTerminal::InnerFailed(
+                                    error,
+                                )
+                            },
+                        };
+                        foci_firmware::tmc_control::PollDriverAction::Terminal
+                    }
+                };
                 let action = {
                     let mut backend = openffboard_backend(tmc, enable_pin);
                     runtime
-                        .tick_commissioning(
+                        .drive_commissioning_poll(
+                            poll,
                             &mut backend,
                             tmc_state(),
                             stepper_state(),
                             &tmc_control_config,
                         )
                         .await
+                        .expect("active commissioning poll produces an action")
                 };
+                let tick_cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(tick_start);
+                commission_tick_max_cycles = commission_tick_max_cycles.max(tick_cycles);
                 #[cfg(feature = "trace")]
                 crate::usb_trace::drain_pending_events();
 
-                if let Some(action) = action {
-                    use foci_firmware::tmc_control::CommissionTickAction;
-                    match action {
-                        CommissionTickAction::Continue => {
-                            #[cfg(feature = "trace")]
-                            if commission_trace_phase
-                                == Some((
-                                    foci_firmware::commissioning::types::EngineKind::Commission,
-                                    foci_firmware::autotune::PhaseId::ClosedLoopEntry,
-                                ))
-                            {
-                                let trace_tick = runtime.advance_trace_sample_tick();
-                                crate::usb_trace::sample_commission_closed_loop_entry(
-                                    tmc,
-                                    runtime.is_motor_enabled(),
-                                    trace_tick,
-                                    || {
-                                        engine_tick_deadline
-                                            .checked_duration_since(Mono::now())
-                                            .map(|d| d.to_micros())
-                                            .unwrap_or(0)
-                                    },
-                                    || Mono::now() > engine_tick_deadline,
-                                )
-                                .await;
-                            }
-                            Mono::delay(1.millis()).await;
-                            continue;
-                        }
-                        CommissionTickAction::PhaseChanged {
-                            oid,
-                            phase_id,
-                            engine_kind,
-                        } => {
+                use foci_firmware::tmc_control::ScheduledCommissionTickAction;
+                match action {
+                    ScheduledCommissionTickAction::ReadyNow { event }
+                    | ScheduledCommissionTickAction::At { event, .. } => {
+                        if let Some(event) = event {
+                            let foci_firmware::commissioning::schedule::CommissionEvent::PhaseChanged {
+                                oid,
+                                phase_id,
+                                engine_kind,
+                            } = event;
                             #[cfg(not(feature = "trace"))]
                             let _ = engine_kind;
                             #[cfg(feature = "trace")]
@@ -575,24 +675,157 @@ mod app {
                                 commission_trace_phase = Some((engine_kind, phase_id));
                             }
                             emit_phase_reply(oid, phase_id);
-                            Mono::delay(1.millis()).await;
-                            continue;
                         }
-                        CommissionTickAction::Terminal { reply, actions } => {
-                            #[cfg(feature = "trace")]
-                            {
-                                commission_trace_phase = None;
+                        #[cfg(feature = "trace")]
+                        if commission_trace_phase
+                            == Some((
+                                foci_firmware::commissioning::types::EngineKind::Commission,
+                                foci_firmware::autotune::PhaseId::ClosedLoopEntry,
+                            ))
+                        {
+                            let trace_tick = runtime.advance_trace_sample_tick();
+                            crate::usb_trace::sample_commission_closed_loop_entry(
+                                tmc,
+                                runtime.is_motor_enabled(),
+                                trace_tick,
+                                || {
+                                    engine_tick_deadline
+                                        .checked_duration_since(Mono::now())
+                                        .map(|d| d.to_micros())
+                                        .unwrap_or(0)
+                                },
+                                || Mono::now() > engine_tick_deadline,
+                            )
+                            .await;
+                        }
+
+                        match driver_action {
+                            foci_firmware::tmc_control::PollDriverAction::PollNow => {
+                                continue 'tmc_loop;
                             }
-                            {
-                                let mut state =
-                                    runtime.dispatch_state(tmc_state(), stepper_state());
-                                apply_stepper_post_action(actions.stepper, &mut state);
+                            foci_firmware::tmc_control::PollDriverAction::WaitUntil(
+                                deadline_us,
+                            ) => {
+                                loop {
+                                    let exit =
+                                        crate::tmc_control::effects::classify_commission_wait_exit(
+                                            SHUTDOWN_ACTIVE
+                                                .load(core::sync::atomic::Ordering::Relaxed),
+                                            TMC_QUEUE_FLUSH
+                                                .load(core::sync::atomic::Ordering::Relaxed),
+                                            TMC_DISABLE_SIGNAL.signaled(),
+                                            FAULT_ACTIVE
+                                                .load(core::sync::atomic::Ordering::Relaxed),
+                                        );
+                                    if let Some(exit) = exit {
+                                        if matches!(
+                                            exit,
+                                            crate::tmc_control::effects::CommissionWaitExit::EmergencyDisable
+                                        ) {
+                                            enable_pin.set_low();
+                                        }
+                                        continue 'tmc_loop;
+                                    }
+
+                                    if let Ok(req) = rx.try_recv() {
+                                        use foci_firmware::tmc_control::CommissionWaitRequestDisposition;
+                                        match crate::tmc_control::effects::commission_wait_request_disposition(&req) {
+                                            CommissionWaitRequestDisposition::Cancel => {
+                                                enable_pin.set_low();
+                                                runtime.take_commission_engine();
+                                                tmc_state().commission_in_flight.store(
+                                                    false,
+                                                    core::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                let outcome = handle_tmc_control_request(
+                                                    req,
+                                                    tmc,
+                                                    enable_pin,
+                                                    &mut runtime,
+                                                    &mut commission_trace_engine_seq,
+                                                )
+                                                .await;
+                                                if let Some(reason) = outcome.shutdown {
+                                                    ctx.shared.app_state.lock(|state| {
+                                                        if crate::firmware_ctx::enter_shutdown(state) {
+                                                            crate::tmc_control::effects::emit_shutdown(reason);
+                                                        }
+                                                    });
+                                                }
+                                                if outcome.should_refresh_velocity_scale {
+                                                    refresh_velocity_scale(&mut runtime);
+                                                }
+                                                commission_measurement_active = false;
+                                                continue 'tmc_loop;
+                                            }
+                                            CommissionWaitRequestDisposition::RejectBusy => {
+                                                let outcome = handle_tmc_control_request(
+                                                    req,
+                                                    tmc,
+                                                    enable_pin,
+                                                    &mut runtime,
+                                                    &mut commission_trace_engine_seq,
+                                                )
+                                                .await;
+                                                if let Some(reason) = outcome.shutdown {
+                                                    ctx.shared.app_state.lock(|state| {
+                                                        if crate::firmware_ctx::enter_shutdown(state) {
+                                                            crate::tmc_control::effects::emit_shutdown(reason);
+                                                        }
+                                                    });
+                                                }
+                                                if outcome.should_refresh_velocity_scale {
+                                                    refresh_velocity_scale(&mut runtime);
+                                                }
+                                            }
+                                            CommissionWaitRequestDisposition::DropBusy => {}
+                                        }
+                                    }
+
+                                    let now_us = Mono::now().duration_since_epoch().to_micros();
+                                    if now_us >= deadline_us {
+                                        break;
+                                    }
+                                    let wake_us = match foci_firmware::tmc_control::next_wait_slice(
+                                        now_us,
+                                        deadline_us,
+                                    ) {
+                                        Ok(wake_us) => wake_us,
+                                        Err(_) => {
+                                            enable_pin.set_low();
+                                            TMC_DISABLE_SIGNAL.signal(());
+                                            continue 'tmc_loop;
+                                        }
+                                    };
+                                    let wake =
+                                        fugit::Instant::<u64, 1, 1_000_000>::from_ticks(wake_us);
+                                    Mono::delay_until(wake).await;
+                                }
+                                continue 'tmc_loop;
                             }
-                            emit_terminal_reply(reply);
+                            foci_firmware::tmc_control::PollDriverAction::Terminal => {
+                                unreachable!("nonterminal poll classified as terminal")
+                            }
                         }
                     }
+                    ScheduledCommissionTickAction::Terminal { reply, actions } => {
+                        #[cfg(feature = "trace")]
+                        {
+                            commission_trace_phase = None;
+                        }
+                        {
+                            let mut state = runtime.dispatch_state(tmc_state(), stepper_state());
+                            apply_stepper_post_action(actions.stepper, &mut state);
+                        }
+                        emit_terminal_reply(reply);
+                        defmt::info!(
+                            "commissioning terminal max tick cycles: {}",
+                            commission_tick_max_cycles,
+                        );
+                        commission_measurement_active = false;
+                    }
                 }
-                // For Terminal cases, fall through to normal channel-receive processing.
+                // Terminal cases fall through to normal channel processing.
             }
 
             let control_period_us = runtime.control_period_us(
@@ -637,83 +870,6 @@ mod app {
             }
             next_control_tick = Mono::now() + u64::from(control_period_us).micros();
             let slow_control_tick = runtime.update_slow_control(control_period_us);
-
-            // Check emergency disable (non-blocking). Triggered by EXTI STATUS,
-            // enter_shutdown, or fatal step-deadline signaling. Disables motor
-            // and reports the fault to Klipper so the host knows the MCU is down.
-            if TMC_DISABLE_SIGNAL.try_take().is_some() {
-                let deadline_channel =
-                    STEPPER_DEADLINE_MISS_CHANNEL.swap(NO_STEPPER_CHANNEL, Relaxed);
-                // Stop hardware stepper immediately
-                let stop_channel = if deadline_channel == NO_STEPPER_CHANNEL {
-                    0
-                } else {
-                    deadline_channel
-                };
-                stepper_stop_from_p1(stop_channel);
-                FAULT_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
-
-                {
-                    let s = runtime.dispatch_state(tmc_state(), stepper_state());
-                    *s.motor_enabled = false;
-                    *s.calibrated = false;
-                }
-                enable_pin.set_low();
-                if deadline_channel != NO_STEPPER_CHANNEL {
-                    let clock = read_tim5();
-                    ctx.shared.app_state.lock(|state| {
-                        if crate::firmware_ctx::enter_shutdown(state) {
-                            foci_firmware::dispatch_shutdown!(
-                                foci_firmware::shutdown::ShutdownReason::StepperTooFarInPast,
-                                clock,
-                                &mut crate::_ankyra_config::Sender
-                            );
-                        }
-                    });
-                    continue;
-                }
-                // Read STATUS_FLAGS to identify the fault cause.
-                let flags = tmc
-                    .read_register(foci_tmc4671::registers::STATUS_FLAGS)
-                    .await
-                    .unwrap_or(0);
-                record_stepper_event(
-                    StepperEventReason::TmcDisableSignal,
-                    0,
-                    read_tim5(),
-                    UNKNOWN_QUEUE_LEN,
-                    flags,
-                    0,
-                );
-                #[cfg(feature = "trace")]
-                crate::usb_trace::request_event(
-                    foci_firmware::trace::events::EVENT_LEVEL_ERROR,
-                    foci_firmware::trace::events::SUBSYSTEM_SAFETY_SHUTDOWN,
-                    crate::usb_trace::EVENT_STATUS_INTERRUPT,
-                    [flags as i32, 0, 0, 0],
-                    1,
-                );
-                defmt::error!("TMC4671 emergency disable: STATUS={:#010x}", flags);
-                // Report shutdown to Klipper with a specific reason.
-                const ADC_I_CLIPPED: u32 = 1 << 26;
-                ctx.shared.app_state.lock(|state| {
-                    if flags & ADC_I_CLIPPED != 0 {
-                        if crate::firmware_ctx::enter_shutdown(state) {
-                            ::ankyra::klipper_shutdown_from!(
-                                &mut crate::_ankyra_config::Sender,
-                                "TMC4671: ADC current clipped (overcurrent)",
-                                read_tim5(),
-                            );
-                        }
-                    } else if crate::firmware_ctx::enter_shutdown(state) {
-                        ::ankyra::klipper_shutdown_from!(
-                            &mut crate::_ankyra_config::Sender,
-                            "TMC4671 fault",
-                            read_tim5(),
-                        );
-                    }
-                });
-            }
 
             // Hardware step/dir: position target is driven by TIM5 CC1 ISR
             // toggling STEP GPIO → TMC4671 hardware step counter. No SPI

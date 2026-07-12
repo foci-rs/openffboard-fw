@@ -67,8 +67,8 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
         stepper_state()
     }
 
-    fn commissioning_blocked(&self, _runtime: &TmcControlRuntime) -> bool {
-        false
+    fn commissioning_blocked(&self, runtime: &TmcControlRuntime) -> bool {
+        runtime.is_commission_active()
     }
 
     fn next_commission_trace_seq(&mut self) -> u32 {

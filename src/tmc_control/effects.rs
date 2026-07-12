@@ -1,9 +1,48 @@
 //! OpenFFBoard effects for shared TMC control runtime actions.
 
 use foci_firmware::tmc_control::{BoardAction, BoardActions, ShutdownReason, StepperAction};
+use foci_firmware::tmc_control::{CommissionWaitRequestDisposition, classify_wait_request};
+
+use foci_firmware::tmc::TmcRequest;
 
 use crate::helpers::lifecycle::read_tim5;
 use crate::helpers::stepper::stepper_stop_from_p1;
+
+/// Board signal that interrupts an absolute commissioning wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommissionWaitExit {
+    /// Enter the existing shutdown safe-state path.
+    Shutdown,
+    /// Return to the queue-flush path.
+    QueueFlush,
+    /// Enter GPIO-first emergency-disable handling.
+    EmergencyDisable,
+}
+
+/// Classify board-owned signals checked between commissioning wait slices.
+pub(crate) const fn classify_commission_wait_exit(
+    shutdown: bool,
+    queue_flush: bool,
+    emergency_disable: bool,
+    fault_active: bool,
+) -> Option<CommissionWaitExit> {
+    if emergency_disable || fault_active {
+        Some(CommissionWaitExit::EmergencyDisable)
+    } else if shutdown {
+        Some(CommissionWaitExit::Shutdown)
+    } else if queue_flush {
+        Some(CommissionWaitExit::QueueFlush)
+    } else {
+        None
+    }
+}
+
+/// Delegate queued commissioning request policy to the shared classifier.
+pub(crate) fn commission_wait_request_disposition(
+    request: &TmcRequest,
+) -> CommissionWaitRequestDisposition {
+    classify_wait_request(&request.kind)
+}
 
 /// Apply all actions emitted by one runtime call immediately.
 pub(crate) fn apply_actions<F>(actions: BoardActions, mut enter_shutdown: F)
@@ -86,4 +125,43 @@ pub(crate) fn emit_shutdown(reason: ShutdownReason) {
 
 fn emit_reply(reply: foci_firmware::commission_dispatch::ReplyPayload) {
     crate::ankyra::replies::emit_terminal_reply(reply);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use foci_firmware::tmc::{TmcRequest, TmcRequestKind};
+    use foci_firmware::tmc_control::CommissionWaitRequestDisposition;
+
+    #[test]
+    fn critical_status_and_disable_exit_commission_wait() {
+        assert_eq!(
+            classify_commission_wait_exit(false, false, false, true),
+            Some(CommissionWaitExit::EmergencyDisable)
+        );
+        assert_eq!(
+            classify_commission_wait_exit(false, false, true, false),
+            Some(CommissionWaitExit::EmergencyDisable)
+        );
+    }
+
+    #[test]
+    fn commission_wait_requests_use_shared_disposition() {
+        let cancel = TmcRequest::new(0, TmcRequestKind::SetEnable(false));
+        let reject = TmcRequest::new(0, TmcRequestKind::Commission { oid: 2, profile: 1 });
+        let drop = TmcRequest::new(0, TmcRequestKind::SetCurrent { run_ma: 800 });
+
+        assert_eq!(
+            commission_wait_request_disposition(&cancel),
+            CommissionWaitRequestDisposition::Cancel
+        );
+        assert_eq!(
+            commission_wait_request_disposition(&reject),
+            CommissionWaitRequestDisposition::RejectBusy
+        );
+        assert_eq!(
+            commission_wait_request_disposition(&drop),
+            CommissionWaitRequestDisposition::DropBusy
+        );
+    }
 }
