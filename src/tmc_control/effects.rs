@@ -164,4 +164,22 @@ mod tests {
             CommissionWaitRequestDisposition::DropBusy
         );
     }
+
+    #[test]
+    fn forced_ready_yield_survives_processing_past_classification_time() {
+        use foci_firmware::tmc_control::{CommissionPollDriver, PollDriverAction};
+
+        let mut driver = CommissionPollDriver::new();
+        for _ in 0..8 {
+            assert_eq!(
+                driver.classify_ready(10_000).unwrap(),
+                PollDriverAction::PollNow
+            );
+        }
+        let action = driver.classify_ready(10_000).unwrap();
+        let processing_finished_us = 20_000;
+
+        assert!(processing_finished_us > 10_001);
+        assert_eq!(action, PollDriverAction::YieldNow);
+    }
 }

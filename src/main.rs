@@ -91,7 +91,7 @@ mod app {
     use crate::tmc_control::board::{
         openffboard_backend, refresh_velocity_scale, stepper_state, tmc_state,
     };
-    use crate::tmc_control::request::handle_tmc_control_request;
+    use crate::tmc_control::request::{handle_commission_wait_reject, handle_tmc_control_request};
     use foci_firmware::tmc_control::TmcControlRequestTail;
 
     // TriggerDomain, PHYSICAL_STEPPER_INDICES, TRIGGER_TIMER_MIN_LEAD_TICKS,
@@ -640,6 +640,12 @@ mod app {
                         foci_firmware::tmc_control::PollDriverAction::Terminal
                     }
                 };
+                if matches!(
+                    driver_action,
+                    foci_firmware::tmc_control::PollDriverAction::YieldNow
+                ) {
+                    Mono::delay(foci_firmware::tmc_control::FORCED_READY_YIELD_US.micros()).await;
+                }
                 let action = {
                     let mut backend = openffboard_backend(tmc, enable_pin);
                     runtime
@@ -703,6 +709,9 @@ mod app {
                             foci_firmware::tmc_control::PollDriverAction::PollNow => {
                                 continue 'tmc_loop;
                             }
+                            foci_firmware::tmc_control::PollDriverAction::YieldNow => {
+                                continue 'tmc_loop;
+                            }
                             foci_firmware::tmc_control::PollDriverAction::WaitUntil(
                                 deadline_us,
                             ) => {
@@ -759,14 +768,7 @@ mod app {
                                                 continue 'tmc_loop;
                                             }
                                             CommissionWaitRequestDisposition::RejectBusy => {
-                                                let outcome = handle_tmc_control_request(
-                                                    req,
-                                                    tmc,
-                                                    enable_pin,
-                                                    &mut runtime,
-                                                    &mut commission_trace_engine_seq,
-                                                )
-                                                .await;
+                                                let outcome = handle_commission_wait_reject(req);
                                                 if let Some(reason) = outcome.shutdown {
                                                     ctx.shared.app_state.lock(|state| {
                                                         if crate::firmware_ctx::enter_shutdown(state) {

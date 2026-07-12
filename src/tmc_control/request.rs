@@ -45,6 +45,22 @@ struct OpenFFBoardRequestBoard<'a> {
     commission_trace_engine_seq: &'a mut u32,
 }
 
+struct OpenFFBoardBusyReplySink;
+
+impl foci_firmware::tmc_control::request::CommissionBusyReplySink for OpenFFBoardBusyReplySink {
+    fn normal_tail(&self) -> TmcControlRequestTail {
+        TmcControlRequestTail::SkipTickTail
+    }
+
+    fn emit_reply(&mut self, payload: ReplyPayload) {
+        crate::ankyra::replies::emit_terminal_reply(payload);
+    }
+
+    fn emit_busy_diagnostic(&mut self, request: TmcRequest) {
+        crate::tmc_diagnostics::emit_commission_busy_diagnostic(request);
+    }
+}
+
 impl<'a> OpenFFBoardRequestBoard<'a> {
     fn new(enable_pin: &'a mut Output<'static>, commission_trace_engine_seq: &'a mut u32) -> Self {
         Self {
@@ -67,8 +83,8 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
         stepper_state()
     }
 
-    fn commissioning_blocked(&self, runtime: &TmcControlRuntime) -> bool {
-        runtime.is_commission_active()
+    fn commissioning_blocked(&self, _runtime: &TmcControlRuntime) -> bool {
+        false
     }
 
     fn next_commission_trace_seq(&mut self) -> u32 {
@@ -245,4 +261,12 @@ pub(crate) async fn handle_tmc_control_request(
         &mut board,
     )
     .await
+}
+
+/// Emit the shared busy-only response without granting hardware capabilities.
+pub(crate) fn handle_commission_wait_reject(req: TmcRequest) -> TmcControlRequestOutcome {
+    foci_firmware::tmc_control::request::handle_commission_wait_reject(
+        req,
+        &mut OpenFFBoardBusyReplySink,
+    )
 }
