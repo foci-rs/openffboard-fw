@@ -182,4 +182,32 @@ mod tests {
         assert!(processing_finished_us > 10_001);
         assert_eq!(action, PollDriverAction::YieldNow);
     }
+
+    #[test]
+    fn signals_arriving_during_yield_exit_before_dispatch_model() {
+        let cases = [
+            (true, false, false, false, false),
+            (false, true, false, false, false),
+            (false, false, true, false, true),
+            (false, false, false, true, true),
+        ];
+
+        for (shutdown, flush, disable, fault, gpio_first) in cases {
+            let exit = classify_commission_wait_exit(shutdown, flush, disable, fault);
+            let dispatch = exit.is_none();
+            let reply = dispatch;
+            let trace = dispatch;
+            let next_engine_poll = dispatch;
+
+            assert!(exit.is_some());
+            assert_eq!(
+                matches!(exit, Some(CommissionWaitExit::EmergencyDisable)),
+                gpio_first
+            );
+            assert!(!dispatch);
+            assert!(!reply);
+            assert!(!trace);
+            assert!(!next_engine_poll);
+        }
+    }
 }

@@ -645,6 +645,21 @@ mod app {
                     foci_firmware::tmc_control::PollDriverAction::YieldNow
                 ) {
                     Mono::delay(foci_firmware::tmc_control::FORCED_READY_YIELD_US.micros()).await;
+                    let exit = crate::tmc_control::effects::classify_commission_wait_exit(
+                        SHUTDOWN_ACTIVE.load(core::sync::atomic::Ordering::Relaxed),
+                        TMC_QUEUE_FLUSH.load(core::sync::atomic::Ordering::Relaxed),
+                        TMC_DISABLE_SIGNAL.signaled(),
+                        FAULT_ACTIVE.load(core::sync::atomic::Ordering::Relaxed),
+                    );
+                    if let Some(exit) = exit {
+                        if matches!(
+                            exit,
+                            crate::tmc_control::effects::CommissionWaitExit::EmergencyDisable
+                        ) {
+                            enable_pin.set_low();
+                        }
+                        continue 'tmc_loop;
+                    }
                 }
                 let action = {
                     let mut backend = openffboard_backend(tmc, enable_pin);
