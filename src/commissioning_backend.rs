@@ -22,13 +22,15 @@ impl CommissionBackendHooks for OpenFFBoardHooks {
     }
 
     fn commission_elapsed_us() -> u64 {
-        crate::commission_deadline_probe::resume();
+        let cycle = cortex_m::peripheral::DWT::cycle_count();
         // Microseconds since Mono start. Returned as u64 so deadline
         // comparisons in commission.rs never wrap across the 51-second
         // TIM5 boundary that previously broke the engine.
         //
         // Source: TIM2 monotonic at 1 MHz (1 us resolution).
-        Mono::now().duration_since_epoch().to_micros()
+        let elapsed_us = Mono::now().duration_since_epoch().to_micros();
+        crate::commission_deadline_probe::observe_elapsed(cycle);
+        elapsed_us
     }
 
     fn commission_is_shutdown_requested() -> bool {
