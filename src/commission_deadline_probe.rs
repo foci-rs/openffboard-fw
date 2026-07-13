@@ -40,7 +40,7 @@ static EVENT_TIMER_LATENESS_US: AtomicU32 = AtomicU32::new(0);
 static EVENT_POLL_ENTRY_CYCLE: AtomicU32 = AtomicU32::new(0);
 static EVENT_LAST_ELAPSED_CYCLE: AtomicU32 = AtomicU32::new(0);
 static EVENT_ENGINE_RETURN_CYCLE: AtomicU32 = AtomicU32::new(0);
-static EVENT_SERVICE_SOURCE_MASK: AtomicU32 = AtomicU32::new(0);
+static EVENT_POST_DEADLINE_SOURCE_MASK: AtomicU32 = AtomicU32::new(0);
 static EVENT_EXPIRED_BEFORE_SLEEP: AtomicBool = AtomicBool::new(false);
 static WORST_ENTRY_LATENESS_CYCLES: AtomicU32 = AtomicU32::new(0);
 static WORST_TIMER_LATENESS_US: AtomicU32 = AtomicU32::new(0);
@@ -49,7 +49,7 @@ static WORST_ENTRY_TO_INNER_RETURN_CYCLES: AtomicU32 = AtomicU32::new(0);
 static WORST_INNER_TO_ENGINE_RETURN_CYCLES: AtomicU32 = AtomicU32::new(0);
 static WORST_ENGINE_RETURN_TO_CLASSIFY_CYCLES: AtomicU32 = AtomicU32::new(0);
 static WORST_REQUESTED_WAIT_US: AtomicU32 = AtomicU32::new(0);
-static WORST_SERVICE_SOURCE_MASK: AtomicU32 = AtomicU32::new(0);
+static WORST_POST_DEADLINE_SOURCE_MASK: AtomicU32 = AtomicU32::new(0);
 static WORST_FLAGS: AtomicU32 = AtomicU32::new(0);
 
 /// Reset retained attribution at the beginning of a commissioning run.
@@ -61,7 +61,7 @@ pub(crate) fn reset() {
     EVENT_POLL_ENTRY_CYCLE.store(0, Ordering::Relaxed);
     EVENT_LAST_ELAPSED_CYCLE.store(0, Ordering::Relaxed);
     EVENT_ENGINE_RETURN_CYCLE.store(0, Ordering::Relaxed);
-    EVENT_SERVICE_SOURCE_MASK.store(0, Ordering::Relaxed);
+    EVENT_POST_DEADLINE_SOURCE_MASK.store(0, Ordering::Relaxed);
     WORST_ENTRY_LATENESS_CYCLES.store(0, Ordering::Relaxed);
     WORST_TIMER_LATENESS_US.store(0, Ordering::Relaxed);
     WORST_RETURN_TO_ENTRY_CYCLES.store(0, Ordering::Relaxed);
@@ -69,7 +69,7 @@ pub(crate) fn reset() {
     WORST_INNER_TO_ENGINE_RETURN_CYCLES.store(0, Ordering::Relaxed);
     WORST_ENGINE_RETURN_TO_CLASSIFY_CYCLES.store(0, Ordering::Relaxed);
     WORST_REQUESTED_WAIT_US.store(0, Ordering::Relaxed);
-    WORST_SERVICE_SOURCE_MASK.store(0, Ordering::Relaxed);
+    WORST_POST_DEADLINE_SOURCE_MASK.store(0, Ordering::Relaxed);
     WORST_FLAGS.store(0, Ordering::Relaxed);
 }
 
@@ -151,8 +151,8 @@ fn close_event(classify_cycle: u32, terminal: bool) {
         EVENT_REQUESTED_WAIT_US.load(Ordering::Relaxed),
         Ordering::Relaxed,
     );
-    WORST_SERVICE_SOURCE_MASK.store(
-        EVENT_SERVICE_SOURCE_MASK.load(Ordering::Relaxed),
+    WORST_POST_DEADLINE_SOURCE_MASK.store(
+        EVENT_POST_DEADLINE_SOURCE_MASK.load(Ordering::Relaxed),
         Ordering::Relaxed,
     );
     WORST_FLAGS.store(flags, Ordering::Relaxed);
@@ -178,7 +178,7 @@ pub(crate) fn arm_short_deadline(deadline_us: u64, now_us: u64, arm_cycle: u32) 
     EVENT_POLL_ENTRY_CYCLE.store(0, Ordering::Relaxed);
     EVENT_LAST_ELAPSED_CYCLE.store(0, Ordering::Relaxed);
     EVENT_ENGINE_RETURN_CYCLE.store(0, Ordering::Relaxed);
-    EVENT_SERVICE_SOURCE_MASK.store(0, Ordering::Relaxed);
+    EVENT_POST_DEADLINE_SOURCE_MASK.store(0, Ordering::Relaxed);
     EVENT_EXPIRED_BEFORE_SLEEP.store(deadline_us <= now_us, Ordering::Relaxed);
 
     if deadline_us > now_us {
@@ -269,12 +269,14 @@ pub(crate) struct DeadlineSourceSpan {
 impl Drop for DeadlineSourceSpan {
     fn drop(&mut self) {
         let exit_cycle = cortex_m::peripheral::DWT::cycle_count();
-        let poll_entry_cycle = EVENT_POLL_ENTRY_CYCLE.load(Ordering::Acquire);
         if EVENT_ACTIVE.load(Ordering::Acquire)
-            && poll_entry_cycle != 0
-            && source_overlap_cycles(poll_entry_cycle, self.entry_cycle, exit_cycle) != 0
+            && source_overlap_cycles(
+                EVENT_DUE_CYCLE.load(Ordering::Relaxed),
+                self.entry_cycle,
+                exit_cycle,
+            ) != 0
         {
-            EVENT_SERVICE_SOURCE_MASK.fetch_or(self.source_mask, Ordering::Relaxed);
+            EVENT_POST_DEADLINE_SOURCE_MASK.fetch_or(self.source_mask, Ordering::Relaxed);
         }
         WAIT_PROBE.record_source_span(self.source_mask, self.entry_cycle, exit_cycle);
         SERVICE_PROBE.record_source_span(self.source_mask, self.entry_cycle, exit_cycle);
@@ -284,10 +286,11 @@ impl Drop for DeadlineSourceSpan {
 /// Encode the worst wait and service windows on the existing generic path.
 ///
 /// Diagnostic 40 contains packed timer-return lateness and return-to-entry time,
-/// packed requested wait and total entry lateness, and the same-event service
-/// source mask plus flags. Diagnostic 41 contains poll-entry-to-inner-return,
-/// inner-return-to-scheduled-engine-return, and engine-return-to-classification
-/// durations. All values describe the same worst entry event.
+/// packed requested wait and total entry lateness, and the same-event
+/// post-deadline source mask plus flags. Diagnostic 41 contains
+/// poll-entry-to-inner-return, inner-return-to-scheduled-engine-return, and
+/// engine-return-to-classification durations. All values describe the same
+/// worst entry event.
 /// Bit 31 marks a terminal event, bit 30 marks a path without a timer wait, and
 /// bit 29 marks a deadline already expired before the wait handoff.
 pub(crate) fn diagnostics() -> Option<[CommissionDiagnostic; 2]> {
@@ -309,7 +312,7 @@ pub(crate) fn diagnostics() -> Option<[CommissionDiagnostic; 2]> {
             status: 2,
             value0: pack_u16(timer_lateness_us, return_to_entry_us),
             value1: pack_u16(requested_wait_us, entry_lateness_us),
-            value2: WORST_SERVICE_SOURCE_MASK.load(Ordering::Relaxed)
+            value2: WORST_POST_DEADLINE_SOURCE_MASK.load(Ordering::Relaxed)
                 | WORST_FLAGS.load(Ordering::Relaxed),
         },
         CommissionDiagnostic {
