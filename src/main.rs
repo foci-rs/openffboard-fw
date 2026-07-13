@@ -751,19 +751,25 @@ mod app {
                             let _ = runtime.push_commission_diagnostic(diagnostic);
                         }
                     }
-                    let action = {
-                        let mut backend = openffboard_backend(tmc, enable_pin);
-                        runtime
-                            .drive_commissioning_poll(
-                                poll,
-                                &mut backend,
-                                tmc_state(),
-                                stepper_state(),
-                                &tmc_control_config,
-                            )
-                            .await
-                            .expect("active commissioning poll produces an action")
-                    };
+                    let action =
+                        {
+                            let mut backend = openffboard_backend(tmc, enable_pin);
+                            let action = match poll {
+                            foci_firmware::commissioning::schedule::CommissionPoll::Terminal {
+                                result,
+                            } => runtime
+                                .drive_commissioning_terminal(
+                                    result,
+                                    &mut backend,
+                                    tmc_state(),
+                                    stepper_state(),
+                                    &tmc_control_config,
+                                )
+                                .await,
+                            poll => runtime.classify_commission_poll(poll),
+                        };
+                            action.expect("active commissioning poll produces an action")
+                        };
                     let tick_cycles =
                         cortex_m::peripheral::DWT::cycle_count().wrapping_sub(tick_start);
                     commission_tick_max_cycles = commission_tick_max_cycles.max(tick_cycles);
