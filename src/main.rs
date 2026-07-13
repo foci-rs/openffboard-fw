@@ -15,6 +15,7 @@ mod ankyra;
 mod app_types;
 mod board_config;
 mod board_init;
+mod commission_deadline_probe;
 mod commissioning_backend;
 mod firmware_ctx;
 mod heartbeat;
@@ -600,6 +601,7 @@ mod app {
                     commission_poll_driver =
                         foci_firmware::tmc_control::CommissionPollDriver::new();
                     commission_tick_max_cycles = 0;
+                    crate::commission_deadline_probe::reset();
                     commission_measurement_active = true;
                 }
                 'commission_poll: loop {
@@ -636,6 +638,7 @@ mod app {
                             .expect("active commissioning engine produces a poll")
                     };
                     let now_us = Mono::now().duration_since_epoch().to_micros();
+                    let driver_classify_cycle = cortex_m::peripheral::DWT::cycle_count();
                     let driver_action = match commission_poll_driver.classify(&poll, now_us) {
                         Ok(action) => action,
                         Err(error) => {
@@ -657,6 +660,14 @@ mod app {
                             foci_firmware::tmc_control::PollDriverAction::Terminal
                         }
                     };
+                    if let foci_firmware::tmc_control::PollDriverAction::WaitUntil(deadline_us) =
+                        driver_action
+                    {
+                        crate::commission_deadline_probe::arm_short_wait(
+                            deadline_us.saturating_sub(now_us),
+                            driver_classify_cycle,
+                        );
+                    }
                     if matches!(
                         driver_action,
                         foci_firmware::tmc_control::PollDriverAction::YieldNow
@@ -677,6 +688,15 @@ mod app {
                                 enable_pin.set_low();
                             }
                             continue 'tmc_loop;
+                        }
+                    }
+                    if matches!(
+                        driver_action,
+                        foci_firmware::tmc_control::PollDriverAction::Terminal
+                    ) && let Some(diagnostics) = crate::commission_deadline_probe::diagnostics()
+                    {
+                        for diagnostic in diagnostics {
+                            let _ = runtime.push_commission_diagnostic(diagnostic);
                         }
                     }
                     let action = {
@@ -749,6 +769,7 @@ mod app {
                                 foci_firmware::tmc_control::PollDriverAction::WaitUntil(
                                     deadline_us,
                                 ) => {
+                                    let mut slept = false;
                                     loop {
                                         let exit =
                                         crate::tmc_control::effects::classify_commission_wait_exit(
@@ -761,6 +782,7 @@ mod app {
                                                 .load(core::sync::atomic::Ordering::Relaxed),
                                         );
                                         if let Some(exit) = exit {
+                                            crate::commission_deadline_probe::cancel_active();
                                             if matches!(
                                             exit,
                                             crate::tmc_control::effects::CommissionWaitExit::EmergencyDisable
@@ -771,6 +793,10 @@ mod app {
                                         }
 
                                         if let Ok(req) = rx.try_recv() {
+                                            let _source_span =
+                                                crate::commission_deadline_probe::source_span(
+                                                    crate::commission_deadline_probe::SOURCE_WAIT_REQUEST,
+                                                );
                                             use foci_firmware::tmc_control::CommissionWaitRequestDisposition;
                                             match crate::tmc_control::effects::commission_wait_request_disposition(&req) {
                                             CommissionWaitRequestDisposition::Cancel => {
@@ -819,24 +845,32 @@ mod app {
                                         }
 
                                         let now_us = Mono::now().duration_since_epoch().to_micros();
+                                        if !slept {
+                                            crate::commission_deadline_probe::mark_sleep_entry();
+                                        }
                                         match foci_firmware::tmc_control::classify_absolute_wait(
                                             now_us,
                                             deadline_us,
                                         ) {
                                             Ok(
                                                 foci_firmware::tmc_control::AbsoluteWaitAction::PollNow,
-                                            ) => break,
+                                            ) => {
+                                                crate::commission_deadline_probe::resume();
+                                                break;
+                                            }
                                             Ok(
                                                 foci_firmware::tmc_control::AbsoluteWaitAction::SleepUntil(
                                                     wake_us,
                                                 ),
                                             ) => {
+                                                slept = true;
                                                 let wake = fugit::Instant::<u64, 1, 1_000_000>::from_ticks(
                                                     wake_us,
                                                 );
                                                 Mono::delay_until(wake).await;
                                             }
                                             Err(_) => {
+                                                crate::commission_deadline_probe::cancel_active();
                                                 enable_pin.set_low();
                                                 TMC_DISABLE_SIGNAL.signal(());
                                                 continue 'tmc_loop;
@@ -1634,6 +1668,9 @@ mod app {
         if !cc1_pending && !cc2_pending {
             return;
         }
+        let _deadline_source = crate::commission_deadline_probe::source_span(
+            crate::commission_deadline_probe::SOURCE_TIM5_IRQ,
+        );
         let entry_now = tim5.cnt().read();
         let mut entry_lateness = 0i32;
         if cc1_pending {
@@ -1683,6 +1720,9 @@ mod app {
     /// immediately. The handler only masks and signals — no FIFO access.
     #[task(binds = OTG_FS, priority = 3)]
     fn otg_fs_irq(_ctx: otg_fs_irq::Context) {
+        let _deadline_source = crate::commission_deadline_probe::source_span(
+            crate::commission_deadline_probe::SOURCE_USB_IRQ,
+        );
         crate::interrupts::otg_fs_irq();
     }
 
@@ -1693,6 +1733,9 @@ mod app {
     /// the cause.
     #[task(binds = EXTI9_5, priority = 3)]
     fn tmc_status_irq(_ctx: tmc_status_irq::Context) {
+        let _deadline_source = crate::commission_deadline_probe::source_span(
+            crate::commission_deadline_probe::SOURCE_FAULT_IRQ,
+        );
         crate::interrupts::tmc_status_irq(&FAULT_ACTIVE, &TMC_DISABLE_SIGNAL);
     }
 
@@ -1745,6 +1788,9 @@ mod app {
         let mut accumulator = crate::heartbeat::StatsAccumulator::new(read_tim5());
         loop {
             Mono::delay(5000.millis()).await;
+            let _deadline_source = crate::commission_deadline_probe::source_span(
+                crate::commission_deadline_probe::SOURCE_STATS_TASK,
+            );
             crate::heartbeat::stats_tick(
                 &mut accumulator,
                 read_tim5(),
@@ -1759,7 +1805,12 @@ mod app {
     #[task(priority = 1, local = [led])]
     async fn blink(ctx: blink::Context) {
         loop {
-            crate::heartbeat::toggle_led(ctx.local.led);
+            {
+                let _deadline_source = crate::commission_deadline_probe::source_span(
+                    crate::commission_deadline_probe::SOURCE_BLINK_TASK,
+                );
+                crate::heartbeat::toggle_led(ctx.local.led);
+            }
             Mono::delay(500.millis()).await;
         }
     }

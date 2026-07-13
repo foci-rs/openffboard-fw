@@ -25,6 +25,9 @@ pub async fn pump(
     report_pending: &AtomicBool,
 ) {
     USB_WAKE.wait().await;
+    let _deadline_source = crate::commission_deadline_probe::source_span(
+        crate::commission_deadline_probe::SOURCE_USB_TASK,
+    );
 
     #[cfg(feature = "trace")]
     if foci_usb_stm32::is_configured() && !crate::usb_trace::is_configured() {
