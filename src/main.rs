@@ -819,25 +819,42 @@ mod app {
                                         }
 
                                         let now_us = Mono::now().duration_since_epoch().to_micros();
-                                        if now_us >= deadline_us {
-                                            break;
-                                        }
-                                        let wake_us =
-                                            match foci_firmware::tmc_control::next_wait_slice(
-                                                now_us,
-                                                deadline_us,
-                                            ) {
-                                                Ok(wake_us) => wake_us,
-                                                Err(_) => {
-                                                    enable_pin.set_low();
-                                                    TMC_DISABLE_SIGNAL.signal(());
-                                                    continue 'tmc_loop;
+                                        match foci_firmware::tmc_control::classify_absolute_wait(
+                                            now_us,
+                                            deadline_us,
+                                        ) {
+                                            Ok(
+                                                foci_firmware::tmc_control::AbsoluteWaitAction::PollNow,
+                                            ) => break,
+                                            Ok(
+                                                foci_firmware::tmc_control::AbsoluteWaitAction::SleepUntil(
+                                                    wake_us,
+                                                ),
+                                            ) => {
+                                                let wake = fugit::Instant::<u64, 1, 1_000_000>::from_ticks(
+                                                    wake_us,
+                                                );
+                                                Mono::delay_until(wake).await;
+                                            }
+                                            Ok(
+                                                foci_firmware::tmc_control::AbsoluteWaitAction::SpinUntil(
+                                                    release_us,
+                                                ),
+                                            ) => {
+                                                while Mono::now()
+                                                    .duration_since_epoch()
+                                                    .to_micros()
+                                                    < release_us
+                                                {
+                                                    core::hint::spin_loop();
                                                 }
-                                            };
-                                        let wake = fugit::Instant::<u64, 1, 1_000_000>::from_ticks(
-                                            wake_us,
-                                        );
-                                        Mono::delay_until(wake).await;
+                                            }
+                                            Err(_) => {
+                                                enable_pin.set_low();
+                                                TMC_DISABLE_SIGNAL.signal(());
+                                                continue 'tmc_loop;
+                                            }
+                                        }
                                     }
                                     continue 'commission_poll;
                                 }
