@@ -632,10 +632,14 @@ mod app {
                     let tick_start = cortex_m::peripheral::DWT::cycle_count();
                     let mut poll = {
                         let mut backend = openffboard_backend(tmc, enable_pin);
-                        runtime
+                        let poll = runtime
                             .step_commissioning_scheduled(&mut backend)
                             .await
-                            .expect("active commissioning engine produces a poll")
+                            .expect("active commissioning engine produces a poll");
+                        crate::commission_deadline_probe::record_engine_return(
+                            cortex_m::peripheral::DWT::cycle_count(),
+                        );
+                        poll
                     };
                     let now_us = Mono::now().duration_since_epoch().to_micros();
                     let driver_classify_cycle = cortex_m::peripheral::DWT::cycle_count();
@@ -676,7 +680,9 @@ mod app {
                         ),
                         foci_firmware::commissioning::schedule::CommissionPoll::ReadyNow {
                             ..
-                        } => {}
+                        } => crate::commission_deadline_probe::close_ready_service(
+                            driver_classify_cycle,
+                        ),
                     }
                     if matches!(
                         driver_action,
@@ -877,6 +883,16 @@ mod app {
                                                     wake_us,
                                                 );
                                                 Mono::delay_until(wake).await;
+                                                let return_cycle =
+                                                    cortex_m::peripheral::DWT::cycle_count();
+                                                let returned_us = Mono::now()
+                                                    .duration_since_epoch()
+                                                    .to_micros();
+                                                crate::commission_deadline_probe::record_timer_return(
+                                                    wake_us,
+                                                    returned_us,
+                                                    return_cycle,
+                                                );
                                             }
                                             Err(_) => {
                                                 crate::commission_deadline_probe::cancel_active();
