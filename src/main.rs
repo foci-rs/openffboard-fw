@@ -673,8 +673,11 @@ mod app {
                         );
                         poll
                     };
+                    crate::commission_deadline_probe::begin_classification_window();
                     let now_us = Mono::now().duration_since_epoch().to_micros();
                     let driver_classify_cycle = cortex_m::peripheral::DWT::cycle_count();
+                    let classification_source_mask =
+                        crate::commission_deadline_probe::finish_classification_window();
                     let driver_action = match commission_poll_driver.classify(&poll, now_us) {
                         Ok(action) => action,
                         Err(error) => {
@@ -704,6 +707,7 @@ mod app {
                             *timestamp_us,
                             now_us,
                             driver_classify_cycle,
+                            classification_source_mask,
                         ),
                         foci_firmware::commissioning::schedule::CommissionPoll::Terminal {
                             ..

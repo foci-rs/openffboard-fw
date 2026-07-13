@@ -16,6 +16,7 @@ const DIAG_DEADLINE_HOPS: u8 = 41;
 const WINDOW_FLAG: u32 = 1 << 31;
 const NO_TIMER_WAIT_FLAG: u32 = 1 << 30;
 const EXPIRED_BEFORE_SLEEP_FLAG: u32 = 1 << 29;
+const PRE_ARM_SOURCE_FLAG: u32 = 1 << 28;
 
 pub(crate) const SOURCE_WAIT_REQUEST: u32 = 1 << 1;
 pub(crate) const SOURCE_USB_TASK: u32 = 1 << 2;
@@ -32,6 +33,8 @@ pub(crate) const SOURCE_TIM2_IRQ: u32 = 1 << 12;
 
 static WAIT_PROBE: DeadlineAttributionProbe = DeadlineAttributionProbe::new();
 static SERVICE_PROBE: DeadlineAttributionProbe = DeadlineAttributionProbe::new();
+static CLASSIFICATION_WINDOW_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CLASSIFICATION_SOURCE_MASK: AtomicU32 = AtomicU32::new(0);
 static EVENT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static EVENT_DUE_CYCLE: AtomicU32 = AtomicU32::new(0);
 static EVENT_REQUESTED_WAIT_US: AtomicU32 = AtomicU32::new(0);
@@ -41,6 +44,7 @@ static EVENT_POLL_ENTRY_CYCLE: AtomicU32 = AtomicU32::new(0);
 static EVENT_LAST_ELAPSED_CYCLE: AtomicU32 = AtomicU32::new(0);
 static EVENT_ENGINE_RETURN_CYCLE: AtomicU32 = AtomicU32::new(0);
 static EVENT_POST_DEADLINE_SOURCE_MASK: AtomicU32 = AtomicU32::new(0);
+static EVENT_PRE_ARM_SOURCE_PRESENT: AtomicBool = AtomicBool::new(false);
 static EVENT_EXPIRED_BEFORE_SLEEP: AtomicBool = AtomicBool::new(false);
 static WORST_ENTRY_LATENESS_CYCLES: AtomicU32 = AtomicU32::new(0);
 static WORST_TIMER_LATENESS_US: AtomicU32 = AtomicU32::new(0);
@@ -56,12 +60,15 @@ static WORST_FLAGS: AtomicU32 = AtomicU32::new(0);
 pub(crate) fn reset() {
     WAIT_PROBE.reset();
     SERVICE_PROBE.reset();
+    CLASSIFICATION_WINDOW_ACTIVE.store(false, Ordering::Release);
+    CLASSIFICATION_SOURCE_MASK.store(0, Ordering::Relaxed);
     EVENT_ACTIVE.store(false, Ordering::Release);
     EVENT_TIMER_RETURN_CYCLE.store(0, Ordering::Relaxed);
     EVENT_POLL_ENTRY_CYCLE.store(0, Ordering::Relaxed);
     EVENT_LAST_ELAPSED_CYCLE.store(0, Ordering::Relaxed);
     EVENT_ENGINE_RETURN_CYCLE.store(0, Ordering::Relaxed);
     EVENT_POST_DEADLINE_SOURCE_MASK.store(0, Ordering::Relaxed);
+    EVENT_PRE_ARM_SOURCE_PRESENT.store(false, Ordering::Relaxed);
     WORST_ENTRY_LATENESS_CYCLES.store(0, Ordering::Relaxed);
     WORST_TIMER_LATENESS_US.store(0, Ordering::Relaxed);
     WORST_RETURN_TO_ENTRY_CYCLES.store(0, Ordering::Relaxed);
@@ -137,6 +144,9 @@ fn close_event(classify_cycle: u32, terminal: bool) {
     if EVENT_EXPIRED_BEFORE_SLEEP.load(Ordering::Relaxed) {
         flags |= EXPIRED_BEFORE_SLEEP_FLAG;
     }
+    if EVENT_PRE_ARM_SOURCE_PRESENT.load(Ordering::Relaxed) {
+        flags |= PRE_ARM_SOURCE_FLAG;
+    }
 
     WORST_TIMER_LATENESS_US.store(
         EVENT_TIMER_LATENESS_US.load(Ordering::Relaxed),
@@ -170,7 +180,12 @@ pub(crate) fn close_ready_service(classify_cycle: u32) {
 }
 
 /// Arm attribution for one short absolute commissioning deadline.
-pub(crate) fn arm_short_deadline(deadline_us: u64, now_us: u64, arm_cycle: u32) {
+pub(crate) fn arm_short_deadline(
+    deadline_us: u64,
+    now_us: u64,
+    arm_cycle: u32,
+    classification_source_mask: u32,
+) {
     close_event(arm_cycle, false);
 
     EVENT_TIMER_RETURN_CYCLE.store(0, Ordering::Relaxed);
@@ -179,6 +194,7 @@ pub(crate) fn arm_short_deadline(deadline_us: u64, now_us: u64, arm_cycle: u32) 
     EVENT_LAST_ELAPSED_CYCLE.store(0, Ordering::Relaxed);
     EVENT_ENGINE_RETURN_CYCLE.store(0, Ordering::Relaxed);
     EVENT_POST_DEADLINE_SOURCE_MASK.store(0, Ordering::Relaxed);
+    EVENT_PRE_ARM_SOURCE_PRESENT.store(false, Ordering::Relaxed);
     EVENT_EXPIRED_BEFORE_SLEEP.store(deadline_us <= now_us, Ordering::Relaxed);
 
     if deadline_us > now_us {
@@ -205,6 +221,10 @@ pub(crate) fn arm_short_deadline(deadline_us: u64, now_us: u64, arm_cycle: u32) 
         arm_cycle.wrapping_sub((overdue_us as u32).saturating_mul(CYCLES_PER_MICROSECOND));
     EVENT_DUE_CYCLE.store(due_cycle, Ordering::Relaxed);
     EVENT_REQUESTED_WAIT_US.store(0, Ordering::Relaxed);
+    if classification_source_mask != 0 {
+        EVENT_POST_DEADLINE_SOURCE_MASK.store(classification_source_mask, Ordering::Relaxed);
+        EVENT_PRE_ARM_SOURCE_PRESENT.store(true, Ordering::Relaxed);
+    }
     EVENT_ACTIVE.store(true, Ordering::Release);
     WAIT_PROBE.arm(due_cycle, 0);
     WAIT_PROBE.mark_sleep_entry(arm_cycle);
@@ -247,6 +267,19 @@ pub(crate) fn cancel_active() {
     SERVICE_PROBE.cancel_active();
 }
 
+/// Begin source attribution around the board classification clock pair.
+pub(crate) fn begin_classification_window() {
+    CLASSIFICATION_SOURCE_MASK.store(0, Ordering::Relaxed);
+    CLASSIFICATION_WINDOW_ACTIVE.store(true, Ordering::Release);
+}
+
+/// End classification attribution and return its guarded-source mask.
+#[must_use]
+pub(crate) fn finish_classification_window() -> u32 {
+    CLASSIFICATION_WINDOW_ACTIVE.store(false, Ordering::Release);
+    CLASSIFICATION_SOURCE_MASK.load(Ordering::Acquire)
+}
+
 /// Begin one attributed task or interrupt span.
 #[must_use]
 pub(crate) fn source_span(source_mask: u32) -> DeadlineSourceSpan {
@@ -269,6 +302,9 @@ pub(crate) struct DeadlineSourceSpan {
 impl Drop for DeadlineSourceSpan {
     fn drop(&mut self) {
         let exit_cycle = cortex_m::peripheral::DWT::cycle_count();
+        if CLASSIFICATION_WINDOW_ACTIVE.load(Ordering::Acquire) {
+            CLASSIFICATION_SOURCE_MASK.fetch_or(self.source_mask, Ordering::Relaxed);
+        }
         if EVENT_ACTIVE.load(Ordering::Acquire)
             && source_overlap_cycles(
                 EVENT_DUE_CYCLE.load(Ordering::Relaxed),
@@ -291,8 +327,9 @@ impl Drop for DeadlineSourceSpan {
 /// poll-entry-to-inner-return, inner-return-to-scheduled-engine-return, and
 /// engine-return-to-classification durations. All values describe the same
 /// worst entry event.
-/// Bit 31 marks a terminal event, bit 30 marks a path without a timer wait, and
-/// bit 29 marks a deadline already expired before the wait handoff.
+/// Bit 31 marks a terminal event, bit 30 marks a path without a timer wait, bit
+/// 29 marks a deadline already expired before the wait handoff, and bit 28
+/// marks a source captured while pairing the pre-arm classification clocks.
 pub(crate) fn diagnostics() -> Option<[CommissionDiagnostic; 2]> {
     let entry_lateness_cycles = WORST_ENTRY_LATENESS_CYCLES.load(Ordering::Acquire);
     if entry_lateness_cycles == 0 {
