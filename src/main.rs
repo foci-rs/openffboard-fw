@@ -602,49 +602,7 @@ mod app {
                     commission_tick_max_cycles = 0;
                     commission_measurement_active = true;
                 }
-                // Capture deadline before the tick so SPI time consumed by the
-                // engine reduces the remaining trace budget.
-                #[cfg(feature = "trace")]
-                let engine_tick_deadline =
-                    Mono::now() + fugit::Duration::<u64, 1, 1_000_000>::millis(1);
-
-                let engine_kind = runtime
-                    .pending_commission_kind()
-                    .expect("active commissioning engine has a kind");
-                let tick_start = cortex_m::peripheral::DWT::cycle_count();
-                let mut poll = {
-                    let mut backend = openffboard_backend(tmc, enable_pin);
-                    runtime
-                        .step_commissioning_scheduled(&mut backend)
-                        .await
-                        .expect("active commissioning engine produces a poll")
-                };
-                let now_us = Mono::now().duration_since_epoch().to_micros();
-                let driver_action = match commission_poll_driver.classify(&poll, now_us) {
-                    Ok(action) => action,
-                    Err(error) => {
-                        poll = foci_firmware::commissioning::schedule::CommissionPoll::Terminal {
-                            result: if matches!(
-                                engine_kind,
-                                foci_firmware::commissioning::types::EngineKind::OuterTune
-                            ) {
-                                foci_firmware::commissioning::schedule::CommissionTerminal::OuterFailed(
-                                    error,
-                                )
-                            } else {
-                                foci_firmware::commissioning::schedule::CommissionTerminal::InnerFailed(
-                                    error,
-                                )
-                            },
-                        };
-                        foci_firmware::tmc_control::PollDriverAction::Terminal
-                    }
-                };
-                if matches!(
-                    driver_action,
-                    foci_firmware::tmc_control::PollDriverAction::YieldNow
-                ) {
-                    Mono::delay(foci_firmware::tmc_control::FORCED_READY_YIELD_US.micros()).await;
+                'commission_poll: loop {
                     let exit = crate::tmc_control::effects::classify_commission_wait_exit(
                         SHUTDOWN_ACTIVE.load(core::sync::atomic::Ordering::Relaxed),
                         TMC_QUEUE_FLUSH.load(core::sync::atomic::Ordering::Relaxed),
@@ -660,78 +618,139 @@ mod app {
                         }
                         continue 'tmc_loop;
                     }
-                }
-                let action = {
-                    let mut backend = openffboard_backend(tmc, enable_pin);
-                    runtime
-                        .drive_commissioning_poll(
-                            poll,
-                            &mut backend,
-                            tmc_state(),
-                            stepper_state(),
-                            &tmc_control_config,
-                        )
-                        .await
-                        .expect("active commissioning poll produces an action")
-                };
-                let tick_cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(tick_start);
-                commission_tick_max_cycles = commission_tick_max_cycles.max(tick_cycles);
-                #[cfg(feature = "trace")]
-                crate::usb_trace::drain_pending_events();
+                    // Capture deadline before the tick so SPI time consumed by the
+                    // engine reduces the remaining trace budget.
+                    #[cfg(feature = "trace")]
+                    let engine_tick_deadline =
+                        Mono::now() + fugit::Duration::<u64, 1, 1_000_000>::millis(1);
 
-                use foci_firmware::tmc_control::ScheduledCommissionTickAction;
-                match action {
-                    ScheduledCommissionTickAction::ReadyNow { event }
-                    | ScheduledCommissionTickAction::At { event, .. } => {
-                        if let Some(event) = event {
-                            let foci_firmware::commissioning::schedule::CommissionEvent::PhaseChanged {
+                    let engine_kind = runtime
+                        .pending_commission_kind()
+                        .expect("active commissioning engine has a kind");
+                    let tick_start = cortex_m::peripheral::DWT::cycle_count();
+                    let mut poll = {
+                        let mut backend = openffboard_backend(tmc, enable_pin);
+                        runtime
+                            .step_commissioning_scheduled(&mut backend)
+                            .await
+                            .expect("active commissioning engine produces a poll")
+                    };
+                    let now_us = Mono::now().duration_since_epoch().to_micros();
+                    let driver_action = match commission_poll_driver.classify(&poll, now_us) {
+                        Ok(action) => action,
+                        Err(error) => {
+                            poll =
+                                foci_firmware::commissioning::schedule::CommissionPoll::Terminal {
+                                    result: if matches!(
+                                        engine_kind,
+                                        foci_firmware::commissioning::types::EngineKind::OuterTune
+                                    ) {
+                                        foci_firmware::commissioning::schedule::CommissionTerminal::OuterFailed(
+                                    error,
+                                )
+                                    } else {
+                                        foci_firmware::commissioning::schedule::CommissionTerminal::InnerFailed(
+                                    error,
+                                )
+                                    },
+                                };
+                            foci_firmware::tmc_control::PollDriverAction::Terminal
+                        }
+                    };
+                    if matches!(
+                        driver_action,
+                        foci_firmware::tmc_control::PollDriverAction::YieldNow
+                    ) {
+                        Mono::delay(foci_firmware::tmc_control::FORCED_READY_YIELD_US.micros())
+                            .await;
+                        let exit = crate::tmc_control::effects::classify_commission_wait_exit(
+                            SHUTDOWN_ACTIVE.load(core::sync::atomic::Ordering::Relaxed),
+                            TMC_QUEUE_FLUSH.load(core::sync::atomic::Ordering::Relaxed),
+                            TMC_DISABLE_SIGNAL.signaled(),
+                            FAULT_ACTIVE.load(core::sync::atomic::Ordering::Relaxed),
+                        );
+                        if let Some(exit) = exit {
+                            if matches!(
+                                exit,
+                                crate::tmc_control::effects::CommissionWaitExit::EmergencyDisable
+                            ) {
+                                enable_pin.set_low();
+                            }
+                            continue 'tmc_loop;
+                        }
+                    }
+                    let action = {
+                        let mut backend = openffboard_backend(tmc, enable_pin);
+                        runtime
+                            .drive_commissioning_poll(
+                                poll,
+                                &mut backend,
+                                tmc_state(),
+                                stepper_state(),
+                                &tmc_control_config,
+                            )
+                            .await
+                            .expect("active commissioning poll produces an action")
+                    };
+                    let tick_cycles =
+                        cortex_m::peripheral::DWT::cycle_count().wrapping_sub(tick_start);
+                    commission_tick_max_cycles = commission_tick_max_cycles.max(tick_cycles);
+                    #[cfg(feature = "trace")]
+                    crate::usb_trace::drain_pending_events();
+
+                    use foci_firmware::tmc_control::ScheduledCommissionTickAction;
+                    match action {
+                        ScheduledCommissionTickAction::ReadyNow { event }
+                        | ScheduledCommissionTickAction::At { event, .. } => {
+                            if let Some(event) = event {
+                                let foci_firmware::commissioning::schedule::CommissionEvent::PhaseChanged {
                                 oid,
                                 phase_id,
                                 engine_kind,
                             } = event;
-                            #[cfg(not(feature = "trace"))]
-                            let _ = engine_kind;
+                                #[cfg(not(feature = "trace"))]
+                                let _ = engine_kind;
+                                #[cfg(feature = "trace")]
+                                {
+                                    commission_trace_phase = Some((engine_kind, phase_id));
+                                }
+                                emit_phase_reply(oid, phase_id);
+                            }
                             #[cfg(feature = "trace")]
+                            if commission_trace_phase
+                                == Some((
+                                    foci_firmware::commissioning::types::EngineKind::Commission,
+                                    foci_firmware::autotune::PhaseId::ClosedLoopEntry,
+                                ))
                             {
-                                commission_trace_phase = Some((engine_kind, phase_id));
+                                let trace_tick = runtime.advance_trace_sample_tick();
+                                crate::usb_trace::sample_commission_closed_loop_entry(
+                                    tmc,
+                                    runtime.is_motor_enabled(),
+                                    trace_tick,
+                                    || {
+                                        engine_tick_deadline
+                                            .checked_duration_since(Mono::now())
+                                            .map(|d| d.to_micros())
+                                            .unwrap_or(0)
+                                    },
+                                    || Mono::now() > engine_tick_deadline,
+                                )
+                                .await;
                             }
-                            emit_phase_reply(oid, phase_id);
-                        }
-                        #[cfg(feature = "trace")]
-                        if commission_trace_phase
-                            == Some((
-                                foci_firmware::commissioning::types::EngineKind::Commission,
-                                foci_firmware::autotune::PhaseId::ClosedLoopEntry,
-                            ))
-                        {
-                            let trace_tick = runtime.advance_trace_sample_tick();
-                            crate::usb_trace::sample_commission_closed_loop_entry(
-                                tmc,
-                                runtime.is_motor_enabled(),
-                                trace_tick,
-                                || {
-                                    engine_tick_deadline
-                                        .checked_duration_since(Mono::now())
-                                        .map(|d| d.to_micros())
-                                        .unwrap_or(0)
-                                },
-                                || Mono::now() > engine_tick_deadline,
-                            )
-                            .await;
-                        }
 
-                        match driver_action {
-                            foci_firmware::tmc_control::PollDriverAction::PollNow => {
-                                continue 'tmc_loop;
-                            }
-                            foci_firmware::tmc_control::PollDriverAction::YieldNow => {
-                                continue 'tmc_loop;
-                            }
-                            foci_firmware::tmc_control::PollDriverAction::WaitUntil(
-                                deadline_us,
-                            ) => {
-                                loop {
-                                    let exit =
+                            match driver_action {
+                                foci_firmware::tmc_control::PollDriverAction::PollNow => {
+                                    continue 'tmc_loop;
+                                }
+                                foci_firmware::tmc_control::PollDriverAction::YieldNow => {
+                                    continue 'tmc_loop;
+                                }
+                                foci_firmware::tmc_control::PollDriverAction::WaitUntil(
+                                    deadline_us,
+                                ) => {
+                                    loop {
+                                        let exit =
                                         crate::tmc_control::effects::classify_commission_wait_exit(
                                             SHUTDOWN_ACTIVE
                                                 .load(core::sync::atomic::Ordering::Relaxed),
@@ -741,19 +760,19 @@ mod app {
                                             FAULT_ACTIVE
                                                 .load(core::sync::atomic::Ordering::Relaxed),
                                         );
-                                    if let Some(exit) = exit {
-                                        if matches!(
+                                        if let Some(exit) = exit {
+                                            if matches!(
                                             exit,
                                             crate::tmc_control::effects::CommissionWaitExit::EmergencyDisable
                                         ) {
                                             enable_pin.set_low();
                                         }
-                                        continue 'tmc_loop;
-                                    }
+                                            continue 'tmc_loop;
+                                        }
 
-                                    if let Ok(req) = rx.try_recv() {
-                                        use foci_firmware::tmc_control::CommissionWaitRequestDisposition;
-                                        match crate::tmc_control::effects::commission_wait_request_disposition(&req) {
+                                        if let Ok(req) = rx.try_recv() {
+                                            use foci_firmware::tmc_control::CommissionWaitRequestDisposition;
+                                            match crate::tmc_control::effects::commission_wait_request_disposition(&req) {
                                             CommissionWaitRequestDisposition::Cancel => {
                                                 enable_pin.set_low();
                                                 runtime.take_commission_engine();
@@ -797,49 +816,54 @@ mod app {
                                             }
                                             CommissionWaitRequestDisposition::DropBusy => {}
                                         }
-                                    }
-
-                                    let now_us = Mono::now().duration_since_epoch().to_micros();
-                                    if now_us >= deadline_us {
-                                        break;
-                                    }
-                                    let wake_us = match foci_firmware::tmc_control::next_wait_slice(
-                                        now_us,
-                                        deadline_us,
-                                    ) {
-                                        Ok(wake_us) => wake_us,
-                                        Err(_) => {
-                                            enable_pin.set_low();
-                                            TMC_DISABLE_SIGNAL.signal(());
-                                            continue 'tmc_loop;
                                         }
-                                    };
-                                    let wake =
-                                        fugit::Instant::<u64, 1, 1_000_000>::from_ticks(wake_us);
-                                    Mono::delay_until(wake).await;
+
+                                        let now_us = Mono::now().duration_since_epoch().to_micros();
+                                        if now_us >= deadline_us {
+                                            break;
+                                        }
+                                        let wake_us =
+                                            match foci_firmware::tmc_control::next_wait_slice(
+                                                now_us,
+                                                deadline_us,
+                                            ) {
+                                                Ok(wake_us) => wake_us,
+                                                Err(_) => {
+                                                    enable_pin.set_low();
+                                                    TMC_DISABLE_SIGNAL.signal(());
+                                                    continue 'tmc_loop;
+                                                }
+                                            };
+                                        let wake = fugit::Instant::<u64, 1, 1_000_000>::from_ticks(
+                                            wake_us,
+                                        );
+                                        Mono::delay_until(wake).await;
+                                    }
+                                    continue 'commission_poll;
                                 }
-                                continue 'tmc_loop;
+                                foci_firmware::tmc_control::PollDriverAction::Terminal => {
+                                    unreachable!("nonterminal poll classified as terminal")
+                                }
                             }
-                            foci_firmware::tmc_control::PollDriverAction::Terminal => {
-                                unreachable!("nonterminal poll classified as terminal")
+                        }
+                        ScheduledCommissionTickAction::Terminal { reply, actions } => {
+                            #[cfg(feature = "trace")]
+                            {
+                                commission_trace_phase = None;
                             }
+                            {
+                                let mut state =
+                                    runtime.dispatch_state(tmc_state(), stepper_state());
+                                apply_stepper_post_action(actions.stepper, &mut state);
+                            }
+                            emit_terminal_reply(reply);
+                            defmt::info!(
+                                "commissioning terminal max tick cycles: {}",
+                                commission_tick_max_cycles,
+                            );
+                            commission_measurement_active = false;
+                            break 'commission_poll;
                         }
-                    }
-                    ScheduledCommissionTickAction::Terminal { reply, actions } => {
-                        #[cfg(feature = "trace")]
-                        {
-                            commission_trace_phase = None;
-                        }
-                        {
-                            let mut state = runtime.dispatch_state(tmc_state(), stepper_state());
-                            apply_stepper_post_action(actions.stepper, &mut state);
-                        }
-                        emit_terminal_reply(reply);
-                        defmt::info!(
-                            "commissioning terminal max tick cycles: {}",
-                            commission_tick_max_cycles,
-                        );
-                        commission_measurement_active = false;
                     }
                 }
                 // Terminal cases fall through to normal channel processing.
