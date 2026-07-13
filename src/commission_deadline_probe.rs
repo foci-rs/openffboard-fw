@@ -4,7 +4,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use foci_firmware::autotune::PhaseId;
 use foci_firmware::selftest::CommissionDiagnostic;
-use foci_firmware::tmc_control::deadline_attribution::DeadlineAttributionProbe;
+use foci_firmware::tmc_control::deadline_attribution::{
+    DeadlineAttributionProbe, source_overlap_cycles,
+};
 
 const CYCLES_PER_MICROSECOND: u32 = 168;
 const MAX_ATTRIBUTED_WAIT_US: u64 = 250;
@@ -35,14 +37,18 @@ static EVENT_REQUESTED_WAIT_US: AtomicU32 = AtomicU32::new(0);
 static EVENT_TIMER_RETURN_CYCLE: AtomicU32 = AtomicU32::new(0);
 static EVENT_TIMER_LATENESS_US: AtomicU32 = AtomicU32::new(0);
 static EVENT_POLL_ENTRY_CYCLE: AtomicU32 = AtomicU32::new(0);
+static EVENT_LAST_ELAPSED_CYCLE: AtomicU32 = AtomicU32::new(0);
 static EVENT_ENGINE_RETURN_CYCLE: AtomicU32 = AtomicU32::new(0);
+static EVENT_SERVICE_SOURCE_MASK: AtomicU32 = AtomicU32::new(0);
 static EVENT_EXPIRED_BEFORE_SLEEP: AtomicBool = AtomicBool::new(false);
 static WORST_ENTRY_LATENESS_CYCLES: AtomicU32 = AtomicU32::new(0);
 static WORST_TIMER_LATENESS_US: AtomicU32 = AtomicU32::new(0);
 static WORST_RETURN_TO_ENTRY_CYCLES: AtomicU32 = AtomicU32::new(0);
-static WORST_ENTRY_TO_ENGINE_RETURN_CYCLES: AtomicU32 = AtomicU32::new(0);
+static WORST_ENTRY_TO_INNER_RETURN_CYCLES: AtomicU32 = AtomicU32::new(0);
+static WORST_INNER_TO_ENGINE_RETURN_CYCLES: AtomicU32 = AtomicU32::new(0);
 static WORST_ENGINE_RETURN_TO_CLASSIFY_CYCLES: AtomicU32 = AtomicU32::new(0);
 static WORST_REQUESTED_WAIT_US: AtomicU32 = AtomicU32::new(0);
+static WORST_SERVICE_SOURCE_MASK: AtomicU32 = AtomicU32::new(0);
 static WORST_FLAGS: AtomicU32 = AtomicU32::new(0);
 
 /// Reset retained attribution at the beginning of a commissioning run.
@@ -52,27 +58,34 @@ pub(crate) fn reset() {
     EVENT_ACTIVE.store(false, Ordering::Release);
     EVENT_TIMER_RETURN_CYCLE.store(0, Ordering::Relaxed);
     EVENT_POLL_ENTRY_CYCLE.store(0, Ordering::Relaxed);
+    EVENT_LAST_ELAPSED_CYCLE.store(0, Ordering::Relaxed);
     EVENT_ENGINE_RETURN_CYCLE.store(0, Ordering::Relaxed);
+    EVENT_SERVICE_SOURCE_MASK.store(0, Ordering::Relaxed);
     WORST_ENTRY_LATENESS_CYCLES.store(0, Ordering::Relaxed);
     WORST_TIMER_LATENESS_US.store(0, Ordering::Relaxed);
     WORST_RETURN_TO_ENTRY_CYCLES.store(0, Ordering::Relaxed);
-    WORST_ENTRY_TO_ENGINE_RETURN_CYCLES.store(0, Ordering::Relaxed);
+    WORST_ENTRY_TO_INNER_RETURN_CYCLES.store(0, Ordering::Relaxed);
+    WORST_INNER_TO_ENGINE_RETURN_CYCLES.store(0, Ordering::Relaxed);
     WORST_ENGINE_RETURN_TO_CLASSIFY_CYCLES.store(0, Ordering::Relaxed);
     WORST_REQUESTED_WAIT_US.store(0, Ordering::Relaxed);
+    WORST_SERVICE_SOURCE_MASK.store(0, Ordering::Relaxed);
     WORST_FLAGS.store(0, Ordering::Relaxed);
 }
 
 /// Record the first engine clock read after one absolute wait.
 pub(crate) fn observe_elapsed(cycle: u32) {
-    if !EVENT_ACTIVE.load(Ordering::Acquire)
-        || EVENT_POLL_ENTRY_CYCLE
-            .compare_exchange(0, cycle, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-    {
+    if !EVENT_ACTIVE.load(Ordering::Acquire) {
         return;
     }
-    WAIT_PROBE.resume(cycle);
-    SERVICE_PROBE.arm(cycle, 0);
+    if EVENT_POLL_ENTRY_CYCLE
+        .compare_exchange(0, cycle, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+    {
+        WAIT_PROBE.resume(cycle);
+        SERVICE_PROBE.arm(cycle, 0);
+    } else {
+        EVENT_LAST_ELAPSED_CYCLE.store(cycle, Ordering::Relaxed);
+    }
 }
 
 fn close_event(classify_cycle: u32, terminal: bool) {
@@ -94,16 +107,22 @@ fn close_event(classify_cycle: u32, terminal: bool) {
     }
 
     let timer_return_cycle = EVENT_TIMER_RETURN_CYCLE.load(Ordering::Relaxed);
+    let inner_return_cycle = EVENT_LAST_ELAPSED_CYCLE.load(Ordering::Relaxed);
     let engine_return_cycle = EVENT_ENGINE_RETURN_CYCLE.load(Ordering::Relaxed);
     let return_to_entry_cycles = if timer_return_cycle == 0 {
         0
     } else {
         poll_entry_cycle.wrapping_sub(timer_return_cycle)
     };
-    let entry_to_engine_return_cycles = if engine_return_cycle == 0 {
+    let entry_to_inner_return_cycles = if inner_return_cycle == 0 {
         0
     } else {
-        engine_return_cycle.wrapping_sub(poll_entry_cycle)
+        inner_return_cycle.wrapping_sub(poll_entry_cycle)
+    };
+    let inner_to_engine_return_cycles = if inner_return_cycle == 0 || engine_return_cycle == 0 {
+        0
+    } else {
+        engine_return_cycle.wrapping_sub(inner_return_cycle)
     };
     let engine_return_to_classify_cycles = if engine_return_cycle == 0 {
         0
@@ -123,11 +142,16 @@ fn close_event(classify_cycle: u32, terminal: bool) {
         Ordering::Relaxed,
     );
     WORST_RETURN_TO_ENTRY_CYCLES.store(return_to_entry_cycles, Ordering::Relaxed);
-    WORST_ENTRY_TO_ENGINE_RETURN_CYCLES.store(entry_to_engine_return_cycles, Ordering::Relaxed);
+    WORST_ENTRY_TO_INNER_RETURN_CYCLES.store(entry_to_inner_return_cycles, Ordering::Relaxed);
+    WORST_INNER_TO_ENGINE_RETURN_CYCLES.store(inner_to_engine_return_cycles, Ordering::Relaxed);
     WORST_ENGINE_RETURN_TO_CLASSIFY_CYCLES
         .store(engine_return_to_classify_cycles, Ordering::Relaxed);
     WORST_REQUESTED_WAIT_US.store(
         EVENT_REQUESTED_WAIT_US.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
+    WORST_SERVICE_SOURCE_MASK.store(
+        EVENT_SERVICE_SOURCE_MASK.load(Ordering::Relaxed),
         Ordering::Relaxed,
     );
     WORST_FLAGS.store(flags, Ordering::Relaxed);
@@ -151,7 +175,9 @@ pub(crate) fn arm_short_deadline(deadline_us: u64, now_us: u64, arm_cycle: u32) 
     EVENT_TIMER_RETURN_CYCLE.store(0, Ordering::Relaxed);
     EVENT_TIMER_LATENESS_US.store(0, Ordering::Relaxed);
     EVENT_POLL_ENTRY_CYCLE.store(0, Ordering::Relaxed);
+    EVENT_LAST_ELAPSED_CYCLE.store(0, Ordering::Relaxed);
     EVENT_ENGINE_RETURN_CYCLE.store(0, Ordering::Relaxed);
+    EVENT_SERVICE_SOURCE_MASK.store(0, Ordering::Relaxed);
     EVENT_EXPIRED_BEFORE_SLEEP.store(deadline_us <= now_us, Ordering::Relaxed);
 
     if deadline_us > now_us {
@@ -242,6 +268,13 @@ pub(crate) struct DeadlineSourceSpan {
 impl Drop for DeadlineSourceSpan {
     fn drop(&mut self) {
         let exit_cycle = cortex_m::peripheral::DWT::cycle_count();
+        let poll_entry_cycle = EVENT_POLL_ENTRY_CYCLE.load(Ordering::Acquire);
+        if EVENT_ACTIVE.load(Ordering::Acquire)
+            && poll_entry_cycle != 0
+            && source_overlap_cycles(poll_entry_cycle, self.entry_cycle, exit_cycle) != 0
+        {
+            EVENT_SERVICE_SOURCE_MASK.fetch_or(self.source_mask, Ordering::Relaxed);
+        }
         WAIT_PROBE.record_source_span(self.source_mask, self.entry_cycle, exit_cycle);
         SERVICE_PROBE.record_source_span(self.source_mask, self.entry_cycle, exit_cycle);
     }
@@ -249,10 +282,11 @@ impl Drop for DeadlineSourceSpan {
 
 /// Encode the worst wait and service windows on the existing generic path.
 ///
-/// Diagnostic 40 contains monotonic timer-return lateness, timer-return to poll
-/// entry, and requested wait plus flags. Diagnostic 41 contains poll entry to
-/// scheduled-engine return, engine return to board classification, and total
-/// poll-entry lateness. All six values describe the same worst entry event.
+/// Diagnostic 40 contains packed timer-return lateness and return-to-entry time,
+/// packed requested wait and total entry lateness, and the same-event service
+/// source mask plus flags. Diagnostic 41 contains poll-entry-to-inner-return,
+/// inner-return-to-scheduled-engine-return, and engine-return-to-classification
+/// durations. All values describe the same worst entry event.
 /// Bit 31 marks a terminal event, bit 30 marks a path without a timer wait, and
 /// bit 29 marks a deadline already expired before the wait handoff.
 pub(crate) fn diagnostics() -> Option<[CommissionDiagnostic; 2]> {
@@ -261,23 +295,29 @@ pub(crate) fn diagnostics() -> Option<[CommissionDiagnostic; 2]> {
         return None;
     }
     let cycles_to_us = |cycles: u32| cycles.div_ceil(CYCLES_PER_MICROSECOND);
+    let pack_u16 =
+        |low: u32, high: u32| low.min(u32::from(u16::MAX)) | (high.min(u32::from(u16::MAX)) << 16);
+    let timer_lateness_us = WORST_TIMER_LATENESS_US.load(Ordering::Relaxed);
+    let return_to_entry_us = cycles_to_us(WORST_RETURN_TO_ENTRY_CYCLES.load(Ordering::Relaxed));
+    let requested_wait_us = WORST_REQUESTED_WAIT_US.load(Ordering::Relaxed);
+    let entry_lateness_us = cycles_to_us(entry_lateness_cycles);
     Some([
         CommissionDiagnostic {
             phase: PhaseId::ElectricalId.to_u8(),
             code: DIAG_DEADLINE_RELEASE,
             status: 2,
-            value0: WORST_TIMER_LATENESS_US.load(Ordering::Relaxed),
-            value1: cycles_to_us(WORST_RETURN_TO_ENTRY_CYCLES.load(Ordering::Relaxed)),
-            value2: WORST_REQUESTED_WAIT_US.load(Ordering::Relaxed)
+            value0: pack_u16(timer_lateness_us, return_to_entry_us),
+            value1: pack_u16(requested_wait_us, entry_lateness_us),
+            value2: WORST_SERVICE_SOURCE_MASK.load(Ordering::Relaxed)
                 | WORST_FLAGS.load(Ordering::Relaxed),
         },
         CommissionDiagnostic {
             phase: PhaseId::ElectricalId.to_u8(),
             code: DIAG_DEADLINE_HOPS,
             status: 2,
-            value0: cycles_to_us(WORST_ENTRY_TO_ENGINE_RETURN_CYCLES.load(Ordering::Relaxed)),
-            value1: cycles_to_us(WORST_ENGINE_RETURN_TO_CLASSIFY_CYCLES.load(Ordering::Relaxed)),
-            value2: cycles_to_us(entry_lateness_cycles),
+            value0: cycles_to_us(WORST_ENTRY_TO_INNER_RETURN_CYCLES.load(Ordering::Relaxed)),
+            value1: cycles_to_us(WORST_INNER_TO_ENGINE_RETURN_CYCLES.load(Ordering::Relaxed)),
+            value2: cycles_to_us(WORST_ENGINE_RETURN_TO_CLASSIFY_CYCLES.load(Ordering::Relaxed)),
         },
     ])
 }
