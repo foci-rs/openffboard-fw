@@ -28,6 +28,7 @@ pub(crate) const SOURCE_STOP_CHECK: u32 = 1 << 8;
 pub(crate) const SOURCE_ARM_CHECK: u32 = 1 << 9;
 pub(crate) const SOURCE_REPORT_TASK: u32 = 1 << 10;
 pub(crate) const SOURCE_STEPPER_DIAG_TASK: u32 = 1 << 11;
+pub(crate) const SOURCE_TIM2_IRQ: u32 = 1 << 12;
 
 static WAIT_PROBE: DeadlineAttributionProbe = DeadlineAttributionProbe::new();
 static SERVICE_PROBE: DeadlineAttributionProbe = DeadlineAttributionProbe::new();
