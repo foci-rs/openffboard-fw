@@ -639,6 +639,17 @@ mod app {
                     };
                     let now_us = Mono::now().duration_since_epoch().to_micros();
                     let driver_classify_cycle = cortex_m::peripheral::DWT::cycle_count();
+                    if let foci_firmware::commissioning::schedule::CommissionPoll::At {
+                        timestamp_us,
+                        ..
+                    } = &poll
+                    {
+                        crate::commission_deadline_probe::arm_short_deadline(
+                            *timestamp_us,
+                            now_us,
+                            driver_classify_cycle,
+                        );
+                    }
                     let driver_action = match commission_poll_driver.classify(&poll, now_us) {
                         Ok(action) => action,
                         Err(error) => {
@@ -660,14 +671,6 @@ mod app {
                             foci_firmware::tmc_control::PollDriverAction::Terminal
                         }
                     };
-                    if let foci_firmware::tmc_control::PollDriverAction::WaitUntil(deadline_us) =
-                        driver_action
-                    {
-                        crate::commission_deadline_probe::arm_short_wait(
-                            deadline_us.saturating_sub(now_us),
-                            driver_classify_cycle,
-                        );
-                    }
                     if matches!(
                         driver_action,
                         foci_firmware::tmc_control::PollDriverAction::YieldNow

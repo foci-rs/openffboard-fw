@@ -6,6 +6,7 @@ use foci_firmware::tmc_control::deadline_attribution::DeadlineAttributionProbe;
 
 const CYCLES_PER_MICROSECOND: u32 = 168;
 const MAX_ATTRIBUTED_WAIT_US: u64 = 250;
+const MAX_ATTRIBUTED_OVERDUE_US: u64 = 1_000;
 const DIAG_DEADLINE_RELEASE: u8 = 40;
 const DIAG_DEADLINE_SOURCE: u8 = 41;
 
@@ -24,15 +25,29 @@ pub(crate) fn reset() {
     PROBE.reset();
 }
 
-/// Arm attribution for one future short commissioning wait.
-pub(crate) fn arm_short_wait(wait_us: u64, arm_cycle: u32) {
-    if wait_us == 0 || wait_us > MAX_ATTRIBUTED_WAIT_US {
+/// Arm attribution for one short absolute commissioning deadline.
+pub(crate) fn arm_short_deadline(deadline_us: u64, now_us: u64, arm_cycle: u32) {
+    if deadline_us > now_us {
+        let wait_us = deadline_us - now_us;
+        if wait_us > MAX_ATTRIBUTED_WAIT_US {
+            PROBE.cancel_active();
+            return;
+        }
+        let wait_us = wait_us as u32;
+        let due_cycle = arm_cycle.wrapping_add(wait_us.saturating_mul(CYCLES_PER_MICROSECOND));
+        PROBE.arm(due_cycle, wait_us);
+        return;
+    }
+
+    let overdue_us = now_us - deadline_us;
+    if overdue_us > MAX_ATTRIBUTED_OVERDUE_US {
         PROBE.cancel_active();
         return;
     }
-    let wait_us_u32 = wait_us as u32;
-    let due_cycle = arm_cycle.wrapping_add(wait_us_u32.saturating_mul(CYCLES_PER_MICROSECOND));
-    PROBE.arm(due_cycle, wait_us_u32);
+    let due_cycle =
+        arm_cycle.wrapping_sub((overdue_us as u32).saturating_mul(CYCLES_PER_MICROSECOND));
+    PROBE.arm(due_cycle, 0);
+    PROBE.mark_sleep_entry(arm_cycle);
 }
 
 /// Mark the final board handoff immediately before sleeping or repolling.
@@ -78,7 +93,7 @@ impl Drop for DeadlineSourceSpan {
 /// Encode the worst retained short-deadline release on the existing generic path.
 pub(crate) fn diagnostics() -> Option<[CommissionDiagnostic; 2]> {
     let retained = PROBE.worst_snapshot();
-    if retained.requested_wait_us == 0 {
+    if retained.release_lateness_cycles == 0 {
         return None;
     }
     let evidence = retained.to_microseconds(CYCLES_PER_MICROSECOND)?;
