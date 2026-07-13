@@ -40,7 +40,7 @@ pub(crate) fn mark_sleep_entry() {
     PROBE.mark_sleep_entry(cortex_m::peripheral::DWT::cycle_count());
 }
 
-/// Complete the active deadline when the P1 commissioning task resumes.
+/// Complete the active deadline when the engine observes its resumed timestamp.
 pub(crate) fn resume() {
     PROBE.resume(cortex_m::peripheral::DWT::cycle_count());
 }

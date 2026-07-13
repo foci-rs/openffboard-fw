@@ -22,6 +22,7 @@ impl CommissionBackendHooks for OpenFFBoardHooks {
     }
 
     fn commission_elapsed_us() -> u64 {
+        crate::commission_deadline_probe::resume();
         // Microseconds since Mono start. Returned as u64 so deadline
         // comparisons in commission.rs never wrap across the 51-second
         // TIM5 boundary that previously broke the engine.

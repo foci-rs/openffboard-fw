@@ -855,7 +855,6 @@ mod app {
                                             Ok(
                                                 foci_firmware::tmc_control::AbsoluteWaitAction::PollNow,
                                             ) => {
-                                                crate::commission_deadline_probe::resume();
                                                 break;
                                             }
                                             Ok(
