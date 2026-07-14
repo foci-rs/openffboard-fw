@@ -27,5 +27,12 @@ impl embedded_hal_async::delay::DelayNs for CycleDelay {
     }
 }
 
+impl embedded_hal::delay::DelayNs for CycleDelay {
+    fn delay_ns(&mut self, ns: u32) {
+        let cycles = (ns as u64 * 168 / 1000) as u32;
+        cortex_m::asm::delay(cycles);
+    }
+}
+
 /// TMC4671 SPI device with exclusive bus access and software CS.
 pub type TmcSpiDevice = ExclusiveDevice<Spi1Bus, Output<'static>, CycleDelay>;
