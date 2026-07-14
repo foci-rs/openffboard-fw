@@ -352,7 +352,8 @@ impl Drop for DeadlineSourceSpan {
 /// marks a source captured while pairing the pre-arm classification clocks.
 pub(crate) fn diagnostics() -> Option<[CommissionDiagnostic; 2]> {
     let entry_lateness_cycles = WORST_ENTRY_LATENESS_CYCLES.load(Ordering::Acquire);
-    if entry_lateness_cycles == 0 {
+    let max_capture_classify_cycles = MAX_CAPTURE_CLASSIFY_CYCLES.load(Ordering::Acquire);
+    if entry_lateness_cycles == 0 && max_capture_classify_cycles == 0 {
         return None;
     }
     let cycles_to_us = |cycles: u32| cycles.div_ceil(CYCLES_PER_MICROSECOND);
@@ -377,7 +378,7 @@ pub(crate) fn diagnostics() -> Option<[CommissionDiagnostic; 2]> {
             code: DIAG_DEADLINE_HOPS,
             status: 2,
             value0: pack_u16(
-                cycles_to_us(MAX_CAPTURE_CLASSIFY_CYCLES.load(Ordering::Relaxed)),
+                cycles_to_us(max_capture_classify_cycles),
                 cycles_to_us(WORST_ENTRY_TO_INNER_RETURN_CYCLES.load(Ordering::Relaxed)),
             ),
             value1: cycles_to_us(WORST_INNER_TO_ENGINE_RETURN_CYCLES.load(Ordering::Relaxed)),
