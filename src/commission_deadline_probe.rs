@@ -55,6 +55,8 @@ static WORST_ENGINE_RETURN_TO_CLASSIFY_CYCLES: AtomicU32 = AtomicU32::new(0);
 static WORST_REQUESTED_WAIT_US: AtomicU32 = AtomicU32::new(0);
 static WORST_POST_DEADLINE_SOURCE_MASK: AtomicU32 = AtomicU32::new(0);
 static WORST_FLAGS: AtomicU32 = AtomicU32::new(0);
+static CAPTURE_CLASSIFY_START_CYCLE: AtomicU32 = AtomicU32::new(0);
+static MAX_CAPTURE_CLASSIFY_CYCLES: AtomicU32 = AtomicU32::new(0);
 
 /// Reset retained attribution at the beginning of a commissioning run.
 pub(crate) fn reset() {
@@ -78,6 +80,23 @@ pub(crate) fn reset() {
     WORST_REQUESTED_WAIT_US.store(0, Ordering::Relaxed);
     WORST_POST_DEADLINE_SOURCE_MASK.store(0, Ordering::Relaxed);
     WORST_FLAGS.store(0, Ordering::Relaxed);
+    CAPTURE_CLASSIFY_START_CYCLE.store(0, Ordering::Relaxed);
+    MAX_CAPTURE_CLASSIFY_CYCLES.store(0, Ordering::Relaxed);
+}
+
+/// Start one DWT measurement around pure sample-slot classification.
+pub(crate) fn capture_classify_start() {
+    CAPTURE_CLASSIFY_START_CYCLE.store(cortex_m::peripheral::DWT::cycle_count(), Ordering::Relaxed);
+}
+
+/// Finish one DWT measurement around pure sample-slot classification.
+pub(crate) fn capture_classify_end() {
+    let end_cycle = cortex_m::peripheral::DWT::cycle_count();
+    let start_cycle = CAPTURE_CLASSIFY_START_CYCLE.swap(0, Ordering::Relaxed);
+    if start_cycle != 0 {
+        MAX_CAPTURE_CLASSIFY_CYCLES
+            .fetch_max(end_cycle.wrapping_sub(start_cycle), Ordering::Relaxed);
+    }
 }
 
 /// Record the first engine clock read after one absolute wait.
@@ -323,10 +342,11 @@ impl Drop for DeadlineSourceSpan {
 ///
 /// Diagnostic 40 contains packed timer-return lateness and return-to-entry time,
 /// packed requested wait and total entry lateness, and the same-event
-/// post-deadline source mask plus flags. Diagnostic 41 contains
-/// poll-entry-to-inner-return, inner-return-to-scheduled-engine-return, and
-/// engine-return-to-classification durations. All values describe the same
-/// worst entry event.
+/// post-deadline source mask plus flags. Diagnostic 41 value0 packs maximum
+/// pure capture classification time in its low half and poll-entry-to-inner-
+/// return time in its high half. Values 1 and 2 contain inner-return-to-
+/// scheduled-engine-return and engine-return-to-classification durations.
+/// The outer hop values describe the same worst entry event.
 /// Bit 31 marks a terminal event, bit 30 marks a path without a timer wait, bit
 /// 29 marks a deadline already expired before the wait handoff, and bit 28
 /// marks a source captured while pairing the pre-arm classification clocks.
@@ -356,7 +376,10 @@ pub(crate) fn diagnostics() -> Option<[CommissionDiagnostic; 2]> {
             phase: PhaseId::ElectricalId.to_u8(),
             code: DIAG_DEADLINE_HOPS,
             status: 2,
-            value0: cycles_to_us(WORST_ENTRY_TO_INNER_RETURN_CYCLES.load(Ordering::Relaxed)),
+            value0: pack_u16(
+                cycles_to_us(MAX_CAPTURE_CLASSIFY_CYCLES.load(Ordering::Relaxed)),
+                cycles_to_us(WORST_ENTRY_TO_INNER_RETURN_CYCLES.load(Ordering::Relaxed)),
+            ),
             value1: cycles_to_us(WORST_INNER_TO_ENGINE_RETURN_CYCLES.load(Ordering::Relaxed)),
             value2: cycles_to_us(WORST_ENGINE_RETURN_TO_CLASSIFY_CYCLES.load(Ordering::Relaxed)),
         },
