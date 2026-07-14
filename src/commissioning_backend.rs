@@ -22,15 +22,12 @@ impl CommissionBackendHooks for OpenFFBoardHooks {
     }
 
     fn commission_elapsed_us() -> u64 {
-        let cycle = cortex_m::peripheral::DWT::cycle_count();
         // Microseconds since Mono start. Returned as u64 so deadline
         // comparisons in commission.rs never wrap across the 51-second
         // TIM5 boundary that previously broke the engine.
         //
         // Source: TIM2 monotonic at 1 MHz (1 us resolution).
-        let elapsed_us = Mono::now().duration_since_epoch().to_micros();
-        crate::commission_deadline_probe::observe_elapsed(cycle);
-        elapsed_us
+        Mono::now().duration_since_epoch().to_micros()
     }
 
     fn commission_is_shutdown_requested() -> bool {
@@ -40,22 +37,6 @@ impl CommissionBackendHooks for OpenFFBoardHooks {
         } else {
             false
         }
-    }
-
-    fn commission_capture_classify_start() {
-        crate::commission_deadline_probe::capture_classify_start();
-    }
-
-    fn commission_capture_classify_end() {
-        crate::commission_deadline_probe::capture_classify_end();
-    }
-
-    fn commission_capture_wait_start(requested_wait_us: u32) {
-        crate::commission_deadline_probe::capture_wait_start(requested_wait_us);
-    }
-
-    fn commission_capture_wait_end() {
-        crate::commission_deadline_probe::capture_wait_end();
     }
 
     async fn commission_delay_us(us: u32) {
