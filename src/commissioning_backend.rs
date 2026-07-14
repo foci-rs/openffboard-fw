@@ -50,6 +50,14 @@ impl CommissionBackendHooks for OpenFFBoardHooks {
         crate::commission_deadline_probe::capture_classify_end();
     }
 
+    fn commission_capture_wait_start(requested_wait_us: u32) {
+        crate::commission_deadline_probe::capture_wait_start(requested_wait_us);
+    }
+
+    fn commission_capture_wait_end() {
+        crate::commission_deadline_probe::capture_wait_end();
+    }
+
     async fn commission_delay_us(us: u32) {
         Mono::delay((us as u64).micros()).await;
     }

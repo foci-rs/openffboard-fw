@@ -33,6 +33,7 @@ pub(crate) const SOURCE_TIM2_IRQ: u32 = 1 << 12;
 
 static WAIT_PROBE: DeadlineAttributionProbe = DeadlineAttributionProbe::new();
 static SERVICE_PROBE: DeadlineAttributionProbe = DeadlineAttributionProbe::new();
+static CAPTURE_WAIT_PROBE: DeadlineAttributionProbe = DeadlineAttributionProbe::new();
 static CLASSIFICATION_WINDOW_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CLASSIFICATION_SOURCE_MASK: AtomicU32 = AtomicU32::new(0);
 static EVENT_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -62,6 +63,7 @@ static MAX_CAPTURE_CLASSIFY_CYCLES: AtomicU32 = AtomicU32::new(0);
 pub(crate) fn reset() {
     WAIT_PROBE.reset();
     SERVICE_PROBE.reset();
+    CAPTURE_WAIT_PROBE.reset();
     CLASSIFICATION_WINDOW_ACTIVE.store(false, Ordering::Release);
     CLASSIFICATION_SOURCE_MASK.store(0, Ordering::Relaxed);
     EVENT_ACTIVE.store(false, Ordering::Release);
@@ -97,6 +99,20 @@ pub(crate) fn capture_classify_end() {
         MAX_CAPTURE_CLASSIFY_CYCLES
             .fetch_max(end_cycle.wrapping_sub(start_cycle), Ordering::Relaxed);
     }
+}
+
+/// Arm attribution against the capture deadline before entering its wait.
+pub(crate) fn capture_wait_start(requested_wait_us: u32) {
+    let arm_cycle = cortex_m::peripheral::DWT::cycle_count();
+    let due_cycle =
+        arm_cycle.wrapping_add(requested_wait_us.saturating_mul(CYCLES_PER_MICROSECOND));
+    CAPTURE_WAIT_PROBE.arm(due_cycle, requested_wait_us);
+    CAPTURE_WAIT_PROBE.mark_sleep_entry(arm_cycle);
+}
+
+/// Retain attribution immediately after the capture wait resumes.
+pub(crate) fn capture_wait_end() {
+    CAPTURE_WAIT_PROBE.resume(cortex_m::peripheral::DWT::cycle_count());
 }
 
 /// Record the first engine clock read after one absolute wait.
@@ -335,43 +351,50 @@ impl Drop for DeadlineSourceSpan {
         }
         WAIT_PROBE.record_source_span(self.source_mask, self.entry_cycle, exit_cycle);
         SERVICE_PROBE.record_source_span(self.source_mask, self.entry_cycle, exit_cycle);
+        CAPTURE_WAIT_PROBE.record_source_span(self.source_mask, self.entry_cycle, exit_cycle);
     }
 }
 
 /// Encode the worst wait and service windows on the existing generic path.
 ///
-/// Diagnostic 40 contains packed timer-return lateness and return-to-entry time,
-/// packed requested wait and total entry lateness, and the same-event
-/// post-deadline source mask plus flags. Diagnostic 41 value0 packs maximum
-/// pure capture classification time in its low half and poll-entry-to-inner-
-/// return time in its high half. Values 1 and 2 contain inner-return-to-
-/// scheduled-engine-return and engine-return-to-classification durations.
-/// The outer hop values describe the same worst entry event.
-/// Bit 31 marks a terminal event, bit 30 marks a path without a timer wait, bit
-/// 29 marks a deadline already expired before the wait handoff, and bit 28
-/// marks a source captured while pairing the pre-arm classification clocks.
+/// Diagnostic 40 contains packed capture-wait release lateness and accumulated
+/// attributed overlap, packed requested wait and maximum single-source
+/// overlap, and the attributed source mask. Bit 29 marks a deadline already
+/// expired before the wait handoff. Diagnostic 41 value0 packs maximum pure
+/// capture classification time in its low half and the legacy outer
+/// poll-entry-to-inner-return time in its high half. Values 1 and 2 retain the
+/// remaining outer-hop durations for comparison with earlier runs.
 pub(crate) fn diagnostics() -> Option<[CommissionDiagnostic; 2]> {
-    let entry_lateness_cycles = WORST_ENTRY_LATENESS_CYCLES.load(Ordering::Acquire);
     let max_capture_classify_cycles = MAX_CAPTURE_CLASSIFY_CYCLES.load(Ordering::Acquire);
-    if entry_lateness_cycles == 0 && max_capture_classify_cycles == 0 {
+    let capture_wait = CAPTURE_WAIT_PROBE
+        .worst_snapshot()
+        .to_microseconds(CYCLES_PER_MICROSECOND)
+        .expect("nonzero OpenFFBoard DWT clock");
+    if capture_wait.release_lateness_us == 0 && max_capture_classify_cycles == 0 {
         return None;
     }
     let cycles_to_us = |cycles: u32| cycles.div_ceil(CYCLES_PER_MICROSECOND);
     let pack_u16 =
         |low: u32, high: u32| low.min(u32::from(u16::MAX)) | (high.min(u32::from(u16::MAX)) << 16);
-    let timer_lateness_us = WORST_TIMER_LATENESS_US.load(Ordering::Relaxed);
-    let return_to_entry_us = cycles_to_us(WORST_RETURN_TO_ENTRY_CYCLES.load(Ordering::Relaxed));
-    let requested_wait_us = WORST_REQUESTED_WAIT_US.load(Ordering::Relaxed);
-    let entry_lateness_us = cycles_to_us(entry_lateness_cycles);
+    let capture_wait_flags = if capture_wait.deadline_expired_before_sleep {
+        EXPIRED_BEFORE_SLEEP_FLAG
+    } else {
+        0
+    };
     Some([
         CommissionDiagnostic {
             phase: PhaseId::ElectricalId.to_u8(),
             code: DIAG_DEADLINE_RELEASE,
             status: 2,
-            value0: pack_u16(timer_lateness_us, return_to_entry_us),
-            value1: pack_u16(requested_wait_us, entry_lateness_us),
-            value2: WORST_POST_DEADLINE_SOURCE_MASK.load(Ordering::Relaxed)
-                | WORST_FLAGS.load(Ordering::Relaxed),
+            value0: pack_u16(
+                capture_wait.release_lateness_us,
+                capture_wait.accumulated_overlap_us,
+            ),
+            value1: pack_u16(
+                capture_wait.requested_wait_us,
+                capture_wait.max_source_overlap_us,
+            ),
+            value2: capture_wait.source_mask | capture_wait_flags,
         },
         CommissionDiagnostic {
             phase: PhaseId::ElectricalId.to_u8(),
