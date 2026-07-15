@@ -212,6 +212,7 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
             crate::tmc_diagnostics::DiagnosticContext {
                 tmc,
                 runtime,
+                enable_pin: self.enable_pin,
                 homing_active,
                 stepper_active,
                 saved_voltage_limit,

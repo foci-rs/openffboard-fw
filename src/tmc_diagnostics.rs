@@ -4,11 +4,13 @@
 //! RTIC delay wiring and OpenFFBoard reply emission local.
 
 use crate::app::Mono;
+use embassy_stm32::gpio::Output;
 use foci_firmware::tmc::TmcRequest;
 use foci_firmware::tmc_diagnostics::{
     CurrentStepReport, CurrentTorqueSampleReport, DiagnosticDelay, DiagnosticOutcome,
-    DiagnosticReadiness, ResistanceAxisReport, ResistanceProfileReport, ResistanceRunReport,
-    VoltageStepReport, handle_diagnostic_request as handle_shared_diagnostic_request,
+    DiagnosticPowerStage, DiagnosticReadiness, ResistanceAxisReport, ResistanceProfileReport,
+    ResistanceRunReport, VoltageStepReport,
+    handle_diagnostic_request as handle_shared_diagnostic_request,
 };
 use foci_tmc4671::spi::Tmc4671Spi;
 use rtic_monotonics::{Monotonic, fugit::ExtU64};
@@ -35,10 +37,22 @@ impl DiagnosticDelay for MonoDiagnosticDelay {
 pub(crate) struct DiagnosticContext<'a> {
     pub(crate) tmc: &'a mut Tmc4671Spi<TmcSpiDevice>,
     pub(crate) runtime: &'a mut foci_firmware::tmc_control::TmcControlRuntime,
+    pub(crate) enable_pin: &'a mut Output<'static>,
     pub(crate) homing_active: bool,
     pub(crate) stepper_active: bool,
     pub(crate) saved_voltage_limit: u32,
     pub(crate) tmc_config: &'static foci_firmware::config::TmcConfig,
+}
+
+struct OpenFFBoardDiagnosticPowerStage<'a> {
+    enable_pin: &'a mut Output<'static>,
+}
+
+impl DiagnosticPowerStage for OpenFFBoardDiagnosticPowerStage<'_> {
+    fn trip_power_stage(&mut self) {
+        self.enable_pin.set_low();
+        crate::helpers::stepper::stepper_stop_from_p1(0);
+    }
 }
 
 /// Result of routing a TMC request through the diagnostic dispatcher.
@@ -253,6 +267,10 @@ impl foci_firmware::tmc_diagnostics::DiagnosticReplySink for BoardDiagnosticRepl
             gain_path_count_slope_milli: i32 = report.gain_path_count_slope_milli,
             warning_flags: u32 = report.warning_flags,
             status_flags_or: u32 = report.status_flags_or,
+            peak_abs_current_count: u16 = report.peak_abs_current_count,
+            max_abs_steady_mean_current_count: u16 = report.max_abs_steady_mean_current_count,
+            current_ceiling_count: u16 = report.current_ceiling_count,
+            power_stage_tripped: u8 = u8::from(report.power_stage_tripped),
             pwm_maxcnt_readback: u16 = report.pwm_maxcnt_readback,
             bbm_readback: u16 = report.bbm_readback,
             dsadc_mdec_readback: u32 = report.dsadc_mdec_readback,
@@ -267,12 +285,16 @@ pub(crate) async fn handle_diagnostic_request(
     ctx: DiagnosticContext<'_>,
 ) -> DiagnosticDispatch {
     let mut delay = MonoDiagnosticDelay;
+    let mut power_stage = OpenFFBoardDiagnosticPowerStage {
+        enable_pin: ctx.enable_pin,
+    };
     let outcome = handle_shared_diagnostic_request(
         req,
         foci_firmware::tmc_diagnostics::DiagnosticContext {
             tmc: ctx.tmc,
             runtime: ctx.runtime,
             delay: &mut delay,
+            power_stage: &mut power_stage,
             readiness: DiagnosticReadiness {
                 homing_active: ctx.homing_active,
                 stepper_active: ctx.stepper_active,
