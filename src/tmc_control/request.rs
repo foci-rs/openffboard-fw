@@ -13,6 +13,7 @@ use foci_firmware::state::stepper::StepperChannelState;
 use foci_firmware::state::tmc::TmcChannelState;
 use foci_firmware::state::trsync::HOMING_STATE;
 use foci_firmware::tmc::TmcRequest;
+use foci_firmware::tmc_control::dispatch::RegisterRequestError;
 use foci_firmware::tmc_control::request::{
     MotionScaleMapperInstallError, TmcPreRequestDisposition, TmcRequestBoard,
     handle_tmc_control_request as handle_shared_request,
@@ -194,7 +195,7 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
         &mut self,
         req: TmcRequest,
         tmc: &mut Tmc4671Spi<TmcSpiDevice>,
-    ) -> Result<(), ()> {
+    ) -> Result<(), RegisterRequestError> {
         handle_tmc_request(req, tmc).await
     }
 

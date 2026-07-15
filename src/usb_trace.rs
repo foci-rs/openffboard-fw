@@ -815,7 +815,7 @@ pub(crate) async fn sample_tick<B>(
             )
             .await,
             pidout_uq_ud_limits: state.voltage_limit_cfg.load(Relaxed),
-            pid_torque_flux_limits: state.current_limit_reg.load(Relaxed),
+            pid_torque_flux_limits: state.load_current_limit(Relaxed).register_value(),
             pid_velocity_limit: state.velocity_limit_cfg.load(Relaxed),
         };
         let mut payload = [0u8; CONTROL_DETAIL_PAYLOAD_LEN];
