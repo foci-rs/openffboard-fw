@@ -379,24 +379,46 @@ mod app {
         // For now, rely on the PSU's own overvoltage protection and the
         // bulk capacitors to absorb typical regen events. PE10 remains
         // held LOW at boot (line ~1650) to keep the Layer 2 brake FET off.
-        {
-            use foci_tmc4671::registers::*;
-            let _ = tmc.write_register(ADC_VM_LIMITS, 0xFFFF_FFFF).await;
+        // Configure STATUS_MASK to route ADC current clipping to the STATUS
+        // output pin (PE8 EXTI). Other flags remain polled.
+        const STATUS_ADC_I_CLIPPED: u32 = 1 << 26;
+        let bootstrap_failure = {
+            let mut backend = openffboard_backend(tmc, enable_pin);
+            foci_firmware::tmc_control::bootstrap_tmc_safety(&mut backend, STATUS_ADC_I_CLIPPED)
+                .await
+                .err()
+        };
+
+        if let Some(failure) = bootstrap_failure {
+            let reason = failure.shutdown_reason(0);
+            defmt::error!(
+                "TMC4671 channel 0 safety bootstrap failed: {:?}",
+                failure.stage
+            );
+            loop {
+                if SHUTDOWN_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+                    Mono::delay(1.millis()).await;
+                    continue;
+                }
+                let _request = rx.recv().await;
+                if SHUTDOWN_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                ctx.shared.app_state.lock(|state| {
+                    if crate::firmware_ctx::enter_shutdown(state) {
+                        foci_firmware::dispatch_shutdown!(
+                            reason,
+                            read_tim5(),
+                            &mut crate::_ankyra_config::Sender
+                        );
+                    }
+                });
+            }
         }
 
-        // Configure STATUS_MASK: route critical fault flags to the STATUS
-        // output pin (PE8 EXTI). TMC4671-LA Rev 1, 02/2024 Table 30 marks
-        // bit 19 as reserved, so only ADC current clipping is interrupting;
-        // other flags are polled.
+        // Safety bootstrap succeeded. Clear any pending EXTI state and enable
+        // the TMC4671 STATUS interrupt before entering normal control.
         {
-            use foci_tmc4671::registers::*;
-            const STATUS_ADC_I_CLIPPED: u32 = 1 << 26;
-            let mask = STATUS_ADC_I_CLIPPED;
-            let _ = tmc.write_register(STATUS_MASK, mask).await;
-            // Clear pending STATUS flags from power-on, then configure
-            // PE8 EXTI for rising edge interrupt on STATUS assertion.
-            let _ = tmc.read_register(STATUS_FLAGS).await;
-            let _ = tmc.write_register(STATUS_FLAGS, 0).await;
             let syscfg = embassy_stm32::pac::SYSCFG;
             // EXTICR3[3:0] = 4 selects port E for EXTI line 8.
             syscfg.exticr(2).modify(|w| w.set_exti(0, 4));
@@ -405,7 +427,10 @@ mod app {
             exti.ftsr(0).modify(|w| w.set_line(8, false));
             exti.pr(0).write(|w| w.set_line(8, true)); // Clear pending
             exti.imr(0).modify(|w| w.set_line(8, true)); // Unmask
-            defmt::info!("TMC4671 STATUS_MASK: {:#010x}, EXTI8 enabled", mask);
+            defmt::info!(
+                "TMC4671 STATUS_MASK: {:#010x}, EXTI8 enabled",
+                STATUS_ADC_I_CLIPPED
+            );
         }
 
         // Shared runtime for board-agnostic control state and timing. This
