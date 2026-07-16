@@ -728,9 +728,6 @@ mod app {
                     let tick_cycles =
                         cortex_m::peripheral::DWT::cycle_count().wrapping_sub(tick_start);
                     commission_tick_max_cycles = commission_tick_max_cycles.max(tick_cycles);
-                    #[cfg(feature = "trace")]
-                    crate::usb_trace::drain_pending_events();
-
                     use foci_firmware::tmc_control::ScheduledCommissionTickAction;
                     match action {
                         ScheduledCommissionTickAction::ReadyNow { event }
@@ -1031,7 +1028,6 @@ mod app {
                 )
                 .await;
                 crate::usb_trace::request_spi_duration_event_if_ready();
-                crate::usb_trace::drain_pending_events();
                 if trace_tick.metadata_due {
                     crate::usb_trace::emit_metadata();
                 }

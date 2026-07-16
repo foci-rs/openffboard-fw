@@ -14,7 +14,7 @@ use foci_firmware::trace::transport::{self, TraceQueueSelection};
 
 use crate::state::usb_trace::{
     MOTION_QUEUE_DEPTH, PENDING_EVENTS, PendingEvent, QueuedFrame, TRACE_COUNTERS, current_tx,
-    event_queue, motion_queue,
+    event_queue, motion_consumer, motion_producer,
 };
 
 /// Product string used by trace builds.
@@ -256,13 +256,19 @@ pub(crate) fn request_event(
         arg_count,
     };
     // O(1) critical section: push one fixed-size event or count one drop.
-    cortex_m::interrupt::free(|_| unsafe {
+    let queued = cortex_m::interrupt::free(|_| unsafe {
         let queue = &mut *core::ptr::addr_of_mut!(PENDING_EVENTS);
         if queue.push_back(event).is_err() {
             TRACE_COUNTERS.event_drops.fetch_add(1, Ordering::Relaxed);
             TRACE_COUNTERS.event_drop_gap.store(true, Ordering::Relaxed);
+            false
+        } else {
+            true
         }
     });
+    if queued {
+        crate::transport::USB_WAKE.signal(());
+    }
 }
 
 pub(crate) fn request_commission_event(
@@ -581,12 +587,11 @@ pub(crate) fn request_velocity_observation(
 
 /// Enqueue a motion/counter frame without blocking.
 pub(crate) fn enqueue_motion(frame: FrameBuf) {
-    // SAFETY: Trace producers enqueue complete frames; the USB task is the
-    // only consumer. RTIC priorities prevent overlapping mutable queue use for
-    // this initial single-producer path.
+    // SAFETY: TMC control is the sole motion-frame producer. The USB task owns
+    // the separately split consumer endpoint.
     unsafe {
-        let queue = motion_queue();
-        if queue.enqueue(QueuedFrame::new(frame)).is_err() {
+        let producer = motion_producer();
+        if producer.enqueue(QueuedFrame::new(frame)).is_err() {
             TRACE_COUNTERS.motion_drops.fetch_add(1, Ordering::Relaxed);
             TRACE_COUNTERS
                 .motion_drop_gap
@@ -594,15 +599,15 @@ pub(crate) fn enqueue_motion(frame: FrameBuf) {
         } else {
             crate::transport::USB_WAKE.signal(());
         }
-        let len = queue.len() as u16;
+        let len = producer.len() as u16;
         transport::update_high_water(&TRACE_COUNTERS.high_water, len);
     }
 }
 
 /// Enqueue an event frame without blocking.
 pub(crate) fn enqueue_event(frame: FrameBuf) {
-    // SAFETY: Trace event producers enqueue complete frames; the USB task is
-    // the only consumer in this initial wiring slice.
+    // SAFETY: Pending events are converted, enqueued, and consumed only by the
+    // priority-2 USB task.
     unsafe {
         if event_queue().enqueue(QueuedFrame::new(frame)).is_err() {
             TRACE_COUNTERS.event_drops.fetch_add(1, Ordering::Relaxed);
@@ -614,17 +619,15 @@ pub(crate) fn enqueue_event(frame: FrameBuf) {
 }
 
 fn motion_queue_len() -> usize {
-    // SAFETY: Trace producers may inspect the queue length for decimation. The
-    // USB task remains the sole consumer, and enqueue paths retain ownership of
-    // actual queue mutation.
-    unsafe { motion_queue().len() }
+    // SAFETY: This runs in the P1 producer context.
+    unsafe { motion_producer().len() }
 }
 
 fn dequeue_next_frame() -> Option<QueuedFrame> {
-    // SAFETY: The USB task is the only trace consumer. Peeking copies sequence
-    // numbers from queue heads before dequeuing from exactly one queue.
+    // SAFETY: The USB task is the only trace consumer and the only event-queue
+    // owner. The motion producer is isolated behind its split SPSC endpoint.
     unsafe {
-        let motion = motion_queue();
+        let motion = motion_consumer();
         let event = event_queue();
         let motion_seq = motion.peek().map(|queued| frame_sequence(&queued.frame));
         let event_seq = event.peek().map(|queued| frame_sequence(&queued.frame));
