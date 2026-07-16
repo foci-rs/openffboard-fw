@@ -552,6 +552,33 @@ pub(crate) fn emit_phase_advance(
     enqueue_motion(frame);
 }
 
+/// Enqueue one characterization-only raw velocity observation.
+pub(crate) fn request_velocity_observation(
+    channel: u8,
+    sample: foci_firmware::trace::stream::VelocityTraceObservation,
+) {
+    use foci_firmware::trace::stream::*;
+
+    if !is_configured() {
+        return;
+    }
+
+    let mut payload = [0u8; VELOCITY_OBSERVATION_PAYLOAD_LEN];
+    encode_velocity_observation_payload(&sample, &mut payload);
+    let mut frame = FrameBuf::new();
+    frame.write_header(header(
+        FRAME_TYPE_VELOCITY_OBSERVATION,
+        VELOCITY_OBSERVATION_PAYLOAD_LEN,
+        SOURCE_KIND_FOCI,
+        channel,
+        motion_flags(),
+    ));
+    frame
+        .payload_mut(VELOCITY_OBSERVATION_PAYLOAD_LEN)
+        .copy_from_slice(&payload);
+    enqueue_motion(frame);
+}
+
 /// Enqueue a motion/counter frame without blocking.
 pub(crate) fn enqueue_motion(frame: FrameBuf) {
     // SAFETY: Trace producers enqueue complete frames; the USB task is the
