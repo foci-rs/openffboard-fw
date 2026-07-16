@@ -137,7 +137,11 @@ mod app {
 
         crate::board_init::init_tim5_clock();
         #[cfg(feature = "trace")]
-        crate::usb_trace::note_trace_boot();
+        {
+            // SAFETY: init runs once before trace producers or consumers spawn.
+            unsafe { crate::state::usb_trace::init_trace_queues() };
+            crate::usb_trace::note_trace_boot();
+        }
         crate::board_init::init_stepdir_gpio();
         defmt::info!("TIM5 enabled for Klipper clock @ 84 MHz, STEP/DIR GPIO configured");
         // TIM2 clock: 84 MHz (APB1 timer clock, same bus as TIM5). At the

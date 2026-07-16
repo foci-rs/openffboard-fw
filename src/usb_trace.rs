@@ -13,8 +13,8 @@ use foci_firmware::trace::stream::{FrameBuf, frame_sequence};
 use foci_firmware::trace::transport::{self, TraceQueueSelection};
 
 use crate::state::usb_trace::{
-    MOTION_QUEUE_DEPTH, PENDING_EVENTS, PendingEvent, QueuedFrame, TRACE_COUNTERS, current_tx,
-    event_queue, motion_consumer, motion_producer,
+    MOTION_QUEUE_DEPTH, PendingEvent, QueuedFrame, TRACE_COUNTERS, current_tx, event_queue,
+    motion_consumer, motion_producer, pending_events,
 };
 
 /// Product string used by trace builds.
@@ -257,7 +257,7 @@ pub(crate) fn request_event(
     };
     // O(1) critical section: push one fixed-size event or count one drop.
     let queued = cortex_m::interrupt::free(|_| unsafe {
-        let queue = &mut *core::ptr::addr_of_mut!(PENDING_EVENTS);
+        let queue = pending_events();
         if queue.push_back(event).is_err() {
             TRACE_COUNTERS.event_drops.fetch_add(1, Ordering::Relaxed);
             TRACE_COUNTERS.event_drop_gap.store(true, Ordering::Relaxed);
@@ -324,7 +324,7 @@ fn enqueue_event_frame(event: PendingEvent) {
 pub(crate) fn drain_pending_events() {
     loop {
         let event = cortex_m::interrupt::free(|_| unsafe {
-            let queue = &mut *core::ptr::addr_of_mut!(PENDING_EVENTS);
+            let queue = pending_events();
             queue.pop_front()
         });
         let Some(event) = event else {

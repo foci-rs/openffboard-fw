@@ -2,7 +2,10 @@
 
 #![cfg(feature = "trace")]
 
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use core::{
+    mem::MaybeUninit,
+    sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering},
+};
 
 use foci_firmware::trace::stream::FrameBuf;
 
@@ -105,22 +108,46 @@ struct MotionQueueEndpoints {
     consumer: heapless::spsc::Consumer<'static, QueuedFrame>,
 }
 
-static mut MOTION_QUEUE_ENDPOINTS: MotionQueueEndpoints = {
-    static mut QUEUE: heapless::spsc::Queue<QueuedFrame, MOTION_QUEUE_DEPTH> =
-        heapless::spsc::Queue::new();
-    // SAFETY: `QUEUE` is private to this initializer. The returned endpoints
-    // are stored separately and accessed only by their owning RTIC contexts.
-    #[allow(static_mut_refs)]
-    let (producer, consumer) = unsafe { QUEUE.split_const() };
-    MotionQueueEndpoints { producer, consumer }
-};
-pub(crate) static mut EVENT_QUEUE: heapless::spsc::Queue<QueuedFrame, EVENT_QUEUE_DEPTH> =
-    heapless::spsc::Queue::new();
-pub(crate) static mut PENDING_EVENTS: heapless::Deque<PendingEvent, PENDING_EVENT_DEPTH> =
-    heapless::Deque::new();
+type MotionQueue = heapless::spsc::Queue<QueuedFrame, MOTION_QUEUE_DEPTH>;
+type EventQueue = heapless::spsc::Queue<QueuedFrame, EVENT_QUEUE_DEPTH>;
+type PendingEventQueue = heapless::Deque<PendingEvent, PENDING_EVENT_DEPTH>;
+
+#[unsafe(link_section = ".ccmram.trace")]
+static mut MOTION_QUEUE: MaybeUninit<MotionQueue> = MaybeUninit::uninit();
+#[unsafe(link_section = ".ccmram.trace")]
+static mut EVENT_QUEUE: MaybeUninit<EventQueue> = MaybeUninit::uninit();
+#[unsafe(link_section = ".ccmram.trace")]
+static mut PENDING_EVENTS: MaybeUninit<PendingEventQueue> = MaybeUninit::uninit();
+static mut MOTION_QUEUE_ENDPOINTS: MaybeUninit<MotionQueueEndpoints> = MaybeUninit::uninit();
 
 /// Partially sent frame owned by the single USB trace consumer.
 pub(crate) static mut CURRENT_TX: Option<QueuedFrame> = None;
+
+/// Initialize the CPU-only trace queues in CCMRAM.
+///
+/// # Safety
+///
+/// Call exactly once during board initialization, before any trace producer or
+/// consumer can run.
+pub(crate) unsafe fn init_trace_queues() {
+    let motion_queue = core::ptr::addr_of_mut!(MOTION_QUEUE).cast::<MotionQueue>();
+    let event_queue = core::ptr::addr_of_mut!(EVENT_QUEUE).cast::<EventQueue>();
+    let pending_events = core::ptr::addr_of_mut!(PENDING_EVENTS).cast::<PendingEventQueue>();
+
+    // SAFETY: init runs once before tasks start, so these NOLOAD allocations
+    // have no live values or concurrent users yet.
+    unsafe {
+        motion_queue.write(MotionQueue::new());
+        event_queue.write(EventQueue::new());
+        pending_events.write(PendingEventQueue::new());
+
+        let motion_queue: &'static mut MotionQueue = &mut *motion_queue;
+        let (producer, consumer) = motion_queue.split();
+        core::ptr::addr_of_mut!(MOTION_QUEUE_ENDPOINTS)
+            .cast::<MotionQueueEndpoints>()
+            .write(MotionQueueEndpoints { producer, consumer });
+    }
+}
 
 /// Return the P1-owned trace motion/counter producer.
 ///
@@ -130,7 +157,8 @@ pub(crate) static mut CURRENT_TX: Option<QueuedFrame> = None;
 #[inline]
 pub(crate) unsafe fn motion_producer() -> &'static mut heapless::spsc::Producer<'static, QueuedFrame>
 {
-    let ptr = unsafe { core::ptr::addr_of_mut!(MOTION_QUEUE_ENDPOINTS.producer) };
+    let endpoints = core::ptr::addr_of_mut!(MOTION_QUEUE_ENDPOINTS).cast::<MotionQueueEndpoints>();
+    let ptr = unsafe { core::ptr::addr_of_mut!((*endpoints).producer) };
     // SAFETY: The caller guarantees exclusive P1 producer access.
     unsafe { &mut *ptr }
 }
@@ -143,7 +171,8 @@ pub(crate) unsafe fn motion_producer() -> &'static mut heapless::spsc::Producer<
 #[inline]
 pub(crate) unsafe fn motion_consumer() -> &'static mut heapless::spsc::Consumer<'static, QueuedFrame>
 {
-    let ptr = unsafe { core::ptr::addr_of_mut!(MOTION_QUEUE_ENDPOINTS.consumer) };
+    let endpoints = core::ptr::addr_of_mut!(MOTION_QUEUE_ENDPOINTS).cast::<MotionQueueEndpoints>();
+    let ptr = unsafe { core::ptr::addr_of_mut!((*endpoints).consumer) };
     // SAFETY: The caller guarantees exclusive P2 consumer access.
     unsafe { &mut *ptr }
 }
@@ -158,8 +187,22 @@ pub(crate) unsafe fn motion_consumer() -> &'static mut heapless::spsc::Consumer<
 #[inline]
 pub(crate) unsafe fn event_queue()
 -> &'static mut heapless::spsc::Queue<QueuedFrame, EVENT_QUEUE_DEPTH> {
-    let ptr = core::ptr::addr_of_mut!(EVENT_QUEUE);
+    let ptr = core::ptr::addr_of_mut!(EVENT_QUEUE).cast::<EventQueue>();
     // SAFETY: The caller guarantees exclusive access for this RTIC context.
+    unsafe { &mut *ptr }
+}
+
+/// Return the pending structured-event queue.
+///
+/// # Safety
+///
+/// Access must remain inside the existing interrupt-free producer sections or
+/// the priority-2 USB consumer context.
+#[inline]
+pub(crate) unsafe fn pending_events()
+-> &'static mut heapless::Deque<PendingEvent, PENDING_EVENT_DEPTH> {
+    let ptr = core::ptr::addr_of_mut!(PENDING_EVENTS).cast::<PendingEventQueue>();
+    // SAFETY: The caller guarantees access follows the documented RTIC discipline.
     unsafe { &mut *ptr }
 }
 
