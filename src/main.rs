@@ -737,18 +737,27 @@ mod app {
                         ScheduledCommissionTickAction::ReadyNow { event }
                         | ScheduledCommissionTickAction::At { event, .. } => {
                             if let Some(event) = event {
-                                let foci_firmware::commissioning::schedule::CommissionEvent::PhaseChanged {
-                                oid,
-                                phase_id,
-                                engine_kind,
-                            } = event;
-                                #[cfg(not(feature = "trace"))]
-                                let _ = engine_kind;
-                                #[cfg(feature = "trace")]
-                                {
-                                    commission_trace_phase = Some((engine_kind, phase_id));
+                                match event {
+                                    foci_firmware::commissioning::schedule::CommissionEvent::PhaseChanged {
+                                        oid,
+                                        phase_id,
+                                        engine_kind,
+                                    } => {
+                                        #[cfg(not(feature = "trace"))]
+                                        let _ = engine_kind;
+                                        #[cfg(feature = "trace")]
+                                        {
+                                            commission_trace_phase = Some((engine_kind, phase_id));
+                                        }
+                                        emit_phase_reply(oid, phase_id);
+                                    }
+                                    foci_firmware::commissioning::schedule::CommissionEvent::VelocitySweep {
+                                        oid,
+                                        event,
+                                    } => {
+                                        crate::ankyra::replies::emit_velocity_sweep_event(oid, event);
+                                    }
                                 }
-                                emit_phase_reply(oid, phase_id);
                             }
                             #[cfg(feature = "trace")]
                             if commission_trace_phase
