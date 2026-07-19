@@ -443,6 +443,8 @@ mod app {
         // RTIC task keeps hardware ownership, request waiting, diagnostics,
         // and USB trace transport board-local.
         let mut runtime = foci_firmware::tmc_control::TmcControlRuntime::new_for_channel(0);
+        let mut stage_b_candidate =
+            foci_firmware::commissioning::outer::velocity::reproduction::StageBCandidateSlot::new();
         let signals = foci_firmware::tmc_control::TmcControlSignals::new(
             &SHUTDOWN_ACTIVE,
             &TMC_QUEUE_FLUSH,
@@ -507,6 +509,7 @@ mod app {
                         .store(false, core::sync::atomic::Ordering::Relaxed);
                     stepper_stop_from_p1(0);
                     shutdown_safe_state_applied = shutdown_safe_state_complete;
+                    stage_b_candidate.clear();
                 }
                 Mono::delay(1.millis()).await;
                 continue;
@@ -516,6 +519,7 @@ mod app {
             // Drain stale requests after config_reset
             if TMC_QUEUE_FLUSH.load(core::sync::atomic::Ordering::Relaxed) {
                 commission_measurement_active = false;
+                stage_b_candidate.clear();
                 while rx.try_recv().is_ok() {}
                 let commission_was_active = runtime.is_commission_active();
                 crate::tmc_control::effects::apply_actions(
@@ -720,6 +724,7 @@ mod app {
                                 .drive_commissioning_terminal(
                                     result,
                                     &mut backend,
+                                    &mut stage_b_candidate,
                                     tmc_state(),
                                     stepper_state(),
                                     &tmc_control_config,
@@ -829,6 +834,7 @@ mod app {
                                                     enable_pin,
                                                     &mut runtime,
                                                     &mut commission_trace_engine_seq,
+                                                    &mut stage_b_candidate,
                                                 )
                                                 .await;
                                                 if let Some(reason) = outcome.shutdown {
@@ -934,6 +940,7 @@ mod app {
                         enable_pin,
                         &mut runtime,
                         &mut commission_trace_engine_seq,
+                        &mut stage_b_candidate,
                     )
                     .await;
 
