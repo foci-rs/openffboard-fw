@@ -953,6 +953,10 @@ mod app {
                                 }
                             }
                         }
+                        ScheduledCommissionTickAction::WorkflowContinuation { reply } => {
+                            emit_terminal_reply(reply);
+                            continue 'commission_poll;
+                        }
                         ScheduledCommissionTickAction::Terminal { reply, actions } => {
                             #[cfg(feature = "trace")]
                             {
