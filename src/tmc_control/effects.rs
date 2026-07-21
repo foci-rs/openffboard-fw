@@ -71,7 +71,6 @@ where
         BoardAction::Stepper(StepperAction::ApplyPostAction(_)) => {
             defmt::warn!("TMC runtime post-action requires dispatch state; handled inline")
         }
-        BoardAction::Reply(reply) => emit_reply(reply),
         BoardAction::DelegatedDiagnostic(delegated) => {
             defmt::warn!(
                 "diagnostic request delegated before board handler: {}",
@@ -126,10 +125,6 @@ pub(crate) fn emit_shutdown(reason: ShutdownReason) {
             clock,
         ),
     }
-}
-
-fn emit_reply(reply: foci_firmware::commission_dispatch::ReplyPayload) {
-    crate::ankyra::replies::emit_terminal_reply(reply);
 }
 
 #[cfg(test)]

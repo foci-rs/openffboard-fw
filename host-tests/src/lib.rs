@@ -81,7 +81,7 @@ mod commissioning_board_contract_tests {
     fn board_owns_and_invalidates_one_stage_c_candidate() {
         assert_eq!(MAIN.matches("StageCCandidateSlot::new()").count(), 1);
         assert_eq!(MAIN.matches("stage_c_candidate.observe_fault()").count(), 2);
-        assert!(MAIN.contains("CommissionRetention::new"));
+        assert!(MAIN.contains("CommissionTerminalContext::new"));
         assert!(REQUEST.contains("handle_tmc_control_request_with_stages"));
         assert!(REQUEST.contains("stage_c_candidate"));
     }

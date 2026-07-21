@@ -750,14 +750,14 @@ mod app {
                                 .drive_commissioning_terminal_with_stages(
                                     result,
                                     &mut backend,
-                                    foci_firmware::commission_dispatch::CommissionRetention::new(
+                                    foci_firmware::commission_dispatch::CommissionTerminalContext::new(
                                         &mut stage_b_candidate,
                                         &mut *stage_c_candidate,
+                                        crate::ankyra::replies::emit_terminal_reply,
                                     ),
                                     tmc_state(),
                                     stepper_state(),
                                     &tmc_control_config,
-                                    crate::ankyra::replies::emit_terminal_reply,
                                 )
                                 .await;
                                 #[cfg(not(feature = "trace-velocity-sweep"))]
