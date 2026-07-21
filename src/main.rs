@@ -115,6 +115,12 @@ mod app {
         app_state: State,
     }
 
+    #[cfg(feature = "trace-velocity-sweep")]
+    type StageCCandidateTaskLocal =
+        foci_firmware::commissioning::outer::velocity::integral_reproduction::StageCCandidateSlot;
+    #[cfg(not(feature = "trace-velocity-sweep"))]
+    type StageCCandidateTaskLocal = ();
+
     #[local]
     struct Local {
         led: Output<'static>,
@@ -122,6 +128,7 @@ mod app {
         tmc_enable: Output<'static>,
         tmc_rx: Receiver<'static, TmcRequest, TMC_CHANNEL_SIZE>,
         wdg: IndependentWatchdog<'static, peripherals::IWDG>,
+        stage_c_candidate: StageCCandidateTaskLocal,
     }
 
     #[init(local = [
@@ -258,6 +265,14 @@ mod app {
                 tmc_enable,
                 tmc_rx,
                 wdg,
+                stage_c_candidate: {
+                    #[cfg(feature = "trace-velocity-sweep")]
+                    {
+                        foci_firmware::commissioning::outer::velocity::integral_reproduction::StageCCandidateSlot::new()
+                    }
+                    #[cfg(not(feature = "trace-velocity-sweep"))]
+                    {}
+                },
             },
         )
     }
@@ -282,11 +297,17 @@ mod app {
     /// rather than only on USB receive — Klipper sends queue_step commands
     /// ahead of time and expects the MCU to process them at the scheduled
     /// clock values, even when no USB traffic is arriving.
-    #[task(priority = 1, shared = [app_state], local = [tmc, tmc_enable, tmc_rx])]
+    #[task(
+        priority = 1,
+        shared = [app_state],
+        local = [tmc, tmc_enable, tmc_rx, stage_c_candidate]
+    )]
     async fn tmc_control(mut ctx: tmc_control::Context) {
         let tmc = ctx.local.tmc;
         let enable_pin = ctx.local.tmc_enable;
         let rx = ctx.local.tmc_rx;
+        #[cfg(feature = "trace-velocity-sweep")]
+        let stage_c_candidate = ctx.local.stage_c_candidate;
 
         // NOTE: auto-init disabled - motor current regulation not yet safe
         // tmc_init_open_loop(tmc, enable_pin).await;
@@ -445,8 +466,6 @@ mod app {
         let mut runtime = foci_firmware::tmc_control::TmcControlRuntime::new_for_channel(0);
         let mut stage_b_candidate =
             foci_firmware::commissioning::outer::velocity::reproduction::StageBCandidateSlot::new();
-        #[cfg(feature = "trace-velocity-sweep")]
-        let mut stage_c_candidate = foci_firmware::commissioning::outer::velocity::integral_reproduction::StageCCandidateSlot::new();
         let signals = foci_firmware::tmc_control::TmcControlSignals::new(
             &SHUTDOWN_ACTIVE,
             &TMC_QUEUE_FLUSH,
@@ -733,7 +752,7 @@ mod app {
                                     &mut backend,
                                     foci_firmware::commission_dispatch::CommissionRetention::new(
                                         &mut stage_b_candidate,
-                                        &mut stage_c_candidate,
+                                        &mut *stage_c_candidate,
                                     ),
                                     tmc_state(),
                                     stepper_state(),
@@ -867,7 +886,7 @@ mod app {
                                                     &mut commission_trace_engine_seq,
                                                     &mut stage_b_candidate,
                                                     #[cfg(feature = "trace-velocity-sweep")]
-                                                    &mut stage_c_candidate,
+                                                    &mut *stage_c_candidate,
                                                 )
                                                 .await;
                                                 if let Some(reason) = outcome.shutdown {
@@ -975,7 +994,7 @@ mod app {
                         &mut commission_trace_engine_seq,
                         &mut stage_b_candidate,
                         #[cfg(feature = "trace-velocity-sweep")]
-                        &mut stage_c_candidate,
+                        &mut *stage_c_candidate,
                     )
                     .await;
 
