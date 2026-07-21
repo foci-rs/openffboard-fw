@@ -757,6 +757,7 @@ mod app {
                                     tmc_state(),
                                     stepper_state(),
                                     &tmc_control_config,
+                                    crate::ankyra::replies::emit_terminal_reply,
                                 )
                                 .await;
                                 #[cfg(not(feature = "trace-velocity-sweep"))]
@@ -953,8 +954,7 @@ mod app {
                                 }
                             }
                         }
-                        ScheduledCommissionTickAction::WorkflowContinuation { reply } => {
-                            emit_terminal_reply(reply);
+                        ScheduledCommissionTickAction::WorkflowContinuation => {
                             continue 'commission_poll;
                         }
                         ScheduledCommissionTickAction::Terminal { reply, actions } => {
