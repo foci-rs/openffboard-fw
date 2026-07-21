@@ -445,6 +445,8 @@ mod app {
         let mut runtime = foci_firmware::tmc_control::TmcControlRuntime::new_for_channel(0);
         let mut stage_b_candidate =
             foci_firmware::commissioning::outer::velocity::reproduction::StageBCandidateSlot::new();
+        #[cfg(feature = "trace-velocity-sweep")]
+        let mut stage_c_candidate = foci_firmware::commissioning::outer::velocity::integral_reproduction::StageCCandidateSlot::new();
         let signals = foci_firmware::tmc_control::TmcControlSignals::new(
             &SHUTDOWN_ACTIVE,
             &TMC_QUEUE_FLUSH,
@@ -510,6 +512,8 @@ mod app {
                     stepper_stop_from_p1(0);
                     shutdown_safe_state_applied = shutdown_safe_state_complete;
                     stage_b_candidate.clear();
+                    #[cfg(feature = "trace-velocity-sweep")]
+                    stage_c_candidate.observe_fault();
                 }
                 Mono::delay(1.millis()).await;
                 continue;
@@ -520,6 +524,8 @@ mod app {
             if TMC_QUEUE_FLUSH.load(core::sync::atomic::Ordering::Relaxed) {
                 commission_measurement_active = false;
                 stage_b_candidate.clear();
+                #[cfg(feature = "trace-velocity-sweep")]
+                stage_c_candidate.observe_fault();
                 while rx.try_recv().is_ok() {}
                 let commission_was_active = runtime.is_commission_active();
                 crate::tmc_control::effects::apply_actions(
@@ -714,26 +720,43 @@ mod app {
                             continue 'tmc_loop;
                         }
                     }
-                    let action =
-                        {
-                            let mut backend = openffboard_backend(tmc, enable_pin);
-                            let action = match poll {
+                    let action = {
+                        let mut backend = openffboard_backend(tmc, enable_pin);
+                        let action = match poll {
                             foci_firmware::commissioning::schedule::CommissionPoll::Terminal {
                                 result,
-                            } => runtime
-                                .drive_commissioning_terminal(
+                            } => {
+                                #[cfg(feature = "trace-velocity-sweep")]
+                                let action = runtime
+                                .drive_commissioning_terminal_with_stages(
                                     result,
                                     &mut backend,
-                                    &mut stage_b_candidate,
+                                    foci_firmware::commission_dispatch::CommissionRetention::new(
+                                        &mut stage_b_candidate,
+                                        &mut stage_c_candidate,
+                                    ),
                                     tmc_state(),
                                     stepper_state(),
                                     &tmc_control_config,
                                 )
-                                .await,
+                                .await;
+                                #[cfg(not(feature = "trace-velocity-sweep"))]
+                                let action = runtime
+                                    .drive_commissioning_terminal(
+                                        result,
+                                        &mut backend,
+                                        &mut stage_b_candidate,
+                                        tmc_state(),
+                                        stepper_state(),
+                                        &tmc_control_config,
+                                    )
+                                    .await;
+                                action
+                            }
                             poll => runtime.classify_commission_poll(poll),
                         };
-                            action.expect("active commissioning poll produces an action")
-                        };
+                        action.expect("active commissioning poll produces an action")
+                    };
                     let tick_cycles =
                         cortex_m::peripheral::DWT::cycle_count().wrapping_sub(tick_start);
                     commission_tick_max_cycles = commission_tick_max_cycles.max(tick_cycles);
@@ -761,6 +784,14 @@ mod app {
                                         event,
                                     } => {
                                         crate::ankyra::replies::emit_velocity_sweep_event(oid, event);
+                                    }
+                                    foci_firmware::commissioning::schedule::CommissionEvent::VelocityIntegral {
+                                        oid,
+                                        event,
+                                    } => {
+                                        crate::ankyra::replies::emit_velocity_integral_event(
+                                            oid, event,
+                                        );
                                     }
                                 }
                             }
@@ -835,6 +866,8 @@ mod app {
                                                     &mut runtime,
                                                     &mut commission_trace_engine_seq,
                                                     &mut stage_b_candidate,
+                                                    #[cfg(feature = "trace-velocity-sweep")]
+                                                    &mut stage_c_candidate,
                                                 )
                                                 .await;
                                                 if let Some(reason) = outcome.shutdown {
@@ -941,6 +974,8 @@ mod app {
                         &mut runtime,
                         &mut commission_trace_engine_seq,
                         &mut stage_b_candidate,
+                        #[cfg(feature = "trace-velocity-sweep")]
+                        &mut stage_c_candidate,
                     )
                     .await;
 

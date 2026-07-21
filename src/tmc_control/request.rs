@@ -17,7 +17,7 @@ use foci_firmware::tmc_control::dispatch::RegisterRequestError;
 #[cfg(not(feature = "trace-velocity-sweep"))]
 use foci_firmware::tmc_control::request::handle_tmc_control_request as handle_shared_request;
 #[cfg(feature = "trace-velocity-sweep")]
-use foci_firmware::tmc_control::request::handle_tmc_control_request_with_stage_b;
+use foci_firmware::tmc_control::request::handle_tmc_control_request_with_stages;
 use foci_firmware::tmc_control::request::{
     MotionScaleMapperInstallError, TmcPreRequestDisposition, TmcRequestBoard,
 };
@@ -101,6 +101,10 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
 
     fn default_current_filter_hz(&self) -> u16 {
         crate::board_config::TMC_CONFIG.default_current_filter_hz()
+    }
+
+    fn pwm_freq_hz(&self) -> u32 {
+        crate::board_config::TMC_CONFIG.pwm_freq_hz()
     }
 
     fn motion_scale_queue_empty(&self) -> bool {
@@ -258,6 +262,8 @@ pub(crate) async fn handle_tmc_control_request(
     runtime: &mut foci_firmware::tmc_control::TmcControlRuntime,
     commission_trace_engine_seq: &mut u32,
     stage_b_candidate: &mut foci_firmware::commissioning::outer::velocity::reproduction::StageBCandidateSlot,
+    #[cfg(feature = "trace-velocity-sweep")]
+    stage_c_candidate: &mut foci_firmware::commissioning::outer::velocity::integral_reproduction::StageCCandidateSlot,
 ) -> TmcControlRequestOutcome {
     if req.channel != 0 {
         return TmcControlRequestOutcome::shutdown(
@@ -268,11 +274,12 @@ pub(crate) async fn handle_tmc_control_request(
 
     let mut board = OpenFFBoardRequestBoard::new(enable_pin, commission_trace_engine_seq);
     #[cfg(feature = "trace-velocity-sweep")]
-    return handle_tmc_control_request_with_stage_b(
+    return handle_tmc_control_request_with_stages(
         req,
         TmcPreRequestDisposition::ContinueRequest,
         runtime,
         stage_b_candidate,
+        stage_c_candidate,
         tmc,
         &mut board,
     )
