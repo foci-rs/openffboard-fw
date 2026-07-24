@@ -107,6 +107,10 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
         crate::board_config::TMC_CONFIG.pwm_freq_hz()
     }
 
+    fn velocity_limit_evidence_capability(&self) -> u32 {
+        crate::ankyra::constants::VELOCITY_LIMIT_EVIDENCE_CAPABILITY
+    }
+
     fn motion_scale_queue_empty(&self) -> bool {
         // SAFETY: The TMC request runs at P1 and only observes queue state.
         unsafe { step_queue(0).is_some_and(|queue| queue.is_empty()) }
