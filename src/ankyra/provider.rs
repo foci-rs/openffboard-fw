@@ -13,7 +13,7 @@
 //!   `RESERVE_PINS_*` family describing which physical pins are
 //!   unavailable to printer.cfg.
 
-#[cfg(feature = "trace-velocity-sweep")]
+#[cfg(feature = "trace-velocity-limit-latch-test")]
 ankyra::ankyra_provider! {
     name: BOARD_PROVIDER,
     commands: [
@@ -56,7 +56,7 @@ ankyra::ankyra_provider! {
     ],
 }
 
-#[cfg(not(feature = "trace-velocity-sweep"))]
+#[cfg(not(feature = "trace-velocity-limit-latch-test"))]
 ankyra::ankyra_provider! {
     name: BOARD_PROVIDER,
     commands: [

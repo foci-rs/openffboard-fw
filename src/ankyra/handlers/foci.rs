@@ -17,7 +17,7 @@ pub use foci_firmware::ankyra::handlers::foci::*;
 
 use ankyra::prelude::klipper_command;
 use core::sync::atomic::Ordering::Relaxed;
-#[cfg(feature = "trace-velocity-sweep")]
+#[cfg(feature = "trace-velocity-limit-latch-test")]
 use foci_firmware::context::TmcHost;
 use foci_firmware::context::{ClockSource, ShutdownRecovery, StateAccess};
 use foci_firmware::diagnostic::{MotionScaleDiagnosticSnapshot, StepperExecutionSnapshot};
@@ -87,7 +87,7 @@ pub fn foci_tune(
 }
 
 /// Run the trace-only focused velocity-output-limit persistence diagnostic.
-#[cfg(feature = "trace-velocity-sweep")]
+#[cfg(feature = "trace-velocity-limit-latch-test")]
 #[klipper_command]
 pub fn tmc_velocity_limit_latch_test(ctx: &mut FirmwareCtx<'_>, oid: u8, channel: u8) {
     let Some(configured_channel) = ctx.state().stepper_channel(oid) else {
