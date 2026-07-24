@@ -55,10 +55,10 @@ const _: () = assert!(
 );
 
 #[klipper_constant]
-pub const VELOCITY_LIMIT_EVIDENCE_CAPABILITY: u32 = 0;
+pub const VELOCITY_LIMIT_EVIDENCE_CAPABILITY: u32 = 1;
 const _: () = assert!(
     VELOCITY_LIMIT_EVIDENCE_CAPABILITY
-        == foci_firmware::commissioning::outer::velocity::VELOCITY_LIMIT_EVIDENCE_CAPABILITY_BEST_EFFORT
+        == foci_firmware::commissioning::outer::velocity::VELOCITY_LIMIT_EVIDENCE_CAPABILITY_LATCHED_FLAG
 );
 
 #[klipper_constant]
