@@ -352,6 +352,40 @@ mod app {
             }
         }
 
+        let Some(channel_state) = foci_firmware::state::tmc::tmc_channel(0) else {
+            ctx.shared.app_state.lock(|state| {
+                if crate::firmware_ctx::enter_shutdown(state) {
+                    ::ankyra::klipper_shutdown_from!(
+                        &mut crate::_ankyra_config::Sender,
+                        "Invalid TMC channel",
+                        read_tim5(),
+                    );
+                }
+            });
+            return;
+        };
+        let pi_representation = {
+            let mut backend = openffboard_backend(tmc, enable_pin);
+            foci_firmware::tmc_control::pi_representation::bootstrap_pi_representation(
+                &mut backend,
+                channel_state,
+            )
+            .await
+        };
+        if let Err(error) = pi_representation {
+            defmt::error!("TMC4671 PI representation failed at boot: {:?}", error);
+            ctx.shared.app_state.lock(|state| {
+                if crate::firmware_ctx::enter_shutdown(state) {
+                    ::ankyra::klipper_shutdown_from!(
+                        &mut crate::_ankyra_config::Sender,
+                        "TMC4671 PI representation failed at boot",
+                        read_tim5(),
+                    );
+                }
+            });
+            return;
+        }
+
         match foci_firmware::adc_vm::capture_adc_vm_offset(tmc).await {
             Ok(capture) => {
                 if let Some(tmc_state) = foci_firmware::state::tmc::tmc_channel(0) {
@@ -1881,7 +1915,7 @@ foci_firmware::foci_ankyra_config! {
         foci_firmware::ankyra::provider::FOCI_FIRMWARE_PROVIDER,
         crate::ankyra::provider::BOARD_PROVIDER,
     ],
-    board_static_strings = [],
+    board_static_strings = ["TMC4671 PI representation failed at boot"],
     app = "foci",
     version = env!("CARGO_PKG_VERSION"),
     build_versions = "",
