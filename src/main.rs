@@ -925,7 +925,6 @@ mod app {
                                             match crate::tmc_control::effects::commission_wait_request_disposition(&req) {
                                             CommissionWaitRequestDisposition::Cancel => {
                                                 enable_pin.set_low();
-                                                runtime.take_commission_engine();
                                                 tmc_state().commission_in_flight.store(
                                                     false,
                                                     core::sync::atomic::Ordering::Relaxed,
