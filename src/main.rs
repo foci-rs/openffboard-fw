@@ -864,6 +864,16 @@ mod app {
                                             oid, event,
                                         );
                                     }
+                                    #[cfg(feature = "trace-velocity-sweep")]
+                                    foci_firmware::commissioning::schedule::CommissionEvent::VelocityIntegralPlan {
+                                        oid,
+                                        run_sequence,
+                                        plan,
+                                    } => {
+                                        crate::ankyra::replies::emit_velocity_integral_plan(
+                                            oid, run_sequence, plan,
+                                        );
+                                    }
                                 }
                             }
                             #[cfg(feature = "trace")]
