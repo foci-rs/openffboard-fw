@@ -1090,7 +1090,22 @@ mod app {
                 }
                 Either::First(Err(_)) => continue,
                 // Control timeout - run fast FF or the decimated 1 kHz maintenance tick.
-                Either::Second(()) => {}
+                // Periodic control tick. Push any configuration recorded by
+                // config-time setters, which record state instead of
+                // enqueueing so a connect-time burst cannot overflow the
+                // bounded TMC request channel.
+                Either::Second(()) => {
+                    if foci_firmware::tmc_control::filters::apply_pending_config(
+                        tmc,
+                        tmc_state(),
+                        TMC_CONFIG.pwm_maxcnt,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        defmt::error!("pending TMC config apply failed");
+                    }
+                }
             }
             next_control_tick = Mono::now() + u64::from(control_period_us).micros();
             let slow_control_tick = runtime.update_slow_control(control_period_us);
