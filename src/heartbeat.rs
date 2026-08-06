@@ -1,10 +1,9 @@
-//! Periodic board heartbeat tasks: LED blink, stats output, and
-//! trsync-report drain. Each function is the body of an RTIC task
-//! declared in `main.rs`; the task shells handle only RTIC plumbing
-//! (Mono, local-resource binding) and delegate all work here.
+//! Periodic board heartbeat tasks: stats output and trsync-report drain.
+//! Each function is the body of an RTIC task declared in `main.rs`; the
+//! task shells handle only RTIC plumbing (Mono, local-resource binding)
+//! and delegate all work here.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
-use embassy_stm32::gpio::Output;
 use embassy_stm32::peripherals;
 use embassy_stm32::wdg::IndependentWatchdog;
 use foci_firmware::ankyra::replies::{FociStepperEvent, FociStepperPerfEvent, Stats, TrsyncState};
@@ -33,12 +32,6 @@ impl StatsAccumulator {
             last_clock: initial_clock,
         }
     }
-}
-
-/// Toggle the heartbeat LED once. Called every 500 ms from the `blink`
-/// RTIC task.
-pub fn toggle_led(led: &mut Output<'static>) {
-    led.toggle();
 }
 
 /// Service the independent watchdog from its dedicated RTIC task.

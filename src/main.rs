@@ -126,7 +126,6 @@ mod app {
 
     #[local]
     struct Local {
-        led: Output<'static>,
         tmc: Tmc4671Spi<TmcSpiDevice>,
         tmc_enable: Output<'static>,
         tmc_rx: Receiver<'static, TmcRequest, TMC_CHANNEL_SIZE>,
@@ -173,9 +172,6 @@ mod app {
         // rtic-monotonics enables and configures TIM2 internally; no PAC
         // setup is required beyond passing the timer clock frequency.
         Mono::start(84_000_000);
-
-        // PD7: system status LED on OpenFFBoard
-        let led = Output::new(p.PD7, Level::Low, Speed::Low);
 
         // PE7: TMC4671 ENABLE pin (active high, start disabled)
         let tmc_enable = Output::new(p.PE7, Level::Low, Speed::Low);
@@ -264,11 +260,10 @@ mod app {
         }
         // Spawn tasks
         stepper_reconcile::spawn().expect("stepper reconciliation worker must spawn exactly once");
-        tmc_control::spawn().ok();
-        usb_task::spawn().ok();
-        blink::spawn().ok();
-        stats::spawn().ok();
-        watchdog::spawn().ok();
+        tmc_control::spawn().expect("tmc_control task must spawn exactly once");
+        usb_task::spawn().expect("usb_task must spawn exactly once");
+        stats::spawn().expect("stats task must spawn exactly once");
+        watchdog::spawn().expect("watchdog task must spawn exactly once");
 
         defmt::info!("FOCI OpenFFBoard initialized");
 
@@ -277,7 +272,6 @@ mod app {
                 app_state: State::new(),
             },
             Local {
-                led,
                 tmc,
                 tmc_enable,
                 tmc_rx,
@@ -1945,15 +1939,6 @@ mod app {
         loop {
             Mono::delay(crate::heartbeat::WATCHDOG_INTERVAL_MS.millis()).await;
             crate::heartbeat::watchdog_tick(ctx.local.wdg);
-        }
-    }
-
-    /// Heartbeat task: toggles the system LED every 500 ms.
-    #[task(priority = 1, local = [led])]
-    async fn blink(ctx: blink::Context) {
-        loop {
-            crate::heartbeat::toggle_led(ctx.local.led);
-            Mono::delay(500.millis()).await;
         }
     }
 }
