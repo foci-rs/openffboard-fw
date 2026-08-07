@@ -23,7 +23,6 @@ mod firmware_ctx;
 mod heartbeat;
 mod helpers;
 mod interrupts;
-mod platform_impl;
 mod state;
 mod tmc_control;
 mod tmc_diagnostics;
