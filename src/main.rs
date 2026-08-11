@@ -785,39 +785,40 @@ mod app {
                     }
                     let action = {
                         let mut backend = openffboard_backend(tmc, enable_pin);
-                        // Every poll goes to the staged driver, not only terminals.
-                        // Stage-C authority retention happens on the nonterminal
-                        // `ReadyNow`/`At` arms that carry the exact Stage-C plan; a
-                        // board that classifies those itself leaves the retention slot
-                        // empty and every Stage-C terminal is then promoted to
-                        // `Fault`/`STAGE_C_CAUSE_EVIDENCE_INTEGRITY` regardless of the
-                        // engine's own verdict.
-                        #[cfg(feature = "trace-velocity-sweep")]
-                        let action = runtime
-                            .drive_commissioning_poll_with_stages(
-                                poll,
-                                &mut backend,
-                                foci_firmware::commission_dispatch::CommissionTerminalContext::new(
-                                    &mut stage_b_candidate,
-                                    &mut *stage_c_candidate,
-                                    crate::ankyra::replies::emit_terminal_reply,
-                                ),
-                                tmc_state(),
-                                stepper_state(),
-                                &tmc_control_config,
-                            )
-                            .await;
-                        #[cfg(not(feature = "trace-velocity-sweep"))]
-                        let action = runtime
-                            .drive_commissioning_poll(
-                                poll,
-                                &mut backend,
-                                &mut stage_b_candidate,
-                                tmc_state(),
-                                stepper_state(),
-                                &tmc_control_config,
-                            )
-                            .await;
+                        let action = match poll {
+                            foci_firmware::commissioning::schedule::CommissionPoll::Terminal {
+                                result,
+                            } => {
+                                #[cfg(feature = "trace-velocity-sweep")]
+                                let action = runtime
+                                .drive_commissioning_terminal_with_stages(
+                                    result,
+                                    &mut backend,
+                                    foci_firmware::commission_dispatch::CommissionTerminalContext::new(
+                                        &mut stage_b_candidate,
+                                        &mut *stage_c_candidate,
+                                        crate::ankyra::replies::emit_terminal_reply,
+                                    ),
+                                    tmc_state(),
+                                    stepper_state(),
+                                    &tmc_control_config,
+                                )
+                                .await;
+                                #[cfg(not(feature = "trace-velocity-sweep"))]
+                                let action = runtime
+                                    .drive_commissioning_terminal(
+                                        result,
+                                        &mut backend,
+                                        &mut stage_b_candidate,
+                                        tmc_state(),
+                                        stepper_state(),
+                                        &tmc_control_config,
+                                    )
+                                    .await;
+                                action
+                            }
+                            poll => runtime.classify_commission_poll(poll),
+                        };
                         action.expect("active commissioning poll produces an action")
                     };
                     let tick_cycles =

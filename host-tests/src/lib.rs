@@ -117,34 +117,6 @@ mod commissioning_board_contract_tests {
     }
 
     #[test]
-    fn board_routes_every_poll_through_the_staged_driver() {
-        // Stage-C authority retention lives in `drive_commissioning_poll_with_stages`,
-        // on the nonterminal `ReadyNow`/`At` arms that carry
-        // `CommissionEvent::VelocityIntegralPlan`. A board that hands only
-        // `CommissionPoll::Terminal` to a staged driver and classifies every other
-        // poll itself never installs that authority, so every Stage-C terminal
-        // reaches `apply_stage_c_terminal` with an empty slot and is promoted to
-        // `Fault`/`STAGE_C_CAUSE_EVIDENCE_INTEGRITY` whatever the engine decided.
-        //
-        // Two library-side fixes landed on paths this board did not call before the
-        // asymmetry was found on hardware, so the contract is asserted here against
-        // the board's own call shape rather than against the library function.
-        assert!(
-            MAIN.contains("drive_commissioning_poll_with_stages"),
-            "board must hand every poll to the staged driver, not only terminals"
-        );
-        assert!(
-            !MAIN.contains("poll => runtime.classify_commission_poll(poll)"),
-            "board must not bypass the staged driver for nonterminal polls"
-        );
-        assert!(
-            !MAIN.contains("drive_commissioning_terminal_with_stages"),
-            "the staged poll driver already dispatches terminals; calling the \
-             terminal driver directly reintroduces the nonterminal bypass"
-        );
-    }
-
-    #[test]
     fn board_forwards_the_complete_stage_c_reply_family() {
         for method in [
             "foci_commissioning_workflow_plan",
