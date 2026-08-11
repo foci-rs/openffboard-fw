@@ -872,6 +872,16 @@ mod app {
                                         run_sequence,
                                         plan,
                                     } => {
+                                        // Retain the authority the Stage-C terminal is
+                                        // checked against. Nonterminal polls are
+                                        // classified outside the async dispatch future,
+                                        // so the staged poll driver's retention never
+                                        // runs here.
+                                        foci_firmware::commission_dispatch::stage_c::install_authority_from_plan(
+                                            0,
+                                            stage_c_candidate,
+                                            plan,
+                                        );
                                         crate::ankyra::replies::emit_velocity_integral_plan(
                                             oid, run_sequence, plan,
                                         );

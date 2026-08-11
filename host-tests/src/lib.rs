@@ -117,6 +117,37 @@ mod commissioning_board_contract_tests {
     }
 
     #[test]
+    fn board_retains_stage_c_authority_from_the_plan_event() {
+        // Nonterminal classification stays outside the terminal async dispatch
+        // future. foci-firmware's `scheduled_step` size gate pins that budget,
+        // so Stage-C authority is installed synchronously from the plan event
+        // rather than by routing polls through the staged poll driver.
+        assert!(
+            MAIN.contains("poll => runtime.classify_commission_poll(poll)"),
+            "nonterminal polls must stay out of the async dispatch future"
+        );
+        assert!(
+            !MAIN.contains("drive_commissioning_poll_with_stages"),
+            "the staged poll driver pulls terminal dispatch into every poll"
+        );
+
+        let arm = MAIN
+            .find("CommissionEvent::VelocityIntegralPlan")
+            .expect("board must handle the Stage-C plan event");
+        let body = &MAIN[arm..];
+        let install = body
+            .find("install_authority_from_plan")
+            .expect("plan event must install retained Stage-C authority");
+        let next_arm = body
+            .find("ScheduledCommissionTickAction")
+            .unwrap_or(body.len());
+        assert!(
+            install < next_arm,
+            "authority install must sit inside the plan-event arm"
+        );
+    }
+
+    #[test]
     fn board_forwards_the_complete_stage_c_reply_family() {
         for method in [
             "foci_commissioning_workflow_plan",
