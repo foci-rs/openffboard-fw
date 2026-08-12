@@ -148,6 +148,33 @@ mod commissioning_board_contract_tests {
     }
 
     #[test]
+    fn board_reaches_the_staged_request_dispatch_that_owns_stage_c_resume() {
+        // Two shared-firmware fixes for the Stage-C authority landed on paths
+        // this board does not execute, and shared tests passed both times. The
+        // board's own call shape is what decides whether new dispatch arms --
+        // the Stage-C resume among them -- are reachable here at all.
+        assert!(
+            REQUEST.contains("handle_tmc_control_request_with_stages"),
+            "tune requests must reach the staged request dispatch"
+        );
+        assert!(
+            REQUEST.contains("stage_c_candidate"),
+            "the staged dispatch must be given the retained Stage-C slot"
+        );
+        // Retention is what a resume consumes. It is installed synchronously
+        // from the plan event because nonterminal classification stays outside
+        // the terminal async dispatch future on this board.
+        assert!(
+            MAIN.contains("install_authority_from_plan"),
+            "the plan event must retain authority for a later resume"
+        );
+        assert!(
+            MAIN.contains("poll => runtime.classify_commission_poll(poll)"),
+            "nonterminal polls must stay out of the async dispatch future"
+        );
+    }
+
+    #[test]
     fn board_forwards_the_complete_stage_c_reply_family() {
         for method in [
             "foci_commissioning_workflow_plan",
