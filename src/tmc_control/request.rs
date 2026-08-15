@@ -265,7 +265,6 @@ pub(crate) async fn handle_tmc_control_request(
     enable_pin: &mut Output<'static>,
     runtime: &mut foci_firmware::tmc_control::TmcControlRuntime,
     commission_trace_engine_seq: &mut u32,
-    stage_b_candidate: &mut foci_firmware::commissioning::outer::velocity::reproduction::StageBCandidateSlot,
     #[cfg(feature = "trace-velocity-sweep")]
     stage_c_candidate: &mut foci_firmware::commissioning::outer::velocity::integral_reproduction::StageCCandidateSlot,
 ) -> TmcControlRequestOutcome {
@@ -282,14 +281,11 @@ pub(crate) async fn handle_tmc_control_request(
         req,
         TmcPreRequestDisposition::ContinueRequest,
         runtime,
-        stage_b_candidate,
         stage_c_candidate,
         tmc,
         &mut board,
     )
     .await;
-    #[cfg(not(feature = "trace-velocity-sweep"))]
-    let _ = stage_b_candidate;
     #[cfg(not(feature = "trace-velocity-sweep"))]
     handle_shared_request(
         req,
