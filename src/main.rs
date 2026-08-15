@@ -117,11 +117,13 @@ mod app {
         app_state: State,
     }
 
-    #[cfg(feature = "trace-velocity-sweep")]
+    /// Persistent Stage-C candidate slot carried across `tmc_control` task calls.
+    ///
+    /// Retains the Stage-C authority a `breakaway_seeded` campaign hands off to
+    /// `stage_c_resume`, so the production build runs the full autotune
+    /// hand-off exactly as the trace build does.
     type StageCCandidateTaskLocal =
         foci_firmware::commissioning::outer::velocity::integral_reproduction::StageCCandidateSlot;
-    #[cfg(not(feature = "trace-velocity-sweep"))]
-    type StageCCandidateTaskLocal = ();
 
     #[local]
     struct Local {
@@ -275,14 +277,8 @@ mod app {
                 tmc_enable,
                 tmc_rx,
                 wdg,
-                stage_c_candidate: {
-                    #[cfg(feature = "trace-velocity-sweep")]
-                    {
-                        foci_firmware::commissioning::outer::velocity::integral_reproduction::StageCCandidateSlot::new()
-                    }
-                    #[cfg(not(feature = "trace-velocity-sweep"))]
-                    {}
-                },
+                stage_c_candidate:
+                    foci_firmware::commissioning::outer::velocity::integral_reproduction::StageCCandidateSlot::new(),
             },
         )
     }
@@ -316,7 +312,6 @@ mod app {
         let tmc = ctx.local.tmc;
         let enable_pin = ctx.local.tmc_enable;
         let rx = ctx.local.tmc_rx;
-        #[cfg(feature = "trace-velocity-sweep")]
         let stage_c_candidate = ctx.local.stage_c_candidate;
 
         // NOTE: auto-init disabled - motor current regulation not yet safe
@@ -572,7 +567,6 @@ mod app {
                         .store(false, core::sync::atomic::Ordering::Relaxed);
                     stepper_stop_from_p1(0);
                     shutdown_safe_state_applied = shutdown_safe_state_complete;
-                    #[cfg(feature = "trace-velocity-sweep")]
                     stage_c_candidate.observe_fault();
                 }
                 Mono::delay(1.millis()).await;
@@ -583,7 +577,6 @@ mod app {
             // Drain stale requests after config_reset
             if TMC_QUEUE_FLUSH.load(core::sync::atomic::Ordering::Relaxed) {
                 commission_measurement_active = false;
-                #[cfg(feature = "trace-velocity-sweep")]
                 stage_c_candidate.observe_fault();
                 while rx.try_recv().is_ok() {}
                 let commission_was_active = runtime.is_commission_active();
@@ -785,8 +778,7 @@ mod app {
                             foci_firmware::commissioning::schedule::CommissionPoll::Terminal {
                                 result,
                             } => {
-                                #[cfg(feature = "trace-velocity-sweep")]
-                                let action = runtime
+                                runtime
                                 .drive_commissioning_terminal_with_stages(
                                     result,
                                     &mut backend,
@@ -798,18 +790,7 @@ mod app {
                                     stepper_state(),
                                     &tmc_control_config,
                                 )
-                                .await;
-                                #[cfg(not(feature = "trace-velocity-sweep"))]
-                                let action = runtime
-                                    .drive_commissioning_terminal(
-                                        result,
-                                        &mut backend,
-                                        tmc_state(),
-                                        stepper_state(),
-                                        &tmc_control_config,
-                                    )
-                                    .await;
-                                action
+                                .await
                             }
                             poll => runtime.classify_commission_poll(poll),
                         };
@@ -845,7 +826,6 @@ mod app {
                                             oid, event,
                                         );
                                     }
-                                    #[cfg(feature = "trace-velocity-sweep")]
                                     foci_firmware::commissioning::schedule::CommissionEvent::BreakawayCampaign {
                                         oid,
                                         event,
@@ -854,7 +834,6 @@ mod app {
                                             oid, event,
                                         );
                                     }
-                                    #[cfg(feature = "trace-velocity-sweep")]
                                     foci_firmware::commissioning::schedule::CommissionEvent::VelocityIntegralPlan {
                                         oid,
                                         run_sequence,
@@ -945,7 +924,6 @@ mod app {
                                                     enable_pin,
                                                     &mut runtime,
                                                     &mut commission_trace_engine_seq,
-                                                    #[cfg(feature = "trace-velocity-sweep")]
                                                     &mut *stage_c_candidate,
                                                 )
                                                 .await;
@@ -1055,7 +1033,6 @@ mod app {
                         enable_pin,
                         &mut runtime,
                         &mut commission_trace_engine_seq,
-                        #[cfg(feature = "trace-velocity-sweep")]
                         &mut *stage_c_candidate,
                     )
                     .await;
