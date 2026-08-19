@@ -159,6 +159,29 @@ mod app {
         let p = embassy_stm32::init(crate::board_init::rcc_config());
         defmt::info!("SYSCLK: 168 MHz, USB: 48 MHz");
 
+        // One-time reset-cause diagnostic. RCC_CSR latches why the MCU last
+        // reset and holds the flags until RMVF clears them. Log the cause by
+        // name, then clear so the next reset's cause is unambiguous. A brown-out
+        // (BORRSTF) or power-on (PORRSTF) flag after a silent communication loss
+        // is the decisive undervoltage evidence; IWDGRSTF, SFTRSTF, and PINRSTF
+        // distinguish the watchdog, a software reset, and the reset pin. The F4
+        // metapac names the independent-watchdog flag `wdgrstf` and the pin flag
+        // `padrstf`.
+        {
+            let csr = embassy_stm32::pac::RCC.csr().read();
+            defmt::info!(
+                "reset cause: LPWRRSTF={} WWDGRSTF={} IWDGRSTF={} SFTRSTF={} PORRSTF={} PINRSTF={} BORRSTF={}",
+                csr.lpwrrstf(),
+                csr.wwdgrstf(),
+                csr.wdgrstf(),
+                csr.sftrstf(),
+                csr.porrstf(),
+                csr.padrstf(),
+                csr.borrstf(),
+            );
+            embassy_stm32::pac::RCC.csr().modify(|w| w.set_rmvf(true));
+        }
+
         crate::board_init::init_tim5_clock();
         #[cfg(feature = "trace")]
         {
