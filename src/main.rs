@@ -901,7 +901,9 @@ mod app {
                                 .await;
                             }
 
-                            match driver_action {
+                            match foci_firmware::tmc_control::nonterminal_continuation(
+                                driver_action,
+                            ) {
                                 foci_firmware::tmc_control::PollDriverAction::PollNow => {
                                     continue 'tmc_loop;
                                 }
