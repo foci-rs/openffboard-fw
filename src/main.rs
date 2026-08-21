@@ -826,6 +826,14 @@ mod app {
                     match action {
                         ScheduledCommissionTickAction::ReadyNow { event }
                         | ScheduledCommissionTickAction::At { event, .. } => {
+                            let phase_changed = matches!(
+                                &event,
+                                Some(
+                                    foci_firmware::commissioning::schedule::CommissionEvent::PhaseChanged {
+                                        ..
+                                    }
+                                )
+                            );
                             if let Some(event) = event {
                                 match event {
                                     foci_firmware::commissioning::schedule::CommissionEvent::PhaseChanged {
@@ -903,6 +911,7 @@ mod app {
 
                             match foci_firmware::tmc_control::nonterminal_continuation(
                                 driver_action,
+                                phase_changed,
                             ) {
                                 foci_firmware::tmc_control::PollDriverAction::PollNow => {
                                     continue 'tmc_loop;
