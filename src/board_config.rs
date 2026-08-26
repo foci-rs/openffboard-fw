@@ -88,8 +88,8 @@ const _: () = assert!(TMC_CONFIG.excitation_voltage == OPENFFBOARD_V13_EXCITATIO
 
 /// Per-channel feedback wiring. Every board channel is ABN-only today;
 /// analog-encoder enablement is a follow-up.
-pub(crate) const FEEDBACK_CONFIGS: [foci_firmware::config::FeedbackConfig; TMC_CHANNEL_COUNT as usize] =
-    [foci_firmware::config::FeedbackConfig {
-        phi_e_source: foci_firmware::config::FeedbackSource::Abn,
-        position_source: foci_firmware::config::FeedbackSource::Abn,
-    }; TMC_CHANNEL_COUNT as usize];
+pub(crate) const FEEDBACK_CONFIGS: [foci_firmware::config::FeedbackConfig;
+    TMC_CHANNEL_COUNT as usize] = [foci_firmware::config::FeedbackConfig {
+    phi_e_source: foci_firmware::config::FeedbackSource::Abn,
+    position_source: foci_firmware::config::FeedbackSource::Abn,
+}; TMC_CHANNEL_COUNT as usize];
