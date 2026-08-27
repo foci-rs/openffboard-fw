@@ -98,8 +98,9 @@ mod app {
     use foci_firmware::tmc_control::TmcControlRequestTail;
 
     // TriggerDomain, PHYSICAL_STEPPER_INDICES, TRIGGER_TIMER_MIN_LEAD_TICKS,
-    // TRIGGER_DOMAIN, with_trigger_domain(), and stop_physical_stepper_no_lock()
-    // live in crate::trigger_domain and are re-imported below.
+    // TRIGGER_DOMAIN, with_trigger_domain(), stop_physical_stepper_unmasked(),
+    // and stop_physical_stepper_masked() live in crate::trigger_domain and
+    // are re-imported below.
 
     // ---- Klipper constants ----
     // Declared in `crate::ankyra::constants` and registered into the data
@@ -154,6 +155,11 @@ mod app {
                 record.pc
             );
             foci_firmware::diagnostic::set_last_panic(record);
+        }
+
+        // SAFETY: init runs exactly once, before any other task starts.
+        unsafe {
+            crate::state::stepper::init_step_queue();
         }
 
         let p = embassy_stm32::init(crate::board_init::rcc_config());
@@ -1254,13 +1260,8 @@ mod app {
                 .load(core::sync::atomic::Ordering::Relaxed)
         }
 
-        fn queue_has_moves(&self, channel: u8) -> bool {
-            // SAFETY: P2 is the sole producer while the timer is inactive.
-            unsafe {
-                step_queue(channel)
-                    .map(|queue| !queue.is_empty())
-                    .unwrap_or(false)
-            }
+        fn queue_has_moves(&self, _channel: u8) -> bool {
+            !crate::state::stepper::STEP_QUEUE_CHANNEL.is_empty()
         }
 
         fn arm_check_timer(
@@ -1465,52 +1466,49 @@ mod app {
             if !stepper.has_active_segment() {
                 // Need a new move from the queue.
                 // SAFETY: P3 is the sole consumer while motor_armed is true.
-                let loaded_steps = match unsafe {
-                    step_queue(0)
-                        .expect("OpenFFBoard channel 0 exists")
-                        .dequeue()
-                } {
-                    Some(m) => {
-                        let loaded_steps = u32::from(m.count);
-                        let interval_add = i32::from(m.add);
-                        let old_direction = stepper.dir_state();
-                        stepper.load_move(m);
-                        let dir_changed = old_direction != stepper.dir_state();
-                        stepper_state()
-                            .interval
-                            .store(stepper.current_interval(), Relaxed);
-                        stepper_state().interval_add.store(interval_add, Relaxed);
-                        let dir_val = if stepper.dir_state() {
-                            embassy_stm32::pac::gpio::vals::Odr::HIGH
-                        } else {
-                            embassy_stm32::pac::gpio::vals::Odr::LOW
-                        };
-                        gpio_a.odr().modify(|w| w.set_odr(0, dir_val));
-                        if dir_changed {
-                            tmc_state().feedforward_reset.store(true, Relaxed);
+                let loaded_steps =
+                    match unsafe { crate::state::stepper::STEP_QUEUE_CHANNEL.isr_dequeue() } {
+                        Some(m) => {
+                            let loaded_steps = u32::from(m.count);
+                            let interval_add = i32::from(m.add);
+                            let old_direction = stepper.dir_state();
+                            stepper.load_move(m);
+                            let dir_changed = old_direction != stepper.dir_state();
+                            stepper_state()
+                                .interval
+                                .store(stepper.current_interval(), Relaxed);
+                            stepper_state().interval_add.store(interval_add, Relaxed);
+                            let dir_val = if stepper.dir_state() {
+                                embassy_stm32::pac::gpio::vals::Odr::HIGH
+                            } else {
+                                embassy_stm32::pac::gpio::vals::Odr::LOW
+                            };
+                            gpio_a.odr().modify(|w| w.set_odr(0, dir_val));
+                            if dir_changed {
+                                tmc_state().feedforward_reset.store(true, Relaxed);
+                            }
+                            loaded_steps
                         }
-                        loaded_steps
-                    }
-                    None => {
-                        stepper.mark_idle();
-                        crate::state::stepper_diag::record_queue_empty(0);
-                        if HOMING_STATE.load(Relaxed) != 0 {
-                            record_stepper_event(
-                                StepperEventReason::QueueEmpty,
-                                0,
-                                read_tim5(),
-                                0,
-                                0,
-                                0,
-                            );
+                        None => {
+                            stepper.mark_idle();
+                            crate::state::stepper_diag::record_queue_empty(0);
+                            if HOMING_STATE.load(Relaxed) != 0 {
+                                record_stepper_event(
+                                    StepperEventReason::QueueEmpty,
+                                    0,
+                                    read_tim5(),
+                                    0,
+                                    0,
+                                    0,
+                                );
+                            }
+                            stepper_state().interval.store(0, Relaxed);
+                            stepper_state().interval_add.store(0, Relaxed);
+                            tmc_state().pid_error_sums_clear.store(true, Relaxed);
+                            td.set_timer_active(0, false);
+                            return;
                         }
-                        stepper_state().interval.store(0, Relaxed);
-                        stepper_state().interval_add.store(0, Relaxed);
-                        tmc_state().pid_error_sums_clear.store(true, Relaxed);
-                        td.set_timer_active(0, false);
-                        return;
-                    }
-                };
+                    };
 
                 let now = read_tim5();
                 let scheduled = stepper.next_step_clock();

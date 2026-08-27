@@ -2,7 +2,7 @@
 //! Promoted from `mod app` in `main.rs` by Task 8c so handlers and the
 //! TIM5 scheduler ISR share a single implementation.
 
-use crate::trigger_domain::stop_physical_stepper_no_lock;
+use crate::trigger_domain::stop_physical_stepper_unmasked;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
 use foci_firmware::commission_dispatch::{
@@ -50,9 +50,10 @@ fn stepper_state() -> &'static foci_firmware::state::stepper::StepperChannelStat
 /// `TriggerDomain`.
 ///
 /// P1 performs the physical quiesce immediately (queue drain via
-/// `stop_physical_stepper_no_lock`) then requests P2 reconciliation to cancel
-/// the stepper scheduler event and update the authoritative `timer_active`
-/// inside `TriggerDomain`. P1 must never enter `TriggerDomain` per spec.
+/// `stop_physical_stepper_unmasked`) then requests P2 reconciliation to
+/// cancel the stepper scheduler event and update the authoritative
+/// `timer_active` inside `TriggerDomain`. P1 must never enter
+/// `TriggerDomain` per spec.
 pub(crate) fn stepper_stop_from_p1(channel: u8) {
     if channel != 0 {
         defmt::error!(
@@ -65,7 +66,7 @@ pub(crate) fn stepper_stop_from_p1(channel: u8) {
     tmc_state()
         .motor_armed
         .store(false, core::sync::atomic::Ordering::Relaxed);
-    stop_physical_stepper_no_lock(channel as usize, StepperEventReason::P1Stop);
+    stop_physical_stepper_unmasked(channel as usize, StepperEventReason::P1Stop);
     crate::helpers::stepper_diag::record_stepper_event(
         StepperEventReason::P1Stop,
         channel,

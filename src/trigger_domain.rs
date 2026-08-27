@@ -9,9 +9,56 @@
 
 use core::ops::{Deref, DerefMut};
 
-use crate::state::stepper::{isr_stepper, step_queue};
+use crate::state::stepper::isr_stepper;
 use foci_firmware::context::trsync::{self, TriggerDispatchBoard, TriggerDomainState};
 use foci_firmware::diagnostic::StepperEventReason;
+use foci_klipper::step_queue::Consumer;
+use foci_klipper::stepper::StepMove;
+
+/// Detach `STEP_QUEUE_CHANNEL`'s consumer under a short, independent
+/// critical section, for a caller about to drain it outside any masked
+/// region. Returns `None` if already detached.
+fn detach_consumer() -> Option<Consumer<'static, StepMove>> {
+    cortex_m::interrupt::free(|_| {
+        // SAFETY: this critical section provides the exclusive access
+        // `take_consumer` requires. It is independent of
+        // `with_trigger_domain` (never touches `TriggerDomain`), so it is
+        // safe to nest inside an outer `interrupt::free` region if the
+        // caller happens to be in one.
+        unsafe { crate::state::stepper::STEP_QUEUE_CHANNEL.take_consumer() }
+    })
+}
+
+/// Reattach a consumer previously detached from `STEP_QUEUE_CHANNEL` by
+/// `detach_consumer`. Private: the only correct caller is the function
+/// that just called `detach_consumer` and is handing its own local
+/// variable straight back.
+fn attach_consumer(consumer: Consumer<'static, StepMove>) {
+    cortex_m::interrupt::free(|_| {
+        // SAFETY: exclusive access from the critical section; `consumer`
+        // is `STEP_QUEUE_CHANNEL`'s own value per this function's contract
+        // (OpenFFBoard has exactly one channel, so there is no other
+        // channel's consumer this could be).
+        unsafe { crate::state::stepper::STEP_QUEUE_CHANNEL.give_consumer(consumer) }
+    })
+}
+
+/// Borrow `STEP_QUEUE_CHANNEL`'s consumer in place, under a short
+/// independent critical section, for a caller already inside an outer
+/// mask that stays in place here (reset, shutdown, trigger-dispatch
+/// stop). Returns `None` if a concurrent unmasked drain
+/// (`stop_physical_stepper_unmasked`) currently holds the consumer
+/// detached -- callers must perform their non-queue side effects and
+/// report zero *additional* drained work in that case: the in-flight
+/// unmasked drain already owns draining this queue.
+pub(crate) fn with_consumer_locked<R>(
+    f: impl FnOnce(&mut Consumer<'static, StepMove>) -> R,
+) -> Option<R> {
+    cortex_m::interrupt::free(|_| {
+        // SAFETY: see detach_consumer.
+        unsafe { crate::state::stepper::STEP_QUEUE_CHANNEL.borrow_consumer_mut(f) }
+    })
+}
 
 // ---- TriggerDomain: unified trsync/endstop/stepper-stop resource ----
 
@@ -123,7 +170,7 @@ impl TriggerDispatchBoard for OpenFfboardDispatchBoard {
         stepper_idx: usize,
         reason: StepperEventReason,
     ) {
-        stop_physical_stepper_no_lock(stepper_idx, reason);
+        stop_physical_stepper_masked(stepper_idx, reason);
     }
 
     fn record_trsync_stop(&mut self, stepper_idx: usize, clock: u32, trsync_oid: u8, reason: u8) {
@@ -248,21 +295,29 @@ where
     result
 }
 
-/// Stop a physical stepper without locking TriggerDomain.
-///
-/// Called from two contexts:
-/// 1. Inside `with_trigger_domain()` during trigger dispatch (P2 holding
-///    an `interrupt::free` critical section; P2 producers cannot preempt).
-/// 2. From [`crate::helpers::stepper::stepper_stop_from_p1`] (P1 context
-///    with no critical section; P2 producers can preempt).
-///
-/// Only acts on physical stepper indices (GPIO and queue).
+/// Distinguishes how `stop_physical_stepper_inner` may access the step
+/// queue's consumer, based on what the caller already holds.
+enum QueueAccess {
+    /// P1 direct-stop path: detach the consumer, drain with interrupts
+    /// enabled, reattach.
+    Unmasked,
+    /// Trigger-dispatch/shutdown: caller already holds an outer mask this
+    /// ticket is not unmasking; drain in place under it.
+    LockedInPlace,
+}
+
+/// Stop a physical stepper. Only acts on physical stepper indices (GPIO
+/// and queue).
 ///
 /// Per spec: clear interval, reset ISR stepper engine, drain queue, reset
 /// direction GPIO. The unified TIM5 scheduler is not disabled here because it
 /// may also be carrying endstop and trsync timers; callers cancel the stepper
 /// scheduler event through `TriggerDomain`.
-pub(crate) fn stop_physical_stepper_no_lock(stepper_idx: usize, reason: StepperEventReason) {
+fn stop_physical_stepper_inner(
+    stepper_idx: usize,
+    reason: StepperEventReason,
+    access: QueueAccess,
+) {
     use core::sync::atomic::Ordering::Relaxed;
     if !PHYSICAL_STEPPER_INDICES.contains(&stepper_idx) {
         return;
@@ -276,12 +331,9 @@ pub(crate) fn stop_physical_stepper_no_lock(stepper_idx: usize, reason: StepperE
             .expect("OpenFFBoard channel 0 exists")
             .active_step_count()
     };
-    let queue_len = unsafe {
-        step_queue(0)
-            .expect("OpenFFBoard channel 0 exists")
-            .len()
-            .min(u16::MAX as usize) as u16
-    };
+    let queue_len = crate::state::stepper::STEP_QUEUE_CHANNEL
+        .len()
+        .min(u16::MAX as usize) as u16;
     // 2. Reset ISR stepper engine state (clear stale partial segment).
     // SAFETY: Triggered stops call this inside `with_trigger_domain()` with
     // interrupts disabled. P1 stops clear `motor_armed` before calling this,
@@ -291,35 +343,49 @@ pub(crate) fn stop_physical_stepper_no_lock(stepper_idx: usize, reason: StepperE
             .expect("OpenFFBoard channel 0 exists")
             .reset();
     }
-    // 3. Drain queue.
-    //
-    // SAFETY: The step queue is a `heapless::spsc::Queue` — single-producer
-    // (P2 `queue_step_move`), single-consumer (P3 TIM5 scheduler IRQ). Triggered
-    // stops run with interrupts disabled. P1 stops clear `motor_armed` before
-    // this drain, so the ISR will discard a stale stepper timer without
-    // consuming the queue. The SPSC implementation supports concurrent
-    // producer/consumer access without a lock, so a P2 enqueue that races this
-    // drain is well-defined.
-    //
-    // Caller invariants for entries that survive the drain (i.e. P2
-    // enqueues completing after the loop exits):
-    // - From `with_trigger_domain` context: the `interrupt::free` critical
-    //   section blocks P2 producers, so no enqueue can race the drain.
-    // - From `stepper_stop_from_p1`: the caller has already cleared the
-    //   channel's motor-armed flag, so the next `arm_check` and the step-timer
-    //   IRQ both bail; any surviving entry is gated from execution and either
-    //   gets processed at the next motor enable (against the freshly-zeroed
-    //   channel position applied by `apply_stepper_post_action_state`) or is
-    //   drained again by the next `stepper_stop_from_p1`.
+    // 3. Drain queue -- access mode depends on caller context.
     let mut drained_segments = 0u32;
     let mut drained_steps = 0u32;
-    while let Some(m) = unsafe {
-        step_queue(0)
-            .expect("OpenFFBoard channel 0 exists")
-            .dequeue()
-    } {
-        drained_segments = drained_segments.saturating_add(1);
-        drained_steps = drained_steps.saturating_add(u32::from(m.count));
+    match access {
+        QueueAccess::Unmasked => {
+            let mut consumer = detach_consumer();
+            if let Some(consumer) = consumer.as_mut() {
+                while let Some(m) = consumer.dequeue() {
+                    drained_segments = drained_segments.saturating_add(1);
+                    drained_steps = drained_steps.saturating_add(u32::from(m.count));
+                }
+            }
+            if let Some(consumer) = consumer {
+                attach_consumer(consumer);
+            }
+            // else: a concurrent locked drain already owns the queue --
+            // this path is unreachable for QueueAccess::Unmasked in
+            // practice (P1 is the only Unmasked caller and detach_consumer
+            // only returns None if *this* channel's consumer was already
+            // detached by another Unmasked call, which cannot happen
+            // concurrently since P1 stops are not reentrant), but the
+            // detach/no-op fallback keeps this branch total.
+        }
+        QueueAccess::LockedInPlace => {
+            let result = with_consumer_locked(|consumer| {
+                let mut segments = 0u32;
+                let mut steps = 0u32;
+                while let Some(m) = consumer.dequeue() {
+                    segments = segments.saturating_add(1);
+                    steps = steps.saturating_add(u32::from(m.count));
+                }
+                (segments, steps)
+            });
+            if let Some((segments, steps)) = result {
+                drained_segments = segments;
+                drained_steps = steps;
+            }
+            // else: None means a P1 unmasked drain currently holds the
+            // consumer detached. Per the spec's recovery rule: report zero
+            // additional drained work here and continue with the rest of
+            // this sequence (steps 4-5 below) unconditionally -- P1's own
+            // in-flight drain already owns draining the queue.
+        }
     }
     crate::state::stepper_diag::record_physical_stop(
         stepper_idx as u8,
@@ -347,4 +413,30 @@ pub(crate) fn stop_physical_stepper_no_lock(stepper_idx: usize, reason: StepperE
     gpio_b
         .odr()
         .modify(|w| w.set_odr(11, embassy_stm32::pac::gpio::vals::Odr::LOW));
+}
+
+/// Stop a physical stepper from the P1 direct-stop path
+/// (`stepper_stop_from_p1`), with no critical section held. The queue
+/// drain runs entirely with interrupts enabled.
+///
+/// This is the only correct caller. Calling this from inside an active
+/// `with_trigger_domain` closure is a bug (not compiler-prevented --
+/// enforced by this being this function's single call site, verified by
+/// workspace reference search as part of code review).
+pub(crate) fn stop_physical_stepper_unmasked(stepper_idx: usize, reason: StepperEventReason) {
+    stop_physical_stepper_inner(stepper_idx, reason, QueueAccess::Unmasked);
+}
+
+/// Stop a physical stepper from inside an active `with_trigger_domain`
+/// closure (trigger-dispatch, shutdown). The queue drain stays inline
+/// under the mask the caller already holds -- moving it outside that
+/// mask requires restructuring the shared-crate call contract this
+/// closure runs inside, which is a separate, larger change.
+///
+/// This is the only correct caller. Calling this without an active mask
+/// already held is a bug (not compiler-prevented -- enforced by single
+/// call sites, verified by workspace reference search as part of code
+/// review).
+pub(crate) fn stop_physical_stepper_masked(stepper_idx: usize, reason: StepperEventReason) {
+    stop_physical_stepper_inner(stepper_idx, reason, QueueAccess::LockedInPlace);
 }

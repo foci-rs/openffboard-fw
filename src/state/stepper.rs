@@ -8,7 +8,7 @@ use foci_firmware::step_pulse::StepPulseTiming;
 use foci_firmware::stepper_runtime::{StepDeadlineStatus, classify_step_deadline};
 use foci_klipper::pulse_mapper::PulseMapperConfig;
 use foci_klipper::scheduler::SchedulerEventKind;
-use foci_klipper::stepper::{HardwareStepper, LogicalStepEvent, MotionScaleConfigError, StepMove};
+use foci_klipper::stepper::{HardwareStepper, LogicalStepEvent, MotionScaleConfigError};
 
 /// OpenFFBoard TIM5 input clock in hertz.
 pub(crate) const STEP_TIMER_HZ: u32 = 84_000_000;
@@ -34,17 +34,57 @@ pub(crate) const STEP_QUEUE_DEPTH: usize = 1024;
 /// Number of hardware stepper runtime channels on OpenFFBoard.
 pub(crate) const STEPPER_CHANNEL_COUNT: usize = 1;
 
-/// Lock-free move queues for hardware step/dir.
+/// Lock-free step/dir move queue with explicit producer/consumer ownership.
+/// Split once at RTIC `init` via `crate::main::init` -- never touched
+/// through the old unsafe accessor again.
+pub(crate) static STEP_QUEUE_CHANNEL: foci_klipper::step_queue::StepQueueChannel<STEP_QUEUE_DEPTH> =
+    foci_klipper::step_queue::StepQueueChannel::new();
+
+/// P2-owned producer handle, populated once by `init_step_queue`. Nothing
+/// else ever touches it, so aliasing is inexpressible.
+pub(crate) static mut STEP_QUEUE_PRODUCER: Option<
+    foci_klipper::step_queue::Producer<'static, foci_klipper::stepper::StepMove>,
+> = None;
+
+/// Split `STEP_QUEUE_CHANNEL` once and store the producer half. Must be
+/// called exactly once, from RTIC `init`, before any other stepper
+/// task runs.
 ///
-/// P2 enqueues, P3 dequeues. When timer is disabled, P1/P2 may drain.
+/// # Safety
 ///
-/// SAFETY: Access protocol enforced by RTIC priorities:
-/// - Timer active: P2 enqueues only (Producer), P3 dequeues only (Consumer)
-/// - Timer disabled: P1/P2 may drain (Consumer side safe, P3 quiesced)
-pub(crate) static mut STEP_QUEUES: [heapless::spsc::Queue<
-    foci_klipper::stepper::StepMove,
-    STEP_QUEUE_DEPTH,
->; STEPPER_CHANNEL_COUNT] = [const { heapless::spsc::Queue::new() }];
+/// Caller (RTIC `init`) guarantees this runs exactly once, before any
+/// other task that touches `STEP_QUEUE_PRODUCER` or `STEP_QUEUE_CHANNEL`.
+pub(crate) unsafe fn init_step_queue() {
+    // SAFETY: `init` runs once, before any other task starts; nothing else
+    // writes `STEP_QUEUE_PRODUCER`. `addr_of_mut!` avoids the edition-2024
+    // `static_mut_refs` lint by never spelling `&mut STEP_QUEUE_PRODUCER`
+    // directly, matching this file's existing `P2_STEPPERS`/`ISR_STEPPERS`
+    // accessor pattern.
+    unsafe {
+        *core::ptr::addr_of_mut!(STEP_QUEUE_PRODUCER) = Some(STEP_QUEUE_CHANNEL.split_once());
+    }
+}
+
+/// Borrow the P2-owned producer for `channel`. Returns `None` for any
+/// channel other than 0 (OpenFFBoard has one physical stepper) or if
+/// `init_step_queue` has not yet run.
+///
+/// # Safety
+///
+/// Callable only from P2 (the sole owner of `STEP_QUEUE_PRODUCER`).
+pub(crate) unsafe fn step_queue_producer(
+    channel: u8,
+) -> Option<&'static mut foci_klipper::step_queue::Producer<'static, foci_klipper::stepper::StepMove>>
+{
+    if channel != 0 {
+        return None;
+    }
+    // SAFETY: caller guarantees P2-only access; `init_step_queue` has run
+    // by the time any P2 command handler executes. `addr_of_mut!` avoids
+    // the edition-2024 `static_mut_refs` lint the same way as above.
+    let producer_slot = unsafe { &mut *core::ptr::addr_of_mut!(STEP_QUEUE_PRODUCER) };
+    producer_slot.as_mut()
+}
 
 /// P2-local HardwareStepper state (direction tracking, prepare_move).
 /// Only accessed from usb_task (P2) command handlers.
@@ -55,28 +95,6 @@ pub(crate) static mut P2_STEPPERS: [foci_klipper::stepper::HardwareStepper; STEP
 /// Only accessed from TIM5 CC1 ISR (P3).
 pub(crate) static mut ISR_STEPPERS: [foci_klipper::stepper::HardwareStepper;
     STEPPER_CHANNEL_COUNT] = [const { foci_klipper::stepper::HardwareStepper::new() }];
-
-/// Return the hardware step queue for `channel`.
-///
-/// # Safety
-///
-/// Callers must uphold OpenFFBoard's per-channel RTIC access discipline for
-/// the returned queue and must not create overlapping mutable references to
-/// the same channel.
-#[inline]
-pub(crate) unsafe fn step_queue(
-    channel: u8,
-) -> Option<&'static mut heapless::spsc::Queue<foci_klipper::stepper::StepMove, STEP_QUEUE_DEPTH>> {
-    let idx = channel as usize;
-    if idx >= STEPPER_CHANNEL_COUNT {
-        return None;
-    }
-    let ptr = core::ptr::addr_of_mut!(STEP_QUEUES)
-        .cast::<heapless::spsc::Queue<foci_klipper::stepper::StepMove, STEP_QUEUE_DEPTH>>();
-    // SAFETY: idx was bounds-checked above. The caller guarantees exclusive
-    // mutable access to this channel under the board's RTIC access discipline.
-    Some(unsafe { &mut *ptr.add(idx) })
-}
 
 /// Return the P2-local hardware stepper state for `channel`.
 ///
@@ -199,22 +217,6 @@ pub(crate) const fn assert_physical_pulse_budget(physical_pulses: u8) {
         physical_pulses <= 2,
         "logical event exceeds two physical pulses"
     );
-}
-
-/// Prepare and enqueue without consuming P2 direction when the queue is full.
-pub(crate) fn prepare_and_enqueue<const N: usize>(
-    stepper: &mut HardwareStepper,
-    queue: &mut heapless::spsc::Queue<StepMove, N>,
-    move_: StepMove,
-) -> Result<usize, usize> {
-    if queue.is_full() {
-        return Err(queue.len());
-    }
-    let prepared = stepper.prepare_move(move_);
-    // P2 is the only producer, so a consumer can only create more space after
-    // the full check. Enqueue therefore cannot fail after direction changes.
-    queue.enqueue(prepared).map_err(|_| queue.len())?;
-    Ok(queue.len())
 }
 
 /// Publish mapper-observable state after a complete pulse train is low.
@@ -345,19 +347,5 @@ mod tests {
     #[should_panic(expected = "logical event exceeds two physical pulses")]
     fn physical_pulse_budget_rejects_three_in_release_code() {
         assert_physical_pulse_budget(3);
-    }
-
-    #[test]
-    fn queue_full_does_not_consume_pending_direction_change() {
-        let mut stepper = foci_klipper::stepper::HardwareStepper::new();
-        stepper.set_next_step_dir(false);
-        let mut queue = heapless::spsc::Queue::<StepMove, 2>::new();
-        queue.enqueue(StepMove::new(100, 1, 0)).unwrap();
-
-        assert_eq!(
-            prepare_and_enqueue(&mut stepper, &mut queue, StepMove::new(100, 1, 0)),
-            Err(1)
-        );
-        assert!(stepper.next_move_changes_direction());
     }
 }
