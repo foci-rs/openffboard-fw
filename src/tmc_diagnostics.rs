@@ -378,6 +378,7 @@ pub(crate) async fn handle_diagnostic_request(
                 saved_voltage_limit: ctx.saved_voltage_limit,
             },
             tmc_config: ctx.tmc_config,
+            feedback_config: crate::board_config::FEEDBACK_CONFIGS[0],
         },
     )
     .await;
