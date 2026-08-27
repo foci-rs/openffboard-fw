@@ -1629,7 +1629,16 @@ mod app {
                     EndstopSampleResult::EnterOversamplingNow => {
                         match td.endstops[endstop_idx].oversample(read_pin(), wake_clock) {
                             EndstopSampleResult::Triggered { trsync_oid, reason } => {
-                                td.trigger(trsync_oid, reason, read_tim5());
+                                {
+                                    let trigger_start = cortex_m::peripheral::DWT::cycle_count();
+                                    td.trigger(trsync_oid, reason, read_tim5());
+                                    let trigger_cycles = cortex_m::peripheral::DWT::cycle_count()
+                                        .wrapping_sub(trigger_start);
+                                    crate::state::stepper_diag::record_critical_section(
+                                        crate::state::stepper_diag::PERF_SITE_TRIGGER_STOP,
+                                        trigger_cycles,
+                                    );
+                                }
                                 *need_report = true;
                             }
                             EndstopSampleResult::Reschedule { next_clock } => {
@@ -1646,7 +1655,16 @@ mod app {
                         }
                     }
                     EndstopSampleResult::Triggered { trsync_oid, reason } => {
-                        td.trigger(trsync_oid, reason, read_tim5());
+                        {
+                            let trigger_start = cortex_m::peripheral::DWT::cycle_count();
+                            td.trigger(trsync_oid, reason, read_tim5());
+                            let trigger_cycles = cortex_m::peripheral::DWT::cycle_count()
+                                .wrapping_sub(trigger_start);
+                            crate::state::stepper_diag::record_critical_section(
+                                crate::state::stepper_diag::PERF_SITE_TRIGGER_STOP,
+                                trigger_cycles,
+                            );
+                        }
                         *need_report = true;
                     }
                     EndstopSampleResult::Reschedule { next_clock } => {
@@ -1670,7 +1688,16 @@ mod app {
                     .map(|(&oid, _)| oid);
                 if let Some(oid) = oid {
                     let expire_reason = td.trsync[trsync_idx].expire_reason();
-                    td.trigger(oid, expire_reason, read_tim5());
+                    {
+                        let trigger_start = cortex_m::peripheral::DWT::cycle_count();
+                        td.trigger(oid, expire_reason, read_tim5());
+                        let trigger_cycles =
+                            cortex_m::peripheral::DWT::cycle_count().wrapping_sub(trigger_start);
+                        crate::state::stepper_diag::record_critical_section(
+                            crate::state::stepper_diag::PERF_SITE_TRIGGER_STOP,
+                            trigger_cycles,
+                        );
+                    }
                     *need_report = true;
                 }
             }

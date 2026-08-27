@@ -276,7 +276,7 @@ pub(crate) fn enter_shutdown(state: &mut State) -> bool {
 
     let entered = foci_firmware::helpers::lifecycle::enter_shutdown(state);
     if entered {
-        with_trigger_domain(|td| {
+        with_trigger_domain_site(crate::state::stepper_diag::PERF_SITE_SHUTDOWN, |td| {
             let mut board = OpenFfboardTrsyncBoard;
             trsync::shutdown_quiesce(td.state_mut(), &mut board);
         });
@@ -409,7 +409,7 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
             return Err(CommandError::InvalidChannel(channel));
         }
 
-        with_trigger_domain(|td| {
+        with_trigger_domain_site(crate::state::stepper_diag::PERF_SITE_RESET, |td| {
             let mut board = OpenFfboardStepperBoard;
             stepper::reset_step_clock(td.state_mut(), &mut board, channel, clock)
         })
