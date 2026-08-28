@@ -164,6 +164,7 @@ mod app {
 
         let p = embassy_stm32::init(crate::board_init::rcc_config());
         defmt::info!("SYSCLK: 168 MHz, USB: 48 MHz");
+        crate::board_init::verify_dma_interrupt_priority();
 
         // One-time reset-cause diagnostic. RCC_CSR latches why the MCU last
         // reset and holds the flags until RMVF clears them. Log the cause by
