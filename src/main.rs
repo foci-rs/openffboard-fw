@@ -1073,7 +1073,9 @@ mod app {
                                     runtime.dispatch_state(tmc_state(), stepper_state());
                                 apply_stepper_post_action(actions.stepper, &mut state);
                             }
+                            foci_firmware::diagnostic::mark_p1_reply_construction_start();
                             emit_terminal_reply(reply);
+                            foci_firmware::diagnostic::mark_p1_reply_construction_end();
                             defmt::info!(
                                 "commissioning terminal max tick cycles: {}",
                                 commission_tick_max_cycles,

@@ -359,6 +359,7 @@ impl<'a> BoardChannels for FirmwareCtx<'a> {
 impl<'a> StepperHost for FirmwareCtx<'a> {
     fn set_next_step_dir(&mut self, channel: u8, forward: bool) {
         if channel != 0 {
+            foci_firmware::diagnostic::record_p2_reply_send();
             ::ankyra::klipper_reply_from!(
                 &mut crate::_ankyra_config::Sender,
                 foci_firmware::ankyra::replies::FociDiagnostic,
@@ -557,6 +558,7 @@ impl<'a> TmcHost for FirmwareCtx<'a> {
         oid: u8,
         rejection: foci_firmware::motion_scale::MotionScaleRejection,
     ) {
+        foci_firmware::diagnostic::record_p2_reply_send();
         ::ankyra::klipper_reply_from!(
             &mut crate::_ankyra_config::Sender,
             foci_firmware::ankyra::replies::FociMotionScaleRejected,
