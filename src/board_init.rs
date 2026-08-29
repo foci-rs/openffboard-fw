@@ -105,6 +105,20 @@ pub fn init_tim5_clock() {
     tim5.sr().write_value(Default::default());
 }
 
+/// Keep the debug/trace clock domain alive while the core sleeps.
+///
+/// The `#[idle]` task's `wfi()` puts the core into Sleep mode whenever no
+/// interrupt is pending -- most of the time, given the 10 kHz control tick.
+/// Without `DBG_SLEEP` set, an attached debugger can lose the core or stall
+/// RTT reads across every sleep entry. `DBG_STOP`/`DBG_STANDBY` are left
+/// unset: this firmware never sets `SLEEPDEEP`, so it never reaches Stop or
+/// Standby.
+pub fn enable_debug_clock_during_sleep() {
+    embassy_stm32::pac::DBGMCU
+        .cr()
+        .modify(|w| w.set_dbg_sleep(true));
+}
+
 /// Configure PB11 (STEP) and PA0 (DIR) as push-pull outputs at very
 /// high speed, initial level low.
 pub fn init_stepdir_gpio() {
