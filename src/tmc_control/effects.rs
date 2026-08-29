@@ -110,9 +110,6 @@ pub(crate) fn lease_expired(now: u32) -> bool {
     elapsed > CLOCK_SYNC_TIMEOUT_TICKS
 }
 
-/// What the P1 loop should do with the clock-sync lease this iteration,
-/// given the same `SHUTDOWN_ACTIVE` read the loop's existing gate above
-/// this call already consulted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LeaseCheckDisposition {
     /// The lease has expired and shutdown is not already active: enter
@@ -247,7 +244,6 @@ mod tests {
         crate::tmc_control::board::tmc_state()
             .enable_pin_asserted
             .store(true, Relaxed);
-        // HAS_RECEIVED_VALID_CLOCK left false.
         assert!(lease_expired(0));
     }
 
@@ -273,9 +269,6 @@ mod tests {
 
     #[test]
     fn lease_expired_transitions_true_across_an_advancing_sequence() {
-        // Simulates advancing 1ms slices of a freshly-sampled tick,
-        // mirroring how a real call site must drive this function --
-        // never one hoisted value reused forever.
         let _guard = reset_lease_state();
         crate::tmc_control::board::tmc_state()
             .enable_pin_asserted
