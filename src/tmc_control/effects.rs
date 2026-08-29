@@ -17,6 +17,9 @@ pub(crate) enum CommissionWaitExit {
     QueueFlush,
     /// Enter GPIO-first emergency-disable handling.
     EmergencyDisable,
+    /// The host-liveness lease has expired; enter the shutdown safe-state
+    /// path exactly like `Shutdown` above.
+    ClockSyncExpired,
 }
 
 /// Classify board-owned signals checked between commissioning wait slices.
@@ -25,6 +28,7 @@ pub(crate) const fn classify_commission_wait_exit(
     queue_flush: bool,
     emergency_disable: bool,
     fault_active: bool,
+    clock_sync_expired: bool,
 ) -> Option<CommissionWaitExit> {
     if emergency_disable || fault_active {
         Some(CommissionWaitExit::EmergencyDisable)
@@ -32,6 +36,8 @@ pub(crate) const fn classify_commission_wait_exit(
         Some(CommissionWaitExit::Shutdown)
     } else if queue_flush {
         Some(CommissionWaitExit::QueueFlush)
+    } else if clock_sync_expired {
+        Some(CommissionWaitExit::ClockSyncExpired)
     } else {
         None
     }
@@ -328,13 +334,45 @@ mod tests {
     }
 
     #[test]
+    fn classify_commission_wait_exit_reports_clock_sync_expired() {
+        assert_eq!(
+            classify_commission_wait_exit(false, false, false, false, true),
+            Some(CommissionWaitExit::ClockSyncExpired)
+        );
+    }
+
+    #[test]
+    fn classify_commission_wait_exit_emergency_disable_takes_priority_over_clock_sync() {
+        assert_eq!(
+            classify_commission_wait_exit(false, false, true, false, true),
+            Some(CommissionWaitExit::EmergencyDisable)
+        );
+    }
+
+    #[test]
+    fn classify_commission_wait_exit_shutdown_takes_priority_over_clock_sync() {
+        assert_eq!(
+            classify_commission_wait_exit(true, false, false, false, true),
+            Some(CommissionWaitExit::Shutdown)
+        );
+    }
+
+    #[test]
+    fn classify_commission_wait_exit_none_when_nothing_set() {
+        assert_eq!(
+            classify_commission_wait_exit(false, false, false, false, false),
+            None
+        );
+    }
+
+    #[test]
     fn critical_status_and_disable_exit_commission_wait() {
         assert_eq!(
-            classify_commission_wait_exit(false, false, false, true),
+            classify_commission_wait_exit(false, false, false, true, false),
             Some(CommissionWaitExit::EmergencyDisable)
         );
         assert_eq!(
-            classify_commission_wait_exit(false, false, true, false),
+            classify_commission_wait_exit(false, false, true, false, false),
             Some(CommissionWaitExit::EmergencyDisable)
         );
     }
@@ -387,7 +425,7 @@ mod tests {
         ];
 
         for (shutdown, flush, disable, fault, gpio_first) in cases {
-            let exit = classify_commission_wait_exit(shutdown, flush, disable, fault);
+            let exit = classify_commission_wait_exit(shutdown, flush, disable, fault, false);
             let dispatch = exit.is_none();
             let reply = dispatch;
             let trace = dispatch;

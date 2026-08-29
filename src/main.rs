@@ -753,6 +753,7 @@ mod app {
                         TMC_QUEUE_FLUSH.load(core::sync::atomic::Ordering::Relaxed),
                         TMC_DISABLE_SIGNAL.signaled(),
                         FAULT_ACTIVE.load(core::sync::atomic::Ordering::Relaxed),
+                        crate::tmc_control::effects::lease_expired(read_tim5()),
                     );
                     if let Some(exit) = exit {
                         if matches!(
@@ -813,6 +814,7 @@ mod app {
                             TMC_QUEUE_FLUSH.load(core::sync::atomic::Ordering::Relaxed),
                             TMC_DISABLE_SIGNAL.signaled(),
                             FAULT_ACTIVE.load(core::sync::atomic::Ordering::Relaxed),
+                            crate::tmc_control::effects::lease_expired(read_tim5()),
                         );
                         if let Some(exit) = exit {
                             if matches!(
@@ -961,6 +963,9 @@ mod app {
                                             TMC_DISABLE_SIGNAL.signaled(),
                                             FAULT_ACTIVE
                                                 .load(core::sync::atomic::Ordering::Relaxed),
+                                            crate::tmc_control::effects::lease_expired(
+                                                read_tim5(),
+                                            ),
                                         );
                                         if let Some(exit) = exit {
                                             if matches!(
