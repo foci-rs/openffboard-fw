@@ -604,6 +604,28 @@ mod app {
             }
             shutdown_safe_state_applied = false;
 
+            // classify_lease_check(shutdown_active, ...) always returns
+            // Proceed while shutdown is already active -- see its doc
+            // comment for why.
+            match crate::tmc_control::effects::classify_lease_check(
+                SHUTDOWN_ACTIVE.load(core::sync::atomic::Ordering::Relaxed),
+                crate::tmc_control::effects::lease_expired(read_tim5()),
+            ) {
+                crate::tmc_control::effects::LeaseCheckDisposition::EnterClockSyncShutdown => {
+                    ctx.shared.app_state.lock(|state| {
+                        if crate::firmware_ctx::enter_shutdown(state) {
+                            foci_firmware::dispatch_shutdown!(
+                                foci_firmware::shutdown::ShutdownReason::HostClockSyncExpired,
+                                read_tim5(),
+                                &mut crate::_ankyra_config::Sender
+                            );
+                        }
+                    });
+                    continue;
+                }
+                crate::tmc_control::effects::LeaseCheckDisposition::Proceed => {}
+            }
+
             // Drain stale requests after config_reset
             if TMC_QUEUE_FLUSH.load(core::sync::atomic::Ordering::Relaxed) {
                 commission_measurement_active = false;

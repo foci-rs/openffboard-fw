@@ -80,6 +80,60 @@ where
     }
 }
 
+const CLOCK_SYNC_TIMEOUT_TICKS: u32 = 5 * crate::ankyra::constants::CLOCK_FREQ;
+
+/// Whether the host-liveness lease has expired: any channel is
+/// physically enabled, and either no valid `get_clock` has ever been
+/// received, or more than `CLOCK_SYNC_TIMEOUT_TICKS` have elapsed since
+/// the last one. `now` must be a freshly sampled `read_tim5()` at the
+/// call site — never a value captured once and reused across iterations.
+pub(crate) fn lease_expired(now: u32) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    use foci_firmware::state::lifecycle::{HAS_RECEIVED_VALID_CLOCK, LAST_HOST_LIVENESS_TICKS};
+
+    let any_enabled = crate::tmc_control::board::tmc_state()
+        .enable_pin_asserted
+        .load(Relaxed);
+    if !any_enabled {
+        return false;
+    }
+    if !HAS_RECEIVED_VALID_CLOCK.load(Relaxed) {
+        return true;
+    }
+    let elapsed = now.wrapping_sub(LAST_HOST_LIVENESS_TICKS.load(Relaxed));
+    elapsed > CLOCK_SYNC_TIMEOUT_TICKS
+}
+
+/// What the P1 loop should do with the clock-sync lease this iteration,
+/// given the same `SHUTDOWN_ACTIVE` read the loop's existing gate above
+/// this call already consulted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaseCheckDisposition {
+    /// The lease has expired and shutdown is not already active: enter
+    /// shutdown now and skip the rest of this iteration.
+    EnterClockSyncShutdown,
+    /// Either shutdown is already active, or the lease has not expired:
+    /// proceed with normal iteration work.
+    Proceed,
+}
+
+/// Decide the disposition above. Always `Proceed` while `shutdown_active`
+/// is true — checking `lease_expired` and acting on it while shutdown is
+/// already active would starve the existing safe-state gate permanently,
+/// since re-entering shutdown is a no-op on repeat calls but a misplaced
+/// continue would still fire every iteration. Call this immediately after
+/// the existing `SHUTDOWN_ACTIVE` handling block — never before it.
+pub(crate) const fn classify_lease_check(
+    shutdown_active: bool,
+    lease_expired: bool,
+) -> LeaseCheckDisposition {
+    if !shutdown_active && lease_expired {
+        LeaseCheckDisposition::EnterClockSyncShutdown
+    } else {
+        LeaseCheckDisposition::Proceed
+    }
+}
+
 /// Emit a Klipper shutdown after the caller has entered MCU shutdown state.
 pub(crate) fn emit_shutdown(reason: ShutdownReason) {
     let clock = read_tim5();
@@ -130,8 +184,148 @@ pub(crate) fn emit_shutdown(reason: ShutdownReason) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::Ordering::Relaxed;
+    use foci_firmware::state::lifecycle::{HAS_RECEIVED_VALID_CLOCK, LAST_HOST_LIVENESS_TICKS};
     use foci_firmware::tmc::{TmcRequest, TmcRequestKind};
     use foci_firmware::tmc_control::CommissionWaitRequestDisposition;
+
+    /// Serializes every test in this module that touches the global
+    /// liveness atomics or `enable_pin_asserted` -- neither is otherwise
+    /// synchronized, and `cargo test` runs this module's tests in
+    /// parallel by default.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn reset_lease_state() -> std::sync::MutexGuard<'static, ()> {
+        let guard = TEST_LOCK.lock().expect("lease test lock is available");
+        HAS_RECEIVED_VALID_CLOCK.store(false, Relaxed);
+        LAST_HOST_LIVENESS_TICKS.store(0, Relaxed);
+        crate::tmc_control::board::tmc_state()
+            .enable_pin_asserted
+            .store(false, Relaxed);
+        guard
+    }
+
+    #[test]
+    fn lease_expired_false_when_no_channel_enabled() {
+        let _guard = reset_lease_state();
+        HAS_RECEIVED_VALID_CLOCK.store(true, Relaxed);
+        LAST_HOST_LIVENESS_TICKS.store(0, Relaxed);
+        assert!(!lease_expired(CLOCK_SYNC_TIMEOUT_TICKS + 1));
+    }
+
+    #[test]
+    fn lease_expired_false_when_enabled_and_recent() {
+        let _guard = reset_lease_state();
+        crate::tmc_control::board::tmc_state()
+            .enable_pin_asserted
+            .store(true, Relaxed);
+        HAS_RECEIVED_VALID_CLOCK.store(true, Relaxed);
+        LAST_HOST_LIVENESS_TICKS.store(100, Relaxed);
+        assert!(!lease_expired(100 + CLOCK_SYNC_TIMEOUT_TICKS - 1));
+    }
+
+    #[test]
+    fn lease_expired_true_when_enabled_and_stale() {
+        let _guard = reset_lease_state();
+        crate::tmc_control::board::tmc_state()
+            .enable_pin_asserted
+            .store(true, Relaxed);
+        HAS_RECEIVED_VALID_CLOCK.store(true, Relaxed);
+        LAST_HOST_LIVENESS_TICKS.store(100, Relaxed);
+        assert!(lease_expired(100 + CLOCK_SYNC_TIMEOUT_TICKS + 1));
+    }
+
+    #[test]
+    fn lease_expired_true_when_enabled_and_no_clock_ever_received() {
+        let _guard = reset_lease_state();
+        crate::tmc_control::board::tmc_state()
+            .enable_pin_asserted
+            .store(true, Relaxed);
+        // HAS_RECEIVED_VALID_CLOCK left false.
+        assert!(lease_expired(0));
+    }
+
+    #[test]
+    fn lease_expired_does_not_self_clear_while_still_enabled_and_stale() {
+        // Once shutdown is active but the pin has not yet been physically
+        // lowered (safe state not yet applied), enable_pin_asserted is
+        // still true and lease_expired must keep reporting true on every
+        // subsequent check -- it must not self-clear just because a
+        // shutdown transition already happened once. The loop's own
+        // SHUTDOWN_ACTIVE gate (not this function) is what stops
+        // lease_expired from being consulted again until the gate finishes.
+        let _guard = reset_lease_state();
+        crate::tmc_control::board::tmc_state()
+            .enable_pin_asserted
+            .store(true, Relaxed);
+        HAS_RECEIVED_VALID_CLOCK.store(true, Relaxed);
+        LAST_HOST_LIVENESS_TICKS.store(0, Relaxed);
+        let now = CLOCK_SYNC_TIMEOUT_TICKS + 1;
+        assert!(lease_expired(now));
+        assert!(lease_expired(now));
+    }
+
+    #[test]
+    fn lease_expired_transitions_true_across_an_advancing_sequence() {
+        // Simulates advancing 1ms slices of a freshly-sampled tick,
+        // mirroring how a real call site must drive this function --
+        // never one hoisted value reused forever.
+        let _guard = reset_lease_state();
+        crate::tmc_control::board::tmc_state()
+            .enable_pin_asserted
+            .store(true, Relaxed);
+        HAS_RECEIVED_VALID_CLOCK.store(true, Relaxed);
+        LAST_HOST_LIVENESS_TICKS.store(0, Relaxed);
+
+        let slice_ticks = 1_000 * (crate::ankyra::constants::CLOCK_FREQ / 1_000_000);
+        let mut now = 0u32;
+        let mut saw_expired = false;
+        for _ in 0..(CLOCK_SYNC_TIMEOUT_TICKS / slice_ticks + 2) {
+            if lease_expired(now) {
+                saw_expired = true;
+                break;
+            }
+            now = now.wrapping_add(slice_ticks);
+        }
+        assert!(
+            saw_expired,
+            "lease_expired never fired across an advancing sequence"
+        );
+    }
+
+    #[test]
+    fn classify_lease_check_enters_shutdown_when_not_active_and_expired() {
+        assert_eq!(
+            classify_lease_check(false, true),
+            LeaseCheckDisposition::EnterClockSyncShutdown
+        );
+    }
+
+    #[test]
+    fn classify_lease_check_proceeds_when_not_active_and_not_expired() {
+        assert_eq!(
+            classify_lease_check(false, false),
+            LeaseCheckDisposition::Proceed
+        );
+    }
+
+    #[test]
+    fn classify_lease_check_proceeds_when_active_and_expired() {
+        // Even though lease_expired is true, an already-active shutdown
+        // must never re-trigger through this path.
+        assert_eq!(
+            classify_lease_check(true, true),
+            LeaseCheckDisposition::Proceed
+        );
+    }
+
+    #[test]
+    fn classify_lease_check_proceeds_when_active_and_not_expired() {
+        assert_eq!(
+            classify_lease_check(true, false),
+            LeaseCheckDisposition::Proceed
+        );
+    }
 
     #[test]
     fn critical_status_and_disable_exit_commission_wait() {
