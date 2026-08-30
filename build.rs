@@ -16,22 +16,13 @@ fn main() {
 
     // Generate CCMRAM linker section supplement
     let ccmram_x = out_dir.join("ccmram.x");
-    let trace_ccmram_assertion = if env::var("CARGO_FEATURE_TRACE").is_ok() {
-        "  ASSERT(SIZEOF(.ccmram) >= 10240, \
-         \"trace queues must reserve at least 10 KiB of CCMRAM\")\n"
-    } else {
-        ""
-    };
     fs::write(
         &ccmram_x,
-        format!(
-            "SECTIONS {{\n\
-             \x20 .ccmram (NOLOAD) : ALIGN(4) {{\n\
-             \x20   *(.ccmram .ccmram.*)\n\
-             \x20 }} > CCMRAM\n\
-             {trace_ccmram_assertion}\
-             }}\n"
-        ),
+        "SECTIONS {\n\
+         \x20 .ccmram (NOLOAD) : ALIGN(4) {\n\
+         \x20   *(.ccmram .ccmram.*)\n\
+         \x20 } > CCMRAM\n\
+         }\n",
     )
     .expect("failed to write ccmram.x");
 

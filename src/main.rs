@@ -193,8 +193,6 @@ mod app {
         crate::board_init::init_tim5_clock();
         #[cfg(feature = "trace")]
         {
-            // SAFETY: init runs once before trace producers or consumers spawn.
-            unsafe { crate::state::usb_trace::init_trace_queues() };
             crate::usb_trace::note_trace_boot();
         }
         crate::board_init::init_stepdir_gpio();
