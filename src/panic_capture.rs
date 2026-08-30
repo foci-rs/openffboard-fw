@@ -51,9 +51,10 @@ struct PanicPersist {
     file_hash: u32,
 }
 
-/// Lives in the `.ccmram` NOLOAD section so it is neither loaded nor zeroed at
-/// startup and survives a reset. The initializer is never written to the image.
-#[unsafe(link_section = ".ccmram")]
+/// Lives in the `.ccmram.diag.panic` NOLOAD section so it is neither loaded nor
+/// zeroed at startup and survives a reset. The initializer is never written to
+/// the image.
+#[unsafe(link_section = ".ccmram.diag.panic")]
 static mut PANIC_PERSIST: PanicPersist = PanicPersist {
     magic: 0,
     kind: 0,
