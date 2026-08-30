@@ -14,10 +14,10 @@ fn main() {
     };
     fs::copy(memory_x, out_dir.join("memory.x")).unwrap();
 
-    // Generate CCMRAM linker section supplement. The allowlist admits only the
-    // two named no-init diagnostic records; any other `.ccmram*` input section
-    // becomes an orphan and is rejected by --orphan-handling=error below rather
-    // than silently absorbed into this section.
+    // The allowlist admits only the two named no-init diagnostic records; any
+    // other `.ccmram*` input section becomes an orphan and is rejected by
+    // --orphan-handling=error below rather than silently absorbed into this
+    // section.
     let ccmram_x = out_dir.join("ccmram.x");
     fs::write(
         &ccmram_x,
