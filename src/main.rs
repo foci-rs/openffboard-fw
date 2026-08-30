@@ -88,6 +88,10 @@ mod app {
     // automatically via an extended u64 counter in a TimerQueueBackend.
     stm32_tim2_monotonic!(Mono, 1_000_000);
 
+    static USB_PUMP_COUNTERS: foci_firmware::usb_pump::UsbPumpCounters =
+        foci_firmware::usb_pump::UsbPumpCounters::new();
+    static USB_PUMP_EMITTER: crate::usb_task::Emitter = crate::usb_task::Emitter::new();
+
     use foci_firmware::tmc::TmcRequest;
 
     use crate::board_config::{CURRENT_SCALE_MA_PER_LSB, TMC_CONFIG};
@@ -2001,8 +2005,14 @@ mod app {
     /// Katapult 1200-baud DTR detection is handled by klipper-usb internally.
     #[task(priority = 2, shared = [app_state])]
     async fn usb_task(mut ctx: usb_task::Context) {
+        let mut backend = crate::usb_task::OpenffUsbBackend::new(
+            |f| ctx.shared.app_state.lock(f),
+            &REPORT_PENDING,
+            &USB_PUMP_EMITTER,
+            &USB_PUMP_COUNTERS,
+        );
         loop {
-            crate::usb_task::pump(|f| ctx.shared.app_state.lock(f), &REPORT_PENDING).await;
+            foci_firmware::usb_pump::run_once(&mut backend, &USB_PUMP_COUNTERS).await;
         }
     }
 
