@@ -141,6 +141,7 @@ mod app {
         uid_str: [u8; 24] = [0; 24],
     ])]
     fn init(ctx: init::Context) -> (Shared, Local) {
+        crate::board_init::paint_stack();
         foci_firmware::diagnostic::recover_last_boot_breakaway_breadcrumb();
         defmt::info!("FOCI OpenFFBoard starting");
 
