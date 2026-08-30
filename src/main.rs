@@ -573,6 +573,16 @@ mod app {
         'tmc_loop: loop {
             use embassy_futures::select::{Either, select};
 
+            // A terminal restore cancelled by a commissioning-loop exit still
+            // owns the motor. Drive it to safe state before anything else
+            // touches the channel; only that drain retires its slots.
+            if runtime.restore_cancel_pending() {
+                let mut backend = openffboard_backend(tmc, enable_pin);
+                let _ = runtime
+                    .drive_restore_cancel(&mut backend, tmc_state(), stepper_state())
+                    .await;
+            }
+
             // On shutdown, perform one-shot motor safe-state then idle until
             // shutdown clears. This catches USB disconnect / host crash where
             // no further commands arrive but the TMC4671 remains energized.
@@ -757,6 +767,7 @@ mod app {
                         crate::tmc_control::effects::lease_expired(read_tim5()),
                     );
                     if let Some(exit) = exit {
+                        runtime.request_restore_cancel();
                         if matches!(
                             exit,
                             crate::tmc_control::effects::CommissionWaitExit::EmergencyDisable
@@ -764,6 +775,58 @@ mod app {
                             enable_pin.set_low();
                         }
                         continue 'tmc_loop;
+                    }
+
+                    // A terminal restore owns the channel until it reports its
+                    // terminal: advance it one backend operation per pass
+                    // instead of stepping the engine again.
+                    if runtime.is_restore_pending() {
+                        let action = {
+                            let mut backend = openffboard_backend(tmc, enable_pin);
+                            let mut retention =
+                                foci_firmware::commission_dispatch::CommissionRetention::new(
+                                    &mut *stage_c_candidate,
+                                );
+                            runtime
+                                .poll_commissioning_terminal(
+                                    &mut backend,
+                                    &mut retention,
+                                    tmc_state(),
+                                    stepper_state(),
+                                )
+                                .await
+                        };
+                        match action {
+                            None => continue 'commission_poll,
+                            Some(
+                                foci_firmware::tmc_control::ScheduledCommissionTickAction::Terminal {
+                                    reply,
+                                    actions,
+                                },
+                            ) => {
+                                #[cfg(feature = "trace")]
+                                {
+                                    commission_trace_phase = None;
+                                }
+                                {
+                                    let mut state =
+                                        runtime.dispatch_state(tmc_state(), stepper_state());
+                                    apply_stepper_post_action(actions.stepper, &mut state);
+                                }
+                                foci_firmware::diagnostic::mark_p1_reply_construction_start();
+                                emit_terminal_reply(reply);
+                                foci_firmware::diagnostic::mark_p1_reply_construction_end();
+                                defmt::info!(
+                                    "commissioning terminal max tick cycles: {}",
+                                    commission_tick_max_cycles,
+                                );
+                                commission_measurement_active = false;
+                                break 'commission_poll;
+                            }
+                            Some(_) => {
+                                unreachable!("terminal restore produced a nonterminal action")
+                            }
+                        }
                     }
                     // Capture deadline before the tick so SPI time consumed by the
                     // engine reduces the remaining trace budget.
@@ -818,6 +881,7 @@ mod app {
                             crate::tmc_control::effects::lease_expired(read_tim5()),
                         );
                         if let Some(exit) = exit {
+                            runtime.request_restore_cancel();
                             if matches!(
                                 exit,
                                 crate::tmc_control::effects::CommissionWaitExit::EmergencyDisable
@@ -827,29 +891,18 @@ mod app {
                             continue 'tmc_loop;
                         }
                     }
-                    let action = {
-                        let mut backend = openffboard_backend(tmc, enable_pin);
-                        let action = match poll {
-                            foci_firmware::commissioning::schedule::CommissionPoll::Terminal {
-                                result,
-                            } => {
-                                runtime
-                                .drive_commissioning_terminal_with_stages(
-                                    result,
-                                    &mut backend,
-                                    foci_firmware::commission_dispatch::CommissionTerminalContext::new(
-                                        &mut *stage_c_candidate,
-                                        crate::ankyra::replies::emit_terminal_reply,
-                                    ),
-                                    tmc_state(),
-                                    stepper_state(),
-                                    &tmc_control_config,
-                                )
-                                .await
-                            }
-                            poll => runtime.classify_commission_poll(poll),
-                        };
-                        action.expect("active commissioning poll produces an action")
+                    let action = match poll {
+                        foci_firmware::commissioning::schedule::CommissionPoll::Terminal {
+                            result,
+                        } => {
+                            // The restore-drain block at the top of this loop
+                            // advances the machine one step per pass.
+                            runtime.begin_commissioning_terminal(result, &tmc_control_config);
+                            continue 'commission_poll;
+                        }
+                        poll => runtime
+                            .classify_commission_poll(poll)
+                            .expect("active commissioning poll produces an action"),
                     };
                     let tick_cycles =
                         cortex_m::peripheral::DWT::cycle_count().wrapping_sub(tick_start);
@@ -946,9 +999,11 @@ mod app {
                                 phase_changed,
                             ) {
                                 foci_firmware::tmc_control::PollDriverAction::PollNow => {
+                                    runtime.request_restore_cancel();
                                     continue 'tmc_loop;
                                 }
                                 foci_firmware::tmc_control::PollDriverAction::YieldNow => {
+                                    runtime.request_restore_cancel();
                                     continue 'tmc_loop;
                                 }
                                 foci_firmware::tmc_control::PollDriverAction::WaitUntil(
@@ -975,6 +1030,7 @@ mod app {
                                         ) {
                                             enable_pin.set_low();
                                         }
+                                            runtime.request_restore_cancel();
                                             continue 'tmc_loop;
                                         }
 
@@ -1007,6 +1063,7 @@ mod app {
                                                     refresh_velocity_scale(&mut runtime);
                                                 }
                                                 commission_measurement_active = false;
+                                                runtime.request_restore_cancel();
                                                 continue 'tmc_loop;
                                             }
                                             CommissionWaitRequestDisposition::RejectBusy => {
@@ -1049,6 +1106,7 @@ mod app {
                                             Err(_) => {
                                                 enable_pin.set_low();
                                                 TMC_DISABLE_SIGNAL.signal(());
+                                                runtime.request_restore_cancel();
                                                 continue 'tmc_loop;
                                             }
                                         }
