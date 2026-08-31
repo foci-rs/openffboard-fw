@@ -119,7 +119,7 @@ pub(crate) fn lease_snapshot(now: u32) -> LeaseSnapshot {
         .load(Relaxed);
     let has_received_valid_clock = HAS_RECEIVED_VALID_CLOCK.load(Relaxed);
     let last_liveness_ticks = LAST_HOST_LIVENESS_TICKS.load(Relaxed);
-    let elapsed_ticks = now.wrapping_sub(last_liveness_ticks);
+    let elapsed_ticks = foci_firmware::helpers::clock::elapsed_ticks(now, last_liveness_ticks);
     let expired =
         any_enabled && (!has_received_valid_clock || elapsed_ticks > CLOCK_SYNC_TIMEOUT_TICKS);
 
@@ -284,6 +284,22 @@ mod tests {
 
         assert!(snapshot.expired);
         assert!(!snapshot.has_received_valid_clock);
+    }
+
+    #[test]
+    fn lease_snapshot_not_expired_when_last_liveness_races_ahead_of_now() {
+        let _guard = reset_lease_state();
+        crate::tmc_control::board::tmc_state()
+            .enable_pin_asserted
+            .store(true, Relaxed);
+        HAS_RECEIVED_VALID_CLOCK.store(true, Relaxed);
+        LAST_HOST_LIVENESS_TICKS.store(1_000, Relaxed);
+        let now = 999;
+
+        let snapshot = lease_snapshot(now);
+
+        assert!(!snapshot.expired);
+        assert_eq!(snapshot.elapsed_ticks, 0);
     }
 
     #[test]
