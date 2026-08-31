@@ -94,20 +94,42 @@ const CLOCK_SYNC_TIMEOUT_TICKS: u32 = 5 * crate::ankyra::constants::CLOCK_FREQ;
 /// the last one. `now` must be a freshly sampled `read_tim5()` at the
 /// call site — never a value captured once and reused across iterations.
 pub(crate) fn lease_expired(now: u32) -> bool {
+    lease_snapshot(now).expired
+}
+
+/// Diagnostic breakdown of the lease-expiry decision at `now`, for logging
+/// at the point a lease actually trips -- distinguishes a genuinely stale
+/// `LAST_HOST_LIVENESS_TICKS` (real stall) from an unexpected `expired`
+/// verdict despite a recent value (bookkeeping bug).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LeaseSnapshot {
+    pub(crate) any_enabled: bool,
+    pub(crate) has_received_valid_clock: bool,
+    pub(crate) last_liveness_ticks: u32,
+    pub(crate) elapsed_ticks: u32,
+    pub(crate) expired: bool,
+}
+
+pub(crate) fn lease_snapshot(now: u32) -> LeaseSnapshot {
     use core::sync::atomic::Ordering::Relaxed;
     use foci_firmware::state::lifecycle::{HAS_RECEIVED_VALID_CLOCK, LAST_HOST_LIVENESS_TICKS};
 
     let any_enabled = crate::tmc_control::board::tmc_state()
         .enable_pin_asserted
         .load(Relaxed);
-    if !any_enabled {
-        return false;
+    let has_received_valid_clock = HAS_RECEIVED_VALID_CLOCK.load(Relaxed);
+    let last_liveness_ticks = LAST_HOST_LIVENESS_TICKS.load(Relaxed);
+    let elapsed_ticks = now.wrapping_sub(last_liveness_ticks);
+    let expired =
+        any_enabled && (!has_received_valid_clock || elapsed_ticks > CLOCK_SYNC_TIMEOUT_TICKS);
+
+    LeaseSnapshot {
+        any_enabled,
+        has_received_valid_clock,
+        last_liveness_ticks,
+        elapsed_ticks,
+        expired,
     }
-    if !HAS_RECEIVED_VALID_CLOCK.load(Relaxed) {
-        return true;
-    }
-    let elapsed = now.wrapping_sub(LAST_HOST_LIVENESS_TICKS.load(Relaxed));
-    elapsed > CLOCK_SYNC_TIMEOUT_TICKS
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +236,54 @@ mod tests {
         HAS_RECEIVED_VALID_CLOCK.store(true, Relaxed);
         LAST_HOST_LIVENESS_TICKS.store(0, Relaxed);
         assert!(!lease_expired(CLOCK_SYNC_TIMEOUT_TICKS + 1));
+    }
+
+    #[test]
+    fn lease_snapshot_matches_lease_expired_when_stale() {
+        let _guard = reset_lease_state();
+        crate::tmc_control::board::tmc_state()
+            .enable_pin_asserted
+            .store(true, Relaxed);
+        HAS_RECEIVED_VALID_CLOCK.store(true, Relaxed);
+        LAST_HOST_LIVENESS_TICKS.store(100, Relaxed);
+        let now = 100 + CLOCK_SYNC_TIMEOUT_TICKS + 1;
+
+        let snapshot = lease_snapshot(now);
+
+        assert!(snapshot.expired);
+        assert!(snapshot.any_enabled);
+        assert!(snapshot.has_received_valid_clock);
+        assert_eq!(snapshot.last_liveness_ticks, 100);
+        assert_eq!(snapshot.elapsed_ticks, CLOCK_SYNC_TIMEOUT_TICKS + 1);
+    }
+
+    #[test]
+    fn lease_snapshot_not_expired_when_enabled_and_recent() {
+        let _guard = reset_lease_state();
+        crate::tmc_control::board::tmc_state()
+            .enable_pin_asserted
+            .store(true, Relaxed);
+        HAS_RECEIVED_VALID_CLOCK.store(true, Relaxed);
+        LAST_HOST_LIVENESS_TICKS.store(100, Relaxed);
+        let now = 100 + CLOCK_SYNC_TIMEOUT_TICKS - 1;
+
+        let snapshot = lease_snapshot(now);
+
+        assert!(!snapshot.expired);
+        assert_eq!(snapshot.elapsed_ticks, CLOCK_SYNC_TIMEOUT_TICKS - 1);
+    }
+
+    #[test]
+    fn lease_snapshot_expired_when_no_clock_ever_received() {
+        let _guard = reset_lease_state();
+        crate::tmc_control::board::tmc_state()
+            .enable_pin_asserted
+            .store(true, Relaxed);
+
+        let snapshot = lease_snapshot(0);
+
+        assert!(snapshot.expired);
+        assert!(!snapshot.has_received_valid_clock);
     }
 
     #[test]

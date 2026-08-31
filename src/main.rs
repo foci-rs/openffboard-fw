@@ -640,11 +640,20 @@ mod app {
             // classify_lease_check(shutdown_active, ...) always returns
             // Proceed while shutdown is already active -- see its doc
             // comment for why.
+            let lease_check_now = read_tim5();
             match crate::tmc_control::effects::classify_lease_check(
                 SHUTDOWN_ACTIVE.load(core::sync::atomic::Ordering::Relaxed),
-                crate::tmc_control::effects::lease_expired(read_tim5()),
+                crate::tmc_control::effects::lease_expired(lease_check_now),
             ) {
                 crate::tmc_control::effects::LeaseCheckDisposition::EnterClockSyncShutdown => {
+                    let snapshot = crate::tmc_control::effects::lease_snapshot(lease_check_now);
+                    defmt::warn!(
+                        "clock-sync lease expired: now={} last_liveness={} elapsed={} has_received_valid_clock={}",
+                        lease_check_now,
+                        snapshot.last_liveness_ticks,
+                        snapshot.elapsed_ticks,
+                        snapshot.has_received_valid_clock,
+                    );
                     ctx.shared.app_state.lock(|state| {
                         if crate::firmware_ctx::enter_shutdown(state) {
                             foci_firmware::dispatch_shutdown!(
