@@ -71,7 +71,10 @@ pub fn stats_tick(
         stats_send_time_high.fetch_add(1, Relaxed);
     }
 
-    defmt::info!("stats tick");
+    defmt::info!(
+        "stats tick p1_p2_reply_overlap_count={}",
+        foci_firmware::diagnostic::p1_p2_reply_overlap_count()
+    );
     ::ankyra::klipper_reply_from!(
         &mut crate::_ankyra_config::Sender,
         Stats,
