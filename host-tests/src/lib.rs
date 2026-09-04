@@ -552,7 +552,7 @@ mod commissioning_board_contract_tests {
             "foci_commission_cancel command handler must be defined"
         );
         assert!(
-            SHARED_FOCI_HANDLERS.contains("#[klipper_command]"),
+            SHARED_FOCI_HANDLERS.contains("#[klipper_command]\npub fn foci_commission_cancel"),
             "foci_commission_cancel must be marked with #[klipper_command]"
         );
     }
