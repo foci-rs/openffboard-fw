@@ -601,8 +601,43 @@ mod app {
             if runtime.restore_cancel_pending() {
                 let mut backend = openffboard_backend(tmc, enable_pin);
                 let _ = runtime
-                    .drive_restore_cancel(&mut backend, tmc_state(), stepper_state())
+                    .drive_restore_cancel(
+                        &mut backend,
+                        tmc_state(),
+                        stepper_state(),
+                        foci_firmware::autotune::CommissionError::Shutdown,
+                    )
                     .await;
+            }
+
+            if tmc_state()
+                .cancel_requested
+                .load(core::sync::atomic::Ordering::Relaxed)
+            {
+                let mut backend = openffboard_backend(tmc, enable_pin);
+                if let Some(foci_firmware::commission_dispatch::CommissionOutcome::Terminal {
+                    reply,
+                    actions,
+                }) = runtime
+                    .drive_operator_cancel(
+                        &mut backend,
+                        tmc_state(),
+                        stepper_state(),
+                        TMC_CONFIG.pwm_maxcnt,
+                    )
+                    .await
+                {
+                    #[cfg(feature = "trace")]
+                    {
+                        commission_trace_phase = None;
+                    }
+                    {
+                        let mut state = runtime.dispatch_state(tmc_state(), stepper_state());
+                        apply_stepper_post_action(actions.stepper, &mut state);
+                    }
+                    emit_terminal_reply(reply);
+                    commission_measurement_active = false;
+                }
             }
 
             // On shutdown, perform one-shot motor safe-state then idle until
@@ -796,7 +831,9 @@ mod app {
                         TMC_DISABLE_SIGNAL.signaled(),
                         FAULT_ACTIVE.load(core::sync::atomic::Ordering::Relaxed),
                         crate::tmc_control::effects::lease_expired(read_tim5()),
-                        false,
+                        tmc_state()
+                            .cancel_requested
+                            .load(core::sync::atomic::Ordering::Relaxed),
                     );
                     if let Some(exit) = exit {
                         runtime.request_restore_cancel();
@@ -911,7 +948,9 @@ mod app {
                             TMC_DISABLE_SIGNAL.signaled(),
                             FAULT_ACTIVE.load(core::sync::atomic::Ordering::Relaxed),
                             crate::tmc_control::effects::lease_expired(read_tim5()),
-                            false,
+                            tmc_state()
+                                .cancel_requested
+                                .load(core::sync::atomic::Ordering::Relaxed),
                         );
                         if let Some(exit) = exit {
                             runtime.request_restore_cancel();
@@ -1055,7 +1094,9 @@ mod app {
                                             crate::tmc_control::effects::lease_expired(
                                                 read_tim5(),
                                             ),
-                                            false,
+                                            tmc_state()
+                                                .cancel_requested
+                                                .load(core::sync::atomic::Ordering::Relaxed),
                                         );
                                         if let Some(exit) = exit {
                                             if matches!(
