@@ -796,6 +796,7 @@ mod app {
                         TMC_DISABLE_SIGNAL.signaled(),
                         FAULT_ACTIVE.load(core::sync::atomic::Ordering::Relaxed),
                         crate::tmc_control::effects::lease_expired(read_tim5()),
+                        false,
                     );
                     if let Some(exit) = exit {
                         runtime.request_restore_cancel();
@@ -910,6 +911,7 @@ mod app {
                             TMC_DISABLE_SIGNAL.signaled(),
                             FAULT_ACTIVE.load(core::sync::atomic::Ordering::Relaxed),
                             crate::tmc_control::effects::lease_expired(read_tim5()),
+                            false,
                         );
                         if let Some(exit) = exit {
                             runtime.request_restore_cancel();
@@ -1053,6 +1055,7 @@ mod app {
                                             crate::tmc_control::effects::lease_expired(
                                                 read_tim5(),
                                             ),
+                                            false,
                                         );
                                         if let Some(exit) = exit {
                                             if matches!(

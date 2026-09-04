@@ -20,6 +20,10 @@ pub(crate) enum CommissionWaitExit {
     /// The host-liveness lease has expired; enter the shutdown safe-state
     /// path exactly like `Shutdown` above.
     ClockSyncExpired,
+    /// An operator-requested cancel reached this checkpoint. Distinct from
+    /// `Shutdown`: the MCU stays running and the run reports a graceful
+    /// `Cancelled` terminal instead of requiring `FIRMWARE_RESTART`.
+    Cancelled,
 }
 
 /// Classify board-owned signals checked between commissioning wait slices.
@@ -29,9 +33,12 @@ pub(crate) const fn classify_commission_wait_exit(
     emergency_disable: bool,
     fault_active: bool,
     clock_sync_expired: bool,
+    cancel_requested: bool,
 ) -> Option<CommissionWaitExit> {
     if emergency_disable || fault_active {
         Some(CommissionWaitExit::EmergencyDisable)
+    } else if cancel_requested {
+        Some(CommissionWaitExit::Cancelled)
     } else if shutdown {
         Some(CommissionWaitExit::Shutdown)
     } else if queue_flush {
@@ -415,7 +422,7 @@ mod tests {
     #[test]
     fn classify_commission_wait_exit_reports_clock_sync_expired() {
         assert_eq!(
-            classify_commission_wait_exit(false, false, false, false, true),
+            classify_commission_wait_exit(false, false, false, false, true, false),
             Some(CommissionWaitExit::ClockSyncExpired)
         );
     }
@@ -423,7 +430,7 @@ mod tests {
     #[test]
     fn classify_commission_wait_exit_emergency_disable_takes_priority_over_clock_sync() {
         assert_eq!(
-            classify_commission_wait_exit(false, false, true, false, true),
+            classify_commission_wait_exit(false, false, true, false, true, false),
             Some(CommissionWaitExit::EmergencyDisable)
         );
     }
@@ -431,7 +438,7 @@ mod tests {
     #[test]
     fn classify_commission_wait_exit_shutdown_takes_priority_over_clock_sync() {
         assert_eq!(
-            classify_commission_wait_exit(true, false, false, false, true),
+            classify_commission_wait_exit(true, false, false, false, true, false),
             Some(CommissionWaitExit::Shutdown)
         );
     }
@@ -439,7 +446,7 @@ mod tests {
     #[test]
     fn classify_commission_wait_exit_none_when_nothing_set() {
         assert_eq!(
-            classify_commission_wait_exit(false, false, false, false, false),
+            classify_commission_wait_exit(false, false, false, false, false, false),
             None
         );
     }
@@ -447,11 +454,11 @@ mod tests {
     #[test]
     fn critical_status_and_disable_exit_commission_wait() {
         assert_eq!(
-            classify_commission_wait_exit(false, false, false, true, false),
+            classify_commission_wait_exit(false, false, false, true, false, false),
             Some(CommissionWaitExit::EmergencyDisable)
         );
         assert_eq!(
-            classify_commission_wait_exit(false, false, true, false, false),
+            classify_commission_wait_exit(false, false, true, false, false, false),
             Some(CommissionWaitExit::EmergencyDisable)
         );
     }
@@ -504,7 +511,7 @@ mod tests {
         ];
 
         for (shutdown, flush, disable, fault, gpio_first) in cases {
-            let exit = classify_commission_wait_exit(shutdown, flush, disable, fault, false);
+            let exit = classify_commission_wait_exit(shutdown, flush, disable, fault, false, false);
             let dispatch = exit.is_none();
             let reply = dispatch;
             let trace = dispatch;
@@ -520,5 +527,53 @@ mod tests {
             assert!(!trace);
             assert!(!next_engine_poll);
         }
+    }
+
+    #[test]
+    fn cancel_requested_exits_wait_when_nothing_else_set() {
+        assert_eq!(
+            classify_commission_wait_exit(false, false, false, false, false, true),
+            Some(CommissionWaitExit::Cancelled)
+        );
+    }
+
+    #[test]
+    fn emergency_disable_takes_priority_over_cancel_requested() {
+        assert_eq!(
+            classify_commission_wait_exit(false, false, true, false, false, true),
+            Some(CommissionWaitExit::EmergencyDisable)
+        );
+    }
+
+    #[test]
+    fn fault_active_takes_priority_over_cancel_requested() {
+        assert_eq!(
+            classify_commission_wait_exit(false, false, false, true, false, true),
+            Some(CommissionWaitExit::EmergencyDisable)
+        );
+    }
+
+    #[test]
+    fn cancel_requested_takes_priority_over_shutdown() {
+        assert_eq!(
+            classify_commission_wait_exit(true, false, false, false, false, true),
+            Some(CommissionWaitExit::Cancelled)
+        );
+    }
+
+    #[test]
+    fn cancel_requested_takes_priority_over_queue_flush() {
+        assert_eq!(
+            classify_commission_wait_exit(false, true, false, false, false, true),
+            Some(CommissionWaitExit::Cancelled)
+        );
+    }
+
+    #[test]
+    fn cancel_requested_takes_priority_over_clock_sync_expired() {
+        assert_eq!(
+            classify_commission_wait_exit(false, false, false, false, true, true),
+            Some(CommissionWaitExit::Cancelled)
+        );
     }
 }
