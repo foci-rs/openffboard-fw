@@ -838,7 +838,12 @@ mod app {
                             .load(core::sync::atomic::Ordering::Relaxed),
                     );
                     if let Some(exit) = exit {
-                        runtime.request_restore_cancel();
+                        if !matches!(
+                            exit,
+                            crate::tmc_control::effects::CommissionWaitExit::Cancelled
+                        ) {
+                            runtime.request_restore_cancel();
+                        }
                         if matches!(
                             exit,
                             crate::tmc_control::effects::CommissionWaitExit::EmergencyDisable
@@ -955,7 +960,12 @@ mod app {
                                 .load(core::sync::atomic::Ordering::Relaxed),
                         );
                         if let Some(exit) = exit {
-                            runtime.request_restore_cancel();
+                            if !matches!(
+                                exit,
+                                crate::tmc_control::effects::CommissionWaitExit::Cancelled
+                            ) {
+                                runtime.request_restore_cancel();
+                            }
                             if matches!(
                                 exit,
                                 crate::tmc_control::effects::CommissionWaitExit::EmergencyDisable
@@ -1107,7 +1117,12 @@ mod app {
                                         ) {
                                             enable_pin.set_low();
                                         }
-                                            runtime.request_restore_cancel();
+                                            if !matches!(
+                                                exit,
+                                                crate::tmc_control::effects::CommissionWaitExit::Cancelled
+                                            ) {
+                                                runtime.request_restore_cancel();
+                                            }
                                             continue 'tmc_loop;
                                         }
 
