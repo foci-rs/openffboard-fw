@@ -27,6 +27,12 @@ mod commissioning_board_contract_tests {
     );
     const SHARED_COMMISSION_REPLY_MANIFEST: &str =
         include_str!("../../../../shared/foci-firmware/src/commission_dispatch/replies.rs");
+    const SHARED_COMMISSION_ERROR_TYPES: &str =
+        include_str!("../../../../shared/foci-firmware/src/autotune/types.rs");
+    const SHARED_CALIBRATION_TYPES: &str =
+        include_str!("../../../../shared/foci-firmware/src/calibration.rs");
+    const SHARED_FOCI_HANDLERS: &str =
+        include_str!("../../../../shared/foci-firmware/src/ankyra/handlers/foci.rs");
     const BOARD_CARGO_TOML: &str = include_str!("../../Cargo.toml");
     const TRIGGER_DOMAIN: &str = include_str!("../../src/trigger_domain.rs");
     const BOARD_INIT: &str = include_str!("../../src/board_init.rs");
@@ -536,6 +542,34 @@ mod commissioning_board_contract_tests {
              GPIO reset must run in that order, all unconditionally outside the \
              branch -- so all three happen regardless of whether the locked \
              path observed None"
+        );
+    }
+
+    #[test]
+    fn board_references_the_foci_commission_cancel_command() {
+        assert!(
+            SHARED_FOCI_HANDLERS.contains("pub fn foci_commission_cancel"),
+            "foci_commission_cancel command handler must be defined"
+        );
+        assert!(
+            SHARED_FOCI_HANDLERS.contains("#[klipper_command]"),
+            "foci_commission_cancel must be marked with #[klipper_command]"
+        );
+    }
+
+    #[test]
+    fn commission_error_cancelled_has_status_code_74() {
+        assert!(
+            SHARED_COMMISSION_ERROR_TYPES.contains("Cancelled => 74"),
+            "CommissionError::Cancelled must map to status code 74"
+        );
+    }
+
+    #[test]
+    fn calibration_error_cancelled_has_status_code_10() {
+        assert!(
+            SHARED_CALIBRATION_TYPES.contains("Cancelled => 10"),
+            "CalibrationError::Cancelled must map to status code 10"
         );
     }
 }
