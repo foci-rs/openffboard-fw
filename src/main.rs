@@ -570,7 +570,7 @@ mod app {
         #[cfg(feature = "trace")]
         let mut commission_trace_phase: Option<(
             foci_firmware::commissioning::types::EngineKind,
-            foci_firmware::autotune::PhaseId,
+            foci_firmware::autotune::CommissionPhase,
         )> = None;
 
         // Whether the shutdown safe-state completed this shutdown cycle.
@@ -1066,7 +1066,7 @@ mod app {
                             if commission_trace_phase
                                 == Some((
                                     foci_firmware::commissioning::types::EngineKind::Commission,
-                                    foci_firmware::autotune::PhaseId::ClosedLoopEntry,
+                                    foci_firmware::autotune::CommissionPhase::ClosedLoopEntry,
                                 ))
                             {
                                 let trace_tick = runtime.advance_trace_sample_tick();
