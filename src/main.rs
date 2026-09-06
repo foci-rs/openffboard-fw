@@ -776,10 +776,11 @@ mod app {
                     });
                     continue;
                 }
-                let flags = tmc
+                let status_flags = tmc
                     .read_register(foci_tmc4671::registers::STATUS_FLAGS)
                     .await
-                    .unwrap_or(0);
+                    .map_err(|_| ());
+                let flags = status_flags.unwrap_or(0);
                 record_stepper_event(
                     StepperEventReason::TmcDisableSignal,
                     0,
@@ -796,10 +797,16 @@ mod app {
                     [flags as i32, 0, 0, 0],
                     1,
                 );
-                defmt::error!("TMC4671 emergency disable: STATUS={:#010x}", flags);
-                const ADC_I_CLIPPED: u32 = 1 << 26;
+                match status_flags {
+                    Ok(flags) => {
+                        defmt::error!("TMC4671 emergency disable: STATUS={:#010x}", flags)
+                    }
+                    Err(_) => defmt::error!("TMC4671 emergency disable: STATUS read failed"),
+                }
+                let adc_current_clipped =
+                    foci_firmware::tmc_control::is_adc_current_clipped(status_flags);
                 ctx.shared.app_state.lock(|state| {
-                    if flags & ADC_I_CLIPPED != 0 {
+                    if adc_current_clipped {
                         if crate::firmware_ctx::enter_shutdown(state) {
                             ::ankyra::klipper_shutdown_from!(
                                 &mut crate::_ankyra_config::Sender,
