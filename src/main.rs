@@ -777,7 +777,7 @@ mod app {
                     continue;
                 }
                 let status_flags = tmc
-                    .read_register(foci_tmc4671::registers::STATUS_FLAGS)
+                    .read_register_retried(foci_tmc4671::registers::STATUS_FLAGS)
                     .await
                     .map_err(|_| ());
                 let flags = status_flags.unwrap_or(0);
@@ -811,6 +811,14 @@ mod app {
                             ::ankyra::klipper_shutdown_from!(
                                 &mut crate::_ankyra_config::Sender,
                                 "TMC4671: ADC current clipped (overcurrent)",
+                                read_tim5(),
+                            );
+                        }
+                    } else if status_flags.is_err() {
+                        if crate::firmware_ctx::enter_shutdown(state) {
+                            ::ankyra::klipper_shutdown_from!(
+                                &mut crate::_ankyra_config::Sender,
+                                "TMC4671: STATUS_FLAGS read failed",
                                 read_tim5(),
                             );
                         }
@@ -2175,7 +2183,10 @@ foci_firmware::foci_ankyra_config! {
         foci_firmware::ankyra::provider::FOCI_FIRMWARE_PROVIDER,
         crate::ankyra::provider::BOARD_PROVIDER,
     ],
-    board_static_strings = ["TMC4671 PI representation failed at boot"],
+    board_static_strings = [
+        "TMC4671 PI representation failed at boot",
+        "TMC4671: STATUS_FLAGS read failed",
+    ],
     app = "foci",
     version = env!("CARGO_PKG_VERSION"),
     build_versions = "",
