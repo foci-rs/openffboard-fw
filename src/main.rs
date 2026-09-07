@@ -133,10 +133,10 @@ mod app {
     /// Persistent Stage-C candidate slot carried across `tmc_control` task calls.
     ///
     /// Retains the Stage-C authority a `breakaway_seeded` campaign hands off to
-    /// `stage_c_resume`, so the production build runs the full autotune
+    /// `integral_resume`, so the production build runs the full autotune
     /// hand-off exactly as the trace build does.
-    type StageCCandidateTaskLocal =
-        foci_firmware::commissioning::outer::velocity::integral_reproduction::StageCCandidateSlot;
+    type IntegralCandidateTaskLocal =
+        foci_firmware::commissioning::outer::velocity::integral_reproduction::IntegralRetentionSlot;
 
     #[local]
     struct Local {
@@ -144,7 +144,7 @@ mod app {
         tmc_enable: Output<'static>,
         tmc_rx: Receiver<'static, TmcRequest, TMC_CHANNEL_SIZE>,
         wdg: IndependentWatchdog<'static, peripherals::IWDG>,
-        stage_c_candidate: StageCCandidateTaskLocal,
+        integral_candidate: IntegralCandidateTaskLocal,
     }
 
     #[init(local = [
@@ -319,8 +319,8 @@ mod app {
                 tmc_enable,
                 tmc_rx,
                 wdg,
-                stage_c_candidate:
-                    foci_firmware::commissioning::outer::velocity::integral_reproduction::StageCCandidateSlot::new(),
+                integral_candidate:
+                    foci_firmware::commissioning::outer::velocity::integral_reproduction::IntegralRetentionSlot::new(),
             },
         )
     }
@@ -348,13 +348,13 @@ mod app {
     #[task(
         priority = 1,
         shared = [app_state],
-        local = [tmc, tmc_enable, tmc_rx, stage_c_candidate]
+        local = [tmc, tmc_enable, tmc_rx, integral_candidate]
     )]
     async fn tmc_control(mut ctx: tmc_control::Context) {
         let tmc = ctx.local.tmc;
         let enable_pin = ctx.local.tmc_enable;
         let rx = ctx.local.tmc_rx;
-        let stage_c_candidate = ctx.local.stage_c_candidate;
+        let integral_candidate = ctx.local.integral_candidate;
 
         // NOTE: auto-init disabled - motor current regulation not yet safe
         // tmc_init_open_loop(tmc, enable_pin).await;
@@ -667,7 +667,7 @@ mod app {
                         .store(false, core::sync::atomic::Ordering::Relaxed);
                     stepper_stop_from_p1(0);
                     shutdown_safe_state_applied = shutdown_safe_state_complete;
-                    stage_c_candidate.observe_fault();
+                    integral_candidate.observe_fault();
                 }
                 Mono::delay(1.millis()).await;
                 continue;
@@ -708,7 +708,7 @@ mod app {
             // Drain stale requests after config_reset
             if TMC_QUEUE_FLUSH.load(core::sync::atomic::Ordering::Relaxed) {
                 commission_measurement_active = false;
-                stage_c_candidate.observe_fault();
+                integral_candidate.observe_fault();
                 while rx.try_recv().is_ok() {}
                 let commission_was_active = runtime.is_commission_active();
                 crate::tmc_control::effects::apply_actions(
@@ -878,7 +878,7 @@ mod app {
                             let mut backend = openffboard_backend(tmc, enable_pin);
                             let mut retention =
                                 foci_firmware::commission_dispatch::CommissionRetention::new(
-                                    &mut *stage_c_candidate,
+                                    &mut *integral_candidate,
                                 );
                             runtime
                                 .poll_commissioning_terminal(
@@ -1061,9 +1061,9 @@ mod app {
                                         // classified outside the async dispatch future,
                                         // so the staged poll driver's retention never
                                         // runs here.
-                                        foci_firmware::commission_dispatch::stage_c::install_authority_from_plan(
+                                        foci_firmware::commission_dispatch::integral::install_authority_from_plan(
                                             0,
-                                            stage_c_candidate,
+                                            integral_candidate,
                                             plan,
                                         );
                                         crate::ankyra::replies::emit_velocity_integral_plan(
@@ -1158,7 +1158,7 @@ mod app {
                                                     enable_pin,
                                                     &mut runtime,
                                                     &mut commission_trace_engine_seq,
-                                                    &mut *stage_c_candidate,
+                                                    &mut *integral_candidate,
                                                 )
                                                 .await;
                                                 if let Some(reason) = outcome.shutdown {
@@ -1271,7 +1271,7 @@ mod app {
                         enable_pin,
                         &mut runtime,
                         &mut commission_trace_engine_seq,
-                        &mut *stage_c_candidate,
+                        &mut *integral_candidate,
                     )
                     .await;
 

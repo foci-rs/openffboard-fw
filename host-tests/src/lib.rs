@@ -154,16 +154,16 @@ mod commissioning_board_contract_tests {
     }
 
     #[test]
-    fn board_owns_and_invalidates_one_stage_c_candidate() {
-        assert_eq!(MAIN.matches("StageCCandidateSlot::new()").count(), 1);
-        assert_eq!(MAIN.matches("stage_c_candidate.observe_fault()").count(), 2);
+    fn board_owns_and_invalidates_one_integral_candidate() {
+        assert_eq!(MAIN.matches("IntegralRetentionSlot::new()").count(), 1);
+        assert_eq!(MAIN.matches("integral_candidate.observe_fault()").count(), 2);
         assert!(MAIN.contains("CommissionRetention::new"));
         assert!(REQUEST.contains("handle_tmc_control_request_with_stages"));
-        assert!(REQUEST.contains("stage_c_candidate"));
+        assert!(REQUEST.contains("integral_candidate"));
     }
 
     #[test]
-    fn board_retains_stage_c_authority_from_the_plan_event() {
+    fn board_retains_integral_authority_from_the_plan_event() {
         // Nonterminal classification stays outside the terminal async dispatch
         // future. foci-firmware's `scheduled_step` size gate pins that budget,
         // so Stage-C authority is installed synchronously from the plan event
@@ -194,7 +194,7 @@ mod commissioning_board_contract_tests {
     }
 
     #[test]
-    fn board_reaches_the_staged_request_dispatch_that_owns_stage_c_resume() {
+    fn board_reaches_the_staged_request_dispatch_that_owns_integral_resume() {
         // Two shared-firmware fixes for the Stage-C authority landed on paths
         // this board does not execute, and shared tests passed both times. The
         // board's own call shape is what decides whether new dispatch arms --
@@ -204,7 +204,7 @@ mod commissioning_board_contract_tests {
             "tune requests must reach the staged request dispatch"
         );
         assert!(
-            REQUEST.contains("stage_c_candidate"),
+            REQUEST.contains("integral_candidate"),
             "the staged dispatch must be given the retained Stage-C slot"
         );
         // Retention is what a resume consumes. It is installed synchronously
@@ -245,7 +245,7 @@ mod commissioning_board_contract_tests {
     }
 
     #[test]
-    fn board_forwards_the_complete_stage_c_reply_family() {
+    fn board_forwards_the_complete_integral_reply_family() {
         for method in [
             "foci_commissioning_workflow_plan",
             "foci_velocity_integral_plan_core",
@@ -313,21 +313,21 @@ mod commissioning_board_contract_tests {
     }
 
     #[test]
-    fn board_publishes_the_stage_c_schema_and_geometry_constants() {
+    fn board_publishes_the_integral_schema_and_geometry_constants() {
         for declaration in [
-            "pub const STAGE_C_EVIDENCE_SCHEMA_REVISION: u32 = 13;",
-            "pub const STAGE_C_MAX_POSITIVE_RUNGS: u32 = 30;",
-            "pub const STAGE_C_OBSERVATIONS_PER_DIRECTION: u32 = 4;",
-            "pub const STAGE_C_OBSERVATIONS_PER_RUNG: u32 = 8;",
+            "pub const INTEGRAL_EVIDENCE_SCHEMA_REVISION: u32 = 13;",
+            "pub const INTEGRAL_MAX_POSITIVE_RUNGS: u32 = 30;",
+            "pub const INTEGRAL_OBSERVATIONS_PER_DIRECTION: u32 = 4;",
+            "pub const INTEGRAL_OBSERVATIONS_PER_RUNG: u32 = 8;",
         ] {
             assert!(CONSTANTS.contains(declaration), "missing {declaration}");
         }
         for constant in [
             "STAGE_B_EVIDENCE_SCHEMA_REVISION",
-            "STAGE_C_EVIDENCE_SCHEMA_REVISION",
-            "STAGE_C_MAX_POSITIVE_RUNGS",
-            "STAGE_C_OBSERVATIONS_PER_DIRECTION",
-            "STAGE_C_OBSERVATIONS_PER_RUNG",
+            "INTEGRAL_EVIDENCE_SCHEMA_REVISION",
+            "INTEGRAL_MAX_POSITIVE_RUNGS",
+            "INTEGRAL_OBSERVATIONS_PER_DIRECTION",
+            "INTEGRAL_OBSERVATIONS_PER_RUNG",
         ] {
             assert!(PROVIDER.contains(constant), "provider omits {constant}");
         }
@@ -364,7 +364,7 @@ mod commissioning_board_contract_tests {
             assert!(!REPLIES.contains(retired), "retained board reply {retired}");
         }
         assert!(CONSTANTS.contains("pub const STAGE_B_EVIDENCE_SCHEMA_REVISION: u32 = 14;"));
-        assert!(CONSTANTS.contains("pub const STAGE_C_EVIDENCE_SCHEMA_REVISION: u32 = 13;"));
+        assert!(CONSTANTS.contains("pub const INTEGRAL_EVIDENCE_SCHEMA_REVISION: u32 = 13;"));
         assert!(SHARED_EVENTS.contains("EVENT_COMMISSION_RUNG_ORIGIN_RECOVERY: u16 = 143"));
         assert!(!REPLIES.contains("rest_selection"));
     }

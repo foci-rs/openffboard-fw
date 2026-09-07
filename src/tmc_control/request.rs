@@ -261,7 +261,7 @@ pub(crate) async fn handle_tmc_control_request(
     enable_pin: &mut Output<'static>,
     runtime: &mut foci_firmware::tmc_control::TmcControlRuntime,
     commission_trace_engine_seq: &mut u32,
-    stage_c_candidate: &mut foci_firmware::commissioning::outer::velocity::integral_reproduction::StageCCandidateSlot,
+    integral_candidate: &mut foci_firmware::commissioning::outer::velocity::integral_reproduction::IntegralRetentionSlot,
 ) -> TmcControlRequestOutcome {
     if req.channel != 0 {
         return TmcControlRequestOutcome::shutdown(
@@ -275,7 +275,7 @@ pub(crate) async fn handle_tmc_control_request(
         req,
         TmcPreRequestDisposition::ContinueRequest,
         runtime,
-        stage_c_candidate,
+        integral_candidate,
         tmc,
         &mut board,
     )
