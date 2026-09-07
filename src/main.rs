@@ -1066,11 +1066,11 @@ mod app {
                             if commission_trace_phase
                                 == Some((
                                     foci_firmware::commissioning::types::EngineKind::Commission,
-                                    foci_firmware::autotune::CommissionPhase::ClosedLoopEntry,
+                                    foci_firmware::autotune::CommissionPhase::ClosedLoopActivation,
                                 ))
                             {
                                 let trace_tick = runtime.advance_trace_sample_tick();
-                                crate::usb_trace::sample_commission_closed_loop_entry(
+                                crate::usb_trace::sample_commission_closed_loop_activation(
                                     tmc,
                                     runtime.is_motor_enabled(),
                                     trace_tick,

@@ -893,7 +893,7 @@ pub(crate) async fn sample_tick<B>(
     record_spi_sample_cycles(spi_sample_cycles);
 }
 
-pub(crate) async fn sample_commission_closed_loop_entry<B, R, D>(
+pub(crate) async fn sample_commission_closed_loop_activation<B, R, D>(
     tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
     motor_enabled: bool,
     control_tick: u32,
