@@ -1808,10 +1808,12 @@ mod app {
                 use foci_klipper::endstop::{EndstopPhase, EndstopSampleResult};
                 let pin_id = ENDSTOP_PIN_IDS[endstop_idx].load(Relaxed);
                 let read_pin = || -> bool {
-                    if pin_id != 0xFF {
-                        gpio_read_pin(pin_id)
-                    } else {
-                        false
+                    match crate::ankyra::enumerations::Pins::try_from(pin_id) {
+                        Ok(crate::ankyra::enumerations::Pins::STALL0) => {
+                            tmc_state().stall_latched.load(Relaxed)
+                        }
+                        _ if pin_id != 0xFF => gpio_read_pin(pin_id),
+                        _ => false,
                     }
                 };
 

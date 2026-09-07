@@ -26,5 +26,7 @@
         STEP0,
         DIR0,
         ENA0,
+        // Virtual endstop pin backed by the channel-0 stall latch.
+        STALL0,
     }
 }
