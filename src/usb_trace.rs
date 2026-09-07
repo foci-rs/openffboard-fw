@@ -750,8 +750,11 @@ pub(crate) async fn sample_tick<B>(
     let (jitter, slack) = take_jitter_and_slack();
     let mut sample_flags = 0u8;
 
+    let step_position = stepper.position.load(Relaxed);
     let position_actual =
         read_register_trace(tmc, PID_POSITION_ACTUAL, &mut sample_flags).await as i32;
+    let position_error =
+        read_sub_register_trace(tmc, PID_ERROR_PID_POSITION_ERROR, &mut sample_flags).await as i32;
     let pid_velocity_actual =
         read_register_trace(tmc, PID_VELOCITY_ACTUAL, &mut sample_flags).await as i32;
     let velocity_error =
@@ -765,12 +768,11 @@ pub(crate) async fn sample_tick<B>(
     let foc_uq_ud = read_sub_register_trace(tmc, INTERIM_FOC_UQ_UD, &mut sample_flags).await;
     let foc_uq_ud_limited =
         read_sub_register_trace(tmc, INTERIM_FOC_UQ_UD_LIMITED, &mut sample_flags).await;
-    let step_position = stepper.position.load(Relaxed);
 
     let sample = CriticalSample {
         step_position,
         tmc_position_actual: position_actual,
-        position_error: step_position.wrapping_sub(position_actual),
+        position_error,
         target_velocity: inputs.command_velocity_reference,
         pid_velocity_actual,
         cached_pid_velocity_offset: inputs.cached_velocity_offset,
@@ -1032,8 +1034,6 @@ pub(crate) async fn emit_status_frames<B>(
     // Fields that do not apply to a source kind are encoded as zero. Board and
     // FOCI frames both carry the full STATUS_FLAGS value by design: the
     // duplicate bytes are cheaper than making host parsing source-specific.
-    // Trace deadline pressure is telemetry degradation, so it is reported with
-    // endpoint-not-ready pressure instead of motion watchdog/step overruns.
     let board = StatusSample {
         status_flags,
         status_interrupt_count: counters.status_interrupt_count,
@@ -1046,6 +1046,8 @@ pub(crate) async fn emit_status_frames<B>(
         dropped_event_log_count: counters.dropped_event_log_count,
         endpoint_not_ready_count: counters.endpoint_not_ready_count,
         suppressed_status_change_count: counters.suppressed_status_change_count,
+        trace_deadline_pressure_count: counters.trace_deadline_pressure_count,
+        max_spi_sample_cycles: counters.max_spi_sample_cycles,
     };
     let foci = StatusSample {
         status_flags,

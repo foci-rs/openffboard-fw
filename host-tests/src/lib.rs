@@ -36,6 +36,7 @@ mod commissioning_board_contract_tests {
     const BOARD_CARGO_TOML: &str = include_str!("../../Cargo.toml");
     const TRIGGER_DOMAIN: &str = include_str!("../../src/trigger_domain.rs");
     const BOARD_INIT: &str = include_str!("../../src/board_init.rs");
+    const USB_TRACE: &str = include_str!("../../src/usb_trace.rs");
 
     const REPLY_ID_WORST_CASE_BYTES: usize = 3;
     const KLIPPER_PAYLOAD_WITH_ID_MAX: usize = 59;
@@ -574,5 +575,23 @@ mod commissioning_board_contract_tests {
             SHARED_CALIBRATION_TYPES.contains("Cancelled => 10"),
             "CalibrationError::Cancelled must map to status code 10"
         );
+    }
+
+    #[test]
+    fn sampler_reads_position_error_right_after_position_actual() {
+        let body = USB_TRACE
+            .split("pub(crate) async fn sample_tick")
+            .nth(1)
+            .expect("sample_tick present");
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}"))
+        };
+        let step = at("stepper.position.load(Relaxed)");
+        let actual = at("read_register_trace(tmc, PID_POSITION_ACTUAL");
+        let error = at("read_sub_register_trace(tmc, PID_ERROR_PID_POSITION_ERROR");
+        let velocity = at("read_register_trace(tmc, PID_VELOCITY_ACTUAL");
+        assert!(step < actual && actual < error && error < velocity);
+        assert!(!body.contains("step_position.wrapping_sub(position_actual)"));
     }
 }
