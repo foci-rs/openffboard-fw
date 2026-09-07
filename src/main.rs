@@ -803,31 +803,33 @@ mod app {
                     }
                     Err(_) => defmt::error!("TMC4671 emergency disable: STATUS read failed"),
                 }
-                let adc_current_clipped =
-                    foci_firmware::tmc_control::is_adc_current_clipped(status_flags);
+                let fault =
+                    foci_firmware::tmc_control::classify_emergency_disable_fault(status_flags);
                 ctx.shared.app_state.lock(|state| {
-                    if adc_current_clipped {
-                        if crate::firmware_ctx::enter_shutdown(state) {
-                            ::ankyra::klipper_shutdown_from!(
-                                &mut crate::_ankyra_config::Sender,
-                                "TMC4671: ADC current clipped (overcurrent)",
-                                read_tim5(),
-                            );
+                    if crate::firmware_ctx::enter_shutdown(state) {
+                        match fault {
+                            foci_firmware::tmc_control::EmergencyDisableFault::AdcCurrentClipped => {
+                                ::ankyra::klipper_shutdown_from!(
+                                    &mut crate::_ankyra_config::Sender,
+                                    "TMC4671: ADC current clipped (overcurrent)",
+                                    read_tim5(),
+                                );
+                            }
+                            foci_firmware::tmc_control::EmergencyDisableFault::StatusReadFailed => {
+                                ::ankyra::klipper_shutdown_from!(
+                                    &mut crate::_ankyra_config::Sender,
+                                    "TMC4671: STATUS_FLAGS read failed",
+                                    read_tim5(),
+                                );
+                            }
+                            foci_firmware::tmc_control::EmergencyDisableFault::Generic => {
+                                ::ankyra::klipper_shutdown_from!(
+                                    &mut crate::_ankyra_config::Sender,
+                                    "TMC4671 fault",
+                                    read_tim5(),
+                                );
+                            }
                         }
-                    } else if status_flags.is_err() {
-                        if crate::firmware_ctx::enter_shutdown(state) {
-                            ::ankyra::klipper_shutdown_from!(
-                                &mut crate::_ankyra_config::Sender,
-                                "TMC4671: STATUS_FLAGS read failed",
-                                read_tim5(),
-                            );
-                        }
-                    } else if crate::firmware_ctx::enter_shutdown(state) {
-                        ::ankyra::klipper_shutdown_from!(
-                            &mut crate::_ankyra_config::Sender,
-                            "TMC4671 fault",
-                            read_tim5(),
-                        );
                     }
                 });
                 continue;
