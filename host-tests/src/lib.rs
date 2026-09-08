@@ -728,4 +728,16 @@ mod commissioning_board_contract_tests {
             "interim_pidout_target_flux must read the real sub-register like its sibling fields"
         );
     }
+
+    #[test]
+    fn invalid_tmc_channel_sends_a_host_visible_diagnostic_reply() {
+        assert!(
+            TMC_DISPATCH.contains("FociDiagnostic"),
+            "an invalid TMC channel must report a FociDiagnostic reply, not just a defmt log"
+        );
+        assert!(
+            TMC_DISPATCH.contains("FaultClass::InvalidChannel"),
+            "the diagnostic reply must use the InvalidChannel fault class"
+        );
+    }
 }

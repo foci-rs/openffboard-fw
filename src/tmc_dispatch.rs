@@ -20,6 +20,19 @@ use crate::app::Mono;
 use crate::app_types::TmcSpiDevice;
 use crate::board_config::{CURRENT_SCALE_MA_PER_LSB, TMC_CONFIG};
 
+fn report_invalid_channel(channel: u8) {
+    ::ankyra::klipper_reply_from!(
+        &mut crate::_ankyra_config::Sender,
+        foci_firmware::ankyra::replies::FociDiagnostic,
+        fault: u8 = foci_firmware::diagnostic::FaultClass::InvalidChannel as u8,
+        operation: u8 = foci_firmware::diagnostic::operation::TMC_CONTROL,
+        oid: u8 = 255,
+        channel: u8 = channel,
+        data0: u32 = 0,
+        data1: u32 = 0,
+    );
+}
+
 /// Handle a TMC request that does not require main-loop state (motor_enabled, enable_pin).
 ///
 /// SetEnable, Init, and TestSpin are handled inline by the tmc_control main loop.
@@ -31,6 +44,7 @@ pub(crate) async fn handle_tmc_request(
     let channel = req.channel;
     if channel != 0 {
         defmt::error!("OpenFFBoard received invalid TMC channel {}", channel);
+        report_invalid_channel(channel);
         return Err(RegisterRequestError::Other);
     }
     let tmc_state =
