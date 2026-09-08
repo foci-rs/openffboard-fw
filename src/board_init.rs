@@ -204,12 +204,12 @@ pub fn init_brake_pin(pe10: Peri<'static, peripherals::PE10>) {
     core::mem::forget(brake_pin);
 }
 
-/// Configure PE8 as a pulled-down input for the TMC4671 STATUS line.
-/// EXTI interrupt is enabled later in `tmc_control` after `STATUS_MASK`
-/// is written to the TMC4671.
-pub fn init_tmc_status_pin(pe8: Peri<'static, peripherals::PE8>) {
-    let status_pin = Input::new(pe8, Pull::Down);
-    core::mem::forget(status_pin);
+/// Configure PE8 as a pulled-down input for the TMC4671 STATUS line and
+/// return it. EXTI interrupt is enabled later in `tmc_control` after
+/// `STATUS_MASK` is written to the TMC4671; the returned input is polled at
+/// every control-loop wake.
+pub fn init_tmc_status_pin(pe8: Peri<'static, peripherals::PE8>) -> Input<'static> {
+    Input::new(pe8, Pull::Down)
 }
 
 /// Configure PA11 (USB D-) and PA12 (USB D+) for USB OTG FS.

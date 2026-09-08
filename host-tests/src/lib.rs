@@ -594,4 +594,17 @@ mod commissioning_board_contract_tests {
         assert!(step < actual && actual < error && error < velocity);
         assert!(!body.contains("step_position.wrapping_sub(position_actual)"));
     }
+
+    #[test]
+    fn board_owns_the_tmc_status_input() {
+        assert!(
+            BOARD_INIT.contains(
+                "pub fn init_tmc_status_pin(pe8: Peri<'static, peripherals::PE8>) -> Input<'static>"
+            ),
+            "the STATUS input must be returned, not forgotten"
+        );
+        assert!(!BOARD_INIT.contains("core::mem::forget(status_pin)"));
+        assert!(MAIN.contains("tmc_status: Input<'static>"));
+        assert!(MAIN.contains("status_pin_asserted"));
+    }
 }

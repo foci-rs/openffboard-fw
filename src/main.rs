@@ -38,6 +38,7 @@ mod app {
     use core::sync::atomic::Ordering::Relaxed;
 
     use crate::ankyra::constants::CLOCK_FREQ;
+    use embassy_stm32::gpio::Input;
     use embassy_stm32::gpio::{Level, Output, Speed};
     use embassy_stm32::spi::Spi;
     use embassy_stm32::wdg::IndependentWatchdog;
@@ -142,6 +143,7 @@ mod app {
     struct Local {
         tmc: Tmc4671Spi<TmcSpiDevice>,
         tmc_enable: Output<'static>,
+        tmc_status: Input<'static>,
         tmc_rx: Receiver<'static, TmcRequest, TMC_CHANNEL_SIZE>,
         wdg: IndependentWatchdog<'static, peripherals::IWDG>,
         integral_candidate: IntegralCandidateTaskLocal,
@@ -220,7 +222,7 @@ mod app {
         let tmc_enable = Output::new(p.PE7, Level::Low, Speed::Low);
 
         crate::board_init::init_brake_pin(p.PE10);
-        crate::board_init::init_tmc_status_pin(p.PE8);
+        let tmc_status = crate::board_init::init_tmc_status_pin(p.PE8);
 
         // IWDG: 10-second timeout, kicked by the stats task every 5 seconds.
         let mut wdg = IndependentWatchdog::new(p.IWDG, 10_000_000);
@@ -317,6 +319,7 @@ mod app {
             Local {
                 tmc,
                 tmc_enable,
+                tmc_status,
                 tmc_rx,
                 wdg,
                 integral_candidate:
@@ -348,12 +351,22 @@ mod app {
     #[task(
         priority = 1,
         shared = [app_state],
-        local = [tmc, tmc_enable, tmc_rx, integral_candidate]
+        local = [
+            tmc,
+            tmc_enable,
+            tmc_status,
+            tmc_rx,
+            integral_candidate,
+            driver: foci_firmware::tmc_control::ChannelDriver =
+                foci_firmware::tmc_control::ChannelDriver::new(0),
+        ]
     )]
     async fn tmc_control(mut ctx: tmc_control::Context) {
         let tmc = ctx.local.tmc;
         let enable_pin = ctx.local.tmc_enable;
+        let _tmc_status = ctx.local.tmc_status;
         let rx = ctx.local.tmc_rx;
+        let _driver = ctx.local.driver;
         let integral_candidate = ctx.local.integral_candidate;
 
         // NOTE: auto-init disabled - motor current regulation not yet safe
@@ -489,12 +502,14 @@ mod app {
         // held LOW at boot (line ~1650) to keep the Layer 2 brake FET off.
         // Configure STATUS_MASK to route ADC current clipping to the STATUS
         // output pin (PE8 EXTI). Other flags remain polled.
-        const STATUS_ADC_I_CLIPPED: u32 = 1 << 26;
         let bootstrap_failure = {
             let mut backend = openffboard_backend(tmc, enable_pin);
-            foci_firmware::tmc_control::bootstrap_tmc_safety(&mut backend, STATUS_ADC_I_CLIPPED)
-                .await
-                .err()
+            foci_firmware::tmc_control::bootstrap_tmc_safety(
+                &mut backend,
+                crate::tmc_control::board::STATUS_CRITICAL_MASK,
+            )
+            .await
+            .err()
         };
 
         if let Some(failure) = bootstrap_failure {
@@ -537,7 +552,7 @@ mod app {
             exti.imr(0).modify(|w| w.set_line(8, true)); // Unmask
             defmt::info!(
                 "TMC4671 STATUS_MASK: {:#010x}, EXTI8 enabled",
-                STATUS_ADC_I_CLIPPED
+                crate::tmc_control::board::STATUS_CRITICAL_MASK
             );
         }
 
