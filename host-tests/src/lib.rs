@@ -662,7 +662,10 @@ mod commissioning_board_contract_tests {
         let clear = body
             .find("FAULT_ACTIVE.store(false")
             .expect("the emergency-disable clear");
-        let window = &body[clear.saturating_sub(1_200)..clear];
+        // Wide enough to span the whole containment block from the enable-pin
+        // drop down to the clear, with margin, while stopping short of any
+        // earlier call site that would satisfy these assertions spuriously.
+        let window = &body[clear.saturating_sub(3_000)..clear];
         assert!(
             window.contains("status_pin.is_high()"),
             "the clear follows a fresh pin poll"
@@ -678,6 +681,21 @@ mod commissioning_board_contract_tests {
         assert!(
             window.contains("record_stepper_event("),
             "the clear follows the STATUS diagnostic"
+        );
+        // The full diagnostic is recorded before the latch drops, so a fault
+        // that survives containment is still reported with its STATUS word.
+        let pin_poll = window
+            .find("status_pin.is_high()")
+            .expect("the pin re-check inside the containment block");
+        let trace_event = window
+            .find("SUBSYSTEM_SAFETY_SHUTDOWN")
+            .expect("the safety-shutdown trace event");
+        let log = window
+            .find("emergency disable: STATUS=")
+            .expect("the emergency-disable log");
+        assert!(
+            trace_event < pin_poll && log < pin_poll,
+            "the trace event and log precede the interlock re-check"
         );
         assert!(
             body.contains("|| status_pin_asserted"),

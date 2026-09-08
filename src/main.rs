@@ -591,18 +591,6 @@ mod app {
                     flags,
                     0,
                 );
-                // A fault raised since entry leaves the signal pending and the
-                // pin high, so those two are the re-check; the only clear site.
-                let status_pin_asserted = status_pin.is_high();
-                tmc_state()
-                    .status_pin_asserted
-                    .store(status_pin_asserted, Relaxed);
-                if status_pin_asserted || TMC_DISABLE_SIGNAL.signaled() {
-                    defmt::error!("TMC4671 fault still reported after containment; latch kept");
-                } else {
-                    FAULT_ACTIVE.store(false, Relaxed);
-                }
-
                 #[cfg(feature = "trace")]
                 crate::usb_trace::request_event(
                     foci_firmware::trace::events::EVENT_LEVEL_ERROR,
@@ -616,6 +604,18 @@ mod app {
                         defmt::error!("TMC4671 emergency disable: STATUS={:#010x}", flags)
                     }
                     Err(_) => defmt::error!("TMC4671 emergency disable: STATUS read failed"),
+                }
+                // A fault raised since entry leaves the signal pending and the
+                // pin high, so those two are the re-check; the only clear site.
+                // Every diagnostic above is recorded before the latch drops.
+                let status_pin_asserted = status_pin.is_high();
+                tmc_state()
+                    .status_pin_asserted
+                    .store(status_pin_asserted, Relaxed);
+                if status_pin_asserted || TMC_DISABLE_SIGNAL.signaled() {
+                    defmt::error!("TMC4671 fault still reported after containment; latch kept");
+                } else {
+                    FAULT_ACTIVE.store(false, Relaxed);
                 }
                 if deadline_channel != NO_STEPPER_CHANNEL {
                     let clock = read_tim5();
