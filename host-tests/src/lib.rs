@@ -706,4 +706,26 @@ mod commissioning_board_contract_tests {
             "EXTI8 is enabled when bootstrap reports Ready"
         );
     }
+
+    #[test]
+    fn control_detail_reads_the_real_interim_pidout_target_flux_register() {
+        assert!(
+            !USB_TRACE.contains("interim_pidout_target_flux: 0,"),
+            "interim_pidout_target_flux must not be a hardcoded placeholder"
+        );
+        let body = USB_TRACE
+            .split("let detail = ControlDetailSample {")
+            .nth(1)
+            .expect("ControlDetailSample construction present");
+        let flux = body
+            .find("interim_pidout_target_flux:")
+            .expect("interim_pidout_target_flux field present");
+        let flux_field = &body[flux..];
+        assert!(
+            flux_field
+                .starts_with("interim_pidout_target_flux: read_sub_register_counting_errors(")
+                && flux_field.contains("INTERIM_PIDOUT_TARGET_FLUX,"),
+            "interim_pidout_target_flux must read the real sub-register like its sibling fields"
+        );
+    }
 }

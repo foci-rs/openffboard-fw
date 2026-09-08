@@ -860,7 +860,11 @@ pub(crate) async fn sample_tick<B>(
                 INTERIM_PIDOUT_TARGET_TORQUE,
             )
             .await,
-            interim_pidout_target_flux: 0,
+            interim_pidout_target_flux: read_sub_register_counting_errors(
+                tmc,
+                INTERIM_PIDOUT_TARGET_FLUX,
+            )
+            .await,
             interim_pidin_target_velocity: read_sub_register_counting_errors(
                 tmc,
                 INTERIM_PIDIN_TARGET_VELOCITY,
