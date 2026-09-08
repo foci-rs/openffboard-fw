@@ -10,6 +10,8 @@ mod stepper;
 #[cfg(test)]
 mod commissioning_board_contract_tests {
     const MAIN: &str = include_str!("../../src/main.rs");
+    const BOARD: &str = include_str!("../../src/tmc_control/board.rs");
+    const DRIVER: &str = include_str!("../../../../shared/foci-firmware/src/tmc_control/driver.rs");
     const TMC_DISPATCH: &str = include_str!("../../src/tmc_dispatch.rs");
     const REQUEST: &str = include_str!("../../src/tmc_control/request.rs");
     const REPLIES: &str = include_str!("../../src/ankyra/replies.rs");
@@ -116,21 +118,25 @@ mod commissioning_board_contract_tests {
 
     #[test]
     fn startup_establishes_pi_representation_before_adc_vm_capture() {
-        let chip_identity = MAIN
+        let chip_identity = DRIVER
             .find("CHIPINFO_SI_TYPE")
             .expect("startup must verify the TMC4671 identity");
-        let representation = MAIN
+        let representation = DRIVER
             .find("bootstrap_pi_representation")
             .expect("startup must establish the fixed PI representation");
-        let adc_vm = MAIN
+        let adc_vm = DRIVER
             .find("capture_adc_vm_offset")
             .expect("startup must retain ADC-VM capture");
 
         assert!(chip_identity < representation);
         assert!(representation < adc_vm);
-        assert_eq!(MAIN.matches("bootstrap_pi_representation").count(), 1);
-        assert!(MAIN.contains("TMC4671 PI representation failed at boot"));
+        assert_eq!(DRIVER.matches("bootstrap_pi_representation").count(), 1);
+        assert!(DRIVER.contains("PI representation failed at boot"));
         assert!(!MAIN.contains("0x15"));
+        assert!(
+            !MAIN.contains("bootstrap_pi_representation"),
+            "bootstrap now lives in the shared driver"
+        );
     }
 
     #[test]
@@ -161,7 +167,7 @@ mod commissioning_board_contract_tests {
             MAIN.matches("integral_candidate.observe_fault()").count(),
             2
         );
-        assert!(MAIN.contains("CommissionRetention::new"));
+        assert!(BOARD.contains("CommissionRetention::new"));
         assert!(REQUEST.contains("handle_tmc_control_request_with_stages"));
         assert!(REQUEST.contains("integral_candidate"));
     }
@@ -173,18 +179,19 @@ mod commissioning_board_contract_tests {
         // so Stage-C authority is installed synchronously from the plan event
         // rather than by routing polls through the staged poll driver.
         assert!(
-            MAIN.contains(".classify_commission_poll(poll)"),
+            DRIVER.contains(".classify_commission_poll(poll)"),
             "nonterminal polls must stay out of the async dispatch future"
         );
         assert!(
-            !MAIN.contains("drive_commissioning_poll_with_stages"),
+            !MAIN.contains("drive_commissioning_poll_with_stages")
+                && !DRIVER.contains("drive_commissioning_poll_with_stages"),
             "the staged poll driver pulls terminal dispatch into every poll"
         );
 
-        let arm = MAIN
+        let arm = DRIVER
             .find("CommissionEvent::VelocityIntegralPlan")
-            .expect("board must handle the Stage-C plan event");
-        let body = &MAIN[arm..];
+            .expect("driver must handle the Stage-C plan event");
+        let body = &DRIVER[arm..];
         let install = body
             .find("install_authority_from_plan")
             .expect("plan event must install retained Stage-C authority");
@@ -215,11 +222,11 @@ mod commissioning_board_contract_tests {
         // from the plan event because nonterminal classification stays outside
         // the terminal async dispatch future on this board.
         assert!(
-            MAIN.contains("install_authority_from_plan"),
+            DRIVER.contains("install_authority_from_plan"),
             "the plan event must retain authority for a later resume"
         );
         assert!(
-            MAIN.contains(".classify_commission_poll(poll)"),
+            DRIVER.contains(".classify_commission_poll(poll)"),
             "nonterminal polls must stay out of the async dispatch future"
         );
     }
@@ -234,17 +241,18 @@ mod commissioning_board_contract_tests {
             !MAIN.contains("drive_commissioning_terminal_with_stages"),
             "the board must not await the whole terminal chain in one future"
         );
-        assert!(MAIN.contains("begin_commissioning_terminal"));
-        assert!(MAIN.contains("poll_commissioning_terminal"));
-        assert!(MAIN.contains("is_restore_pending"));
+        assert!(DRIVER.contains("begin_commissioning_terminal"));
+        assert!(DRIVER.contains("poll_commissioning_terminal"));
+        assert!(DRIVER.contains("is_restore_pending"));
         assert!(
             MAIN.contains("restore_cancel_pending") && MAIN.contains("drive_restore_cancel"),
             "the loop must drain a latched restore cancel"
         );
         assert_eq!(
             MAIN.matches("request_restore_cancel").count(),
-            7,
-            "every commissioning-loop exit must latch a restore cancel"
+            2,
+            "the two loop sites that latch a restore cancel: the commission \
+             wait-exit check and the in-commissioning request cancel"
         );
     }
 
@@ -606,5 +614,78 @@ mod commissioning_board_contract_tests {
         assert!(!BOARD_INIT.contains("core::mem::forget(status_pin)"));
         assert!(MAIN.contains("tmc_status: Input<'static>"));
         assert!(MAIN.contains("status_pin_asserted"));
+    }
+
+    #[test]
+    fn control_loop_drives_one_unit_per_iteration_and_never_loops_over_channels() {
+        let task_start = MAIN
+            .find("async fn tmc_control(")
+            .expect("tmc_control task");
+        let task_end = MAIN[task_start..]
+            .find("#[task(")
+            .map_or(MAIN.len(), |o| task_start + o);
+        let body = &MAIN[task_start..task_end];
+        assert!(
+            !body.contains("for channel in"),
+            "no channel loops inside the future"
+        );
+        assert!(
+            !body.contains("'commission_poll"),
+            "the commission poll loop is gone"
+        );
+        assert_eq!(
+            body.matches(".drive(").count(),
+            1,
+            "exactly one drive await site"
+        );
+        assert_eq!(body.matches("scheduler.pick(").count(), 1);
+        assert_eq!(
+            body.matches("scheduler.record(").count(),
+            1,
+            "finalize and drive share one record site"
+        );
+        assert!(body.contains("select(rx.recv(), control_sleep)"));
+        assert!(body.contains("status_pin_asserted"));
+    }
+
+    #[test]
+    fn fault_active_is_cleared_only_after_the_interlock_recheck() {
+        let task_start = MAIN
+            .find("async fn tmc_control(")
+            .expect("tmc_control task");
+        let body = &MAIN[task_start..];
+        assert_eq!(
+            body.matches("FAULT_ACTIVE.store(false").count(),
+            1,
+            "one emergency-disable clear shared by the fault and deadline-miss paths"
+        );
+        let clear = body
+            .find("FAULT_ACTIVE.store(false")
+            .expect("the emergency-disable clear");
+        let window = &body[clear.saturating_sub(1_200)..clear];
+        assert!(
+            window.contains("status_pin.is_high()"),
+            "the clear follows a fresh pin poll"
+        );
+        assert!(
+            window.contains("TMC_DISABLE_SIGNAL.signaled()"),
+            "the clear follows a pending-signal check"
+        );
+        assert!(
+            window.contains("enable_pin.set_low()"),
+            "the clear follows lowering the enable pin"
+        );
+        assert!(
+            window.contains("record_stepper_event("),
+            "the clear follows the STATUS diagnostic"
+        );
+        assert!(
+            body.contains("|| status_pin_asserted"),
+            "the polled level is part of the containment predicate"
+        );
+        assert!(
+            body.contains("enable_status_exti()"),
+            "EXTI8 is enabled when bootstrap reports Ready"
+        );
     }
 }

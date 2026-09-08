@@ -30,7 +30,7 @@ pub(crate) fn drive_ctx<'a>(
     homing_snapshot: u8,
     status_pin_asserted: bool,
     config: &'a TmcControlConfig,
-    stage_c: &'a mut IntegralRetentionSlot,
+    integral_candidate: &'a mut IntegralRetentionSlot,
 ) -> DriveCtx<'a> {
     DriveCtx {
         now_us,
@@ -39,25 +39,28 @@ pub(crate) fn drive_ctx<'a>(
         status_pin_asserted,
         status_mask: STATUS_CRITICAL_MASK,
         config,
-        retention: CommissionRetention::new(stage_c),
+        retention: CommissionRetention::new(integral_candidate),
     }
 }
 
-/// How a parked channel is reported to the host: the old bootstrap's
-/// message for the first three failures, the stage-specific shutdown reason
-/// for the safety bootstrap.
+/// How a parked channel is reported to the host. The first three failures
+/// keep the fixed messages Klipper configs and dashboards already match on;
+/// the safety bootstrap reports its stage-specific shutdown reason. The
+/// message variants carry no string because `klipper_shutdown_from!` accepts
+/// only a literal, so the call site owns the text and this enum owns the
+/// choice.
 pub(crate) enum ParkShutdown {
-    Message(&'static str),
+    SpiFailedAtBoot,
+    ChipIdMismatch,
+    PiRepresentationFailedAtBoot,
     Reason(ShutdownReason),
 }
 
 pub(crate) fn park_shutdown(reason: ParkReason) -> ParkShutdown {
     match reason {
-        ParkReason::SpiUnavailable => ParkShutdown::Message("TMC4671 SPI failed at boot"),
-        ParkReason::ChipIdMismatch(_) => ParkShutdown::Message("TMC4671 chip ID mismatch"),
-        ParkReason::PiRepresentation => {
-            ParkShutdown::Message("TMC4671 PI representation failed at boot")
-        }
+        ParkReason::SpiUnavailable => ParkShutdown::SpiFailedAtBoot,
+        ParkReason::ChipIdMismatch(_) => ParkShutdown::ChipIdMismatch,
+        ParkReason::PiRepresentation => ParkShutdown::PiRepresentationFailedAtBoot,
         ParkReason::SafetyBootstrap(stage) => {
             ParkShutdown::Reason(TmcSafetyBootstrapFailure { stage }.shutdown_reason(0))
         }
