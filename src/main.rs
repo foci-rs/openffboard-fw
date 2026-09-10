@@ -103,7 +103,7 @@ mod app {
 
     use foci_firmware::tmc::TmcRequest;
 
-    use crate::board_config::{CURRENT_SCALE_MA_PER_LSB, TMC_CONFIG};
+    use crate::board_config::TMC_CONFIG;
     use crate::tmc_control::board::{
         openffboard_backend, refresh_velocity_scale, stepper_state, tmc_state,
     };
@@ -386,7 +386,7 @@ mod app {
         let tmc_control_config = foci_firmware::tmc_control::TmcControlConfig::new(
             CLOCK_FREQ,
             TMC_CONFIG.pwm_freq_hz(),
-            CURRENT_SCALE_MA_PER_LSB,
+            TMC_CONFIG.current_scale_ma_per_lsb,
             TMC_CONFIG,
         );
 

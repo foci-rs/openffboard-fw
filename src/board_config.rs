@@ -5,10 +5,6 @@ use crate::ankyra::enumerations::Pins;
 /// Number of board-local TMC4671 motor channels.
 pub(crate) const TMC_CHANNEL_COUNT: u8 = 1;
 
-/// Current scaling for OpenFFBoard: milliamps per ADC least significant bit.
-/// Derived from sense resistor value and ADC configuration.
-pub(crate) const CURRENT_SCALE_MA_PER_LSB: f32 = 1.155;
-
 /// OpenFFBoard v1.3 VM sense divider high-side resistor (R23).
 pub(crate) const VM_DIVIDER_HIGH_OHMS: u32 = 71_500;
 
@@ -76,6 +72,9 @@ pub(crate) const TMC_CONFIG: foci_firmware::config::TmcConfig = foci_firmware::c
     current_validation_torque_max_encoder_delta_counts: 16,
     resistance_max_expected_current_count: 1600,
     resistance_scale_metadata_validated: true,
+    // Milliamps per ADC least significant bit, derived from the sense
+    // resistor value and ADC configuration.
+    current_scale_ma_per_lsb: 1.155,
 };
 
 const OPENFFBOARD_V13_BBM_REGISTER: u32 = 0x0909;
