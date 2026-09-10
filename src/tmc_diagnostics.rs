@@ -365,6 +365,8 @@ pub(crate) async fn handle_diagnostic_request(
     let mut power_stage = OpenFFBoardDiagnosticPowerStage {
         enable_pin: ctx.enable_pin,
     };
+    let mut host_liveness_expired =
+        || crate::tmc_control::effects::lease_expired(crate::helpers::lifecycle::read_tim5());
     let outcome = handle_shared_diagnostic_request(
         req,
         foci_firmware::tmc_diagnostics::DiagnosticContext {
@@ -379,6 +381,7 @@ pub(crate) async fn handle_diagnostic_request(
             },
             tmc_config: ctx.tmc_config,
             feedback_config: crate::board_config::FEEDBACK_CONFIGS[0],
+            host_liveness_expired: Some(&mut host_liveness_expired),
         },
     )
     .await;

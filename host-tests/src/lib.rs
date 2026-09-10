@@ -39,6 +39,7 @@ mod commissioning_board_contract_tests {
     const TRIGGER_DOMAIN: &str = include_str!("../../src/trigger_domain.rs");
     const BOARD_INIT: &str = include_str!("../../src/board_init.rs");
     const USB_TRACE: &str = include_str!("../../src/usb_trace.rs");
+    const TMC_DIAGNOSTICS: &str = include_str!("../../src/tmc_diagnostics.rs");
 
     const REPLY_ID_WORST_CASE_BYTES: usize = 3;
     const KLIPPER_PAYLOAD_WITH_ID_MAX: usize = 59;
@@ -738,6 +739,22 @@ mod commissioning_board_contract_tests {
         assert!(
             TMC_DISPATCH.contains("FaultClass::InvalidChannel"),
             "the diagnostic reply must use the InvalidChannel fault class"
+        );
+    }
+
+    #[test]
+    fn diagnostic_dispatch_uses_raw_lease_expired_not_the_classifier() {
+        assert!(
+            TMC_DIAGNOSTICS.contains("tmc_control::effects::lease_expired("),
+            "diagnostic dispatch must wire the host-liveness check to the raw \
+             lease_expired function"
+        );
+        assert!(
+            !TMC_DIAGNOSTICS.contains("classify_lease_check")
+                && !TMC_DIAGNOSTICS.contains("LeaseCheckDisposition"),
+            "diagnostic dispatch must not use classify_lease_check -- its \
+             shutdown-active suppression does not apply to a diagnostic \
+             runner's one-shot poll"
         );
     }
 }
