@@ -92,3 +92,23 @@ pub(crate) const FEEDBACK_CONFIGS: [foci_firmware::config::FeedbackConfig;
     phi_e_source: foci_firmware::config::FeedbackSource::Abn,
     position_source: foci_firmware::config::FeedbackSource::Abn,
 }; TMC_CHANNEL_COUNT as usize];
+
+/// Return the `shared/foci-firmware` `ANALOG_CHANNELS` slot index for a
+/// virtual analog-in pin. OpenFFBoard has only `MCU_TEMP`, at index 0.
+pub(crate) fn analog_pin_channel(pin: u8) -> Option<u8> {
+    match Pins::try_from(pin) {
+        Ok(Pins::MCU_TEMP) => Some(0),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analog_pin_channel_resolves_mcu_temp_only() {
+        assert_eq!(analog_pin_channel(Pins::MCU_TEMP as u8), Some(0));
+        assert_eq!(analog_pin_channel(Pins::STEP0 as u8), None);
+    }
+}

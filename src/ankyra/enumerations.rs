@@ -28,5 +28,6 @@
         ENA0,
         // Virtual endstop pin backed by the channel-0 stall latch.
         STALL0,
+        MCU_TEMP,
     }
 }
