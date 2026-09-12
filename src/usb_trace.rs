@@ -29,17 +29,7 @@ pub(crate) const EVENT_FIRMWARE_BOOT: u16 = 1;
 pub(crate) const EVENT_USB_CONFIGURED: u16 = 2;
 pub(crate) const EVENT_MOTOR_ARM: u16 = 3;
 pub(crate) const EVENT_MOTOR_DISARM: u16 = 4;
-#[allow(dead_code)]
-pub(crate) const EVENT_HOMING_OR_ENDSTOP: u16 = 5;
-#[allow(dead_code)]
-pub(crate) const EVENT_GAIN_APPLIED: u16 = 6;
-#[allow(dead_code)]
-pub(crate) const EVENT_TRACE_QUEUE_OVERFLOW: u16 = 7;
-#[allow(dead_code)]
-pub(crate) const EVENT_SPI_ERROR: u16 = 8;
 pub(crate) const EVENT_STATUS_INTERRUPT: u16 = 9;
-#[allow(dead_code)]
-pub(crate) const EVENT_SHUTDOWN: u16 = 10;
 
 const CRITICAL_HZ: u32 = 1000;
 const CONTROL_DETAIL_HZ: u32 = 500;
