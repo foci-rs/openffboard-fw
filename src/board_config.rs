@@ -93,6 +93,26 @@ pub(crate) const FEEDBACK_CONFIGS: [foci_firmware::config::FeedbackConfig;
     position_source: foci_firmware::config::FeedbackSource::Abn,
 }; TMC_CHANNEL_COUNT as usize];
 
+/// STM32F407 ADC instance carrying the internal temperature sensor channel.
+///
+/// RM0090 is not cached in this repository, so this is verified instead
+/// against the real Klipper STM32 ADC driver at `src/stm32/adc.c` in the
+/// `klipper` checkout (`~/Documents/Development/klipper` at the time of
+/// writing): `gpio_adc_setup` (around line 84) defaults to
+/// `ADC_TypeDef *adc = ADC1`, and only reassigns `adc = ADC3` when the
+/// resolved channel index is `>= 19` (line ~89), which is reserved for the
+/// extra PF-pin channels present on STM32F4x5/F446 parts. The internal
+/// temperature-sensor pseudo-pin (`ADC_TEMPERATURE_PIN`, line 18) sits at
+/// channel index 16 in the `adc_pins` table (line ~21-26) -- below that
+/// threshold -- so it stays on the default `ADC1`; enabling it is done via
+/// `ADC123_COMMON->CCR = ADC_CCR_TSVREFE` (line ~113), the ADC1/2/3 shared
+/// common-control register, not a per-instance one. Independently
+/// corroborated via web search: ST community references confirm RM0090
+/// wires the STM32F40x/F41x temperature sensor only to `ADC1_IN16`, not
+/// ADC2 or ADC3.
+#[allow(dead_code)] // consumed by Task 8's ADC peripheral construction
+pub(crate) type InternalTempAdcInstance = embassy_stm32::peripherals::ADC1;
+
 /// Return the `shared/foci-firmware` `ANALOG_CHANNELS` slot index for a
 /// virtual analog-in pin. OpenFFBoard has only `MCU_TEMP`, at index 0.
 pub(crate) fn analog_pin_channel(pin: u8) -> Option<u8> {
