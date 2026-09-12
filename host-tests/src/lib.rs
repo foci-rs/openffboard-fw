@@ -162,15 +162,17 @@ mod commissioning_board_contract_tests {
     }
 
     #[test]
-    fn board_owns_and_invalidates_one_integral_candidate() {
-        assert_eq!(MAIN.matches("IntegralRetentionSlot::new()").count(), 1);
+    fn board_owns_and_invalidates_channel_indexed_integral_candidates() {
+        assert!(MAIN.contains("IntegralRetentionSlots<"));
+        assert!(MAIN.contains("{ TMC_CHANNEL_COUNT as usize }"));
         assert_eq!(
-            MAIN.matches("integral_candidate.observe_fault()").count(),
+            MAIN.matches("integral_candidates.invalidate_all()").count(),
             2
         );
+        assert!(MAIN.contains(".slot_mut(0)"));
         assert!(BOARD.contains("CommissionRetention::new"));
         assert!(REQUEST.contains("handle_tmc_control_request_with_stages"));
-        assert!(REQUEST.contains("integral_candidate"));
+        assert!(REQUEST.contains(".slot_mut(req.channel)"));
     }
 
     #[test]

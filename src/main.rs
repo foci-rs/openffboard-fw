@@ -61,6 +61,7 @@ mod app {
         TRIGGER_DOMAIN, TRIGGER_TIMER_MIN_LEAD_TICKS, TriggerDomain, with_trigger_domain,
         with_trigger_domain_site,
     };
+    use foci_firmware::commissioning::outer::velocity::integral_reproduction::IntegralRetentionSlots;
     use foci_firmware::context::stepper::{
         StepperArmCheckBoard, StepperStopCheckBoard, StepperTimerStateBoard,
     };
@@ -103,7 +104,7 @@ mod app {
 
     use foci_firmware::tmc::TmcRequest;
 
-    use crate::board_config::TMC_CONFIG;
+    use crate::board_config::{TMC_CHANNEL_COUNT, TMC_CONFIG};
     use crate::tmc_control::board::{
         openffboard_backend, refresh_velocity_scale, stepper_state, tmc_state,
     };
@@ -131,13 +132,12 @@ mod app {
         app_state: State,
     }
 
-    /// Persistent Stage-C candidate slot carried across `tmc_control` task calls.
+    /// Persistent Stage-C candidate slots carried across `tmc_control` task calls.
     ///
     /// Retains the Stage-C authority a `breakaway_seeded` campaign hands off to
     /// `integral_resume`, so the production build runs the full autotune
     /// hand-off exactly as the trace build does.
-    type IntegralCandidateTaskLocal =
-        foci_firmware::commissioning::outer::velocity::integral_reproduction::IntegralRetentionSlot;
+    type IntegralCandidatesTaskLocal = IntegralRetentionSlots<{ TMC_CHANNEL_COUNT as usize }>;
 
     #[local]
     struct Local {
@@ -146,7 +146,7 @@ mod app {
         tmc_status: Input<'static>,
         tmc_rx: Receiver<'static, TmcRequest, TMC_CHANNEL_SIZE>,
         wdg: IndependentWatchdog<'static, peripherals::IWDG>,
-        integral_candidate: IntegralCandidateTaskLocal,
+        integral_candidates: IntegralCandidatesTaskLocal,
     }
 
     #[init(local = [
@@ -322,8 +322,7 @@ mod app {
                 tmc_status,
                 tmc_rx,
                 wdg,
-                integral_candidate:
-                    foci_firmware::commissioning::outer::velocity::integral_reproduction::IntegralRetentionSlot::new(),
+                integral_candidates: IntegralCandidatesTaskLocal::new(),
             },
         )
     }
@@ -369,7 +368,7 @@ mod app {
             tmc_enable,
             tmc_status,
             tmc_rx,
-            integral_candidate,
+            integral_candidates,
             driver: foci_firmware::tmc_control::ChannelDriver =
                 foci_firmware::tmc_control::ChannelDriver::new(0),
         ]
@@ -383,7 +382,7 @@ mod app {
         let enable_pin = ctx.local.tmc_enable;
         let status_pin = ctx.local.tmc_status;
         let rx = ctx.local.tmc_rx;
-        let integral_candidate = ctx.local.integral_candidate;
+        let integral_candidates = ctx.local.integral_candidates;
         let driver = ctx.local.driver;
 
         // This board never auto-initializes the motor; init is
@@ -495,7 +494,7 @@ mod app {
                     tmc_state().commission_in_flight.store(false, Relaxed);
                     stepper_stop_from_p1(0);
                     shutdown_safe_state_applied = shutdown_safe_state_complete;
-                    integral_candidate.observe_fault();
+                    integral_candidates.invalidate_all();
                 }
                 Mono::delay(1.millis()).await;
                 continue;
@@ -535,7 +534,7 @@ mod app {
 
             // Drain stale requests after config_reset
             if TMC_QUEUE_FLUSH.load(Relaxed) {
-                integral_candidate.observe_fault();
+                integral_candidates.invalidate_all();
                 while rx.try_recv().is_ok() {}
                 let commission_was_active = driver.runtime.is_commission_active();
                 crate::tmc_control::effects::apply_actions(
@@ -737,7 +736,7 @@ mod app {
                             enable_pin,
                             &mut driver.runtime,
                             &mut driver.commission_trace_engine_seq,
-                            &mut *integral_candidate,
+                            &mut *integral_candidates,
                         )
                         .await;
                         if let Some(reason) = outcome.shutdown {
@@ -808,12 +807,15 @@ mod app {
                 None
             } else {
                 let mut backend = openffboard_backend(tmc, enable_pin);
+                let integral_candidate = integral_candidates
+                    .slot_mut(0)
+                    .expect("OpenFFBoard channel 0 exists");
                 let ctx_unit = crate::tmc_control::board::drive_ctx(
                     now,
                     snapshot,
                     status_pin_asserted,
                     &tmc_control_config,
-                    &mut *integral_candidate,
+                    integral_candidate,
                 );
                 Some(driver.drive(unit, &mut backend, ctx_unit).await)
             };
