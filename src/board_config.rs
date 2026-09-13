@@ -115,6 +115,7 @@ pub(crate) type InternalTempAdcInstance = embassy_stm32::peripherals::ADC1;
 
 /// Return the `shared/foci-firmware` `ANALOG_CHANNELS` slot index for a
 /// virtual analog-in pin. OpenFFBoard has only `MCU_TEMP`, at index 0.
+#[allow(dead_code)] // consumed by Task 6's analog-in dispatch wiring
 pub(crate) fn analog_pin_channel(pin: u8) -> Option<u8> {
     match Pins::try_from(pin) {
         Ok(Pins::MCU_TEMP) => Some(0),
