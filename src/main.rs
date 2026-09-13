@@ -147,6 +147,10 @@ mod app {
         tmc_rx: Receiver<'static, TmcRequest, TMC_CHANNEL_SIZE>,
         wdg: IndependentWatchdog<'static, peripherals::IWDG>,
         integral_candidates: IntegralCandidatesTaskLocal,
+        adc_internal:
+            embassy_stm32::adc::Adc<'static, crate::board_config::InternalTempAdcInstance>,
+        temp_channel: embassy_stm32::adc::Temperature,
+        mcu_temp_calibration: foci_firmware::mcu_temp::FactoryCalibration,
     }
 
     #[init(local = [
@@ -303,12 +307,20 @@ mod app {
                 .cast::<TriggerDomain>()
                 .write(TriggerDomain::new());
         }
+        // MCU_TEMP is the only analog-in channel on this board; the
+        // internal temperature sensor is wired only to ADC1 (see
+        // board_config.rs's InternalTempAdcInstance docs).
+        let adc_internal = embassy_stm32::adc::Adc::new(p.ADC1);
+        let temp_channel = adc_internal.enable_temperature();
+        let mcu_temp_calibration = crate::board_config::read_mcu_temp_calibration();
+
         // Spawn tasks
         stepper_reconcile::spawn().expect("stepper reconciliation worker must spawn exactly once");
         tmc_control::spawn().expect("tmc_control task must spawn exactly once");
         usb_task::spawn().expect("usb_task must spawn exactly once");
         stats::spawn().expect("stats task must spawn exactly once");
         watchdog::spawn().expect("watchdog task must spawn exactly once");
+        analog_sampling::spawn().expect("analog_sampling task must spawn exactly once");
 
         defmt::info!("FOCI OpenFFBoard initialized");
 
@@ -323,6 +335,9 @@ mod app {
                 tmc_rx,
                 wdg,
                 integral_candidates: IntegralCandidatesTaskLocal::new(),
+                adc_internal,
+                temp_channel,
+                mcu_temp_calibration,
             },
         )
     }
@@ -1800,6 +1815,43 @@ mod app {
         loop {
             Mono::delay(crate::heartbeat::WATCHDOG_INTERVAL_MS.millis()).await;
             crate::heartbeat::watchdog_tick(ctx.local.wdg);
+        }
+    }
+
+    /// Sample MCU_TEMP at low priority and report readings to the host,
+    /// entering the shutdown state on a sustained out-of-range reading.
+    ///
+    /// The 1ms poll period is coarse relative to `AnalogChannelState`'s own
+    /// `sample_ticks`/`rest_ticks` pacing (in TIM5-domain ticks via
+    /// `read_tim5()`, not this loop's `Mono` wakeup) -- this task only needs
+    /// to wake often enough that the configured channel's due sample is
+    /// never late by more than one period.
+    #[task(
+        priority = 1,
+        shared = [app_state],
+        local = [adc_internal, temp_channel, mcu_temp_calibration]
+    )]
+    async fn analog_sampling(mut ctx: analog_sampling::Context) {
+        loop {
+            Mono::delay(1.millis()).await;
+            let now = read_tim5();
+            let shutdown_requested = crate::heartbeat::analog_sampling_tick(
+                ctx.local.adc_internal,
+                ctx.local.temp_channel,
+                ctx.local.mcu_temp_calibration,
+                now,
+            );
+            if shutdown_requested {
+                ctx.shared.app_state.lock(|state| {
+                    if crate::firmware_ctx::enter_shutdown(state) {
+                        foci_firmware::dispatch_shutdown!(
+                            foci_firmware::shutdown::ShutdownReason::AdcOutOfRange,
+                            now,
+                            &mut crate::_ankyra_config::Sender
+                        );
+                    }
+                });
+            }
         }
     }
 }

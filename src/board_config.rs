@@ -110,7 +110,6 @@ pub(crate) const FEEDBACK_CONFIGS: [foci_firmware::config::FeedbackConfig;
 /// corroborated via web search: ST community references confirm RM0090
 /// wires the STM32F40x/F41x temperature sensor only to `ADC1_IN16`, not
 /// ADC2 or ADC3.
-#[allow(dead_code)] // consumed by Task 8's ADC peripheral construction
 pub(crate) type InternalTempAdcInstance = embassy_stm32::peripherals::ADC1;
 
 /// Return the `shared/foci-firmware` `ANALOG_CHANNELS` slot index for a
@@ -141,7 +140,6 @@ const TS_CAL2_TEMP_C: f32 = 110.0;
 /// area, valid on every STM32F407 device -- reading them is always safe;
 /// this function exists only to centralize the `unsafe` block, not because
 /// the read itself is conditionally unsafe.
-#[allow(dead_code)] // consumed by Task 8's MCU_TEMP init-time cache
 pub(crate) fn read_mcu_temp_calibration() -> foci_firmware::mcu_temp::FactoryCalibration {
     // SAFETY: TS_CAL1_ADDR/TS_CAL2_ADDR are ST's documented factory
     // calibration addresses in system memory, present and readable on
