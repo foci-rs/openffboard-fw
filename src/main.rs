@@ -425,6 +425,28 @@ mod app {
         // If phase-advance restore fails, keep retrying before idling.
         let mut shutdown_safe_state_applied = false;
 
+        {
+            let mut backend = crate::tmc_control::board::openffboard_backend(tmc, enable_pin);
+            if let Err(failure) = foci_firmware::tmc_control::bootstrap_tmc_safety(
+                &mut backend,
+                0,
+                crate::tmc_control::board::STATUS_CRITICAL_MASK,
+            )
+            .await
+            {
+                let reason = failure.shutdown_reason(0);
+                ctx.shared.app_state.lock(|state| {
+                    if crate::firmware_ctx::enter_shutdown(state) {
+                        foci_firmware::dispatch_shutdown!(
+                            reason,
+                            read_tim5(),
+                            &mut crate::_ankyra_config::Sender
+                        );
+                    }
+                });
+            }
+        }
+
         'tmc_loop: loop {
             #[cfg(feature = "usb-p1-probe")]
             {
