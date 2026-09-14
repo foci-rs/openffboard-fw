@@ -44,6 +44,31 @@ mod commissioning_board_contract_tests {
     const REPLY_ID_WORST_CASE_BYTES: usize = 3;
     const KLIPPER_PAYLOAD_WITH_ID_MAX: usize = 59;
 
+    fn extract_fn<'a>(text: &'a str, name: &str) -> &'a str {
+        let marker = std::format!("fn {name}");
+        let start = text
+            .find(&marker)
+            .unwrap_or_else(|| panic!("missing fn {name}"));
+        let brace_start = text[start..]
+            .find('{')
+            .map(|offset| start + offset)
+            .expect("unterminated function signature");
+        let mut depth = 0usize;
+        for (offset, ch) in text[brace_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &text[start..brace_start + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated fn {name}");
+    }
+
     fn assert_reply_contract(method: &str, reply: &str, fields: &[&str]) {
         let start = REPLIES
             .find(method)
@@ -757,6 +782,32 @@ mod commissioning_board_contract_tests {
             "diagnostic dispatch must not use classify_lease_check -- its \
              shutdown-active suppression does not apply to a diagnostic \
              runner's one-shot poll"
+        );
+    }
+
+    #[test]
+    fn safety_bootstrap_runs_before_the_first_status_pin_read_and_before_drive() {
+        let tmc_control_fn = extract_fn(MAIN, "tmc_control");
+        let bootstrap_pos = tmc_control_fn
+            .find("bootstrap_tmc_safety(")
+            .expect("eager safety-bootstrap call must exist in tmc_control()");
+        let status_read_pos = tmc_control_fn
+            .find("status_pin.is_high()")
+            .expect("the control loop's STATUS-pin read must exist in tmc_control()");
+        let drive_call_pos = tmc_control_fn
+            .find("driver.drive(unit, &mut backend, ctx_unit)")
+            .expect("the drive() call must exist in tmc_control()");
+
+        assert!(
+            bootstrap_pos < status_read_pos,
+            "safety bootstrap must run before the control loop's first STATUS-pin \
+             read -- a stale STATUS_MASK from a prior session can otherwise trip \
+             the emergency-disable branch before bootstrap ever corrects it, \
+             permanently skipping the correction on every subsequent boot"
+        );
+        assert!(
+            bootstrap_pos < drive_call_pos,
+            "safety bootstrap must run before the drive() call"
         );
     }
 }
