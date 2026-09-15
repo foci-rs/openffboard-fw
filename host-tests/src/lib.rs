@@ -10,6 +10,7 @@ mod stepper;
 #[cfg(test)]
 mod commissioning_board_contract_tests {
     const MAIN: &str = include_str!("../../src/main.rs");
+    const FIRMWARE_CTX: &str = include_str!("../../src/firmware_ctx.rs");
     const BOARD: &str = include_str!("../../src/tmc_control/board.rs");
     const DRIVER: &str = include_str!("../../../../shared/foci-firmware/src/tmc_control/driver.rs");
     const TMC_DISPATCH: &str = include_str!("../../src/tmc_dispatch.rs");
@@ -162,6 +163,27 @@ mod commissioning_board_contract_tests {
         assert!(
             !MAIN.contains("bootstrap_pi_representation"),
             "bootstrap now lives in the shared driver"
+        );
+    }
+
+    #[test]
+    fn homing_start_notification_is_an_explicit_no_op() {
+        let implementation = extract_fn(FIRMWARE_CTX, "notify_homing_start");
+        assert!(
+            implementation.contains("maintenance loop is always armed"),
+            "the no-op must retain the OpenFFBoard-specific rationale"
+        );
+
+        let open = implementation.find('{').expect("notification body");
+        let close = implementation.rfind('}').expect("notification body");
+        let executable = implementation[open + 1..close]
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .collect::<std::string::String>();
+        assert_eq!(
+            executable, "Ok(())",
+            "OpenFFBoard must acknowledge homing without queue, signal, or event side effects"
         );
     }
 

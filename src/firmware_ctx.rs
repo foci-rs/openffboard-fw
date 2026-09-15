@@ -535,6 +535,11 @@ impl<'a> TrsyncHost for FirmwareCtx<'a> {
                 .map_err(|_| ())
         })
     }
+
+    fn notify_homing_start(&mut self) -> Result<(), ()> {
+        // OpenFFBoard's maintenance loop is always armed, so no wake event is needed.
+        Ok(())
+    }
 }
 
 impl<'a> TmcHost for FirmwareCtx<'a> {
