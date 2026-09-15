@@ -699,6 +699,36 @@ mod commissioning_board_contract_tests {
     }
 
     #[test]
+    fn maintenance_always_armed_is_explicit_before_the_wait_deadline() {
+        let body = extract_fn(MAIN, "tmc_control");
+        let mode = body
+            .find("scheduler.set_mode(0, driver.mode(), now_us());")
+            .expect("channel mode update");
+        let arm = body
+            .find("scheduler.set_maintenance_arm(MaintenanceArm::Armed, now_us());")
+            .expect("explicit always-armed maintenance policy");
+        let deadline = body
+            .find(".earliest_due_us()")
+            .expect("scheduler wait deadline");
+
+        assert!(mode < arm && arm < deadline);
+        assert_eq!(body.matches("scheduler.set_maintenance_arm(").count(), 1);
+        assert!(!body.contains("MaintenanceArm::Disarmed"));
+    }
+
+    #[test]
+    fn maintenance_always_armed_diagnostic_reports_state_and_transition_counts() {
+        let body = extract_fn(MAIN, "tmc_control");
+
+        assert!(body.contains("let arm = scheduler.maintenance_arm_stats();"));
+        assert!(body.contains("maint arm={:?} a2d={} d2a={}"));
+        assert!(body.contains("arm.state"));
+        assert!(body.contains("arm.armed_to_disarmed"));
+        assert!(body.contains("arm.disarmed_to_armed"));
+        assert_eq!(body.matches("maintenance_arm_stats()").count(), 1);
+    }
+
+    #[test]
     fn fault_active_is_cleared_only_after_the_interlock_recheck() {
         let task_start = MAIN
             .find("async fn tmc_control(")

@@ -390,7 +390,9 @@ mod app {
     )]
     async fn tmc_control(mut ctx: tmc_control::Context) {
         use embassy_futures::select::{Either, select};
-        use foci_firmware::tmc_control::scheduler::{ChannelMode, ChannelScheduler, UnitClass};
+        use foci_firmware::tmc_control::scheduler::{
+            ChannelMode, ChannelScheduler, MaintenanceArm, UnitClass,
+        };
         use foci_firmware::tmc_control::{AuditResult, CommissionNext, UnitOutcome};
 
         let tmc = ctx.local.tmc;
@@ -742,6 +744,7 @@ mod app {
                 }
             }
             scheduler.set_mode(0, driver.mode(), now_us());
+            scheduler.set_maintenance_arm(MaintenanceArm::Armed, now_us());
 
             let control_sleep = Mono::delay_until(fugit::Instant::<u64, 1, 1_000_000>::from_ticks(
                 scheduler
@@ -988,8 +991,9 @@ mod app {
                     let commission = scheduler.commission_stats(0);
                     let maintenance = scheduler.maintenance_stats();
                     let audit = scheduler.audit_stats();
+                    let arm = scheduler.maintenance_arm_stats();
                     defmt::info!(
-                        "sched ch0 fast req={} svc={} miss={} late={}us cyc={} | commission req={} svc={} late={}us cyc={} | maint svc={} miss={} late={}us | audit svc={} miss={}",
+                        "sched ch0 fast req={} svc={} miss={} late={}us cyc={} | commission req={} svc={} late={}us cyc={} | maint svc={} miss={} late={}us | audit svc={} miss={} | maint arm={:?} a2d={} d2a={}",
                         fast.requested,
                         fast.serviced,
                         fast.missed,
@@ -1004,6 +1008,9 @@ mod app {
                         maintenance.max_lateness_us,
                         audit.serviced,
                         audit.missed,
+                        arm.state,
+                        arm.armed_to_disarmed,
+                        arm.disarmed_to_armed,
                     );
                 }
                 UnitOutcome::Commission { event, next } => {
