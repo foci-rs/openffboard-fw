@@ -1757,8 +1757,8 @@ mod app {
 
     /// USB OTG FS interrupt handler. Masks interrupt sources and wakes usb_task.
     ///
-    /// Priority 3: must be above P2 protocol tasks so the ISR always runs
-    /// immediately. The handler only masks and signals — no FIFO access.
+    /// Priority 3: the shared handler completes its FIFO and MMIO work through
+    /// its terminal barrier before the P2 USB consumer can execute.
     #[task(binds = OTG_FS, priority = 3)]
     fn otg_fs_irq(_ctx: otg_fs_irq::Context) {
         crate::interrupts::otg_fs_irq();
