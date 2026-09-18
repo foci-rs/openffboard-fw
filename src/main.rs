@@ -668,19 +668,6 @@ mod app {
                 } else {
                     FAULT_ACTIVE.store(false, Relaxed);
                 }
-                if deadline_channel != NO_STEPPER_CHANNEL {
-                    let clock = read_tim5();
-                    ctx.shared.app_state.lock(|state| {
-                        if crate::firmware_ctx::enter_shutdown(state) {
-                            foci_firmware::dispatch_shutdown!(
-                                foci_firmware::shutdown::ShutdownReason::StepperTooFarInPast,
-                                clock,
-                                &mut crate::_ankyra_config::Sender
-                            );
-                        }
-                    });
-                    continue;
-                }
                 let fault =
                     foci_firmware::tmc_control::classify_emergency_disable_fault(status_flags);
                 ctx.shared.app_state.lock(|state| {
@@ -701,11 +688,19 @@ mod app {
                                 );
                             }
                             foci_firmware::tmc_control::EmergencyDisableFault::Generic => {
-                                ::ankyra::klipper_shutdown_from!(
-                                    &mut crate::_ankyra_config::Sender,
-                                    "TMC4671 fault",
-                                    read_tim5(),
-                                );
+                                if deadline_channel != NO_STEPPER_CHANNEL {
+                                    foci_firmware::dispatch_shutdown!(
+                                        foci_firmware::shutdown::ShutdownReason::StepperTooFarInPast,
+                                        read_tim5(),
+                                        &mut crate::_ankyra_config::Sender
+                                    );
+                                } else {
+                                    ::ankyra::klipper_shutdown_from!(
+                                        &mut crate::_ankyra_config::Sender,
+                                        "TMC4671 fault",
+                                        read_tim5(),
+                                    );
+                                }
                             }
                         }
                     }
@@ -1307,21 +1302,6 @@ mod app {
             tmc_state().pid_error_sums_clear.store(true, Relaxed);
             return;
         }
-        if HOMING_STATE.load(Relaxed) == 1 {
-            // P1 has not yet performed homing preparation. Defer the first
-            // step so it can restore phase advance and suppress position I.
-            arm_stepper_timer_event(
-                td,
-                0,
-                read_tim5().wrapping_add(CLOCK_FREQ / 1000),
-                scheduler_cycles,
-                stepper_slot.take(),
-            );
-            td.set_timer_active(0, true);
-            td.reprogram_timer();
-            return;
-        }
-
         // SAFETY: ISR stepper state is only accessed from this P3 ISR or from
         // stop paths that first gate/cancel the stepper timer.
         let stepper = unsafe { isr_stepper(0).expect("OpenFFBoard channel 0 exists") };
@@ -1419,6 +1399,21 @@ mod app {
                         return;
                     }
                 }
+            }
+
+            if step_held_for_homing(stepper.next_step_clock()) {
+                // P1 has not yet performed homing preparation for this step;
+                // re-check in 1 ms.
+                arm_stepper_timer_event(
+                    td,
+                    0,
+                    read_tim5().wrapping_add(CLOCK_FREQ / 1000),
+                    scheduler_cycles,
+                    stepper_slot.take(),
+                );
+                td.set_timer_active(0, true);
+                td.reprogram_timer();
+                return;
             }
 
             let result = stepper.step_event();
