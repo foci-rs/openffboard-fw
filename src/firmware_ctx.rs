@@ -272,7 +272,7 @@ impl TrsyncBoard for OpenFfboardTrsyncBoard {
 pub(crate) fn enter_shutdown(state: &mut State) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     use foci_firmware::state::lifecycle::REPORT_PENDING;
-    use foci_firmware::state::trsync::{HOMING_STATE, HOMING_TRIGGERED};
+    use foci_firmware::state::trsync::{HOMING_REENTER_PENDING, HOMING_STATE, HOMING_TRIGGERED};
 
     let entered = foci_firmware::helpers::lifecycle::enter_shutdown(state);
     if entered {
@@ -284,6 +284,7 @@ pub(crate) fn enter_shutdown(state: &mut State) -> bool {
         REPORT_PENDING.store(false, Relaxed);
         HOMING_TRIGGERED.store(0xFF, Relaxed);
         HOMING_STATE.store(0, Relaxed);
+        HOMING_REENTER_PENDING.store(false, Relaxed);
     }
     entered
 }

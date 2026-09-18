@@ -167,6 +167,16 @@ mod commissioning_board_contract_tests {
     }
 
     #[test]
+    fn shutdown_drops_a_queued_homing_re_entry() {
+        let shutdown = extract_fn(FIRMWARE_CTX, "enter_shutdown");
+        assert!(shutdown.contains("HOMING_STATE.store(0, Relaxed)"));
+        assert!(
+            shutdown.contains("HOMING_REENTER_PENDING.store(false, Relaxed)"),
+            "shutdown must drop a queued homing re-entry or the next restore re-arms homing"
+        );
+    }
+
+    #[test]
     fn step_hold_is_gated_on_the_homing_start_clock() {
         assert_eq!(
             MAIN.matches("step_held_for_homing(stepper.next_step_clock())")

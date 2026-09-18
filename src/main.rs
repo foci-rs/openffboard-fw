@@ -834,6 +834,7 @@ mod app {
                     foci_firmware::tmc_control::TmcControlHomingRefs::new(
                         &HOMING_STATE,
                         &HOMING_TRIGGERED,
+                        &HOMING_REENTER_PENDING,
                     ),
                     snapshot,
                     group_all_ready,
