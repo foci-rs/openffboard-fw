@@ -6,11 +6,11 @@ use embassy_stm32::gpio::Output;
 use foci_firmware::commission_dispatch::CommissionRetention;
 use foci_firmware::commissioning::outer::velocity::integral_reproduction::IntegralRetentionSlot;
 use foci_firmware::shutdown::ShutdownReason;
-use foci_firmware::state::trsync::HOMING_STATE;
+use foci_firmware::state::trsync::{HOMING_START_CLOCK, HOMING_STATE};
 use foci_firmware::tmc_control::TmcControlRuntime;
 use foci_firmware::tmc_control::helpers::refresh_velocity_scale_from_state;
 use foci_firmware::tmc_control::{
-    DriveCtx, ParkReason, TmcControlConfig, TmcSafetyBootstrapFailure,
+    DriveCtx, HomingClockWindow, ParkReason, TmcControlConfig, TmcSafetyBootstrapFailure,
 };
 use foci_tmc4671::spi::Tmc4671Spi;
 
@@ -36,6 +36,10 @@ pub(crate) fn drive_ctx<'a>(
         now_us,
         homing_active: HOMING_STATE.load(Relaxed) != 0,
         homing_snapshot,
+        homing_clock: HomingClockWindow {
+            now: crate::helpers::lifecycle::read_tim5(),
+            start: HOMING_START_CLOCK.load(Relaxed),
+        },
         status_pin_asserted,
         status_mask: STATUS_CRITICAL_MASK,
         config,

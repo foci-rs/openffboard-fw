@@ -167,6 +167,22 @@ mod commissioning_board_contract_tests {
     }
 
     #[test]
+    fn step_hold_is_gated_on_the_homing_start_clock() {
+        assert_eq!(
+            MAIN.matches("step_held_for_homing(stepper.next_step_clock())")
+                .count(),
+            1,
+            "the only homing hold sits where a due step is emitted and keys off \
+             that step's scheduled clock"
+        );
+        assert!(
+            !MAIN.contains("HOMING_STATE.load(Relaxed) == 1"),
+            "a hold keyed on HOMING_STATE alone stalls the previous move's \
+             in-flight steps past their deadline"
+        );
+    }
+
+    #[test]
     fn homing_start_notification_is_an_explicit_no_op() {
         let implementation = extract_fn(FIRMWARE_CTX, "notify_homing_start");
         assert!(

@@ -1402,8 +1402,6 @@ mod app {
             }
 
             if step_held_for_homing(stepper.next_step_clock()) {
-                // P1 has not yet performed homing preparation for this step;
-                // re-check in 1 ms.
                 arm_stepper_timer_event(
                     td,
                     0,
