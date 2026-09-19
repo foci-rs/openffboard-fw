@@ -70,6 +70,10 @@ pub(crate) fn with_consumer_locked<R>(
 /// OpenFFBoard has one physical stepper (index 0).
 pub(crate) const PHYSICAL_STEPPER_INDICES: &[usize] = &[0];
 
+/// A physical stepper's detached step queue, captured at stop time,
+/// awaiting drain by `trigger_drain_task`. Everything `record_physical_stop`
+/// needs is captured here because it is only known at stop time (before the
+/// drain), not at drain time.
 struct PendingStopDrain {
     consumer: Consumer<'static, StepMove>,
     reason: StepperEventReason,
@@ -77,6 +81,13 @@ struct PendingStopDrain {
     queue_len: u16,
 }
 
+/// The single physical stepper channel's pending drain slot, written by
+/// `stop_physical_stepper` (masked, O(1)) and taken by `trigger_drain_task`
+/// (its own short masked window, never across the drain loop).
+///
+/// `UnsafeCell` is `!Sync` by default, so this newtype exists specifically
+/// to carry an explicit `unsafe impl Sync` -- a bare `UnsafeCell` field
+/// doesn't get that impl on its own.
 struct TriggerDrainSlot(core::cell::UnsafeCell<Option<PendingStopDrain>>);
 
 // SAFETY: every access goes through `cortex_m::interrupt::free` (see
@@ -86,11 +97,16 @@ unsafe impl Sync for TriggerDrainSlot {}
 
 static TRIGGER_DRAIN_SLOT: TriggerDrainSlot = TriggerDrainSlot(core::cell::UnsafeCell::new(None));
 
+/// Wakes `trigger_drain_task`. `signal(())` is lossless regardless of the
+/// task's current execution state.
 pub(crate) static TRIGGER_DRAIN_WAKE: embassy_sync::signal::Signal<
     embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
     (),
 > = embassy_sync::signal::Signal::new();
 
+/// Store a freshly detached consumer and wake the drain task. Called only
+/// from inside `stop_physical_stepper`'s existing masked window -- never
+/// call this outside `cortex_m::interrupt::free`.
 fn store_pending_drain(drain: PendingStopDrain) {
     // SAFETY: caller holds `cortex_m::interrupt::free` already -- see
     // `stop_physical_stepper_inner`'s `LockedInPlace` arm, the only caller.
@@ -100,6 +116,9 @@ fn store_pending_drain(drain: PendingStopDrain) {
     TRIGGER_DRAIN_WAKE.signal(());
 }
 
+/// Take the pending drain, if any, under its own short masked window --
+/// never held across the drain loop below. Mirrors `detach_consumer`'s own
+/// critical-section shape.
 fn take_pending_drain() -> Option<PendingStopDrain> {
     cortex_m::interrupt::free(|_| {
         // SAFETY: see `store_pending_drain`.
@@ -378,10 +397,11 @@ enum QueueAccess {
 /// Stop a physical stepper. Only acts on physical stepper indices (GPIO
 /// and queue).
 ///
-/// Per spec: clear interval, reset ISR stepper engine, drain queue, reset
-/// direction GPIO. The unified TIM5 scheduler is not disabled here because it
-/// may also be carrying endstop and trsync timers; callers cancel the stepper
-/// scheduler event through `TriggerDomain`.
+/// Per spec: clear interval, reset ISR stepper engine, drain queue (or hand
+/// it off, for `LockedInPlace`), reset direction GPIO. The unified TIM5
+/// scheduler is not disabled here because it may also be carrying endstop
+/// and trsync timers; callers cancel the stepper scheduler event through
+/// `TriggerDomain`.
 fn stop_physical_stepper_inner(
     stepper_idx: usize,
     reason: StepperEventReason,
@@ -430,13 +450,15 @@ fn stop_physical_stepper_inner(
             if let Some(consumer) = consumer {
                 attach_consumer(consumer);
             }
-            // else: a concurrent locked drain already owns the queue --
-            // this path is unreachable for QueueAccess::Unmasked in
-            // practice (P1 is the only Unmasked caller and detach_consumer
-            // only returns None if *this* channel's consumer was already
-            // detached by another Unmasked call, which cannot happen
-            // concurrently since P1 stops are not reentrant), but the
-            // detach/no-op fallback keeps this branch total.
+            // else: `detach_consumer` returned `None` -- possible because
+            // a pending hand-off is sitting in `TRIGGER_DRAIN_SLOT`, or
+            // because `trigger_drain_task` itself currently holds the
+            // consumer detached mid-drain. Neither is reachable from this
+            // Unmasked (P1) caller in practice: `trigger_drain_task` runs
+            // at priority 2, which outranks P1, and the hand-off/drain
+            // sequence contains no `.await` point where a lower-priority
+            // P1 caller could interleave and observe the detached window.
+            // The detach/no-op fallback keeps this branch total regardless.
         }
         QueueAccess::LockedInPlace => {
             if let Some(consumer) = detach_consumer() {
@@ -449,9 +471,14 @@ fn stop_physical_stepper_inner(
                 deferred_record = true;
             }
             // else: a P1 unmasked drain, or trigger_drain_task itself,
-            // currently holds the consumer detached -- fall through and
-            // record zero additional drained work below, matching the
-            // pre-existing recovery-rule behavior for this case.
+            // currently holds the consumer detached, or a prior hand-off
+            // is still sitting untaken in TRIGGER_DRAIN_SLOT (no drain in
+            // flight at all -- just waiting for trigger_drain_task to be
+            // scheduled) -- fall through and record zero additional
+            // drained work below, matching the pre-existing recovery-rule
+            // behavior for this case: whichever drain already owns the
+            // consumer, in flight or queued to be taken by
+            // trigger_drain_task, already owns draining this queue.
         }
     }
     if !deferred_record {

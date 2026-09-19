@@ -662,6 +662,34 @@ mod commissioning_board_contract_tests {
              direction-GPIO and STEP-GPIO reset must run unconditionally for every \
              stop, and an early return from an arm would skip them"
         );
+
+        let direction_gpio_pos = TRIGGER_DOMAIN
+            .find("set_odr(0, embassy_stm32::pac::gpio::vals::Odr::LOW)")
+            .expect("stop_physical_stepper_inner must reset the direction GPIO to LOW");
+        let step_gpio_pos = TRIGGER_DOMAIN
+            .find("set_odr(11, embassy_stm32::pac::gpio::vals::Odr::LOW)")
+            .expect("stop_physical_stepper_inner must reset the STEP GPIO to LOW");
+        let locked_open_marker = TRIGGER_DOMAIN
+            .find("QueueAccess::LockedInPlace => {")
+            .expect("stop_physical_stepper_inner must branch on QueueAccess::LockedInPlace");
+        let locked_open_brace = locked_open_marker + "QueueAccess::LockedInPlace => ".len();
+        let locked_close_brace = find_matching_close_brace(TRIGGER_DOMAIN, locked_open_brace);
+
+        assert!(
+            locked_close_brace < direction_gpio_pos,
+            "the direction GPIO reset must run after the LockedInPlace arm's \
+             actual closing brace, not nested inside it"
+        );
+        assert!(
+            locked_close_brace < step_gpio_pos,
+            "the STEP GPIO reset must run after the LockedInPlace arm's actual \
+             closing brace, not nested inside it"
+        );
+        assert!(
+            direction_gpio_pos < step_gpio_pos,
+            "the direction GPIO reset must run before the STEP GPIO reset, \
+             matching the real code's order"
+        );
     }
 
     #[test]
@@ -699,7 +727,7 @@ mod commissioning_board_contract_tests {
         assert!(
             !fn_body.contains("interrupt::free"),
             "drain_all_populated_slots must never hold a critical section across the \
-             drain loop -- masking belongs only inside detach_consumer/attach_consumer, \
+             drain loop -- masking belongs only inside take_pending_drain/attach_consumer, \
              never across the dequeue loop"
         );
     }
