@@ -68,6 +68,8 @@ pub(crate) const TMC_CONFIG: foci_firmware::config::TmcConfig = foci_firmware::c
     excitation_voltage: 1024,
     bandwidth_hz: 1600.0,
     electrical_model_theta_e_us: 160,
+    high_rate_delay_period_us: 200,
+    high_rate_delay_cycles_per_us: 168,
     current_validation_flux_max_encoder_delta_counts: 4,
     current_validation_torque_max_encoder_delta_counts: 16,
     resistance_max_expected_current_count: 1600,
