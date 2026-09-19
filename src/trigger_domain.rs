@@ -84,8 +84,7 @@ struct TriggerDrainSlot(core::cell::UnsafeCell<Option<PendingStopDrain>>);
 // `STEP_QUEUE_CHANNEL`'s own access discipline in this file.
 unsafe impl Sync for TriggerDrainSlot {}
 
-static TRIGGER_DRAIN_SLOT: TriggerDrainSlot =
-    TriggerDrainSlot(core::cell::UnsafeCell::new(None));
+static TRIGGER_DRAIN_SLOT: TriggerDrainSlot = TriggerDrainSlot(core::cell::UnsafeCell::new(None));
 
 pub(crate) static TRIGGER_DRAIN_WAKE: embassy_sync::signal::Signal<
     embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
