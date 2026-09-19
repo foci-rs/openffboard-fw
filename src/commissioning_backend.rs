@@ -7,19 +7,26 @@ use core::sync::atomic::Ordering::Relaxed;
 
 use embassy_stm32::gpio::Output;
 use foci_firmware::commissioning::backend::{
-    CommissionBackendHooks, SharedCommissioningBackend, shutdown_requested_from,
+    CommissionBackendHooks, SharedCommissioningBackend, StimulusError, shutdown_requested_from,
 };
 use foci_firmware::config::TmcConfig;
+use foci_firmware::context::stepper::{self, StepperEnqueueError};
+use foci_firmware::diagnostic::StepperEventReason;
 use foci_firmware::state::lifecycle::{FAULT_ACTIVE, SHUTDOWN_ACTIVE};
-use foci_firmware::state::tmc::TMC_DISABLE_SIGNAL;
+use foci_firmware::state::tmc::{TMC_DISABLE_SIGNAL, tmc_channel0};
+use foci_klipper::commands::CommandError;
+use foci_klipper::scheduler::SchedulerEventKind;
+use foci_klipper::stepper::StepMove;
 use rtic_monotonics::Monotonic;
 use rtic_monotonics::fugit::ExtU64;
 
 use crate::app::Mono;
 use crate::app_types::TmcSpiDevice;
 use crate::board_config::TMC_CONFIG;
+use crate::firmware_ctx::OpenFfboardStepperBoard;
 use crate::helpers::lifecycle::read_tim5;
 use crate::tmc_control::effects::lease_expired;
+use crate::trigger_domain::with_trigger_domain;
 
 pub(crate) struct OpenFFBoardHooks;
 
@@ -82,6 +89,140 @@ impl CommissionBackendHooks for OpenFFBoardHooks {
         record: foci_firmware::ankyra::velocity_sweep_encoding::VelocitySweepCanonicalRecord,
     ) {
         crate::usb_trace::request_velocity_sweep_evidence(channel, record);
+    }
+
+    fn commission_step_timer_hz() -> u32 {
+        crate::state::stepper::STEP_TIMER_HZ
+    }
+
+    fn commission_step_clock_now() -> u32 {
+        read_tim5()
+    }
+
+    fn commission_stimulus_queue_free(channel: u8) -> usize {
+        if channel != 0 {
+            return 0;
+        }
+        // `StepQueueChannel::len` is a lock-free atomic load, sound from
+        // any priority whether or not the consumer is attached. The wrapped
+        // `heapless::spsc::Queue<_, N>` holds at most `N - 1` items.
+        (crate::state::stepper::STEP_QUEUE_DEPTH - 1)
+            .saturating_sub(crate::state::stepper::STEP_QUEUE_CHANNEL.len())
+    }
+
+    fn commission_stimulus_trigger_blocked(channel: u8) -> bool {
+        if channel != 0 {
+            return true;
+        }
+        with_trigger_domain(|td| {
+            td.state()
+                .stepper_stop
+                .get(channel as usize)
+                .is_none_or(|stop| stop.blocked_by_trigger)
+        })
+    }
+
+    fn commission_stimulus_set_direction(channel: u8, forward: bool) {
+        if channel != 0 {
+            return;
+        }
+        with_trigger_domain(|_| {
+            // SAFETY: the trigger-domain lock serialises this against the P2
+            // command handlers that otherwise own the P2 stepper; the host
+            // sends no stepper commands while commissioning owns the channel.
+            if let Some(stepper) = unsafe { crate::state::stepper::p2_stepper(channel) } {
+                stepper.set_next_step_dir(forward);
+            }
+        });
+    }
+
+    fn commission_stimulus_reset_step_clock(channel: u8, clock: u32) -> Result<(), StimulusError> {
+        if channel != 0 {
+            return Err(StimulusError::InvalidChannel);
+        }
+        with_trigger_domain(|td| {
+            let mut board = OpenFfboardStepperBoard;
+            stepper::reset_step_clock(td.state_mut(), &mut board, channel, clock).map_err(
+                |error| match error {
+                    CommandError::StepperActive => StimulusError::TimerActive,
+                    _ => StimulusError::InvalidChannel,
+                },
+            )?;
+            if td.state().stepper_stop[channel as usize].need_reset {
+                return Err(StimulusError::TriggerBlocked);
+            }
+            Ok(())
+        })
+    }
+
+    fn commission_stimulus_queue_segment(
+        channel: u8,
+        segment: StepMove,
+    ) -> Result<(), StimulusError> {
+        if channel != 0 {
+            return Err(StimulusError::InvalidChannel);
+        }
+        with_trigger_domain(|td| {
+            let mut board = OpenFfboardStepperBoard;
+            let was_len = crate::state::stepper::STEP_QUEUE_CHANNEL.len();
+            match stepper::queue_step_move(td.state_mut(), &mut board, channel, segment) {
+                Ok(()) => {
+                    if td.state().stepper_stop[channel as usize].need_reset {
+                        Err(StimulusError::NeedsReset)
+                    } else {
+                        Ok(())
+                    }
+                }
+                Err(StepperEnqueueError::QueueFull { queue_len, .. }) => {
+                    Err(StimulusError::QueueRefused {
+                        queue_len: queue_len as u32,
+                    })
+                }
+                Err(_) => Err(StimulusError::QueueRefused {
+                    queue_len: was_len as u32,
+                }),
+            }
+        })
+    }
+
+    fn commission_stimulus_arm(channel: u8) -> Result<(), StimulusError> {
+        if channel != 0 {
+            return Err(StimulusError::InvalidChannel);
+        }
+        let tmc_state = tmc_channel0();
+        if !tmc_state.enable_pin_asserted.load(Relaxed) {
+            return Err(StimulusError::NotEnergized);
+        }
+        with_trigger_domain(|td| {
+            // Captures whatever `motor_armed` actually holds -- true or
+            // false -- once per stimulus session; a channel a prior
+            // commissioning run left armed (e.g. an ArmPreservePosition
+            // post-action) is not distinguishable here from a channel this
+            // hook itself just armed, so the session-scoped capture guard
+            // lives on `TmcChannelState`, not a bare `motor_armed` read.
+            tmc_state.stimulus_capture_motor_armed_once();
+            tmc_state.motor_armed.store(true, Relaxed);
+            let mut board = OpenFfboardStepperBoard;
+            stepper::arm_check(td.state_mut(), &mut board, channel);
+        });
+        Ok(())
+    }
+
+    fn commission_stimulus_stop(channel: u8) {
+        if channel != 0 {
+            return;
+        }
+        let tmc_state = tmc_channel0();
+        let idx = channel as usize;
+        with_trigger_domain(|td| {
+            td.state_mut()
+                .scheduler
+                .cancel(|kind| matches!(kind, SchedulerEventKind::Stepper(i) if *i == idx));
+            crate::trigger_domain::stop_physical_stepper_masked(idx, StepperEventReason::P1Stop);
+            td.set_timer_active(idx, false);
+            td.state_mut().stepper_stop[idx].need_reset = true;
+            tmc_state.stimulus_restore_motor_armed();
+        });
     }
 }
 
