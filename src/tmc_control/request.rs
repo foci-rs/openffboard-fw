@@ -106,6 +106,10 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
         crate::board_config::TMC_CONFIG.pwm_freq_hz()
     }
 
+    fn stimulus_step_timer_hz(&self) -> u32 {
+        crate::state::stepper::STEP_TIMER_HZ
+    }
+
     fn velocity_limit_evidence_capability(&self) -> u32 {
         crate::ankyra::constants::VELOCITY_LIMIT_EVIDENCE_CAPABILITY
     }
