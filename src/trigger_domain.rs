@@ -88,10 +88,6 @@ pub(crate) static TRIGGER_DRAIN_WAKE: embassy_sync::signal::Signal<
     (),
 > = embassy_sync::signal::Signal::new();
 
-/// `#[allow(dead_code)]`: unused until the masked stop path is wired to
-/// call it. Remove this attribute in that step, in the same edit that
-/// adds the call.
-#[allow(dead_code)]
 fn store_pending_drain(drain: PendingStopDrain) {
     // SAFETY: caller holds `cortex_m::interrupt::free` already -- see
     // `stop_physical_stepper_inner`'s `LockedInPlace` arm, the only caller.
@@ -411,9 +407,12 @@ fn stop_physical_stepper_inner(
             .expect("OpenFFBoard channel 0 exists")
             .reset();
     }
-    // 3. Drain queue -- access mode depends on caller context.
+    // 3. Drain queue -- access mode depends on caller context. The
+    // LockedInPlace arm hands the detached consumer to trigger_drain_task
+    // instead of draining here.
     let mut drained_segments = 0u32;
     let mut drained_steps = 0u32;
+    let mut deferred_record = false;
     match access {
         QueueAccess::Unmasked => {
             let mut consumer = detach_consumer();
@@ -435,34 +434,31 @@ fn stop_physical_stepper_inner(
             // detach/no-op fallback keeps this branch total.
         }
         QueueAccess::LockedInPlace => {
-            let result = with_consumer_locked(|consumer| {
-                let mut segments = 0u32;
-                let mut steps = 0u32;
-                while let Some(m) = consumer.dequeue() {
-                    segments = segments.saturating_add(1);
-                    steps = steps.saturating_add(u32::from(m.count));
-                }
-                (segments, steps)
-            });
-            if let Some((segments, steps)) = result {
-                drained_segments = segments;
-                drained_steps = steps;
+            if let Some(consumer) = detach_consumer() {
+                store_pending_drain(PendingStopDrain {
+                    consumer,
+                    reason,
+                    remaining_events: u32::from(remaining_events),
+                    queue_len,
+                });
+                deferred_record = true;
             }
-            // else: None means a P1 unmasked drain currently holds the
-            // consumer detached. Per the spec's recovery rule: report zero
-            // additional drained work here and continue with the rest of
-            // this sequence (steps 4-5 below) unconditionally -- P1's own
-            // in-flight drain already owns draining the queue.
+            // else: a P1 unmasked drain, or trigger_drain_task itself,
+            // currently holds the consumer detached -- fall through and
+            // record zero additional drained work below, matching the
+            // pre-existing recovery-rule behavior for this case.
         }
     }
-    crate::state::stepper_diag::record_physical_stop(
-        stepper_idx as u8,
-        reason,
-        u32::from(remaining_events),
-        queue_len,
-        drained_segments,
-        drained_steps,
-    );
+    if !deferred_record {
+        crate::state::stepper_diag::record_physical_stop(
+            stepper_idx as u8,
+            reason,
+            u32::from(remaining_events),
+            queue_len,
+            drained_segments,
+            drained_steps,
+        );
+    }
     // 4. Reset direction GPIO (PA0) to known low state
     let gpio_a = embassy_stm32::pac::GPIOA;
     gpio_a
