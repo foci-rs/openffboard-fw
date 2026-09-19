@@ -56,6 +56,8 @@ pub fn foci_tune(
     negative_position_headroom_mrev: u32,
     positive_position_headroom_mrev: u32,
     max_duration_ms: u16,
+    homing_speed_mrev_s: u32,
+    max_accel_mrev_s2: u32,
 ) {
     let channel = match ctx.state().stepper_channel(oid) {
         Some(channel) => channel,
@@ -86,6 +88,8 @@ pub fn foci_tune(
         negative_position_headroom_mrev,
         positive_position_headroom_mrev,
         max_duration_ms,
+        homing_speed_mrev_s,
+        max_accel_mrev_s2,
     });
 }
 
