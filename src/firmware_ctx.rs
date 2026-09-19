@@ -170,9 +170,12 @@ impl StepperResetBoard for OpenFfboardStepperBoard {
             }
         });
         if drained.is_none() {
-            // A concurrent P1 unmasked drain holds the consumer detached;
-            // it already owns draining this queue. Report zero additional
-            // drained work for this reset -- see the spec's recovery rule.
+            // Either a concurrent P1 unmasked drain holds the consumer
+            // detached, or a pending trigger-stop hand-off for this
+            // channel is sitting in TRIGGER_DRAIN_SLOT awaiting
+            // trigger_drain_task (both P2). Either way that drain already
+            // owns draining this queue. Report zero additional drained
+            // work for this reset -- see the spec's recovery rule.
         }
         Ok(stats)
     }

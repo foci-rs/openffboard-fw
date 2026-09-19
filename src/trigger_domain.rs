@@ -45,12 +45,16 @@ fn attach_consumer(consumer: Consumer<'static, StepMove>) {
 
 /// Borrow `STEP_QUEUE_CHANNEL`'s consumer in place, under a short
 /// independent critical section, for a caller already inside an outer
-/// mask that stays in place here (reset, shutdown, trigger-dispatch
-/// stop). Returns `None` if a concurrent unmasked drain
+/// mask that stays in place here (the stepper-reset command path is the
+/// only remaining caller). Returns `None` if a concurrent unmasked drain
 /// (`stop_physical_stepper_unmasked`) currently holds the consumer
-/// detached -- callers must perform their non-queue side effects and
-/// report zero *additional* drained work in that case: the in-flight
-/// unmasked drain already owns draining this queue.
+/// detached, or if a pending hand-off from `stop_physical_stepper_masked`
+/// is sitting in `TRIGGER_DRAIN_SLOT`, detached but not yet taken by
+/// `trigger_drain_task` (reachable since this function's caller and
+/// `trigger_drain_task` both run at P2) -- callers must perform their
+/// non-queue side effects and report zero *additional* drained work in
+/// either case: whichever in-flight drain currently owns the consumer
+/// already owns draining this queue.
 pub(crate) fn with_consumer_locked<R>(
     f: impl FnOnce(&mut Consumer<'static, StepMove>) -> R,
 ) -> Option<R> {
@@ -366,7 +370,9 @@ enum QueueAccess {
     /// enabled, reattach.
     Unmasked,
     /// Trigger-dispatch/shutdown: caller already holds an outer mask this
-    /// ticket is not unmasking; drain in place under it.
+    /// call is not unmasking. Detaches the consumer and hands it off to
+    /// `trigger_drain_task` via `store_pending_drain` instead of draining
+    /// it here.
     LockedInPlace,
 }
 
@@ -492,10 +498,10 @@ pub(crate) fn stop_physical_stepper_unmasked(stepper_idx: usize, reason: Stepper
 }
 
 /// Stop a physical stepper from inside an active `with_trigger_domain`
-/// closure (trigger-dispatch, shutdown). The queue drain stays inline
-/// under the mask the caller already holds -- moving it outside that
-/// mask requires restructuring the shared-crate call contract this
-/// closure runs inside, which is a separate, larger change.
+/// closure (trigger-dispatch, shutdown). Detaches the consumer under the
+/// mask the caller already holds and hands it off to `trigger_drain_task`
+/// via `store_pending_drain`; the queue drain itself runs later, outside
+/// this mask, with interrupts enabled.
 ///
 /// This is the only correct caller. Calling this without an active mask
 /// already held is a bug (not compiler-prevented -- enforced by single
