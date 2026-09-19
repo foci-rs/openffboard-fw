@@ -66,6 +66,74 @@ pub(crate) fn with_consumer_locked<R>(
 /// OpenFFBoard has one physical stepper (index 0).
 pub(crate) const PHYSICAL_STEPPER_INDICES: &[usize] = &[0];
 
+struct PendingStopDrain {
+    consumer: Consumer<'static, StepMove>,
+    reason: StepperEventReason,
+    remaining_events: u32,
+    queue_len: u16,
+}
+
+struct TriggerDrainSlot(core::cell::UnsafeCell<Option<PendingStopDrain>>);
+
+// SAFETY: every access goes through `cortex_m::interrupt::free` (see
+// `store_pending_drain` and `take_pending_drain` below), mirroring
+// `STEP_QUEUE_CHANNEL`'s own access discipline in this file.
+unsafe impl Sync for TriggerDrainSlot {}
+
+static TRIGGER_DRAIN_SLOT: TriggerDrainSlot =
+    TriggerDrainSlot(core::cell::UnsafeCell::new(None));
+
+pub(crate) static TRIGGER_DRAIN_WAKE: embassy_sync::signal::Signal<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    (),
+> = embassy_sync::signal::Signal::new();
+
+/// `#[allow(dead_code)]`: unused until the masked stop path is wired to
+/// call it. Remove this attribute in that step, in the same edit that
+/// adds the call.
+#[allow(dead_code)]
+fn store_pending_drain(drain: PendingStopDrain) {
+    // SAFETY: caller holds `cortex_m::interrupt::free` already -- see
+    // `stop_physical_stepper_inner`'s `LockedInPlace` arm, the only caller.
+    unsafe {
+        *TRIGGER_DRAIN_SLOT.0.get() = Some(drain);
+    }
+    TRIGGER_DRAIN_WAKE.signal(());
+}
+
+fn take_pending_drain() -> Option<PendingStopDrain> {
+    cortex_m::interrupt::free(|_| {
+        // SAFETY: see `store_pending_drain`.
+        unsafe { (*TRIGGER_DRAIN_SLOT.0.get()).take() }
+    })
+}
+
+/// Drain and reattach the pending stop, if any. Returns `true` if one was
+/// found (so the caller can retry-until-stable). Called only from
+/// `trigger_drain_task` (P2), never from an ISR.
+pub(crate) fn drain_all_populated_slots() -> bool {
+    let Some(pending) = take_pending_drain() else {
+        return false;
+    };
+    let mut consumer = pending.consumer;
+    let mut drained_segments = 0u32;
+    let mut drained_steps = 0u32;
+    while let Some(m) = consumer.dequeue() {
+        drained_segments = drained_segments.saturating_add(1);
+        drained_steps = drained_steps.saturating_add(u32::from(m.count));
+    }
+    crate::state::stepper_diag::record_physical_stop(
+        0,
+        pending.reason,
+        pending.remaining_events,
+        pending.queue_len,
+        drained_segments,
+        drained_steps,
+    );
+    attach_consumer(consumer);
+    true
+}
+
 fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
     foci_firmware::state::tmc::tmc_channel0()
 }

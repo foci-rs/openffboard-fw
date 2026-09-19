@@ -321,6 +321,7 @@ mod app {
         stats::spawn().expect("stats task must spawn exactly once");
         watchdog::spawn().expect("watchdog task must spawn exactly once");
         analog_sampling::spawn().expect("analog_sampling task must spawn exactly once");
+        trigger_drain_task::spawn().expect("trigger drain worker must spawn exactly once");
 
         defmt::info!("FOCI OpenFFBoard initialized");
 
@@ -1823,6 +1824,27 @@ mod app {
     #[task(priority = 2)]
     async fn stepper_diag_task(_ctx: stepper_diag_task::Context) {
         crate::heartbeat::emit_stepper_diagnostics(&STEPPER_DIAG_PENDING);
+    }
+
+    /// Upper bound on `drain_all_populated_slots` retry passes per wake.
+    /// Not a correctness requirement -- see the spec's Review Log for why
+    /// capping this cannot reintroduce a lost-wakeup.
+    const MAX_DRAIN_RETRY_PASSES: u8 = 4;
+
+    /// P2 software task: drain the step queue detached by a masked trigger
+    /// stop (trigger dispatch, shutdown, reset). Runs with interrupts
+    /// enabled -- see
+    /// docs/specs/2026-09-17-foci-16-trigger-drain-outside-critical-section.md.
+    #[task(priority = 2)]
+    async fn trigger_drain_task(_ctx: trigger_drain_task::Context) {
+        loop {
+            crate::trigger_domain::TRIGGER_DRAIN_WAKE.wait().await;
+            for _ in 0..MAX_DRAIN_RETRY_PASSES {
+                if !crate::trigger_domain::drain_all_populated_slots() {
+                    break;
+                }
+            }
+        }
     }
 
     /// Periodic stats heartbeat sent to Klipper.
