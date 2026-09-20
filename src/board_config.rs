@@ -49,9 +49,6 @@ pub(crate) fn enable_pin_channel(pin: u32) -> Option<u8> {
 /// symmetric DSADC MDEC derived from the PWM period.
 /// The 1024-count commissioning excitation is kept unchanged for this diagnostic test
 /// while staying within the ADC setup phase's conservative voltage clamp.
-///
-/// Current-loop P uses a physical-bandwidth formula and the 1600 Hz OpenFFBoard baseline;
-/// live validation found bandwidth alone is not the holding-noise control lever.
 const OPENFFBOARD_V13_PWM_MAXCNT: u16 = 3999;
 const OPENFFBOARD_V13_DSADC_MDEC: u16 =
     foci_firmware::config::dsadc_mdec_from_pwm_maxcnt(OPENFFBOARD_V13_PWM_MAXCNT);
@@ -66,7 +63,6 @@ pub(crate) const TMC_CONFIG: foci_firmware::config::TmcConfig = foci_firmware::c
     // OpenFFBoard v1.3 ACS724 routing: UX=I0, WY=I1, V=I2.
     adc_i_select: 0x1800_0100,
     excitation_voltage: 1024,
-    bandwidth_hz: 1600.0,
     electrical_model_theta_e_us: 160,
     high_rate_delay_period_us: 200,
     high_rate_delay_cycles_per_us: 168,
