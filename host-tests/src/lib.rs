@@ -647,11 +647,11 @@ mod commissioning_board_contract_tests {
             let before_ok = from_match_onward[..pos]
                 .chars()
                 .next_back()
-                .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
             let after_ok = from_match_onward["return".len() + pos..]
                 .chars()
                 .next()
-                .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+                .is_none_or(|c| !c.is_alphanumeric() && c != '_');
             before_ok && after_ok
         });
         assert!(
