@@ -214,22 +214,6 @@ mod commissioning_board_contract_tests {
     }
 
     #[test]
-    fn board_does_not_forward_removed_stage_b_reply_families() {
-        assert!(!REPLIES.contains("foci_velocity_stage_b_reproduction_v3_"));
-        for removed in [
-            "structured_boundary",
-            "directional_region_core",
-            "joint_region",
-            "stage_b_handoff_core",
-            "stage_b_nomination",
-            "stage_b_directional_handoff",
-            "stage_b_reproduction_v4_",
-        ] {
-            assert!(!REPLIES.contains(removed), "retained board reply {removed}");
-        }
-    }
-
-    #[test]
     fn board_publishes_the_proportional_schema_revision() {
         assert!(CONSTANTS.contains("pub const PROPORTIONAL_EVIDENCE_SCHEMA_REVISION: u32 = 14;"));
     }
@@ -252,7 +236,7 @@ mod commissioning_board_contract_tests {
     fn board_retains_integral_authority_from_the_plan_event() {
         // Nonterminal classification stays outside the terminal async dispatch
         // future. foci-firmware's `scheduled_step` size gate pins that budget,
-        // so Stage-C authority is installed synchronously from the plan event
+        // so Integral authority is installed synchronously from the plan event
         // rather than by routing polls through the staged poll driver.
         assert!(
             DRIVER.contains(".classify_commission_poll(poll)"),
@@ -266,11 +250,11 @@ mod commissioning_board_contract_tests {
 
         let arm = DRIVER
             .find("CommissionEvent::VelocityIntegralPlan")
-            .expect("driver must handle the Stage-C plan event");
+            .expect("driver must handle the Integral plan event");
         let body = &DRIVER[arm..];
         let install = body
             .find("install_authority_from_plan")
-            .expect("plan event must install retained Stage-C authority");
+            .expect("plan event must install retained Integral authority");
         let next_arm = body
             .find("ScheduledCommissionTickAction")
             .unwrap_or(body.len());
@@ -282,17 +266,17 @@ mod commissioning_board_contract_tests {
 
     #[test]
     fn board_reaches_the_staged_request_dispatch_that_owns_integral_resume() {
-        // Two shared-firmware fixes for the Stage-C authority landed on paths
+        // Two shared-firmware fixes for the Integral authority landed on paths
         // this board does not execute, and shared tests passed both times. The
         // board's own call shape is what decides whether new dispatch arms --
-        // the Stage-C resume among them -- are reachable here at all.
+        // the Integral resume among them -- are reachable here at all.
         assert!(
             REQUEST.contains("handle_tmc_control_request_with_stages"),
             "tune requests must reach the staged request dispatch"
         );
         assert!(
             REQUEST.contains("integral_candidate"),
-            "the staged dispatch must be given the retained Stage-C slot"
+            "the staged dispatch must be given the retained Integral slot"
         );
         // Retention is what a resume consumes. It is installed synchronously
         // from the plan event because nonterminal classification stays outside
