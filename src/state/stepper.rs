@@ -28,8 +28,7 @@ pub(crate) static PHYSICAL_PULSE_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Last mapper phase published after STEP returned low.
 pub(crate) static MAPPER_PHASE: AtomicI32 = AtomicI32::new(0);
 
-/// Depth of each hardware step/dir move queue.
-pub(crate) const STEP_QUEUE_DEPTH: usize = 1024;
+pub(crate) use foci_klipper::step_queue::STEP_QUEUE_DEPTH;
 
 /// Number of hardware stepper runtime channels on OpenFFBoard.
 pub(crate) const STEPPER_CHANNEL_COUNT: usize = 1;
