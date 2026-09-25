@@ -59,7 +59,6 @@ mod app {
     use crate::state::tmc::*;
     use crate::trigger_domain::{
         TRIGGER_DOMAIN, TRIGGER_TIMER_MIN_LEAD_TICKS, TriggerDomain, with_trigger_domain,
-        with_trigger_domain_site,
     };
     use foci_firmware::commissioning::outer::velocity::integral_reproduction::IntegralRetentionSlots;
     use foci_firmware::context::stepper::{
@@ -1182,19 +1181,10 @@ mod app {
     /// On OpenFFBoard TIM5 runs at 84 MHz, so this is 420 timer ticks.
     const TIM5_SCHEDULER_DEFER_TICKS: u32 = CLOCK_FREQ / 200_000;
 
-    #[inline(always)]
-    fn add_scheduler_cycles(accumulator: &mut u32, start: u32) {
-        *accumulator = (*accumulator)
-            .wrapping_add(cortex_m::peripheral::DWT::cycle_count().wrapping_sub(start));
-    }
-
     fn record_schedule_result(result: foci_klipper::scheduler::ScheduleResult) -> bool {
         match result {
             foci_klipper::scheduler::ScheduleResult::Inserted { new_earliest } => new_earliest,
-            foci_klipper::scheduler::ScheduleResult::Full => {
-                crate::state::stepper_diag::record_scheduler_full();
-                false
-            }
+            foci_klipper::scheduler::ScheduleResult::Full => false,
         }
     }
 
@@ -1208,28 +1198,18 @@ mod app {
     fn insert_trigger_event(
         td: &mut TriggerDomain,
         event: foci_klipper::scheduler::SchedulerEvent,
-        scheduler_cycles: &mut u32,
     ) -> bool {
-        let start = cortex_m::peripheral::DWT::cycle_count();
-        let result = td.scheduler.try_schedule(event);
-        add_scheduler_cycles(scheduler_cycles, start);
-        record_schedule_result(result)
+        record_schedule_result(td.scheduler.try_schedule(event))
     }
 
     fn arm_stepper_timer_event(
         td: &mut TriggerDomain,
         stepper_idx: usize,
         clock: u32,
-        scheduler_cycles: &mut u32,
         slot: Option<foci_klipper::scheduler::ScheduledSlot>,
     ) {
         if let Some(slot) = slot {
-            let start = cortex_m::peripheral::DWT::cycle_count();
-            let result = td.scheduler.requeue_slot(slot, clock);
-            add_scheduler_cycles(scheduler_cycles, start);
-            if matches!(result, foci_klipper::scheduler::ScheduleResult::Full) {
-                crate::state::stepper_diag::record_scheduler_full();
-            }
+            td.scheduler.requeue_slot(slot, clock);
         } else {
             insert_trigger_event(
                 td,
@@ -1237,7 +1217,6 @@ mod app {
                     wake_clock: clock,
                     kind: foci_klipper::scheduler::SchedulerEventKind::Stepper(stepper_idx),
                 },
-                scheduler_cycles,
             );
         }
     }
@@ -1285,7 +1264,6 @@ mod app {
     fn process_stepper_timer(
         td: &mut TriggerDomain,
         stepper_idx: usize,
-        scheduler_cycles: &mut u32,
         slot: Option<foci_klipper::scheduler::ScheduledSlot>,
     ) {
         use core::sync::atomic::Ordering::Relaxed;
@@ -1383,13 +1361,7 @@ mod app {
                             scheduled,
                             compare,
                         );
-                        arm_stepper_timer_event(
-                            td,
-                            0,
-                            compare,
-                            scheduler_cycles,
-                            stepper_slot.take(),
-                        );
+                        arm_stepper_timer_event(td, 0, compare, stepper_slot.take());
                         return;
                     }
                     Err(_) => {
@@ -1420,7 +1392,6 @@ mod app {
                     td,
                     0,
                     read_tim5().wrapping_add(CLOCK_FREQ / 1000),
-                    scheduler_cycles,
                     stepper_slot.take(),
                 );
                 td.set_timer_active(0, true);
@@ -1453,7 +1424,7 @@ mod app {
                 StepEventResult::ScheduleNext { clock, .. } => {
                     #[cfg(feature = "trace")]
                     crate::usb_trace::record_step_timing(clock, now);
-                    arm_stepper_timer_event(td, 0, clock, scheduler_cycles, stepper_slot.take());
+                    arm_stepper_timer_event(td, 0, clock, stepper_slot.take());
                     return;
                 }
                 StepEventResult::NeedMove { .. } => {
@@ -1469,7 +1440,6 @@ mod app {
         kind: foci_klipper::scheduler::SchedulerEventKind,
         wake_clock: u32,
         need_report: &mut bool,
-        scheduler_cycles: &mut u32,
         stepper_slot: Option<foci_klipper::scheduler::ScheduledSlot>,
     ) {
         use core::sync::atomic::Ordering::Relaxed;
@@ -1477,7 +1447,7 @@ mod app {
 
         match kind {
             SchedulerEventKind::Stepper(stepper_idx) => {
-                process_stepper_timer(td, stepper_idx, scheduler_cycles, stepper_slot);
+                process_stepper_timer(td, stepper_idx, stepper_slot);
             }
             SchedulerEventKind::EndstopSample(endstop_idx) => {
                 use foci_klipper::endstop::{EndstopPhase, EndstopSampleResult};
@@ -1504,16 +1474,7 @@ mod app {
                     EndstopSampleResult::EnterOversamplingNow => {
                         match td.endstops[endstop_idx].oversample(read_pin(), wake_clock) {
                             EndstopSampleResult::Triggered { trsync_oid, reason } => {
-                                {
-                                    let trigger_start = cortex_m::peripheral::DWT::cycle_count();
-                                    td.trigger(trsync_oid, reason, read_tim5());
-                                    let trigger_cycles = cortex_m::peripheral::DWT::cycle_count()
-                                        .wrapping_sub(trigger_start);
-                                    crate::state::stepper_diag::record_critical_section(
-                                        crate::state::stepper_diag::PERF_SITE_TRIGGER_STOP,
-                                        trigger_cycles,
-                                    );
-                                }
+                                td.trigger(trsync_oid, reason, read_tim5());
                                 *need_report = true;
                             }
                             EndstopSampleResult::Reschedule { next_clock } => {
@@ -1523,23 +1484,13 @@ mod app {
                                         wake_clock: next_clock,
                                         kind: SchedulerEventKind::EndstopSample(endstop_idx),
                                     },
-                                    scheduler_cycles,
                                 );
                             }
                             _ => {}
                         }
                     }
                     EndstopSampleResult::Triggered { trsync_oid, reason } => {
-                        {
-                            let trigger_start = cortex_m::peripheral::DWT::cycle_count();
-                            td.trigger(trsync_oid, reason, read_tim5());
-                            let trigger_cycles = cortex_m::peripheral::DWT::cycle_count()
-                                .wrapping_sub(trigger_start);
-                            crate::state::stepper_diag::record_critical_section(
-                                crate::state::stepper_diag::PERF_SITE_TRIGGER_STOP,
-                                trigger_cycles,
-                            );
-                        }
+                        td.trigger(trsync_oid, reason, read_tim5());
                         *need_report = true;
                     }
                     EndstopSampleResult::Reschedule { next_clock } => {
@@ -1549,7 +1500,6 @@ mod app {
                                 wake_clock: next_clock,
                                 kind: SchedulerEventKind::EndstopSample(endstop_idx),
                             },
-                            scheduler_cycles,
                         );
                     }
                     EndstopSampleResult::Inactive => {}
@@ -1563,16 +1513,7 @@ mod app {
                     .map(|(&oid, _)| oid);
                 if let Some(oid) = oid {
                     let expire_reason = td.trsync[trsync_idx].expire_reason();
-                    {
-                        let trigger_start = cortex_m::peripheral::DWT::cycle_count();
-                        td.trigger(oid, expire_reason, read_tim5());
-                        let trigger_cycles =
-                            cortex_m::peripheral::DWT::cycle_count().wrapping_sub(trigger_start);
-                        crate::state::stepper_diag::record_critical_section(
-                            crate::state::stepper_diag::PERF_SITE_TRIGGER_STOP,
-                            trigger_cycles,
-                        );
-                    }
+                    td.trigger(oid, expire_reason, read_tim5());
                     *need_report = true;
                 }
             }
@@ -1600,7 +1541,6 @@ mod app {
                                 wake_clock: next_report,
                                 kind: SchedulerEventKind::TrSyncReport(trsync_idx),
                             },
-                            scheduler_cycles,
                         );
                     }
                 }
@@ -1617,35 +1557,20 @@ mod app {
         crate::usb_trace::TRACE_TIMING
             .missed_or_deferred_steps
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        crate::state::stepper_diag::record_tim5_defer();
         td.arm_timer_at(read_tim5().wrapping_add(TIM5_SCHEDULER_DEFER_TICKS));
     }
 
-    fn dispatch_tim5_scheduler(
-        td: &mut TriggerDomain,
-        need_report: &mut bool,
-        scheduler_cycles: &mut u32,
-    ) -> u32 {
+    fn dispatch_tim5_scheduler(td: &mut TriggerDomain, need_report: &mut bool) {
         let dispatch_start = read_tim5();
-        let mut processed_events = 0;
         loop {
             let now = read_tim5();
-            let start = cortex_m::peripheral::DWT::cycle_count();
             let slot = td.scheduler.pop_due_slot(now);
-            add_scheduler_cycles(scheduler_cycles, start);
             if let Some(slot) = slot {
                 let event = slot.event();
                 let stepper_slot = match event.kind {
                     foci_klipper::scheduler::SchedulerEventKind::Stepper(_) => Some(slot),
                     _ => None,
                 };
-                // Record before the callback so dispatch work is not folded
-                // into scheduler-pop lateness.
-                let lateness = now.wrapping_sub(event.wake_clock) as i32;
-                if lateness > 0 {
-                    crate::state::stepper_diag::record_scheduler_pop_lateness(lateness as u32);
-                }
-                processed_events += 1;
                 if let Some((channel, StepDeadlineStatus::Fatal { .. })) =
                     crate::state::stepper::scheduler_step_deadline_status(
                         event.kind,
@@ -1667,30 +1592,21 @@ mod app {
                     td.disarm_timer();
                     td.set_timer_active(channel as usize, false);
                     TMC_DISABLE_SIGNAL.signal(());
-                    return processed_events;
+                    return;
                 }
-                process_trigger_timer(
-                    td,
-                    event.kind,
-                    event.wake_clock,
-                    need_report,
-                    scheduler_cycles,
-                    stepper_slot,
-                );
+                process_trigger_timer(td, event.kind, event.wake_clock, need_report, stepper_slot);
                 let elapsed = read_tim5().wrapping_sub(dispatch_start) as i32;
                 if elapsed >= TIM5_SCHEDULER_REPEAT_TICKS as i32 {
                     defer_tim5_scheduler(td);
-                    return processed_events;
+                    return;
                 }
                 continue;
             }
 
-            let start = cortex_m::peripheral::DWT::cycle_count();
             let next_clock = td.scheduler.earliest_deadline();
-            add_scheduler_cycles(scheduler_cycles, start);
             let Some(next_clock) = next_clock else {
                 td.disarm_timer();
-                return processed_events;
+                return;
             };
             let now = read_tim5();
             let compare = foci_klipper::scheduler::timer_arm_clock(
@@ -1699,7 +1615,7 @@ mod app {
                 TRIGGER_TIMER_MIN_LEAD_TICKS,
             );
             td.arm_timer_at(compare);
-            return processed_events;
+            return;
         }
     }
 
@@ -1719,43 +1635,15 @@ mod app {
         if !cc1_pending && !cc2_pending {
             return;
         }
-        let entry_now = tim5.cnt().read();
-        let mut entry_lateness = 0i32;
-        if cc1_pending {
-            let ccr = tim5.ccr(0).read();
-            let delta = entry_now.wrapping_sub(ccr) as i32;
-            if delta > entry_lateness {
-                entry_lateness = delta;
-            }
-        }
-        if cc2_pending {
-            let ccr = tim5.ccr(1).read();
-            let delta = entry_now.wrapping_sub(ccr) as i32;
-            if delta > entry_lateness {
-                entry_lateness = delta;
-            }
-        }
-        if entry_lateness > 0 {
-            crate::state::stepper_diag::record_tim5_entry_latency(entry_lateness as u32);
-        }
-        let irq_start = cortex_m::peripheral::DWT::cycle_count();
         tim5.sr().modify(|w| {
             w.set_ccif(0, false);
             w.set_ccif(1, false);
         });
 
         let mut need_report = false;
-        let mut dispatch_cycles = 0;
-        let mut processed_events = 0;
-        let mut scheduler_cycles = 0;
-        with_trigger_domain_site(crate::state::stepper_diag::PERF_SITE_TIM5, |td| {
-            let dispatch_start = cortex_m::peripheral::DWT::cycle_count();
-            processed_events = dispatch_tim5_scheduler(td, &mut need_report, &mut scheduler_cycles);
-            dispatch_cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(dispatch_start);
+        with_trigger_domain(|td| {
+            dispatch_tim5_scheduler(td, &mut need_report);
         });
-        let irq_cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(irq_start);
-        crate::state::stepper_diag::record_tim5_irq(irq_cycles, dispatch_cycles, processed_events);
-        crate::state::stepper_diag::record_scheduler_cycles(scheduler_cycles, processed_events);
         if need_report {
             REPORT_PENDING.store(true, Relaxed);
             report_task::spawn().ok();

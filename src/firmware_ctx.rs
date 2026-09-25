@@ -36,7 +36,7 @@ use crate::helpers::trsync::{gpio_configure_input, gpio_read_pin};
 use crate::state::stepper::{isr_stepper, p2_stepper};
 use crate::trigger_domain::{
     OpenFfboardDispatchBoard, PHYSICAL_STEPPER_INDICES, disarm_timer, reprogram_timer,
-    set_timer_active, with_trigger_domain, with_trigger_domain_site,
+    set_timer_active, with_trigger_domain,
 };
 
 fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
@@ -46,10 +46,7 @@ fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
 fn record_schedule_result(result: ScheduleResult) -> bool {
     match result {
         ScheduleResult::Inserted { new_earliest } => new_earliest,
-        ScheduleResult::Full => {
-            crate::state::stepper_diag::record_scheduler_full();
-            false
-        }
+        ScheduleResult::Full => false,
     }
 }
 
@@ -279,7 +276,7 @@ pub(crate) fn enter_shutdown(state: &mut State) -> bool {
 
     let entered = foci_firmware::helpers::lifecycle::enter_shutdown(state);
     if entered {
-        with_trigger_domain_site(crate::state::stepper_diag::PERF_SITE_SHUTDOWN, |td| {
+        with_trigger_domain(|td| {
             let mut board = OpenFfboardTrsyncBoard;
             trsync::shutdown_quiesce(td.state_mut(), &mut board);
         });
@@ -403,7 +400,7 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
             )));
         }
 
-        with_trigger_domain_site(crate::state::stepper_diag::PERF_SITE_QUEUE_STEP, |td| {
+        with_trigger_domain(|td| {
             let mut board = OpenFfboardStepperBoard;
             stepper::queue_step_move(td.state_mut(), &mut board, channel, move_)
         })
@@ -414,7 +411,7 @@ impl<'a> StepperHost for FirmwareCtx<'a> {
             return Err(CommandError::InvalidChannel(channel));
         }
 
-        with_trigger_domain_site(crate::state::stepper_diag::PERF_SITE_RESET, |td| {
+        with_trigger_domain(|td| {
             let mut board = OpenFfboardStepperBoard;
             stepper::reset_step_clock(td.state_mut(), &mut board, channel, clock)
         })
