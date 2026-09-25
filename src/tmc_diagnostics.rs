@@ -91,8 +91,6 @@ impl foci_firmware::tmc_diagnostics::DiagnosticReplySink for BoardDiagnosticRepl
             status: u8 = report.status,
             axis: u8 = axis.as_u8(),
             target: i16 = report.torque_target,
-            duration_ms: u16 = report.duration_ms,
-            voltage_limit: u16 = report.voltage_limit,
             torque_before: i16 = report.torque_before,
             torque_during: i16 = report.torque_during,
             torque_after: i16 = report.torque_after,
@@ -103,7 +101,6 @@ impl foci_firmware::tmc_diagnostics::DiagnosticReplySink for BoardDiagnosticRepl
             ud_limited: i16 = report.ud_limited,
             encoder_before: u32 = report.encoder_before,
             encoder_after: u32 = report.encoder_after,
-            encoder_delta: i32 = report.encoder_delta,
             adc_vm_raw: u16 = report.adc_vm_raw,
         );
     }
@@ -116,8 +113,6 @@ impl foci_firmware::tmc_diagnostics::DiagnosticReplySink for BoardDiagnosticRepl
             status: u8 = report.status,
             torque_target: i16 = report.torque_target,
             flux_target: i16 = report.flux_target,
-            duration_ms: u16 = report.duration_ms,
-            voltage_limit: u16 = report.voltage_limit,
             torque_before: i16 = report.torque_before,
             torque_during: i16 = report.torque_during,
             torque_after: i16 = report.torque_after,
@@ -128,7 +123,6 @@ impl foci_firmware::tmc_diagnostics::DiagnosticReplySink for BoardDiagnosticRepl
             ud_limited: i16 = report.ud_limited,
             encoder_before: u32 = report.encoder_before,
             encoder_after: u32 = report.encoder_after,
-            encoder_delta: i32 = report.encoder_delta,
             adc_vm_raw: u16 = report.adc_vm_raw,
         );
     }
