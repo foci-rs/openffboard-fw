@@ -84,12 +84,6 @@ where
         BoardAction::Stepper(StepperAction::ApplyPostAction(_)) => {
             defmt::warn!("TMC runtime post-action requires dispatch state; handled inline")
         }
-        BoardAction::DelegatedDiagnostic(delegated) => {
-            defmt::warn!(
-                "diagnostic request delegated before board handler: {}",
-                delegated.request.channel,
-            );
-        }
     }
 }
 

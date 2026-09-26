@@ -222,16 +222,10 @@ mod commissioning_board_contract_tests {
     fn board_retains_integral_authority_from_the_plan_event() {
         // Nonterminal classification stays outside the terminal async dispatch
         // future. foci-firmware's `scheduled_step` size gate pins that budget,
-        // so Integral authority is installed synchronously from the plan event
-        // rather than by routing polls through the staged poll driver.
+        // so Integral authority is installed synchronously from the plan event.
         assert!(
             DRIVER.contains(".classify_commission_poll(poll)"),
             "nonterminal polls must stay out of the async dispatch future"
-        );
-        assert!(
-            !MAIN.contains("drive_commissioning_poll_with_stages")
-                && !DRIVER.contains("drive_commissioning_poll_with_stages"),
-            "the staged poll driver pulls terminal dispatch into every poll"
         );
 
         let arm = DRIVER
@@ -283,10 +277,6 @@ mod commissioning_board_contract_tests {
         // awaited chain inside this task's future. Every commissioning-loop
         // exit must latch a cancel, and the loop must drain that latch before
         // touching the channel again.
-        assert!(
-            !MAIN.contains("drive_commissioning_terminal_with_stages"),
-            "the board must not await the whole terminal chain in one future"
-        );
         assert!(DRIVER.contains("begin_commissioning_terminal"));
         assert!(DRIVER.contains("poll_commissioning_terminal"));
         assert!(DRIVER.contains("is_restore_pending"));
