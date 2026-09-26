@@ -55,8 +55,8 @@ impl foci_firmware::tmc_control::request::CommissionBusyReplySink for OpenFFBoar
         TmcControlRequestTail::SkipTickTail
     }
 
-    fn emit_reply(&mut self, payload: ReplyPayload) {
-        crate::ankyra::replies::emit_terminal_reply(payload);
+    fn emit_reply(&mut self, channel: u8, payload: ReplyPayload) {
+        crate::ankyra::replies::emit_terminal_reply(channel, payload);
     }
 
     fn emit_busy_diagnostic(&mut self, request: TmcRequest) {
@@ -150,8 +150,8 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
         );
     }
 
-    fn emit_reply(&mut self, payload: ReplyPayload) {
-        crate::ankyra::replies::emit_terminal_reply(payload);
+    fn emit_reply(&mut self, channel: u8, payload: ReplyPayload) {
+        crate::ankyra::replies::emit_terminal_reply(channel, payload);
     }
 
     #[cfg(feature = "trace")]

@@ -506,7 +506,7 @@ mod app {
                         apply_stepper_post_action(actions.stepper, &mut state);
                     }
                     foci_firmware::diagnostic::mark_p1_reply_construction_start();
-                    emit_terminal_reply(reply);
+                    emit_terminal_reply(0, reply);
                     foci_firmware::diagnostic::mark_p1_reply_construction_end();
                 }
             }
@@ -1076,7 +1076,7 @@ mod app {
                         apply_stepper_post_action(actions.stepper, &mut state);
                     }
                     foci_firmware::diagnostic::mark_p1_reply_construction_start();
-                    emit_terminal_reply(reply);
+                    emit_terminal_reply(0, reply);
                     foci_firmware::diagnostic::mark_p1_reply_construction_end();
                     defmt::info!(
                         "commissioning terminal max tick cycles: {}",
