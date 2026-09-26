@@ -1,6 +1,5 @@
-//! Stepper helpers: P1-safe physical stepper halt.
-//! Promoted from `mod app` in `main.rs` by Task 8c so handlers and the
-//! TIM5 scheduler ISR share a single implementation.
+//! Stepper helpers: P1-safe physical stepper halt, shared by handlers and
+//! the TIM5 scheduler ISR.
 
 use crate::trigger_domain::stop_physical_stepper_unmasked;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;

@@ -1,17 +1,12 @@
 //! Concrete context passed to every ankyra command handler in this
 //! binary.
 //!
-//! Starts as a thin wrapper around `foci_klipper::state::State` and
-//! grows into the board-side implementation of every capability trait
-//! declared in `foci_firmware::context`. The trait-method bodies
+//! Wraps `foci_klipper::state::State` and provides the board-side
+//! implementation of every capability trait declared in
+//! `foci_firmware::context`. The trait-method bodies
 //! forward verbatim to the board-local helpers (`helpers::*`,
 //! `trigger_domain::with_trigger_domain`, `state::tmc::
 //! TMC_REQUEST_SENDER`) that the handlers call today — no new logic.
-//!
-//! The full handler audit driving this surface lives at
-//! `docs/notes/foci-firmware-lift-handler-audit.md`. Tasks 10–17 move
-//! the handler bodies into `foci-firmware`; this file is what they
-//! bind against.
 
 use foci_firmware::context::stepper::{
     self, StepperDrainStats, StepperEnqueueError, StepperQueueBoard, StepperResetBoard,
