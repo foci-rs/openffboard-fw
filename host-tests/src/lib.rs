@@ -576,7 +576,7 @@ mod commissioning_board_contract_tests {
             !locked_arm.contains(".dequeue()"),
             "the LockedInPlace arm must never drain the queue itself -- that is exactly \
              the critical-section-duration problem this ticket fixes. Draining belongs \
-             only in drain_all_populated_slots, run by trigger_drain_task with interrupts \
+             only in drain_pending_stop, run by trigger_drain_task with interrupts \
              enabled."
         );
         assert!(
@@ -586,7 +586,7 @@ mod commissioning_board_contract_tests {
         assert!(
             !locked_arm.contains("record_physical_stop("),
             "diagnostic recording for a masked stop that was successfully handed off must \
-             happen in drain_all_populated_slots (after the drain, with real segment/step \
+             happen in drain_pending_stop (after the drain, with real segment/step \
              counts), not inside stop_physical_stepper_inner's LockedInPlace arm itself"
         );
     }
@@ -674,26 +674,26 @@ mod commissioning_board_contract_tests {
     }
 
     #[test]
-    fn drain_all_populated_slots_records_after_draining() {
+    fn drain_pending_stop_records_after_draining() {
         let fn_open_marker = TRIGGER_DOMAIN
-            .find("pub(crate) fn drain_all_populated_slots()")
-            .expect("trigger_domain.rs must define drain_all_populated_slots");
+            .find("pub(crate) fn drain_pending_stop()")
+            .expect("trigger_domain.rs must define drain_pending_stop");
         let fn_open_brace = TRIGGER_DOMAIN[fn_open_marker..]
             .find('{')
             .map(|offset| fn_open_marker + offset)
-            .expect("drain_all_populated_slots must have a body");
+            .expect("drain_pending_stop must have a body");
         let fn_close_brace = find_matching_close_brace(TRIGGER_DOMAIN, fn_open_brace);
         let fn_body = &TRIGGER_DOMAIN[fn_open_brace..=fn_close_brace];
 
         let dequeue_pos = fn_body
             .find(".dequeue()")
-            .expect("drain_all_populated_slots must actually drain the detached consumer");
+            .expect("drain_pending_stop must actually drain the detached consumer");
         let record_pos = fn_body
             .find("record_physical_stop(")
-            .expect("drain_all_populated_slots must record the stop after draining it");
+            .expect("drain_pending_stop must record the stop after draining it");
         let attach_pos = fn_body
             .find("attach_consumer(")
-            .expect("drain_all_populated_slots must reattach the consumer after draining");
+            .expect("drain_pending_stop must reattach the consumer after draining");
 
         assert!(
             dequeue_pos < record_pos,
@@ -707,7 +707,7 @@ mod commissioning_board_contract_tests {
         );
         assert!(
             !fn_body.contains("interrupt::free"),
-            "drain_all_populated_slots must never hold a critical section across the \
+            "drain_pending_stop must never hold a critical section across the \
              drain loop -- masking belongs only inside take_pending_drain/attach_consumer, \
              never across the dequeue loop"
         );

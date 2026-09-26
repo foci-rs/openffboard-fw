@@ -125,12 +125,11 @@ fn take_pending_drain() -> Option<PendingStopDrain> {
     })
 }
 
-/// Drain and reattach the pending stop, if any. Returns `true` if one was
-/// found (so the caller can retry-until-stable). Called only from
+/// Drain and reattach the pending stop, if any. Called only from
 /// `trigger_drain_task` (P2), never from an ISR.
-pub(crate) fn drain_all_populated_slots() -> bool {
+pub(crate) fn drain_pending_stop() {
     let Some(pending) = take_pending_drain() else {
-        return false;
+        return;
     };
     let mut consumer = pending.consumer;
     let mut drained_segments = 0u32;
@@ -148,7 +147,6 @@ pub(crate) fn drain_all_populated_slots() -> bool {
         drained_steps,
     );
     attach_consumer(consumer);
-    true
 }
 
 fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
