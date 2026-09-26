@@ -46,7 +46,6 @@ impl QueuedFrame {
 }
 
 /// Trace queue counters.
-#[allow(dead_code)]
 pub(crate) struct TraceCounters {
     pub(crate) configured: AtomicBool,
     pub(crate) boot_id: AtomicU32,
@@ -92,7 +91,6 @@ impl TraceCounters {
     }
 
     /// Allocate the next global per-device frame sequence.
-    #[allow(dead_code)]
     pub(crate) fn next_sequence(&self) -> u32 {
         self.sequence.fetch_add(1, Ordering::Relaxed)
     }
