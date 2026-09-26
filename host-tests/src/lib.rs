@@ -1,9 +1,9 @@
 #![no_std]
-#![allow(dead_code)]
 
 #[cfg(test)]
 extern crate std;
 
+#[allow(dead_code)]
 #[path = "../../src/state/stepper.rs"]
 mod stepper;
 
@@ -25,9 +25,6 @@ mod commissioning_board_contract_tests {
     const SHARED_INTEGRAL_REPORTING: &str = include_str!(
         "../../../../shared/foci-firmware/src/commissioning/outer/velocity/integral_reporting.rs"
     );
-    const SHARED_INTEGRAL_PLAN: &str = include_str!(
-        "../../../../shared/foci-firmware/src/commissioning/outer/velocity/integral_plan.rs"
-    );
     const SHARED_COMMISSION_REPLY_MANIFEST: &str =
         include_str!("../../../../shared/foci-firmware/src/commission_dispatch/replies.rs");
     const SHARED_COMMISSION_ERROR_TYPES: &str =
@@ -41,9 +38,6 @@ mod commissioning_board_contract_tests {
     const BOARD_INIT: &str = include_str!("../../src/board_init.rs");
     const USB_TRACE: &str = include_str!("../../src/usb_trace.rs");
     const TMC_DIAGNOSTICS: &str = include_str!("../../src/tmc_diagnostics.rs");
-
-    const REPLY_ID_WORST_CASE_BYTES: usize = 3;
-    const KLIPPER_PAYLOAD_WITH_ID_MAX: usize = 59;
 
     fn extract_fn<'a>(text: &'a str, name: &str) -> &'a str {
         let marker = std::format!("fn {name}");
@@ -119,14 +113,6 @@ mod commissioning_board_contract_tests {
                 .unwrap_or_else(|| panic!("{method} manifest entry missing field {field}"));
             cursor += offset + field.len();
         }
-    }
-
-    fn assert_wire_budget(name: &str, field_widths: &[usize]) {
-        let encoded = field_widths.iter().sum::<usize>() + REPLY_ID_WORST_CASE_BYTES;
-        assert!(
-            encoded <= KLIPPER_PAYLOAD_WITH_ID_MAX,
-            "{name} worst-case payload with id is {encoded} bytes"
-        );
     }
 
     #[test]
