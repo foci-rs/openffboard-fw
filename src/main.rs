@@ -477,7 +477,9 @@ mod app {
                     .await;
             }
 
-            if tmc_state().cancel_requested.load(Relaxed) {
+            let emergency_pending =
+                TMC_DISABLE_SIGNAL.signaled() || FAULT_ACTIVE.load(Relaxed) || status_pin_asserted;
+            if !emergency_pending && tmc_state().cancel_requested.load(Relaxed) {
                 let mut backend = openffboard_backend(tmc, enable_pin);
                 if let Some(foci_firmware::commission_dispatch::CommissionOutcome::Terminal {
                     reply,
