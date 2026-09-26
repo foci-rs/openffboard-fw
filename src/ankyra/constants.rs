@@ -88,11 +88,11 @@ const _: () = assert!(
 pub const MCU: &str = "stm32f407xx";
 
 /// Fixed 12-bit ADC resolution shared by every analog-in channel on this
-/// board -- see the spec's "ADC_MAX = 4095" rationale. Must be identical
-/// across every channel; do not vary this per channel. Klipper reads this
-/// via `get_constant_float`, which parses the wire string regardless of
-/// the declared type here, so a plain `u32` literal is sufficient --
-/// `#[klipper_constant]` does not support a float-typed constant.
+/// board. Must be identical across every channel; do not vary this per
+/// channel. Klipper reads this via `get_constant_float`, which parses the
+/// wire string regardless of the declared type here, so a plain `u32`
+/// literal is sufficient -- `#[klipper_constant]` does not support a
+/// float-typed constant.
 #[klipper_constant]
 pub const ADC_MAX: u32 = 4095;
 
