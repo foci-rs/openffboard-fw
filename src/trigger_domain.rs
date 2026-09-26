@@ -6,8 +6,6 @@
 //! the coordination surface is inspectable independently of RTIC's macro
 //! expansion.
 
-use core::ops::{Deref, DerefMut};
-
 use crate::state::stepper::isr_stepper;
 use foci_firmware::context::trsync::{self, TriggerDispatchBoard, TriggerDomainState};
 use foci_firmware::diagnostic::StepperEventReason;
@@ -182,17 +180,6 @@ impl TriggerDomain {
         &self.state
     }
 
-    /// Set `timer_active` for a stepper, updating the P1 mirror
-    /// for physical steppers.
-    pub(crate) fn set_timer_active(&mut self, stepper_idx: usize, active: bool) {
-        set_timer_active(&mut self.state, stepper_idx, active);
-    }
-
-    /// Read `timer_active` for a stepper.
-    pub(crate) fn timer_active(&self, stepper_idx: usize) -> bool {
-        timer_active(&self.state, stepper_idx)
-    }
-
     /// Attempt to trigger a trsync, dispatching stop signals to all
     /// linked steppers. Returns the trigger result.
     ///
@@ -205,42 +192,6 @@ impl TriggerDomain {
     ) -> foci_klipper::trigger::TriggerResult {
         let mut board = OpenFfboardDispatchBoard;
         trsync::dispatch_trigger(&mut self.state, &mut board, trsync_oid, reason, clock)
-    }
-
-    /// Arm TIM5 CC1 for the next unified scheduler deadline.
-    ///
-    /// Called inside the TriggerDomain lock from both P2 command handlers and
-    /// the P3 ISR after processing events.
-    pub(crate) fn arm_timer_at(&mut self, clock: u32) {
-        arm_timer_at(&mut self.state, clock);
-    }
-
-    /// Disable the unified TIM5 scheduler compare.
-    pub(crate) fn disarm_timer(&mut self) {
-        disarm_timer(&mut self.state);
-    }
-
-    /// Reprogram TIM5 CC1 from the scheduler's earliest deadline.
-    ///
-    /// Called inside the TriggerDomain lock from P2 command handlers. Deadlines
-    /// that are too close to arm reliably are clamped forward instead of
-    /// forcing the TIM5 ISR to busy-wait with interrupts disabled.
-    pub(crate) fn reprogram_timer(&mut self) {
-        reprogram_timer(&mut self.state);
-    }
-}
-
-impl Deref for TriggerDomain {
-    type Target = TriggerDomainState;
-
-    fn deref(&self) -> &Self::Target {
-        &self.state
-    }
-}
-
-impl DerefMut for TriggerDomain {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.state
     }
 }
 
@@ -277,6 +228,8 @@ impl TriggerDispatchBoard for OpenFfboardDispatchBoard {
     }
 }
 
+/// Set `timer_active` for a stepper, updating the P1 mirror
+/// for physical steppers.
 pub(crate) fn set_timer_active(state: &mut TriggerDomainState, stepper_idx: usize, active: bool) {
     state.stepper_stop[stepper_idx].timer_active = active;
     // Mirror to P1-readable atomic for physical steppers
@@ -287,10 +240,15 @@ pub(crate) fn set_timer_active(state: &mut TriggerDomainState, stepper_idx: usiz
     }
 }
 
+/// Read `timer_active` for a stepper.
 pub(crate) fn timer_active(state: &TriggerDomainState, stepper_idx: usize) -> bool {
     state.stepper_stop[stepper_idx].timer_active
 }
 
+/// Arm TIM5 CC1 for the next unified scheduler deadline.
+///
+/// Called inside the TriggerDomain lock from both P2 command handlers and
+/// the P3 ISR after processing events.
 pub(crate) fn arm_timer_at(state: &mut TriggerDomainState, clock: u32) {
     let tim5 = embassy_stm32::pac::TIM5;
     tim5.ccr(0).write_value(clock);
@@ -309,6 +267,7 @@ pub(crate) fn arm_timer_at(state: &mut TriggerDomainState, clock: u32) {
     state.scheduler.set_cc2_active(true);
 }
 
+/// Disable the unified TIM5 scheduler compare.
 pub(crate) fn disarm_timer(state: &mut TriggerDomainState) {
     let tim5 = embassy_stm32::pac::TIM5;
     tim5.dier().modify(|w| {
@@ -322,6 +281,11 @@ pub(crate) fn disarm_timer(state: &mut TriggerDomainState) {
     state.scheduler.set_cc2_active(false);
 }
 
+/// Reprogram TIM5 CC1 from the scheduler's earliest deadline.
+///
+/// Called inside the TriggerDomain lock from P2 command handlers. Deadlines
+/// that are too close to arm reliably are clamped forward instead of
+/// forcing the TIM5 ISR to busy-wait with interrupts disabled.
 pub(crate) fn reprogram_timer(state: &mut TriggerDomainState) {
     if let Some(earliest) = state.scheduler.earliest_deadline() {
         let tim5 = embassy_stm32::pac::TIM5;

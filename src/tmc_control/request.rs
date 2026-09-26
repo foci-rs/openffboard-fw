@@ -125,7 +125,7 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
         with_trigger_domain(|td| {
             let motor_armed = tmc_state().motor_armed.load(Ordering::Relaxed);
             let queue_empty = crate::state::stepper::STEP_QUEUE_CHANNEL.is_empty();
-            let timer_active = td.timer_active(0);
+            let timer_active = crate::trigger_domain::timer_active(td.state(), 0);
             let admitted = motion_scale_install_admitted(motor_armed, queue_empty, timer_active);
 
             // SAFETY: The trigger-domain lock excludes P2/P3 while replacement

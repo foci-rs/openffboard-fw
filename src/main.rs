@@ -58,7 +58,8 @@ mod app {
     use crate::state::stepper::*;
     use crate::state::tmc::*;
     use crate::trigger_domain::{
-        TRIGGER_DOMAIN, TRIGGER_TIMER_MIN_LEAD_TICKS, TriggerDomain, with_trigger_domain,
+        TRIGGER_DOMAIN, TRIGGER_TIMER_MIN_LEAD_TICKS, TriggerDomain, arm_timer_at, disarm_timer,
+        reprogram_timer, set_timer_active, with_trigger_domain,
     };
     use foci_firmware::commissioning::outer::velocity::integral_reproduction::IntegralRetentionSlots;
     use foci_firmware::context::stepper::{
@@ -1104,7 +1105,7 @@ mod app {
                 )
             });
             self.set_timer_active(state, stepper_idx, false);
-            crate::trigger_domain::reprogram_timer(state);
+            reprogram_timer(state);
         }
     }
 
@@ -1145,7 +1146,7 @@ mod app {
                 },
             );
             self.set_timer_active(state, stepper_idx, true);
-            crate::trigger_domain::reprogram_timer(state);
+            reprogram_timer(state);
         }
     }
 
@@ -1196,7 +1197,7 @@ mod app {
         td: &mut TriggerDomain,
         event: foci_klipper::scheduler::SchedulerEvent,
     ) -> bool {
-        record_schedule_result(td.scheduler.try_schedule(event))
+        record_schedule_result(td.state_mut().scheduler.try_schedule(event))
     }
 
     fn arm_stepper_timer_event(
@@ -1206,7 +1207,7 @@ mod app {
         slot: Option<foci_klipper::scheduler::ScheduledSlot>,
     ) {
         if let Some(slot) = slot {
-            td.scheduler.requeue_slot(slot, clock);
+            td.state_mut().scheduler.requeue_slot(slot, clock);
         } else {
             insert_trigger_event(
                 td,
@@ -1273,7 +1274,7 @@ mod app {
         let gpio_b = embassy_stm32::pac::GPIOB;
         gpio_b.bsrr().write(|w| w.set_br(11, true));
         if FAULT_ACTIVE.load(Relaxed) || !tmc_state().motor_armed.load(Relaxed) {
-            td.set_timer_active(0, false);
+            set_timer_active(td.state_mut(), 0, false);
             stepper_state().interval.store(0, Relaxed);
             stepper_state().interval_add.store(0, Relaxed);
             tmc_state().pid_error_sums_clear.store(true, Relaxed);
@@ -1340,7 +1341,7 @@ mod app {
                             stepper_state().interval.store(0, Relaxed);
                             stepper_state().interval_add.store(0, Relaxed);
                             tmc_state().pid_error_sums_clear.store(true, Relaxed);
-                            td.set_timer_active(0, false);
+                            set_timer_active(td.state_mut(), 0, false);
                             return;
                         }
                     };
@@ -1376,7 +1377,7 @@ mod app {
                             scheduled,
                             now,
                         );
-                        td.set_timer_active(0, false);
+                        set_timer_active(td.state_mut(), 0, false);
                         STEPPER_DEADLINE_MISS_CHANNEL.store(0, Relaxed);
                         TMC_DISABLE_SIGNAL.signal(());
                         return;
@@ -1391,8 +1392,8 @@ mod app {
                     read_tim5().wrapping_add(CLOCK_FREQ / 1000),
                     stepper_slot.take(),
                 );
-                td.set_timer_active(0, true);
-                td.reprogram_timer();
+                set_timer_active(td.state_mut(), 0, true);
+                reprogram_timer(td.state_mut());
                 return;
             }
 
@@ -1459,17 +1460,21 @@ mod app {
                     }
                 };
 
-                let phase = td.endstops[endstop_idx].phase();
+                let phase = td.state().endstops[endstop_idx].phase();
                 let result = match phase {
-                    EndstopPhase::Scanning => td.endstops[endstop_idx].scan(read_pin(), wake_clock),
+                    EndstopPhase::Scanning => {
+                        td.state_mut().endstops[endstop_idx].scan(read_pin(), wake_clock)
+                    }
                     EndstopPhase::Oversampling => {
-                        td.endstops[endstop_idx].oversample(read_pin(), wake_clock)
+                        td.state_mut().endstops[endstop_idx].oversample(read_pin(), wake_clock)
                     }
                 };
 
                 match result {
                     EndstopSampleResult::EnterOversamplingNow => {
-                        match td.endstops[endstop_idx].oversample(read_pin(), wake_clock) {
+                        match td.state_mut().endstops[endstop_idx]
+                            .oversample(read_pin(), wake_clock)
+                        {
                             EndstopSampleResult::Triggered { trsync_oid, reason } => {
                                 td.trigger(trsync_oid, reason, read_tim5());
                                 *need_report = true;
@@ -1504,34 +1509,36 @@ mod app {
             }
             SchedulerEventKind::TrSyncExpire(trsync_idx) => {
                 let oid = td
+                    .state()
                     .trsync_by_oid
                     .iter()
                     .find(|&(_, &idx)| idx == trsync_idx)
                     .map(|(&oid, _)| oid);
                 if let Some(oid) = oid {
-                    let expire_reason = td.trsync[trsync_idx].expire_reason();
+                    let expire_reason = td.state().trsync[trsync_idx].expire_reason();
                     td.trigger(oid, expire_reason, read_tim5());
                     *need_report = true;
                 }
             }
             SchedulerEventKind::TrSyncReport(trsync_idx) => {
                 let oid = td
+                    .state()
                     .trsync_by_oid
                     .iter()
                     .find(|&(_, &idx)| idx == trsync_idx)
                     .map(|(&oid, _)| oid);
                 if let Some(oid) = oid
-                    && td.trsync[trsync_idx].can_trigger()
+                    && td.state().trsync[trsync_idx].can_trigger()
                 {
                     let now = read_tim5();
-                    td.trsync[trsync_idx].set_liveness_report(oid, now);
+                    td.state_mut().trsync[trsync_idx].set_liveness_report(oid, now);
                     *need_report = true;
-                    let report_ticks = td.trsync[trsync_idx].report_ticks();
+                    let report_ticks = td.state().trsync[trsync_idx].report_ticks();
                     if report_ticks > 0 {
-                        let next_report = td.trsync[trsync_idx]
+                        let next_report = td.state().trsync[trsync_idx]
                             .report_clock()
                             .wrapping_add(report_ticks);
-                        td.trsync[trsync_idx].set_report_clock(next_report);
+                        td.state_mut().trsync[trsync_idx].set_report_clock(next_report);
                         insert_trigger_event(
                             td,
                             foci_klipper::scheduler::SchedulerEvent {
@@ -1546,22 +1553,25 @@ mod app {
     }
 
     fn defer_tim5_scheduler(td: &mut TriggerDomain) {
-        if td.scheduler.is_empty() {
-            td.disarm_timer();
+        if td.state().scheduler.is_empty() {
+            disarm_timer(td.state_mut());
             return;
         }
         #[cfg(feature = "trace")]
         crate::usb_trace::TRACE_TIMING
             .missed_or_deferred_steps
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        td.arm_timer_at(read_tim5().wrapping_add(TIM5_SCHEDULER_DEFER_TICKS));
+        arm_timer_at(
+            td.state_mut(),
+            read_tim5().wrapping_add(TIM5_SCHEDULER_DEFER_TICKS),
+        );
     }
 
     fn dispatch_tim5_scheduler(td: &mut TriggerDomain, need_report: &mut bool) {
         let dispatch_start = read_tim5();
         loop {
             let now = read_tim5();
-            let slot = td.scheduler.pop_due_slot(now);
+            let slot = td.state_mut().scheduler.pop_due_slot(now);
             if let Some(slot) = slot {
                 let event = slot.event();
                 let stepper_slot = match event.kind {
@@ -1586,8 +1596,8 @@ mod app {
                         now,
                     );
                     STEPPER_DEADLINE_MISS_CHANNEL.store(channel, Relaxed);
-                    td.disarm_timer();
-                    td.set_timer_active(channel as usize, false);
+                    disarm_timer(td.state_mut());
+                    set_timer_active(td.state_mut(), channel as usize, false);
                     TMC_DISABLE_SIGNAL.signal(());
                     return;
                 }
@@ -1600,9 +1610,9 @@ mod app {
                 continue;
             }
 
-            let next_clock = td.scheduler.earliest_deadline();
+            let next_clock = td.state().scheduler.earliest_deadline();
             let Some(next_clock) = next_clock else {
-                td.disarm_timer();
+                disarm_timer(td.state_mut());
                 return;
             };
             let now = read_tim5();
@@ -1611,7 +1621,7 @@ mod app {
                 next_clock,
                 TRIGGER_TIMER_MIN_LEAD_TICKS,
             );
-            td.arm_timer_at(compare);
+            arm_timer_at(td.state_mut(), compare);
             return;
         }
     }
@@ -1694,7 +1704,7 @@ mod app {
         crate::heartbeat::emit_trigger_reports(
             |snaps| {
                 with_trigger_domain(|td| {
-                    for ts in td.trsync.iter_mut() {
+                    for ts in td.state_mut().trsync.iter_mut() {
                         if let Some(snap) = ts.take_report() {
                             let _ = snaps.push(snap);
                         }
