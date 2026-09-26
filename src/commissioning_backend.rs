@@ -103,10 +103,7 @@ impl CommissionBackendHooks for OpenFFBoardHooks {
         if channel != 0 {
             return 0;
         }
-        // `StepQueueChannel::len` is a lock-free atomic load, sound from
-        // any priority whether or not the consumer is attached. The wrapped
-        // `heapless::spsc::Queue<_, N>` holds at most `N - 1` items.
-        (crate::state::stepper::STEP_QUEUE_DEPTH - 1)
+        foci_klipper::step_queue::STEP_QUEUE_CAPACITY
             .saturating_sub(crate::state::stepper::STEP_QUEUE_CHANNEL.len())
     }
 
