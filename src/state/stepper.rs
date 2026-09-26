@@ -239,6 +239,14 @@ mod tests {
     use foci_klipper::pulse_mapper::PulseMapperConfig;
     use foci_klipper::stepper::StepMove;
 
+    static OBSERVABLES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_observables() -> std::sync::MutexGuard<'static, ()> {
+        OBSERVABLES_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn openffboard_timing_contains_waveform_and_runtime_threshold_only() {
         let timing = step_pulse_timing();
@@ -265,6 +273,7 @@ mod tests {
 
     #[test]
     fn invalid_mapper_replacement_clears_prior_mapper_and_observables() {
+        let _guard = lock_observables();
         let mut stepper = foci_klipper::stepper::HardwareStepper::new();
         stepper
             .configure_motion_scale(PulseMapperConfig::new(3_200).unwrap())
@@ -299,6 +308,7 @@ mod tests {
         queue_empty: bool,
         timer_active: bool,
     ) {
+        let _guard = lock_observables();
         let mut stepper = foci_klipper::stepper::HardwareStepper::new();
         stepper
             .configure_motion_scale(PulseMapperConfig::new(3_200).unwrap())
