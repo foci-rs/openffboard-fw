@@ -67,10 +67,6 @@ impl StepperQueueBoard for OpenFfboardStepperBoard {
         }
     }
 
-    fn queue_was_empty(&self, _channel: u8) -> Result<bool, CommandError> {
-        Ok(crate::state::stepper::STEP_QUEUE_CHANNEL.is_empty())
-    }
-
     fn motion_scale_configured(&self, channel: u8) -> Result<bool, CommandError> {
         self.queue_stepper_index(channel)?;
         Ok(tmc_state().motion_scale_configured())
