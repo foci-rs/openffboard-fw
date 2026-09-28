@@ -518,7 +518,7 @@ mod app {
                     {
                         driver.commission_trace_phase = None;
                     }
-                    let shutdown_safe_state_complete = {
+                    {
                         let mut backend = openffboard_backend(tmc, enable_pin);
                         foci_firmware::tmc_control::lifecycle::apply_shutdown_safe_state(
                             &mut driver.runtime,
@@ -526,11 +526,11 @@ mod app {
                             tmc_state(),
                             stepper_state(),
                         )
-                        .await
-                    };
+                        .await;
+                    }
                     tmc_state().commission_in_flight.store(false, Relaxed);
                     stepper_stop_from_p1(0);
-                    shutdown_safe_state_applied = shutdown_safe_state_complete;
+                    shutdown_safe_state_applied = true;
                     integral_candidates.invalidate_all();
                 }
                 Mono::delay(1.millis()).await;
@@ -948,15 +948,6 @@ mod app {
                             inputs,
                         )
                         .await;
-                        if trace_tick.phase_advance_due {
-                            crate::usb_trace::emit_phase_advance(
-                                trace_tick.phase_advance_counts,
-                                trace_tick.phase_advance_flags,
-                                tmc_state().phase_advance_gain_ppm.load(Relaxed),
-                                tmc_state().phase_advance_max_counts.load(Relaxed),
-                                tmc_state().phase_advance_deadband.load(Relaxed),
-                            );
-                        }
                         crate::usb_trace::emit_status_frames(
                             tmc,
                             trace_tick.control_tick,
