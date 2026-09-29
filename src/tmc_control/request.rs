@@ -248,12 +248,17 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
 
     #[cfg(feature = "dev")]
     async fn run_dev_init(&mut self, tmc: &mut Tmc4671Spi<TmcSpiDevice>) {
-        tmc_enter_openloop(tmc, self.enable_pin).await;
+        if let Err(e) = tmc_enter_openloop(tmc, self.enable_pin).await {
+            self.enable_pin.set_low();
+            defmt::error!("dev init aborted, driver disabled: {}", e);
+        }
     }
 
     #[cfg(feature = "dev")]
     async fn run_dev_test_spin(&mut self, tmc: &mut Tmc4671Spi<TmcSpiDevice>, revolutions: u8) {
-        do_test_spin(tmc, revolutions).await;
+        if let Err(e) = do_test_spin(tmc, revolutions).await {
+            defmt::error!("dev test spin aborted: {}", e);
+        }
     }
 }
 

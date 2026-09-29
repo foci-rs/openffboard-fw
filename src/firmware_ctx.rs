@@ -220,9 +220,7 @@ impl TrsyncBoard for OpenFfboardTrsyncBoard {
         ENDSTOP_PIN_IDS[endstop_idx].load(core::sync::atomic::Ordering::Relaxed)
     }
 
-    fn record_schedule_result(&mut self, result: ScheduleResult) {
-        let _ = record_schedule_result(result);
-    }
+    fn record_schedule_result(&mut self, _result: ScheduleResult) {}
 
     fn reprogram_trigger_timer(&mut self, state: &mut TriggerDomainState) {
         reprogram_timer(state);
