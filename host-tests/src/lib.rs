@@ -3,9 +3,9 @@
 #[cfg(test)]
 extern crate std;
 
-#[allow(dead_code)]
-#[path = "../../src/state/stepper.rs"]
-mod stepper;
+#[cfg(test)]
+#[path = "../../src/state/stepper_mapper.rs"]
+mod stepper_mapper;
 
 #[cfg(test)]
 mod commissioning_board_contract_tests {
