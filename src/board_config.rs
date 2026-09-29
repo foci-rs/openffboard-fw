@@ -2,6 +2,9 @@
 
 use crate::ankyra::enumerations::Pins;
 
+/// USB product string; trace builds are told apart by their vendor-specific interface.
+pub(crate) const USB_PRODUCT: &str = "FOCI OpenFFBoard";
+
 pub(crate) const TMC_CHANNEL_COUNT: u8 = 1;
 
 /// OpenFFBoard v1.3 VM sense divider high-side resistor (R23).

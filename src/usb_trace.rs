@@ -15,8 +15,6 @@ use crate::state::usb_trace::{
     motion_consumer, motion_producer, pending_events,
 };
 
-pub(crate) const TRACE_PRODUCT: &str = "FOCI OpenFFBoard (trace)";
-
 static TRACE_PRESSURE: TracePressureRuntime = TracePressureRuntime::new();
 
 const CURRENT_PATH_DIAGNOSTIC_ENABLED: bool = cfg!(feature = "trace-current-path");
@@ -463,7 +461,7 @@ pub(crate) fn emit_metadata() {
             .load(Relaxed),
         pre_configuration_skipped_status: TRACE_COUNTERS.pre_config_skipped_status.load(Relaxed),
         firmware_id: "openffboard-fw",
-        product: TRACE_PRODUCT,
+        product: crate::board_config::USB_PRODUCT,
         serial: trace_serial(),
         sources: sources.as_slice(),
     }) else {
