@@ -51,7 +51,13 @@ pub(crate) const TMC_CONFIG: foci_firmware::config::TmcConfig = foci_firmware::c
     dsadc_mdec_a: OPENFFBOARD_V13_DSADC_MDEC,
     dsadc_mdec_b: OPENFFBOARD_V13_DSADC_MDEC,
     // OpenFFBoard v1.3 ACS724 routing: UX=I0, WY=I1, V=I2.
-    adc_i_select: 0x1800_0100,
+    adc_i_select: foci_tmc4671::registers::AdcISelect::new()
+        .with_i0_select(0)
+        .with_i1_select(1)
+        .with_ux_select(0)
+        .with_v_select(2)
+        .with_wy_select(1)
+        .into_bits(),
     excitation_voltage: 1024,
     electrical_model_theta_e_us: 160,
     current_validation_flux_max_encoder_delta_counts: 4,
