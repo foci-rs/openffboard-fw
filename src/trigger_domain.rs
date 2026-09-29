@@ -17,7 +17,6 @@ fn detach_consumer() -> Option<Consumer<'static, StepMove>> {
     })
 }
 
-/// Reattach a consumer previously detached by `detach_consumer`.
 fn attach_consumer(consumer: Consumer<'static, StepMove>) {
     cortex_m::interrupt::free(|_| {
         // SAFETY: exclusive access from the critical section; `consumer`
@@ -74,7 +73,6 @@ unsafe impl Sync for TriggerDrainSlot {}
 
 static TRIGGER_DRAIN_SLOT: TriggerDrainSlot = TriggerDrainSlot(core::cell::UnsafeCell::new(None));
 
-/// Wakes `trigger_drain_task`.
 pub(crate) static TRIGGER_DRAIN_WAKE: embassy_sync::signal::Signal<
     embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
     (),
@@ -91,7 +89,6 @@ fn store_pending_drain(drain: PendingStopDrain) {
     TRIGGER_DRAIN_WAKE.signal(());
 }
 
-/// Take the pending drain, if any.
 fn take_pending_drain() -> Option<PendingStopDrain> {
     cortex_m::interrupt::free(|_| {
         // SAFETY: see `store_pending_drain`.
@@ -263,11 +260,9 @@ pub(crate) fn reprogram_timer(state: &mut TriggerDomainState) {
 /// Minimum lead time for TIM5 scheduler arming.
 pub(crate) const TRIGGER_TIMER_MIN_LEAD_TICKS: u32 = 128;
 
-/// TriggerDomain static, initialized in RTIC `init`.
 pub(crate) static mut TRIGGER_DOMAIN: core::mem::MaybeUninit<TriggerDomain> =
     core::mem::MaybeUninit::uninit();
 
-/// Lock TriggerDomain with an interrupt-disabled critical section.
 #[inline]
 pub(crate) fn with_trigger_domain<F, R>(f: F) -> R
 where
