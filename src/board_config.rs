@@ -71,6 +71,7 @@ pub(crate) const TMC_CONFIG: foci_firmware::config::TmcConfig = foci_firmware::c
     // Milliamps per ADC least significant bit, derived from the sense
     // resistor value and ADC configuration.
     current_scale_ma_per_lsb: 1.155,
+    max_run_current_ma: 20_000,
 };
 
 const OPENFFBOARD_V13_BBM_REGISTER: u32 = 0x0909;
