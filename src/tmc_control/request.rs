@@ -1,8 +1,4 @@
 //! OpenFFBoard TMC control request handling.
-//!
-//! This module owns the OpenFFBoard adapter for the shared TMC request runner.
-//! The RTIC task in `main.rs` keeps request waiting, shutdown locking, and
-//! control-loop timing.
 
 use core::sync::atomic::Ordering;
 

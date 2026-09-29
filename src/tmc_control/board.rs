@@ -19,9 +19,7 @@ use crate::app_types::TmcSpiDevice;
 use crate::board_config::TMC_CONFIG;
 use crate::commissioning_backend::OpenFFBoardBackend;
 
-/// `STATUS_FLAGS` bit routed to the TMC4671 STATUS pin (PE8 EXTI). Set by
-/// the safety bootstrap in `STATUS_MASK`; the emergency-disable audit reads
-/// it back to correlate the pin level with the flag.
+/// `STATUS_FLAGS` bit routed to the TMC4671 STATUS pin (PE8 EXTI).
 pub(crate) const STATUS_CRITICAL_MASK: u32 = 1 << 26;
 
 /// Assemble one drive-context borrow for the control loop's current tick.
@@ -47,12 +45,7 @@ pub(crate) fn drive_ctx<'a>(
     }
 }
 
-/// How a parked channel is reported to the host. The first three failures
-/// keep the fixed messages Klipper configs and dashboards already match on;
-/// the safety bootstrap reports its stage-specific shutdown reason. The
-/// message variants carry no string because `klipper_shutdown_from!` accepts
-/// only a literal, so the call site owns the text and this enum owns the
-/// choice.
+/// How a parked channel is reported to the host.
 pub(crate) enum ParkShutdown {
     SpiFailedAtBoot,
     ChipIdMismatch,
@@ -72,7 +65,7 @@ pub(crate) fn park_shutdown(reason: ParkReason) -> ParkShutdown {
 }
 
 /// Enable the TMC4671 STATUS interrupt on PE8 once the safety bootstrap has
-/// written `STATUS_MASK`. Moved verbatim from the old startup sequence.
+/// written `STATUS_MASK`.
 pub(crate) fn enable_status_exti() {
     let syscfg = embassy_stm32::pac::SYSCFG;
     // EXTICR3[3:0] = 4 selects port E for EXTI line 8.

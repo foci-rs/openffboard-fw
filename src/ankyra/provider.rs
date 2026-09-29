@@ -1,18 +1,3 @@
-//! Board-specific ankyra provider for OpenFFBoard. Composed with
-//! `foci_firmware::ankyra::provider::FOCI_FIRMWARE_PROVIDER` inside
-//! the `foci_ankyra_config!` invocation in `main.rs` via
-//! `ankyra_reexport_provider!`.
-//!
-//! This provider carries only items that can't live in the shared
-//! crate:
-//! - `foci_tune` — emits replies through the board-local ankyra sender
-//!   (`crate::_ankyra_config::Sender`) directly; cannot be dispatched
-//!   through a capability trait.
-//! - `Pins` enumeration — the physical pin set depends on the MCU / PCB.
-//! - Board-specific constants: `CLOCK_FREQ`, `MCU`, and the
-//!   `RESERVE_PINS_*` family describing which physical pins are
-//!   unavailable to printer.cfg.
-
 ankyra::ankyra_provider! {
     name: BOARD_PROVIDER,
     commands: [

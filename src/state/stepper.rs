@@ -1,6 +1,4 @@
 //! Stepper-subsystem board-local state (queue, hardware stepper handles).
-//! The cross-priority atomics (position, interval, direction, timer mirror)
-//! have moved to `foci_firmware::state::stepper`.
 
 use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
@@ -34,20 +32,15 @@ pub(crate) use foci_klipper::step_queue::STEP_QUEUE_DEPTH;
 pub(crate) const STEPPER_CHANNEL_COUNT: usize = 1;
 
 /// Lock-free step/dir move queue with explicit producer/consumer ownership.
-/// Split once at RTIC `init` via `crate::main::init` -- never touched
-/// through the old unsafe accessor again.
 pub(crate) static STEP_QUEUE_CHANNEL: foci_klipper::step_queue::StepQueueChannel<STEP_QUEUE_DEPTH> =
     foci_klipper::step_queue::StepQueueChannel::new();
 
-/// P2-owned producer handle, populated once by `init_step_queue`. Nothing
-/// else ever touches it, so aliasing is inexpressible.
+/// P2-owned producer handle, populated once by `init_step_queue`.
 pub(crate) static mut STEP_QUEUE_PRODUCER: Option<
     foci_klipper::step_queue::Producer<'static, foci_klipper::stepper::StepMove>,
 > = None;
 
-/// Split `STEP_QUEUE_CHANNEL` once and store the producer half. Must be
-/// called exactly once, from RTIC `init`, before any other stepper
-/// task runs.
+/// Split `STEP_QUEUE_CHANNEL` once and store the producer half.
 ///
 /// # Safety
 ///
@@ -55,10 +48,7 @@ pub(crate) static mut STEP_QUEUE_PRODUCER: Option<
 /// other task that touches `STEP_QUEUE_PRODUCER` or `STEP_QUEUE_CHANNEL`.
 pub(crate) unsafe fn init_step_queue() {
     // SAFETY: `init` runs once, before any other task starts; nothing else
-    // writes `STEP_QUEUE_PRODUCER`. `addr_of_mut!` avoids the edition-2024
-    // `static_mut_refs` lint by never spelling `&mut STEP_QUEUE_PRODUCER`
-    // directly, matching this file's existing `P2_STEPPERS`/`ISR_STEPPERS`
-    // accessor pattern.
+    // writes `STEP_QUEUE_PRODUCER`.
     unsafe {
         *core::ptr::addr_of_mut!(STEP_QUEUE_PRODUCER) = Some(STEP_QUEUE_CHANNEL.split_once());
     }

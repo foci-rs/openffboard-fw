@@ -1,11 +1,5 @@
 //! Lifecycle helpers: Klipper clock reads and Katapult bootloader
 //! reset, shared by handlers and the RTIC task graph.
-//!
-//! Shutdown entry is split in two: the board-agnostic Klipper-level transition lives in
-//! `foci_firmware::helpers::lifecycle::enter_shutdown`; the
-//! trigger-domain quiesce and post-quiesce atomics live in
-//! `FirmwareCtx`'s `ShutdownRecovery::enter_shutdown` impl in
-//! `firmware_ctx.rs`.
 
 /// Katapult bootloader vector table base (from Klipper `armcm_reset.c`).
 pub(crate) const KATAPULT_BOOT_ADDRESS: u32 = 0x0800_0000;
@@ -37,12 +31,10 @@ pub(crate) fn katapult_reset(req_signature: u64) {
         let boot_sig_addr = (reset_handler - 9) as *const u64;
         let req_sig_addr = core::ptr::read_volatile(bl_vectors) as *mut u64;
 
-        // Verify alignment and signature
         if !(boot_sig_addr as usize).is_multiple_of(8)
             || core::ptr::read_volatile(boot_sig_addr) != KATAPULT_SIGNATURE
             || !(req_sig_addr as usize).is_multiple_of(8)
         {
-            // No valid bootloader — just reset
             cortex_m::peripheral::SCB::sys_reset();
         }
 

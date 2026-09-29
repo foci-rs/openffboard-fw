@@ -1,12 +1,4 @@
 //! Handle `TmcRequest` messages that don't need main-loop motor state.
-//!
-//! Returned from the P2 protocol handler via the tmc-control channel.
-//! `SetEnable`, `Init`, `TestSpin`, `SetPidGains`, `SetPositionGains`,
-//! `Commission`, `Calibrate`, and `Tune` remain in the tmc_control main
-//! loop because they mutate `motor_enabled` / `enable_pin` / engine
-//! state. Everything else — SetCurrent / SetEncoder / SetEncoderDir /
-//! DumpRegisters, and the `#[cfg(feature = "dev")]` Read / Write pair —
-//! dispatches here.
 
 use foci_firmware::tmc::{TmcRequest, TmcRequestKind};
 use foci_firmware::tmc_control::dispatch::{
@@ -19,6 +11,10 @@ use rtic_monotonics::fugit::ExtU64;
 use crate::app::Mono;
 use crate::app_types::TmcSpiDevice;
 use crate::board_config::TMC_CONFIG;
+
+async fn yield_for_usb_drain() {
+    Mono::delay(1.millis()).await;
+}
 
 fn report_invalid_channel(channel: u8) {
     ::ankyra::klipper_reply_from!(
@@ -33,9 +29,8 @@ fn report_invalid_channel(channel: u8) {
     );
 }
 
-/// Handle a TMC request that does not require main-loop state (motor_enabled, enable_pin).
+/// Handle a TMC request that does not require main-loop state.
 ///
-/// SetEnable, Init, and TestSpin are handled inline by the tmc_control main loop.
 /// Returns `Ok(())` on success or the reason the caller should enter shutdown.
 pub(crate) async fn handle_tmc_request(
     req: TmcRequest,
@@ -110,8 +105,7 @@ pub(crate) async fn handle_tmc_request(
         }
         TmcRequestKind::DumpRegisters { oid } => {
             for &addr in foci_firmware::dump::DUMP_REGISTERS {
-                // Yield between SPI reads to let USB task drain TX buffer.
-                Mono::delay(1.millis()).await;
+                yield_for_usb_drain().await;
 
                 let reg = foci_tmc4671::registers::Register::new(addr);
                 let value = match tmc.read_register_blocking(reg) {
@@ -129,9 +123,8 @@ pub(crate) async fn handle_tmc_request(
                     value: u32 = value,
                 );
             }
-            // Sub-registers use synthetic addrs 0x80+.
             for &(synthetic_addr, sub_reg) in foci_firmware::dump::DUMP_SUB_REGISTERS {
-                Mono::delay(1.millis()).await;
+                yield_for_usb_drain().await;
 
                 let value = match tmc.read_sub_register_blocking(sub_reg) {
                     Ok(v) => v,
@@ -156,7 +149,7 @@ pub(crate) async fn handle_tmc_request(
                 tmc_state.velocity_clamp_count(),
             );
             for &(addr, value) in &clamp_values {
-                Mono::delay(1.millis()).await;
+                yield_for_usb_drain().await;
 
                 ::ankyra::klipper_reply_from!(
                     &mut crate::_ankyra_config::Sender,
@@ -166,7 +159,7 @@ pub(crate) async fn handle_tmc_request(
                     value: u32 = value,
                 );
             }
-            Mono::delay(1.millis()).await;
+            yield_for_usb_drain().await;
             ::ankyra::klipper_reply_from!(
                 &mut crate::_ankyra_config::Sender,
                 foci_firmware::ankyra::replies::FociDumpDone,

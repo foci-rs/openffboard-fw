@@ -1,13 +1,3 @@
-//! Concrete context passed to every ankyra command handler in this
-//! binary.
-//!
-//! Wraps `foci_klipper::state::State` and provides the board-side
-//! implementation of every capability trait declared in
-//! `foci_firmware::context`. The trait-method bodies
-//! forward verbatim to the board-local helpers (`helpers::*`,
-//! `trigger_domain::with_trigger_domain`, `state::tmc::
-//! TMC_REQUEST_SENDER`) that the handlers call today — no new logic.
-
 use foci_firmware::context::stepper::{
     self, StepperDrainStats, StepperEnqueueError, StepperQueueBoard, StepperResetBoard,
     StepperTimerStateBoard,
@@ -30,8 +20,8 @@ use crate::helpers::tmc::OpenFfboardTmcQueue;
 use crate::helpers::trsync::{gpio_configure_input, gpio_read_pin};
 use crate::state::stepper::{isr_stepper, p2_stepper};
 use crate::trigger_domain::{
-    OpenFfboardDispatchBoard, PHYSICAL_STEPPER_INDICES, disarm_timer, reprogram_timer,
-    set_timer_active, with_trigger_domain,
+    ConsumerBorrow, OpenFfboardDispatchBoard, PHYSICAL_STEPPER_INDICES, disarm_timer,
+    reprogram_timer, set_timer_active, with_trigger_domain,
 };
 
 fn tmc_state() -> &'static foci_firmware::state::tmc::TmcChannelState {
@@ -92,8 +82,6 @@ impl StepperQueueBoard for OpenFfboardStepperBoard {
             return Err(producer.len());
         }
         let prepared = stepper.prepare_move(move_);
-        // No other producer can run here, so a consumer can only create more space
-        // after the full check above -- enqueue therefore cannot fail here.
         producer.enqueue(prepared).map_err(|_| producer.len())?;
         Ok(producer.len())
     }
@@ -108,11 +96,9 @@ impl StepperQueueBoard for OpenFfboardStepperBoard {
         crate::state::stepper_diag::record_discarded_segment(channel, steps);
     }
 
-    fn record_queued_segment(&mut self, channel: u8, steps: u32, queue_len: usize) {
+    fn record_queued_segment(&mut self, channel: u8, steps: u32, _queue_len: usize) {
         #[cfg(feature = "trace")]
-        crate::usb_trace::record_step_queue_depth(queue_len);
-        #[cfg(not(feature = "trace"))]
-        let _ = queue_len;
+        crate::usb_trace::record_step_queue_depth(_queue_len);
         crate::state::stepper_diag::record_queued_segment(channel, steps);
     }
 
@@ -153,17 +139,15 @@ impl StepperResetBoard for OpenFfboardStepperBoard {
             return Err(CommandError::InvalidChannel(channel));
         }
         let mut stats = StepperDrainStats::ZERO;
-        // `None`: a P1 drain or a pending trigger-stop hand-off owns the
-        // consumer and drains this queue later, including any `queue_step`
-        // accepted first. Klipper never sends one in that window: after a
-        // trigger it waits on the `stepper_get_position` reply, and awaiting
-        // its next USB read lets `trigger_drain_task` run first.
-        let _ = crate::trigger_domain::with_consumer_locked(|consumer| {
+        match crate::trigger_domain::with_consumer_locked(|consumer| {
             while let Some(m) = consumer.dequeue() {
                 stats.segments = stats.segments.saturating_add(1);
                 stats.steps = stats.steps.saturating_add(u32::from(m.count));
             }
-        });
+        }) {
+            ConsumerBorrow::Borrowed(()) => {}
+            ConsumerBorrow::PendingHandoff | ConsumerBorrow::DrainInFlight => {}
+        }
         Ok(stats)
     }
 
@@ -249,16 +233,7 @@ impl TrsyncBoard for OpenFfboardTrsyncBoard {
     }
 }
 
-/// Full shutdown: Klipper-level transition, board-local trigger-domain
-/// quiesce, and post-quiesce atomic resets. Returns `true` if this call
-/// performed the transition (first call).
-///
-/// This wraps the shared `foci_firmware::helpers::lifecycle::enter_shutdown`
-/// with the trigger-domain cleanup that only the board can perform. Call
-/// it from RTIC task contexts that have a `&mut State` but not a full
-/// `FirmwareCtx`. The `ShutdownRecovery::enter_shutdown` impl below
-/// delegates to this function so handler-path and RTIC-path shutdowns
-/// share the same cleanup.
+/// Returns `true` if this call performed the shutdown transition.
 pub(crate) fn enter_shutdown(state: &mut State) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     use foci_firmware::state::lifecycle::REPORT_PENDING;
@@ -270,7 +245,6 @@ pub(crate) fn enter_shutdown(state: &mut State) -> bool {
             let mut board = OpenFfboardTrsyncBoard;
             trsync::shutdown_quiesce(td.state_mut(), &mut board);
         });
-        // Post-quiesce atomics — order preserved from pre-lift body
         REPORT_PENDING.store(false, Relaxed);
         HOMING_TRIGGERED.store(0xFF, Relaxed);
         HOMING_STATE.store(0, Relaxed);
@@ -318,10 +292,9 @@ impl<'a> ShutdownRecovery for FirmwareCtx<'a> {
 
     fn reset_to_bootloader(&mut self) -> ! {
         katapult_reset(KATAPULT_BYPASS);
-        // `katapult_reset` always triggers `SCB::sys_reset`.
-        // SAFETY: reachable only if the reset faulted; treat as unrecoverable.
-        #[allow(clippy::empty_loop)]
-        loop {}
+        loop {
+            cortex_m::asm::wfi();
+        }
     }
 
     fn send_shutdown(&mut self, reason: foci_firmware::shutdown::ShutdownReason, clock: u32) {

@@ -1,14 +1,3 @@
-//! `#[klipper_constant]` declarations registered into the binary's
-//! data dictionary `config` section. Consumed by the `constants: [...]`
-//! list in `src/ankyra/provider.rs`.
-//!
-//! All constant identifiers are SCREAMING_SNAKE_CASE; ankyra preserves
-//! them verbatim as wire names (per `pascal_to_snake` passthrough rule).
-//!
-//! `MCU` and the `RESERVE_PINS_*` constants are only consumed over the wire and
-//! are never referenced from Rust — the `#[allow(dead_code)]` suppresses
-//! the unused-const lint without masking genuinely dead code elsewhere.
-
 use ankyra::klipper_constant;
 
 use crate::board_config;
@@ -87,18 +76,10 @@ const _: () = assert!(
 #[klipper_constant]
 pub const MCU: &str = "stm32f407xx";
 
-/// Fixed 12-bit ADC resolution shared by every analog-in channel on this
-/// board. Must be identical across every channel; do not vary this per
-/// channel. Klipper reads this via `get_constant_float`, which parses the
-/// wire string regardless of the declared type here, so a plain `u32`
-/// literal is sufficient -- `#[klipper_constant]` does not support a
-/// float-typed constant.
+/// Klipper reads this via `get_constant_float`, which parses the wire string, so `u32` is
+/// enough; `#[klipper_constant]` has no float type.
 #[klipper_constant]
 pub const ADC_MAX: u32 = 4095;
-
-// ---- Reserved pin constants ----
-// Tells the Klipper host which pins are firmware-owned and must not be
-// assigned to user-facing config sections (steppers, heaters, fans, etc.).
 
 #[allow(dead_code)]
 #[klipper_constant]
@@ -124,7 +105,6 @@ pub const RESERVE_PINS_SWD: &str = "PA13,PA14";
 #[klipper_constant]
 pub const RESERVE_PINS_DRV: &str = "PB0,PB1,PC4,PC5";
 
-/// STEP (PB11) and DIR (PA0) GPIO pins for TMC4671 hardware step/dir.
 #[allow(dead_code)]
 #[klipper_constant]
 pub const RESERVE_PINS_STEP: &str = "PA0,PB11";

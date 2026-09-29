@@ -1,12 +1,11 @@
 //! Periodic board heartbeat tasks: stats output and trsync-report drain.
-//! Each function is the body of an RTIC task declared in `main.rs`; the
-//! task shells handle only RTIC plumbing (Mono, local-resource binding)
-//! and delegate all work here.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use embassy_stm32::peripherals;
 use embassy_stm32::wdg::IndependentWatchdog;
 use foci_firmware::ankyra::replies::{AnalogInState, FociStepperEvent, Stats, TrsyncState};
+
+const MCU_TEMP_SAMPLE_COUNT: u8 = 1;
 
 /// Period between independent-watchdog service ticks.
 pub const WATCHDOG_INTERVAL_MS: u64 = 5_000;
@@ -48,7 +47,6 @@ pub fn stats_tick(
 
     let sample = foci_firmware::cpu_load::take(wall);
 
-    // Track 32-bit clock wraps for `get_uptime`'s high word.
     let prev = stats_send_time.swap(now, Relaxed);
     if now < prev {
         stats_send_time_high.fetch_add(1, Relaxed);
@@ -69,15 +67,10 @@ pub fn stats_tick(
 
 /// Drain pending trsync reports and emit `trsync_state` replies.
 ///
-/// Spawned by the TIM5 CC2 ISR when any trsync has a pending report. The
-/// caller-supplied `drain_snapshots` closure collects snapshots in one
-/// brief critical section (typically inside the trigger-domain lock); the
-/// replies are then sent at P2 without holding that lock.
-///
-/// Runs until a pass finds `report_pending` still clear afterward, via
-/// [`foci_firmware::helpers::drain::drain_until_quiescent`], so a report
-/// that a producer raises while this task is already running is never
-/// stranded behind the single-capacity spawn slot.
+/// `drain_snapshots` collects snapshots in one brief critical section; the
+/// replies are then sent without holding that lock. Runs until a pass finds
+/// `report_pending` still clear, via
+/// [`foci_firmware::helpers::drain::drain_until_quiescent`].
 pub fn emit_trigger_reports<F>(mut drain_snapshots: F, report_pending: &AtomicBool)
 where
     F: FnMut(&mut heapless::Vec<foci_klipper::trigger::ReportSnapshot, 4>),
@@ -103,9 +96,7 @@ where
 /// `analog_in_state` reply. Returns `true` if sustained out-of-range
 /// readings require the caller to enter the shutdown state -- this
 /// function itself has no access to `app_state` and must not dispatch a
-/// shutdown on its own. Called from the `analog_sampling` RTIC task's loop
-/// body; see `main.rs` for the `Mono::delay` wrapper and the clock-domain
-/// note on why `now` must be a TIM5 tick, not a `Mono` tick.
+/// shutdown on its own. `now` must be a TIM5 tick, not a `Mono` tick.
 #[must_use]
 pub fn analog_sampling_tick(
     adc_internal: &mut embassy_stm32::adc::Adc<
@@ -128,7 +119,7 @@ pub fn analog_sampling_tick(
             mcu_temp_calibration,
             raw_internal,
             crate::ankyra::constants::ADC_MAX as f32,
-            1, // AnalogChannelState::record_sample's own accumulation enforces the host's sample_count
+            MCU_TEMP_SAMPLE_COUNT,
         );
         shutdown_requested |= emit_analog_sample(channel, synthesized, now);
     }
@@ -170,10 +161,8 @@ fn emit_analog_sample(
 
 /// Drain pending stepper diagnostic events and emit host-visible replies.
 ///
-/// Runs until a pass finds `stepper_diag_pending` still clear afterward, via
-/// [`foci_firmware::helpers::drain::drain_until_quiescent`], so an event
-/// queued while this task is already running is never stranded behind the
-/// single-capacity spawn slot.
+/// Runs until a pass finds `stepper_diag_pending` still clear, via
+/// [`foci_firmware::helpers::drain::drain_until_quiescent`].
 pub fn emit_stepper_diagnostics(stepper_diag_pending: &AtomicBool) {
     foci_firmware::helpers::drain::drain_until_quiescent(stepper_diag_pending, || {
         emit_stepper_diagnostics_pass();

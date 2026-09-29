@@ -1,7 +1,4 @@
 //! OpenFFBoard active diagnostic reply glue.
-//!
-//! The diagnostic state machines live in `foci-firmware`; this module keeps
-//! RTIC delay wiring and OpenFFBoard reply emission local.
 
 use crate::app::Mono;
 use embassy_stm32::gpio::Output;

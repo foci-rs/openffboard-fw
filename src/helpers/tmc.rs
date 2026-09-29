@@ -20,9 +20,7 @@ impl TmcRequestQueueBoard for OpenFfboardTmcQueue {
     }
 }
 
-/// Parameters for `foci_tune` grouped into a struct to satisfy
-/// clippy's `too_many_arguments` lint. The `#[klipper_command]`
-/// handler signature is protocol-bound and cannot be changed.
+/// Parameters of the `foci_tune` command.
 pub(crate) struct FociTuneParams {
     pub(crate) channel: u8,
     pub(crate) oid: u8,

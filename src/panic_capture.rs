@@ -1,12 +1,9 @@
 //! Probe-free panic and HardFault capture.
 //!
-//! The board's default panic handler was `panic-probe`, whose message reaches
-//! only defmt-RTT; on a board with no debugger attached a panic escalates to a
-//! HardFault and the independent watchdog silently resets it, losing every clue.
-//! This module instead persists the fault into a
-//! no-init CCMRAM record that survives the warm reset, then hands it to
-//! [`foci_firmware::diagnostic`] at startup so the connect-time register dump
-//! reports it to the host over the ordinary command transport.
+//! Persists the fault into a no-init CCMRAM record that survives the warm
+//! reset, then hands it to [`foci_firmware::diagnostic`] at startup so the
+//! connect-time register dump reports it to the host over the ordinary command
+//! transport.
 //!
 //! CCMRAM (0x1000_0000) is core-coupled RAM the startup code never clears; it
 //! retains its contents across an `SCB::sys_reset` or watchdog reset while
@@ -85,13 +82,9 @@ unsafe fn persist_and_reset(kind: u8, line: u32, pc: u32, file_hash: u32) -> ! {
 /// Recover any record persisted by the previous boot, without clearing it. Call
 /// once, early in startup, before the command transport comes up.
 ///
-/// The magic is deliberately left set: a crash triggers an autonomous watchdog
-/// reboot that recovers the record before the host reconnects, and the host's
-/// own `FIRMWARE_RESTART` then resets the board a second time. Clearing here
-/// would drop the record on that first reboot, before the connect-time dump
-/// could ever report it. Leaving it set lets every reboot re-recover the same
-/// record until a newer fault overwrites it or power is cycled; the host-facing
-/// dedup (report once per boot) lives in the diagnostic layer's take.
+/// The magic is deliberately left set so every reboot re-recovers the same
+/// record until a newer fault overwrites it or power is cycled; report-once
+/// dedup lives in the diagnostic layer's take.
 pub fn recover() -> Option<LastPanic> {
     let slot = addr_of_mut!(PANIC_PERSIST);
     // SAFETY: called once at startup before any handler can run concurrently.
@@ -124,8 +117,7 @@ unsafe fn HardFault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
 }
 
 /// Route defmt's own panic path (`defmt::unwrap!`, `defmt::assert!`) through the
-/// core panic handler above so those faults are persisted too. Previously
-/// supplied by `panic-probe`.
+/// core panic handler above so those faults are persisted too.
 #[defmt::panic_handler]
 fn defmt_panic() -> ! {
     core::panic!("defmt")

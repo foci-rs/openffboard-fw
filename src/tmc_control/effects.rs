@@ -17,12 +17,9 @@ pub(crate) enum CommissionWaitExit {
     QueueFlush,
     /// Enter GPIO-first emergency-disable handling.
     EmergencyDisable,
-    /// The host-liveness lease has expired; enter the shutdown safe-state
-    /// path exactly like `Shutdown` above.
+    /// The host-liveness lease has expired; handled like `Shutdown`.
     ClockSyncExpired,
-    /// An operator-requested cancel reached this checkpoint. Distinct from
-    /// `Shutdown`: the MCU stays running and the run reports a graceful
-    /// `Cancelled` terminal instead of requiring `FIRMWARE_RESTART`.
+    /// Operator cancel: the MCU stays running and the run ends `Cancelled`.
     Cancelled,
 }
 
@@ -98,10 +95,7 @@ pub(crate) fn lease_expired(now: u32) -> bool {
     lease_snapshot(now).expired
 }
 
-/// Diagnostic breakdown of the lease-expiry decision at `now`, for logging
-/// at the point a lease actually trips -- distinguishes a genuinely stale
-/// `LAST_HOST_LIVENESS_TICKS` (real stall) from an unexpected `expired`
-/// verdict despite a recent value (bookkeeping bug).
+/// Breakdown of the lease-expiry decision at `now`, for logging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LeaseSnapshot {
     pub(crate) any_enabled: bool,
@@ -135,24 +129,19 @@ pub(crate) fn lease_snapshot(now: u32) -> LeaseSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LeaseCheckDisposition {
-    /// The lease has expired and shutdown is not already active: enter
-    /// shutdown now and skip the rest of this iteration.
+    /// Lease expired and shutdown is not active: enter shutdown.
     EnterClockSyncShutdown,
-    /// Either shutdown is already active, or the lease has not expired:
-    /// proceed with normal iteration work.
+    /// Shutdown already active or lease still valid.
     Proceed,
 }
 
-/// Decide the disposition above. Always `Proceed` while `shutdown_active`
-/// is true — checking `lease_expired` and acting on it while shutdown is
-/// already active would starve the existing safe-state gate permanently,
-/// since re-entering shutdown is a no-op on repeat calls but a misplaced
-/// continue would still fire every iteration. Call this immediately after
-/// the existing `SHUTDOWN_ACTIVE` handling block — never before it.
-pub(crate) const fn classify_lease_check(
-    shutdown_active: bool,
-    lease_expired: bool,
-) -> LeaseCheckDisposition {
+/// Lease disposition at `now`. Always `Proceed` while `shutdown_active`, so a
+/// lease that expired during shutdown never re-enters it.
+pub(crate) fn check_lease(shutdown_active: bool, now: u32) -> LeaseCheckDisposition {
+    classify_lease_check(shutdown_active, lease_expired(now))
+}
+
+const fn classify_lease_check(shutdown_active: bool, lease_expired: bool) -> LeaseCheckDisposition {
     if !shutdown_active && lease_expired {
         LeaseCheckDisposition::EnterClockSyncShutdown
     } else {
@@ -220,10 +209,6 @@ mod tests {
     use foci_firmware::tmc::{TmcRequest, TmcRequestKind};
     use foci_firmware::tmc_control::CommissionWaitRequestDisposition;
 
-    /// Serializes every test in this module that touches the global
-    /// liveness atomics or `enable_pin_asserted` -- neither is otherwise
-    /// synchronized, and `cargo test` runs this module's tests in
-    /// parallel by default.
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn reset_lease_state() -> std::sync::MutexGuard<'static, ()> {
@@ -341,13 +326,6 @@ mod tests {
 
     #[test]
     fn lease_expired_does_not_self_clear_while_still_enabled_and_stale() {
-        // Once shutdown is active but the pin has not yet been physically
-        // lowered (safe state not yet applied), enable_pin_asserted is
-        // still true and lease_expired must keep reporting true on every
-        // subsequent check -- it must not self-clear just because a
-        // shutdown transition already happened once. The loop's own
-        // SHUTDOWN_ACTIVE gate (not this function) is what stops
-        // lease_expired from being consulted again until the gate finishes.
         let _guard = reset_lease_state();
         crate::tmc_control::board::tmc_state()
             .enable_pin_asserted
@@ -402,8 +380,6 @@ mod tests {
 
     #[test]
     fn classify_lease_check_proceeds_when_active_and_expired() {
-        // Even though lease_expired is true, an already-active shutdown
-        // must never re-trigger through this path.
         assert_eq!(
             classify_lease_check(true, true),
             LeaseCheckDisposition::Proceed

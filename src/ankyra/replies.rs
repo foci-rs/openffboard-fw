@@ -1,8 +1,3 @@
-//! Klipper reply emitters for commission/calibrate/selftest/tune outcomes.
-//!
-//! The semantic `ReplyPayload` mapping lives in `foci_firmware`; this module
-//! keeps only the board-generated ankyra sender calls.
-
 struct BoardCommissionReplySink;
 
 impl foci_firmware::commission_dispatch::CommissionReplySink for BoardCommissionReplySink {
@@ -59,9 +54,7 @@ impl foci_firmware::commission_dispatch::CommissionReplySink for BoardCommission
             lambda_us: u32 = inner.lambda_us,
             theta_e_us: u32 = inner.theta_e_us,
             theta_source: u8 = inner.theta_source,
-            // `bandwidth_hz` is capped at `MAX_PHYSICAL_CURRENT_BANDWIDTH_HZ`
-            // (2000) before it reaches `InnerResult`, so this narrowing is exact.
-            bandwidth_hz: u16 = inner.bandwidth_hz as u16,
+            bandwidth_hz: u16 = u16::try_from(inner.bandwidth_hz).unwrap_or(u16::MAX),
             fallback_velocity_p: u16 = result.fallback_velocity_p,
             fallback_velocity_i: u16 = result.fallback_velocity_i,
             fallback_position_p: u16 = result.fallback_position_p,
@@ -414,7 +407,6 @@ impl foci_firmware::commission_dispatch::CommissionReplySink for BoardCommission
     }
 }
 
-/// Emit terminal commissioning-family replies.
 pub(crate) fn emit_terminal_reply(
     channel: u8,
     payload: foci_firmware::commission_dispatch::ReplyPayload,
@@ -423,7 +415,6 @@ pub(crate) fn emit_terminal_reply(
     foci_firmware::commission_dispatch::emit_terminal_reply(&mut sink, channel, payload);
 }
 
-/// Emit one nonterminal velocity-integral evidence group.
 pub(crate) fn emit_velocity_integral_event(
     oid: u8,
     event: foci_firmware::commissioning::types::VelocityIntegralEvent,
@@ -434,7 +425,6 @@ pub(crate) fn emit_velocity_integral_event(
     );
 }
 
-/// Emit one breakaway-campaign evidence group.
 pub(crate) fn emit_breakaway_campaign_event(
     oid: u8,
     event: foci_firmware::commissioning::types::BreakawayCampaignEvent,
@@ -445,12 +435,6 @@ pub(crate) fn emit_breakaway_campaign_event(
     );
 }
 
-/// Emit the exact velocity-integral plan an accepted breakaway campaign handed off to.
-///
-/// The host assembler refuses every velocity-integral observation until it has seen a
-/// complete plan, and a breakaway hand-off reaches the integral phase on the
-/// scheduled-tick path, which carries the plan as a `CommissionEvent` rather
-/// than through a dispatch reply.
 pub(crate) fn emit_velocity_integral_plan(
     oid: u8,
     run_sequence: u32,
@@ -465,7 +449,6 @@ pub(crate) fn emit_velocity_integral_plan(
     );
 }
 
-/// Emit a `FociCommissionPhase` reply for a phase transition.
 pub(crate) fn emit_phase_reply(oid: u8, phase_id: foci_firmware::autotune::CommissionPhase) {
     let mut sink = BoardCommissionReplySink;
     foci_firmware::commission_dispatch::emit_phase_reply(&mut sink, oid, phase_id);

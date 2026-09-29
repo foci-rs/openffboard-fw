@@ -1,11 +1,4 @@
 //! Hardware interrupt service routine bodies.
-//!
-//! The RTIC `#[task(binds = ...)]` declarations live in `main.rs`; the
-//! bodies of the simpler ISRs live here. `step_timer_irq` remains in
-//! `main.rs` until its hot-path statics migrate to `foci-firmware` in a
-//! later task — moving it now would require either duplicating ~40
-//! statics across modules or routing every access through
-//! `crate::app::*` paths.
 
 use crate::transport::USB_WAKE;
 
@@ -33,7 +26,6 @@ pub fn tmc_status_irq(
     let exti = embassy_stm32::pac::EXTI;
     exti.pr(0).write(|w| w.set_line(8, true));
 
-    // Immediately quiesce step generation (same P3, atomic).
     fault_active.store(true, core::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "trace")]
     crate::usb_trace::record_status_interrupt();
@@ -43,5 +35,4 @@ pub fn tmc_status_irq(
     tmc_disable_signal.signal(());
     // No logging here: this P3 handler can fire repeatedly during energized
     // injection, and a reentrant defmt call panics in RttEncoder::acquire.
-    // tmc_control logs the cause from STATUS_FLAGS on its next tick.
 }

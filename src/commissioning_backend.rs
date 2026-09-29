@@ -40,11 +40,6 @@ impl CommissionBackendHooks for OpenFFBoardHooks {
     }
 
     fn commission_elapsed_us() -> u64 {
-        // Microseconds since Mono start. Returned as u64 so deadline
-        // comparisons in commission.rs never wrap across the 51-second
-        // TIM5 boundary that previously broke the engine.
-        //
-        // Source: TIM2 monotonic at 1 MHz (1 us resolution).
         Mono::now().duration_since_epoch().to_micros()
     }
 
@@ -191,13 +186,7 @@ impl CommissionBackendHooks for OpenFFBoardHooks {
             return Err(StimulusError::NotEnergized);
         }
         with_trigger_domain(|td| {
-            // Captures whatever `motor_armed` actually holds -- true or
-            // false -- once per stimulus session; a channel a prior
-            // commissioning run left armed (e.g. an ArmPreservePosition
-            // post-action) is not distinguishable here from a channel this
-            // hook itself just armed, so the session-scoped capture guard
-            // lives on `TmcChannelState`, not a bare `motor_armed` read.
-            tmc_state.stimulus_capture_motor_armed_once();
+            tmc_state.stimulus_save_motor_armed();
             tmc_state.motor_armed.store(true, Relaxed);
             let mut board = OpenFfboardStepperBoard;
             stepper::arm_check(td.state_mut(), &mut board, channel);

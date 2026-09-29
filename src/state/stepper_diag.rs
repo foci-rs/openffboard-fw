@@ -1,8 +1,4 @@
 //! Bounded stepper diagnostic event queue and execution counters.
-//!
-//! Events are produced from P1/P2/P3 contexts and drained from a P2 task.
-//! The queue is protected with a short interrupt-free critical section so
-//! producers never touch the transport from an ISR.
 
 use foci_firmware::diagnostic::{
     StepperDiagnosticEvent, StepperDiagnosticQueue, StepperExecutionStats,

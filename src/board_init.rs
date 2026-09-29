@@ -1,11 +1,4 @@
 //! Board-bring-up helpers for OpenFFBoard.
-//!
-//! These functions perform the hardware-specific pieces of the RTIC
-//! `init` task: clock tree configuration, timer bring-up, GPIO setup,
-//! USB peripheral preparation, DWT instrumentation, and stack painting.
-//! Each helper is a
-//! pure step in the init sequence; the RTIC `init` task orchestrates the
-//! ordering and ownership of peripherals.
 
 use embassy_stm32::Peri;
 use embassy_stm32::gpio::{AfType, Flex, Input, Level, Output, Pull, Speed};
@@ -99,32 +92,7 @@ pub fn rcc_config() -> embassy_stm32::Config {
     config.rcc.sys = Sysclk::PLL1_P;
     config.rcc.mux.clk48sel = embassy_stm32::pac::rcc::vals::Clk48sel::PLL1_Q;
 
-    // SPI1 RX/TX DMA completion (DMA2_STREAM2/DMA2_STREAM3) defaults to
-    // Embassy's Priority::P0, the highest hardware priority on this part --
-    // above every RTIC task, including the P3 TIM5/USB/STATUS handlers RTIC
-    // treats as the hard-real-time ceiling. F407 implements 4 NVIC priority
-    // bits; RTIC's cortex_logical2hw maps its logical priorities to raw NVIC
-    // bytes as P3 -> 0xD0, P2 -> 0xE0, P1 -> 0xF0. Embassy's `Priority` enum
-    // uses the same byte encoding (`Priority::P13` = 0xD0, `P14` = 0xE0,
-    // `P15` = 0xF0).
-    //
-    // Use P15 (RTIC-P1 level), not P14 (RTIC-P2 level): P14 can preempt P1
-    // tasks, including tmc_control itself, mid-execution; P15 cannot, since
-    // equal-priority interrupts never preempt each other on Cortex-M, so a
-    // P15 DMA completion can only run in a gap between tmc_control's own
-    // execution slices, never inside one. P14 does not eliminate contention
-    // with the P2 tasks either way -- P14 sits at the exact same priority as
-    // usb_task and the other P2 tasks (so it cannot preempt them), and P15
-    // sits strictly below P2 (so it cannot preempt them either); neither
-    // choice bounds usb_task's unyielding per-wake loop. Live homing testing
-    // correlated P14 with an intermittent TMC4671 current-loop/encoder-read
-    // disruption that did not reproduce at P15 across repeated trials; the
-    // full causal mechanism is not yet instrumented and this should be
-    // revisited with per-source DMA/USB/TIM5 activation-and-duration
-    // counters if further tuning is needed.
-    // `board_init::verify_dma_interrupt_priority` checks the programmed
-    // priority stays below P3 at boot.
-    config.dma_interrupt_priority = embassy_stm32::interrupt::Priority::P15;
+    config.dma_interrupt_priority = SPI_DMA_INTERRUPT_PRIORITY;
 
     config
 }
@@ -138,15 +106,13 @@ pub fn rcc_config() -> embassy_stm32::Config {
 pub fn init_tim5_clock() {
     let rcc = embassy_stm32::pac::RCC;
     rcc.apb1enr().modify(|w| w.set_tim5en(true));
-    // Two cycles for clock to stabilize.
     cortex_m::asm::delay(2);
     let tim5 = embassy_stm32::pac::TIM5;
-    tim5.psc().write_value(0); // No prescaler: 84 MHz
-    tim5.arr().write_value(0xFFFF_FFFF); // Full 32-bit range
-    tim5.egr().write(|w| w.set_ug(true)); // Force update to load PSC/ARR
-    tim5.cr1().modify(|w| w.set_cen(true)); // Start counting
+    tim5.psc().write_value(0);
+    tim5.arr().write_value(0xFFFF_FFFF);
+    tim5.egr().write(|w| w.set_ug(true));
+    tim5.cr1().modify(|w| w.set_cen(true));
 
-    // Disable all TIM5 interrupts and clear pending flags.
     tim5.dier().write_value(Default::default());
     tim5.sr().write_value(Default::default());
 }
@@ -246,12 +212,17 @@ pub fn enable_dwt_cyccnt() {
     // Cortex-M system registers that are always safe to read/write here.
     unsafe {
         let dcb = &*cortex_m::peripheral::DCB::PTR;
-        dcb.demcr.modify(|v| v | (1 << 24)); // TRCENA
+        dcb.demcr.modify(|v| v | (1 << 24));
         let dwt = &*cortex_m::peripheral::DWT::PTR;
         dwt.cyccnt.write(0);
-        dwt.ctrl.modify(|v| v | 1); // CYCCNTENA
+        dwt.ctrl.modify(|v| v | 1);
     }
 }
+
+/// NVIC priority of the SPI1 DMA completion interrupts: numerically above
+/// (less urgent than) the RTIC P3 ceiling that [`verify_dma_interrupt_priority`] enforces.
+const SPI_DMA_INTERRUPT_PRIORITY: embassy_stm32::interrupt::Priority =
+    embassy_stm32::interrupt::Priority::P15;
 
 /// Confirm the SPI1 RX/TX DMA completion interrupts (DMA2_STREAM2,
 /// DMA2_STREAM3) are configured below the RTIC P3 hard-real-time ceiling
@@ -260,9 +231,7 @@ pub fn enable_dwt_cyccnt() {
 ///
 /// Panics if either DMA interrupt is at or above that level: that would let
 /// SPI DMA completion preempt STEP/DIR dispatch, the exact regression this
-/// check exists to catch (a future embassy-stm32 upgrade could reintroduce
-/// it by changing the default, or a later edit could remove the explicit
-/// override in `rcc_config`).
+/// check exists to catch.
 pub fn verify_dma_interrupt_priority() {
     use embassy_stm32::interrupt::{Interrupt, InterruptExt, Priority};
 

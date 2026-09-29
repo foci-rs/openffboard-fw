@@ -2,7 +2,6 @@
 
 use crate::ankyra::enumerations::Pins;
 
-/// Number of board-local TMC4671 motor channels.
 pub(crate) const TMC_CHANNEL_COUNT: u8 = 1;
 
 /// OpenFFBoard v1.3 VM sense divider high-side resistor (R23).
@@ -17,7 +16,6 @@ pub(crate) const VM_ADC_REFERENCE_MILLIVOLTS: u32 = 2_500;
 /// Centered positive ADC_VM count span for the TMC4671 16-bit raw ADC.
 pub(crate) const VM_ADC_CENTER_COUNTS: u32 = 32_767;
 
-/// Return the motor channel represented by a virtual STEP pin.
 pub(crate) fn step_pin_channel(pin: u8) -> Option<u8> {
     match Pins::try_from(pin) {
         Ok(Pins::STEP0) => Some(0),
@@ -25,7 +23,6 @@ pub(crate) fn step_pin_channel(pin: u8) -> Option<u8> {
     }
 }
 
-/// Return the motor channel represented by a virtual DIR pin.
 pub(crate) fn dir_pin_channel(pin: u8) -> Option<u8> {
     match Pins::try_from(pin) {
         Ok(Pins::DIR0) => Some(0),
@@ -33,7 +30,6 @@ pub(crate) fn dir_pin_channel(pin: u8) -> Option<u8> {
     }
 }
 
-/// Return the motor channel represented by a virtual ENA pin.
 pub(crate) fn enable_pin_channel(pin: u32) -> Option<u8> {
     let pin = u8::try_from(pin).ok()?;
     match Pins::try_from(pin) {
@@ -42,13 +38,7 @@ pub(crate) fn enable_pin_channel(pin: u32) -> Option<u8> {
     }
 }
 
-/// Board-specific TMC4671 hardware configuration for OpenFFBoard v1.3 ACS724.
-///
-/// PWM at 25 kHz (PWM_MAXCNT=3999, fCLK=25 MHz per datasheet 4.9.3),
-/// 90ns BBM dead-time for resistance-method diagnostics,
-/// symmetric DSADC MDEC derived from the PWM period.
-/// The 1024-count commissioning excitation is kept unchanged for this diagnostic test
-/// while staying within the ADC setup phase's conservative voltage clamp.
+/// PWM at 25 kHz: PWM_MAXCNT=3999 with fCLK=25 MHz (TMC4671 datasheet 4.9.3).
 const OPENFFBOARD_V13_PWM_MAXCNT: u16 = 3999;
 const OPENFFBOARD_V13_DSADC_MDEC: u16 =
     foci_firmware::config::dsadc_mdec_from_pwm_maxcnt(OPENFFBOARD_V13_PWM_MAXCNT);
@@ -68,8 +58,6 @@ pub(crate) const TMC_CONFIG: foci_firmware::config::TmcConfig = foci_firmware::c
     current_validation_torque_max_encoder_delta_counts: 16,
     resistance_max_expected_current_count: 1600,
     resistance_scale_metadata_validated: true,
-    // Milliamps per ADC least significant bit, derived from the sense
-    // resistor value and ADC configuration.
     current_scale_ma_per_lsb: 1.155,
     max_run_current_ma: 20_000,
 };
@@ -82,35 +70,15 @@ const _: () = assert!(TMC_CONFIG.dsadc_mdec_register() == OPENFFBOARD_V13_DSADC_
 const OPENFFBOARD_V13_EXCITATION_VOLTAGE: u16 = 1024;
 const _: () = assert!(TMC_CONFIG.excitation_voltage == OPENFFBOARD_V13_EXCITATION_VOLTAGE);
 
-/// Per-channel feedback wiring. Every board channel is ABN-only today;
-/// analog-encoder enablement is a follow-up.
 pub(crate) const FEEDBACK_CONFIGS: [foci_firmware::config::FeedbackConfig;
     TMC_CHANNEL_COUNT as usize] = [foci_firmware::config::FeedbackConfig {
     phi_e_source: foci_firmware::config::FeedbackSource::Abn,
     position_source: foci_firmware::config::FeedbackSource::Abn,
 }; TMC_CHANNEL_COUNT as usize];
 
-/// STM32F407 ADC instance carrying the internal temperature sensor channel.
-///
-/// RM0090 is not cached in this repository, so this is verified instead
-/// against the real Klipper STM32 ADC driver at `src/stm32/adc.c` in the
-/// `klipper` checkout (`~/Documents/Development/klipper` at the time of
-/// writing): `gpio_adc_setup` (around line 84) defaults to
-/// `ADC_TypeDef *adc = ADC1`, and only reassigns `adc = ADC3` when the
-/// resolved channel index is `>= 19` (line ~89), which is reserved for the
-/// extra PF-pin channels present on STM32F4x5/F446 parts. The internal
-/// temperature-sensor pseudo-pin (`ADC_TEMPERATURE_PIN`, line 18) sits at
-/// channel index 16 in the `adc_pins` table (line ~21-26) -- below that
-/// threshold -- so it stays on the default `ADC1`; enabling it is done via
-/// `ADC123_COMMON->CCR = ADC_CCR_TSVREFE` (line ~113), the ADC1/2/3 shared
-/// common-control register, not a per-instance one. Independently
-/// corroborated via web search: ST community references confirm RM0090
-/// wires the STM32F40x/F41x temperature sensor only to `ADC1_IN16`, not
-/// ADC2 or ADC3.
+/// The internal temperature sensor is wired to ADC1_IN16 only (RM0090).
 pub(crate) type InternalTempAdcInstance = embassy_stm32::peripherals::ADC1;
 
-/// Return the `shared/foci-firmware` `ANALOG_CHANNELS` slot index for a
-/// virtual analog-in pin. OpenFFBoard has only `MCU_TEMP`, at index 0.
 pub(crate) fn analog_pin_channel(pin: u8) -> Option<u8> {
     match Pins::try_from(pin) {
         Ok(Pins::MCU_TEMP) => Some(0),
@@ -118,24 +86,13 @@ pub(crate) fn analog_pin_channel(pin: u8) -> Option<u8> {
     }
 }
 
-/// STM32F407 internal temperature sensor factory calibration, read from
-/// ST's documented system-memory addresses (RM0090 device electronic
-/// signature section). `TS_CAL1` is captured at 30C, `TS_CAL2` at 110C,
-/// both at 3.3V VDDA per the datasheet -- confirm this against the
-/// STM32F407 datasheet's "temperature sensor characteristics" table before
-/// relying on it.
+/// Factory calibration addresses (RM0090 device electronic signature): `TS_CAL1` at 30C,
+/// `TS_CAL2` at 110C, both at 3.3V VDDA.
 const TS_CAL1_ADDR: *const u16 = 0x1FFF_7A2C as *const u16;
 const TS_CAL2_ADDR: *const u16 = 0x1FFF_7A2E as *const u16;
 const TS_CAL1_TEMP_C: f32 = 30.0;
 const TS_CAL2_TEMP_C: f32 = 110.0;
 
-/// Read the STM32F407's factory-programmed temperature sensor calibration.
-///
-/// # Safety
-/// These addresses are ST's documented read-only system memory calibration
-/// area, valid on every STM32F407 device -- reading them is always safe;
-/// this function exists only to centralize the `unsafe` block, not because
-/// the read itself is conditionally unsafe.
 pub(crate) fn read_mcu_temp_calibration() -> foci_firmware::mcu_temp::FactoryCalibration {
     // SAFETY: TS_CAL1_ADDR/TS_CAL2_ADDR are ST's documented factory
     // calibration addresses in system memory, present and readable on

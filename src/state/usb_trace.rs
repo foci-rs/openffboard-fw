@@ -7,14 +7,9 @@ use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use foci_firmware::trace::stream::FrameBuf;
 
 /// Motion/counter queue depth in frames.
-///
-/// `FrameBuf` is 256 bytes so metadata can fit. Depth 32 keeps this queue at
-/// 8 KiB, matching the SRAM budget in the design spec.
 pub(crate) const MOTION_QUEUE_DEPTH: usize = 32;
 
 /// Event queue depth in frames.
-///
-/// Depth 8 keeps this queue at 2 KiB.
 pub(crate) const EVENT_QUEUE_DEPTH: usize = 8;
 
 /// Pending structured-event queue depth.
@@ -103,13 +98,20 @@ struct MotionQueueEndpoints {
     consumer: heapless::spsc::Consumer<'static, QueuedFrame>,
 }
 
+struct MotionQueueStorage(
+    core::cell::UnsafeCell<heapless::spsc::Queue<QueuedFrame, MOTION_QUEUE_DEPTH>>,
+);
+
+// SAFETY: the queue is only reachable through the endpoints split from it once, below.
+unsafe impl Sync for MotionQueueStorage {}
+
+static MOTION_QUEUE: MotionQueueStorage =
+    MotionQueueStorage(core::cell::UnsafeCell::new(heapless::spsc::Queue::new()));
+
 static mut MOTION_QUEUE_ENDPOINTS: MotionQueueEndpoints = {
-    static mut QUEUE: heapless::spsc::Queue<QueuedFrame, MOTION_QUEUE_DEPTH> =
-        heapless::spsc::Queue::new();
-    // SAFETY: `QUEUE` is private to this initializer. The returned endpoints
+    // SAFETY: `MOTION_QUEUE` is split exactly once, here. The returned endpoints
     // are stored separately and accessed only by their owning RTIC contexts.
-    #[allow(static_mut_refs)]
-    let (producer, consumer) = unsafe { QUEUE.split_const() };
+    let (producer, consumer) = unsafe { (*MOTION_QUEUE.0.get()).split_const() };
     MotionQueueEndpoints { producer, consumer }
 };
 pub(crate) static mut EVENT_QUEUE: heapless::spsc::Queue<QueuedFrame, EVENT_QUEUE_DEPTH> =

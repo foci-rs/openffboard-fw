@@ -3,11 +3,8 @@
 
 use defmt_rtt as _;
 
-// Probe-free panic/HardFault capture replaces panic-probe: it persists the
-// fault into no-init CCMRAM and reports it to the host on the next connect.
 mod panic_capture;
 
-// PAC shim for RTIC + embassy-stm32
 pub mod pac {
     pub use embassy_stm32::Peripherals;
     pub use embassy_stm32::pac::Interrupt as interrupt;
@@ -78,16 +75,6 @@ mod app {
         DMA2_STREAM3 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH3>;
     });
 
-    // TIM2-backed monotonic at 1 MHz (1 us resolution).
-    //
-    // Previously used SysTick at 1 kHz, but the commissioning engine's
-    // tight sample loops in Phase 5 (R/L measurement) rely on sub-ms
-    // deadlines. Using a TIM2-backed monotonic gives true u64 us
-    // precision without the 51-second wraparound bug that affected
-    // the old read_tim5()/84 path.
-    //
-    // The rtic-monotonics crate handles the hardware timer overflow
-    // automatically via an extended u64 counter in a TimerQueueBackend.
     stm32_tim2_monotonic!(Mono, 1_000_000);
 
     static USB_PUMP_COUNTERS: foci_firmware::usb_pump::UsbPumpCounters =
@@ -111,27 +98,11 @@ mod app {
     use crate::tmc_control::request::{handle_commission_wait_reject, handle_tmc_control_request};
     use foci_firmware::tmc_control::TmcControlRequestTail;
 
-    // TriggerDomain, PHYSICAL_STEPPER_INDICES, TRIGGER_TIMER_MIN_LEAD_TICKS,
-    // TRIGGER_DOMAIN, with_trigger_domain(), stop_physical_stepper_unmasked(),
-    // and stop_physical_stepper_masked() live in crate::trigger_domain and
-    // are re-imported below.
-
-    // ---- Klipper constants ----
-    // Declared in `crate::ankyra::constants` and registered into the data
-    // dictionary via the `constants: [...]` list in `crate::ankyra::provider`.
-
-    // ---- RTIC resources ----
-
     #[shared]
     struct Shared {
         app_state: State,
     }
 
-    /// Persistent Integral candidate slots carried across `tmc_control` task calls.
-    ///
-    /// Retains the Integral authority a `breakaway_seeded` campaign hands off to
-    /// `integral_resume`, so the production build runs the full autotune
-    /// hand-off exactly as the trace build does.
     type IntegralCandidatesTaskLocal = IntegralRetentionSlots<{ TMC_CHANNEL_COUNT as usize }>;
 
     #[local]
@@ -158,9 +129,6 @@ mod app {
         foci_firmware::diagnostic::recover_last_boot_breakaway_breadcrumb();
         defmt::info!("FOCI OpenFFBoard starting");
 
-        // Recover any panic/HardFault the previous boot persisted to no-init
-        // CCMRAM, before anything else can overwrite it, and hand it to the
-        // diagnostic layer so the connect-time dump reports it to the host.
         if let Some(record) = crate::panic_capture::recover() {
             defmt::error!(
                 "recovered last-boot fault: kind={} line={} pc={:#010x}",
@@ -181,14 +149,6 @@ mod app {
         crate::board_init::verify_dma_interrupt_priority();
         crate::board_init::enable_debug_clock_during_sleep();
 
-        // One-time reset-cause diagnostic. RCC_CSR latches why the MCU last
-        // reset and holds the flags until RMVF clears them. Log the cause by
-        // name, then clear so the next reset's cause is unambiguous. A brown-out
-        // (BORRSTF) or power-on (PORRSTF) flag after a silent communication loss
-        // is the decisive undervoltage evidence; IWDGRSTF, SFTRSTF, and PINRSTF
-        // distinguish the watchdog, a software reset, and the reset pin. The F4
-        // metapac names the independent-watchdog flag `wdgrstf` and the pin flag
-        // `padrstf`.
         {
             let csr = embassy_stm32::pac::RCC.csr().read();
             defmt::info!(
@@ -211,24 +171,17 @@ mod app {
         }
         crate::board_init::init_stepdir_gpio();
         defmt::info!("TIM5 enabled for Klipper clock @ 84 MHz, STEP/DIR GPIO configured");
-        // TIM2 clock: 84 MHz (APB1 timer clock, same bus as TIM5). At the
-        // 1 MHz target monotonic rate, the prescaler is 84 (integer divisor).
-        // rtic-monotonics enables and configures TIM2 internally; no PAC
-        // setup is required beyond passing the timer clock frequency.
         Mono::start(84_000_000);
 
-        // PE7: TMC4671 ENABLE pin (active high, start disabled)
         let tmc_enable = Output::new(p.PE7, Level::Low, Speed::Low);
 
         crate::board_init::init_brake_pin(p.PE10);
         let tmc_status = crate::board_init::init_tmc_status_pin(p.PE8);
 
-        // IWDG: 10-second timeout, kicked by the stats task every 5 seconds.
         let mut wdg = IndependentWatchdog::new(p.IWDG, 10_000_000);
         wdg.unleash();
         defmt::info!("IWDG started: 10s timeout");
 
-        // SPI1: TMC4671 communication at 8 MHz, Mode 3 (CPOL=1, CPHA=1)
         let mut spi_config = embassy_stm32::spi::Config::default();
         spi_config.mode = embassy_stm32::spi::Mode {
             polarity: embassy_stm32::spi::Polarity::IdleHigh,
@@ -237,22 +190,15 @@ mod app {
         spi_config.frequency = embassy_stm32::time::Hertz(8_000_000);
 
         let spi1 = Spi::new(
-            p.SPI1, p.PA5,      // SCK
-            p.PA7,      // MOSI
-            p.PA6,      // MISO
-            p.DMA2_CH3, // TX DMA
-            p.DMA2_CH2, // RX DMA
-            Irqs, spi_config,
+            p.SPI1, p.PA5, p.PA7, p.PA6, p.DMA2_CH3, p.DMA2_CH2, Irqs, spi_config,
         );
 
-        // PA4: TMC4671 chip select (active low)
         let spi_cs = Output::new(p.PA4, Level::High, Speed::VeryHigh);
         let spi_dev = ExclusiveDevice::new(spi1, spi_cs, CycleDelay)
             .expect("ExclusiveDevice::new is infallible");
         let tmc = Tmc4671Spi::new(spi_dev)
             .with_retry_policy(foci_tmc4671::spi::RetryPolicy::production());
 
-        // TMC register request channel
         let (tmc_tx, tmc_rx) = ctx.local.tmc_channel.split();
         critical_section::with(|cs| {
             TMC_REQUEST_SENDER.borrow(cs).replace(Some(tmc_tx));
@@ -295,21 +241,16 @@ mod app {
 
         crate::board_init::enable_dwt_cyccnt();
 
-        // Initialize TriggerDomain
         // SAFETY: init runs once before any task starts. No concurrent access.
         unsafe {
             core::ptr::addr_of_mut!(TRIGGER_DOMAIN)
                 .cast::<TriggerDomain>()
                 .write(TriggerDomain::new());
         }
-        // MCU_TEMP is the only analog-in channel on this board; the
-        // internal temperature sensor is wired only to ADC1 (see
-        // board_config.rs's InternalTempAdcInstance docs).
         let adc_internal = embassy_stm32::adc::Adc::new(p.ADC1);
         let temp_channel = adc_internal.enable_temperature();
         let mcu_temp_calibration = crate::board_config::read_mcu_temp_calibration();
 
-        // Spawn tasks
         stepper_reconcile::spawn().expect("stepper reconciliation worker must spawn exactly once");
         tmc_control::spawn().expect("tmc_control task must spawn exactly once");
         usb_task::spawn().expect("usb_task must spawn exactly once");
@@ -338,39 +279,26 @@ mod app {
         )
     }
 
+    /// Sleep until the next interrupt with interrupts masked, and record the sleep as an idle lap.
+    fn measure_masked_sleep() {
+        // PRIMASK set so wfi wakes on a pending IRQ without running its handler.
+        cortex_m::interrupt::free(|_| {
+            let sleep_start = read_tim5();
+            rtic::export::wfi();
+            let slept = read_tim5().wrapping_sub(sleep_start);
+            foci_firmware::cpu_load::record_idle_lap(slept);
+        });
+    }
+
     #[idle]
     fn idle(_: idle::Context) -> ! {
         loop {
-            // Mask interrupts so wfi wakes on a pending IRQ but defers the
-            // handler until we re-enable: the bracketed interval is pure sleep,
-            // not sleep plus the work burst that runs before idle (the
-            // lowest-priority context) can resume. Recording the lap inside the
-            // masked region keeps measure-and-record atomic against the P1
-            // stats reader, so each stats window accounts its own sleep even
-            // when a single sleep spans most of the window. Mirrors Klipper
-            // sched.c's irq_disable / irq_wait / irq_enable around its sleep.
-            cortex_m::interrupt::free(|_| {
-                let sleep_start = read_tim5();
-                rtic::export::wfi();
-                let slept = read_tim5().wrapping_sub(sleep_start);
-                foci_firmware::cpu_load::record_idle_lap(slept);
-            });
+            measure_masked_sleep();
         }
     }
 
     use crate::ankyra::replies::{emit_phase_reply, emit_terminal_reply};
 
-    /// TMC4671 control task. Runs at priority 1 (preempted by protocol tasks).
-    ///
-    /// On startup, reads the TMC4671 chip identification register to verify
-    /// SPI communication. Then processes register read/write requests from
-    /// the protocol handler via the TMC request channel.
-    ///
-    /// The 1ms loop also advances the emulated stepper, converting queued
-    /// step commands into position target updates. This must run on a timer
-    /// rather than only on USB receive — Klipper sends queue_step commands
-    /// ahead of time and expects the MCU to process them at the scheduled
-    /// clock values, even when no USB traffic is arriving.
     #[task(
         priority = 1,
         shared = [app_state],
@@ -398,8 +326,6 @@ mod app {
         let integral_candidates = ctx.local.integral_candidates;
         let driver = ctx.local.driver;
 
-        // This board never auto-initializes the motor; init is
-        // host-command-driven only.
         let signals = foci_firmware::tmc_control::TmcControlSignals::new(
             &SHUTDOWN_ACTIVE,
             &TMC_QUEUE_FLUSH,
@@ -407,7 +333,6 @@ mod app {
             &TMC_DISABLE_SIGNAL,
         );
 
-        // Board constants bundled once and passed to every driven unit.
         let tmc_control_config = foci_firmware::tmc_control::TmcControlConfig::new(
             CLOCK_FREQ,
             TMC_CONFIG.pwm_freq_hz(),
@@ -419,8 +344,6 @@ mod app {
         let mut scheduler = ChannelScheduler::<1>::new(now_us(), [1_000]);
         let mut group_all_ready = true;
 
-        // Whether the shutdown safe-state completed this shutdown cycle.
-        // If phase-advance restore fails, keep retrying before idling.
         let mut shutdown_safe_state_applied = false;
 
         {
@@ -456,18 +379,14 @@ mod app {
                 P1_PROBE_ITERS.fetch_add(1, Relaxed);
             }
 
-            // Loop top: no scheduled work runs before containment is checked.
             let status_pin_asserted = status_pin.is_high();
             tmc_state()
                 .status_pin_asserted
                 .store(status_pin_asserted, Relaxed);
 
-            // A terminal restore cancelled by a commissioning-loop exit still
-            // owns the motor. Drive it to safe state before anything else
-            // touches the channel; only that drain retires its slots.
             if driver.runtime.restore_cancel_pending() {
                 let mut backend = openffboard_backend(tmc, enable_pin);
-                let _ = driver
+                driver
                     .runtime
                     .drive_restore_cancel(
                         &mut backend,
@@ -509,9 +428,6 @@ mod app {
                 }
             }
 
-            // On shutdown, perform one-shot motor safe-state then idle until
-            // shutdown clears. This catches USB disconnect / host crash where
-            // no further commands arrive but the TMC4671 remains energized.
             if SHUTDOWN_ACTIVE.load(Relaxed) {
                 if !shutdown_safe_state_applied {
                     #[cfg(feature = "trace")]
@@ -538,13 +454,10 @@ mod app {
             }
             shutdown_safe_state_applied = false;
 
-            // classify_lease_check(shutdown_active, ...) always returns
-            // Proceed while shutdown is already active -- see its doc
-            // comment for why.
             let lease_check_now = read_tim5();
-            match crate::tmc_control::effects::classify_lease_check(
+            match crate::tmc_control::effects::check_lease(
                 SHUTDOWN_ACTIVE.load(Relaxed),
-                crate::tmc_control::effects::lease_expired(lease_check_now),
+                lease_check_now,
             ) {
                 crate::tmc_control::effects::LeaseCheckDisposition::EnterClockSyncShutdown => {
                     let snapshot = crate::tmc_control::effects::lease_snapshot(lease_check_now);
@@ -569,7 +482,6 @@ mod app {
                 crate::tmc_control::effects::LeaseCheckDisposition::Proceed => {}
             }
 
-            // Drain stale requests after config_reset
             if TMC_QUEUE_FLUSH.load(Relaxed) {
                 integral_candidates.invalidate_all();
                 while rx.try_recv().is_ok() {}
@@ -586,9 +498,6 @@ mod app {
                         });
                     },
                 );
-                // Clear any in-flight commissioning engine and restore safe
-                // hardware state (zero targets, disable outputs) so the motor
-                // is not left energized in whatever mode the engine last set.
                 if commission_was_active {
                     #[cfg(feature = "trace")]
                     {
@@ -603,10 +512,6 @@ mod app {
                 defmt::info!("TMC request queue flushed after config_reset");
             }
 
-            // Process emergency-disable signals before any scheduled unit can
-            // run. Entered on a pending signal, on the firmware latch, or on an
-            // asserted polled STATUS level, so a missed or unavailable
-            // interrupt still contains.
             if TMC_DISABLE_SIGNAL.try_take().is_some()
                 || FAULT_ACTIVE.load(Relaxed)
                 || status_pin_asserted
@@ -626,7 +531,6 @@ mod app {
                 }
                 enable_pin.set_low();
 
-                // Diagnose before anything can erase the chip's copy of the fault.
                 let status_flags = tmc
                     .read_register_retried(foci_tmc4671::registers::STATUS_FLAGS)
                     .await
@@ -654,9 +558,6 @@ mod app {
                     }
                     Err(_) => defmt::error!("TMC4671 emergency disable: STATUS read failed"),
                 }
-                // A fault raised since entry leaves the signal pending and the
-                // pin high, so those two are the re-check; the only clear site.
-                // Every diagnostic above is recorded before the latch drops.
                 let status_pin_asserted = status_pin.is_high();
                 tmc_state()
                     .status_pin_asserted
@@ -706,8 +607,6 @@ mod app {
                 continue;
             }
 
-            // A commissioning channel leaves its engine on the same board
-            // signals that interrupt an absolute wait between polls.
             if matches!(
                 driver.mode(),
                 ChannelMode::Commissioning | ChannelMode::Restore
@@ -782,9 +681,6 @@ mod app {
                         if outcome.should_refresh_velocity_scale {
                             refresh_velocity_scale(&mut driver.runtime);
                         }
-                        // A request that installed an engine is the only way
-                        // into Commissioning, and the scheduler hands out no
-                        // commission unit until its deadline is armed.
                         if !commissioning && matches!(driver.mode(), ChannelMode::Commissioning) {
                             scheduler.set_commission_due(0, Some(now_us()));
                         }
@@ -814,7 +710,6 @@ mod app {
                 scheduler.set_mode(0, driver.mode(), now_us());
             }
 
-            // One due unit per iteration, after either arm.
             let now = now_us();
             let homing_state = HOMING_STATE.load(Relaxed);
             let Some(unit) = scheduler.pick(now, homing_state) else {
@@ -865,8 +760,6 @@ mod app {
                     scheduler.set_fast_period(0, fast_period_us, now_us());
                 }
                 UnitOutcome::Ready => {
-                    // Safety bootstrap succeeded: the STATUS mask is written,
-                    // so the interrupt can be armed.
                     crate::tmc_control::board::enable_status_exti();
                     scheduler.set_mode(0, ChannelMode::Ready, now_us());
                 }
@@ -966,8 +859,6 @@ mod app {
                         AuditResult::Critical { .. }
                         | AuditResult::PinMismatch { .. }
                         | AuditResult::ReadFailed => {
-                            // Contain through the emergency block at the next
-                            // loop top, exactly like an ISR-signalled fault.
                             FAULT_ACTIVE.store(true, Relaxed);
                             TMC_DISABLE_SIGNAL.signal(());
                         }
@@ -1141,7 +1032,6 @@ mod app {
         }
     }
 
-    /// P2 software task: reconcile pending stepper stop and arm state.
     #[task(priority = 2)]
     async fn stepper_reconcile(_ctx: stepper_reconcile::Context) {
         loop {
@@ -1159,15 +1049,7 @@ mod app {
         }
     }
 
-    /// Maximum continuous TIM5 scheduler dispatch before deferring.
-    ///
-    /// Matches Klipper's repeat guard shape: process bursts in one IRQ, but
-    /// avoid monopolizing P3 if a pathological stream stays immediately due.
     const TIM5_SCHEDULER_REPEAT_TICKS: u32 = CLOCK_FREQ / 10_000;
-    /// Short defer after a saturated TIM5 dispatch burst.
-    ///
-    /// Klipper C uses a 5 us defer when timer dispatch keeps main tasks busy.
-    /// On OpenFFBoard TIM5 runs at 84 MHz, so this is 420 timer ticks.
     const TIM5_SCHEDULER_DEFER_TICKS: u32 = CLOCK_FREQ / 200_000;
 
     fn record_schedule_result(result: foci_klipper::scheduler::ScheduleResult) -> bool {
@@ -1217,10 +1099,6 @@ mod app {
         }
     }
 
-    /// Emit one bounded logical event as a complete, non-preemptible pulse train.
-    ///
-    /// This P3 hot path performs no SPI, logging, allocation, scheduler work,
-    /// or yield. The mapper guarantees zero, one, or two physical pulses.
     #[inline(always)]
     fn emit_logical_step_event(event: foci_klipper::stepper::LogicalStepEvent) {
         let gpio_a = embassy_stm32::pac::GPIOA;
@@ -1279,7 +1157,6 @@ mod app {
 
         loop {
             if !stepper.has_active_segment() {
-                // Need a new move from the queue.
                 // SAFETY: P3 is the sole consumer while motor_armed is true.
                 let loaded_steps =
                     match unsafe { crate::state::stepper::STEP_QUEUE_CHANNEL.isr_dequeue() } {
@@ -1287,9 +1164,8 @@ mod app {
                             let loaded_steps = u32::from(m.count);
                             let interval_add = i32::from(m.add);
                             let old_direction = stepper.dir_state();
-                            let phase_transition = stepper.load_move(m);
                             #[cfg(feature = "trace")]
-                            if let Some((old_class, new_class)) = phase_transition {
+                            if let Some((old_class, new_class)) = stepper.load_move(m) {
                                 crate::usb_trace::request_event(
                                     foci_firmware::trace::events::EVENT_LEVEL_INFO,
                                     foci_firmware::trace::events::SUBSYSTEM_STEP_TIMER,
@@ -1299,7 +1175,7 @@ mod app {
                                 );
                             }
                             #[cfg(not(feature = "trace"))]
-                            let _ = phase_transition;
+                            stepper.load_move(m);
                             let dir_changed = old_direction != stepper.dir_state();
                             stepper_state()
                                 .interval
@@ -1392,8 +1268,6 @@ mod app {
             let event = result.event();
             emit_logical_step_event(event);
 
-            // STEP is low before mapper state, pulse counts, or the logical
-            // execution become observable outside this P3 train.
             let now = read_tim5();
             crate::state::stepper::publish_logical_event(stepper, event);
             let logical_delta = if event.direction { 1 } else { -1 };
@@ -1416,10 +1290,7 @@ mod app {
                     arm_stepper_timer_event(td, 0, clock, stepper_slot.take());
                     return;
                 }
-                StepEventResult::NeedMove { .. } => {
-                    // The final logical event is fully emitted and published;
-                    // load a contiguous queued move only after STEP is low.
-                }
+                StepEventResult::NeedMove { .. } => {}
             }
         }
     }
@@ -1617,10 +1488,6 @@ mod app {
         }
     }
 
-    /// TIM5 unified Klipper scheduler interrupt.
-    ///
-    /// Dispatches stepper, endstop, and trsync timers from one ordered software
-    /// queue on the TIM5 clock. Same priority as USB OTG and fault EXTI (P3).
     #[task(binds = TIM5, priority = 3)]
     fn step_timer_irq(_ctx: step_timer_irq::Context) {
         use core::sync::atomic::Ordering::Relaxed;
@@ -1648,30 +1515,16 @@ mod app {
         }
     }
 
-    /// USB OTG FS interrupt handler. Masks interrupt sources and wakes usb_task.
-    ///
-    /// Priority 3: the shared handler completes its FIFO and MMIO work through
-    /// its terminal barrier before the P2 USB consumer can execute.
     #[task(binds = OTG_FS, priority = 3)]
     fn otg_fs_irq(_ctx: otg_fs_irq::Context) {
         crate::interrupts::otg_fs_irq();
     }
 
-    /// TMC4671 STATUS pin interrupt (PE8, EXTI line 8).
-    ///
-    /// Fires when any STATUS_MASK-enabled flag is asserted. Currently this is
-    /// `adc_i_clipped`; tmc_control reads STATUS_FLAGS on the next tick to log
-    /// the cause.
     #[task(binds = EXTI9_5, priority = 3)]
     fn tmc_status_irq(_ctx: tmc_status_irq::Context) {
         crate::interrupts::tmc_status_irq(&FAULT_ACTIVE, &TMC_DISABLE_SIGNAL);
     }
 
-    /// Single USB task replacing usb_pump, usb_receive, usb_send, usb_control.
-    ///
-    /// Handles EP0 setup, bulk RX, protocol dispatch, and bulk TX in one pass.
-    /// No scheduling gap between receiving commands and sending acks.
-    /// Katapult 1200-baud DTR detection is handled by klipper-usb internally.
     #[task(priority = 2, shared = [app_state])]
     async fn usb_task(mut ctx: usb_task::Context) {
         let mut backend = crate::usb_task::OpenffUsbBackend::new(
@@ -1685,35 +1538,28 @@ mod app {
         }
     }
 
-    /// Send pending trsync_state reports outside the TriggerDomain lock.
-    ///
-    /// Spawned by the TIM5 CC2 ISR when any trsync has a pending report.
-    /// Drains all pending snapshots in one brief critical section, then
-    /// sends replies at P2 without holding the lock.
     #[task(priority = 2)]
     async fn report_task(_ctx: report_task::Context) {
         crate::heartbeat::emit_trigger_reports(
             |snaps| {
                 with_trigger_domain(|td| {
-                    for ts in td.state_mut().trsync.iter_mut() {
-                        if let Some(snap) = ts.take_report() {
-                            let _ = snaps.push(snap);
-                        }
-                    }
+                    snaps.extend(
+                        td.state_mut()
+                            .trsync
+                            .iter_mut()
+                            .filter_map(|ts| ts.take_report()),
+                    );
                 });
             },
             &REPORT_PENDING,
         );
     }
 
-    /// Send pending stepper diagnostic events outside ISR/P1 contexts.
     #[task(priority = 2)]
     async fn stepper_diag_task(_ctx: stepper_diag_task::Context) {
         crate::heartbeat::emit_stepper_diagnostics(&STEPPER_DIAG_PENDING);
     }
 
-    /// P2 software task: drain the step queue detached by a masked trigger
-    /// stop (trigger dispatch, shutdown, reset), with interrupts enabled.
     #[task(priority = 2)]
     async fn trigger_drain_task(_ctx: trigger_drain_task::Context) {
         loop {
@@ -1722,11 +1568,6 @@ mod app {
         }
     }
 
-    /// Periodic stats heartbeat sent to Klipper.
-    ///
-    /// Klipper requires regular stats messages to confirm the MCU is alive.
-    /// Sends `stats count=%u sum=%u sumsq=%u` every 5 seconds with basic
-    /// CPU usage metrics.
     #[task(priority = 1)]
     async fn stats(_ctx: stats::Context) {
         let mut accumulator = crate::heartbeat::StatsAccumulator::new(read_tim5());
@@ -1741,7 +1582,6 @@ mod app {
         }
     }
 
-    /// Service the independent watchdog above sustained priority-1 work.
     #[task(priority = 2, local = [wdg])]
     async fn watchdog(ctx: watchdog::Context) {
         loop {
@@ -1750,14 +1590,6 @@ mod app {
         }
     }
 
-    /// Sample MCU_TEMP at low priority and report readings to the host,
-    /// entering the shutdown state on a sustained out-of-range reading.
-    ///
-    /// The 1ms poll period is coarse relative to `AnalogChannelState`'s own
-    /// `sample_ticks`/`rest_ticks` pacing (in TIM5-domain ticks via
-    /// `read_tim5()`, not this loop's `Mono` wakeup) -- this task only needs
-    /// to wake often enough that the configured channel's due sample is
-    /// never late by more than one period.
     #[task(
         priority = 1,
         shared = [app_state],

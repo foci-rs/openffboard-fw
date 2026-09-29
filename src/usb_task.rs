@@ -1,10 +1,4 @@
 //! USB task body.
-//!
-//! [`OpenffUsbBackend`] is driven by the RTIC `usb_task` shell inside
-//! `mod app` via `foci_firmware::usb_pump::run_once`: it waits on the USB
-//! wake signal, drains queued RX frames into the Klipper protocol via the
-//! caller-supplied state lock closure, and flushes TX after each drain
-//! quantum.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 

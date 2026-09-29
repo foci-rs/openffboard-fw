@@ -65,6 +65,26 @@ mod commissioning_board_contract_tests {
         panic!("unterminated fn {name}");
     }
 
+    /// Text from the `levels`-th unclosed `{` before `at` up to `at`.
+    fn enclosing_block_before(text: &str, at: usize, levels: usize) -> &str {
+        let mut depth = 0usize;
+        let mut remaining = levels;
+        for (index, ch) in text[..at].char_indices().rev() {
+            match ch {
+                '}' => depth += 1,
+                '{' if depth > 0 => depth -= 1,
+                '{' => {
+                    remaining -= 1;
+                    if remaining == 0 {
+                        return &text[index..at];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("fewer than {levels} enclosing blocks");
+    }
+
     fn assert_reply_contract(method: &str, reply: &str, fields: &[&str]) {
         let start = REPLIES
             .find(method)
@@ -81,25 +101,11 @@ mod commissioning_board_contract_tests {
         }
     }
 
-    /// Same contract `assert_reply_contract` checks, against the shared
-    /// manifest's `entry { ... }` text instead of a board's compiled
-    /// REPLIES -- valid because `entry { name: <method>, ..., reply:
-    /// <Type>, ..., fields: { <field>: <ty>, ... } }` contains the method
-    /// name, then (searching forward) the reply type, then each field in
-    /// order, the same shape `assert_reply_contract` already expects.
     fn assert_manifest_entry(method: &str, reply: &str, fields: &[&str]) {
         let start = SHARED_COMMISSION_REPLY_MANIFEST
             .find(&std::format!("name: {method}"))
             .unwrap_or_else(|| panic!("missing manifest entry {method}"));
         let after = &SHARED_COMMISSION_REPLY_MANIFEST[start..];
-        // Bound the search to this one entry: many entries share common
-        // field names (`oid: u8` alone appears in most of them), so without
-        // an upper bound a missing/misordered field in this entry could be
-        // silently satisfied by a *later* entry's matching text instead --
-        // the check would pass while proving nothing about this method.
-        // `after` starts at "name: <method>", i.e. strictly after this
-        // entry's own opening "entry {", so the next occurrence of
-        // "entry {" (if any) is the following entry's, never this one's.
         let entry_end = after.find("entry {").unwrap_or(after.len());
         let body = &after[..entry_end];
         assert!(
@@ -119,10 +125,14 @@ mod commissioning_board_contract_tests {
     #[test]
     fn spi_dma_interrupt_priority_is_explicit_and_below_hard_real_time() {
         assert!(
+            BOARD_INIT.contains("config.dma_interrupt_priority = SPI_DMA_INTERRUPT_PRIORITY;"),
+            "rcc_config() must set dma_interrupt_priority explicitly, not inherit Embassy's P0 default"
+        );
+        assert!(
             BOARD_INIT.contains(
-                "config.dma_interrupt_priority = embassy_stm32::interrupt::Priority::P15;"
+                "const SPI_DMA_INTERRUPT_PRIORITY: embassy_stm32::interrupt::Priority =\n    embassy_stm32::interrupt::Priority::P15;"
             ),
-            "rcc_config() must set dma_interrupt_priority explicitly to P15, not inherit Embassy's P0 default"
+            "the SPI DMA priority must be P15"
         );
         assert!(
             MAIN.contains("board_init::verify_dma_interrupt_priority();"),
@@ -221,9 +231,6 @@ mod commissioning_board_contract_tests {
 
     #[test]
     fn board_retains_integral_authority_from_the_plan_event() {
-        // Nonterminal classification stays outside the terminal async dispatch
-        // future. foci-firmware's `scheduled_step` size gate pins that budget,
-        // so Integral authority is installed synchronously from the plan event.
         assert!(
             DRIVER.contains(".classify_commission_poll(poll)"),
             "nonterminal polls must stay out of the async dispatch future"
@@ -247,10 +254,6 @@ mod commissioning_board_contract_tests {
 
     #[test]
     fn board_reaches_the_staged_request_dispatch_that_owns_integral_resume() {
-        // Two shared-firmware fixes for the Integral authority landed on paths
-        // this board does not execute, and shared tests passed both times. The
-        // board's own call shape is what decides whether new dispatch arms --
-        // the Integral resume among them -- are reachable here at all.
         assert!(
             REQUEST.contains("handle_tmc_control_request_with_stages"),
             "tune requests must reach the staged request dispatch"
@@ -259,9 +262,6 @@ mod commissioning_board_contract_tests {
             REQUEST.contains("integral_candidate"),
             "the staged dispatch must be given the retained Integral slot"
         );
-        // Retention is what a resume consumes. It is installed synchronously
-        // from the plan event because nonterminal classification stays outside
-        // the terminal async dispatch future on this board.
         assert!(
             DRIVER.contains("install_authority_from_plan"),
             "the plan event must retain authority for a later resume"
@@ -274,10 +274,6 @@ mod commissioning_board_contract_tests {
 
     #[test]
     fn board_polls_the_terminal_restore_and_cancels_it_on_every_exit() {
-        // The terminal restore is a poll-driven machine on the runtime, not an
-        // awaited chain inside this task's future. Every commissioning-loop
-        // exit must latch a cancel, and the loop must drain that latch before
-        // touching the channel again.
         assert!(DRIVER.contains("begin_commissioning_terminal"));
         assert!(DRIVER.contains("poll_commissioning_terminal"));
         assert!(DRIVER.contains("is_restore_pending"));
@@ -543,11 +539,6 @@ mod commissioning_board_contract_tests {
         );
     }
 
-    /// Return the index of the `}` matching the `{` at `open_brace_pos`
-    /// (which must itself be a `{` character), by counting brace depth.
-    /// Comment- and string-literal-blind, like every other source-contract
-    /// check in this module -- adequate for this crate's existing use of
-    /// `include_str!` guards, not a real parser.
     fn find_matching_close_brace(text: &str, open_brace_pos: usize) -> usize {
         let mut depth = 0i32;
         for (offset, ch) in text[open_brace_pos..].char_indices() {
@@ -603,18 +594,6 @@ mod commissioning_board_contract_tests {
 
     #[test]
     fn locked_stop_still_resets_gpio_state_unconditionally() {
-        // Regression guard for a defect caught in this plan's own cross-agent
-        // review: an early `return` *inside* the LockedInPlace arm would skip
-        // direction/STEP GPIO reset, corrupting the next segment's pulse
-        // parity. This must check from the start of the match (so it covers
-        // the match arms themselves, where the original defect actually
-        // lived) through the end of the function -- an earlier draft of this
-        // guard checked only after the match's closing brace, which does not
-        // cover a `return` inside an arm and would not have caught the
-        // defect it was written to guard against. A legitimate early
-        // `return` exists before the match (the
-        // `!PHYSICAL_STEPPER_INDICES.contains(...)` bounds check at the top
-        // of the function) and must stay outside this checked region.
         let fn_open_marker = TRIGGER_DOMAIN
             .find("fn stop_physical_stepper_inner(")
             .expect("trigger_domain.rs must define stop_physical_stepper_inner");
@@ -630,10 +609,6 @@ mod commissioning_board_contract_tests {
             .expect("stop_physical_stepper_inner must branch on QueueAccess");
         let from_match_onward = &fn_body[match_pos..];
 
-        // Word-boundary match, not a plain substring search: the region
-        // legitimately contains the comment word "returns" (describing
-        // detach_consumer's Option), which a bare `contains("return")`
-        // would misfire on even though it is not the `return` keyword.
         let has_return_keyword = from_match_onward.match_indices("return").any(|(pos, _)| {
             let before_ok = from_match_onward[..pos]
                 .chars()
@@ -889,10 +864,7 @@ mod commissioning_board_contract_tests {
         let clear = body
             .find("FAULT_ACTIVE.store(false")
             .expect("the emergency-disable clear");
-        // Wide enough to span the whole containment block from the enable-pin
-        // drop down to the clear, with margin, while stopping short of any
-        // earlier call site that would satisfy these assertions spuriously.
-        let window = &body[clear.saturating_sub(3_000)..clear];
+        let window = enclosing_block_before(body, clear, 2);
         assert!(
             window.contains("status_pin.is_high()"),
             "the clear follows a fresh pin poll"
@@ -909,8 +881,6 @@ mod commissioning_board_contract_tests {
             window.contains("record_stepper_event("),
             "the clear follows the STATUS diagnostic"
         );
-        // The full diagnostic is recorded before the latch drops, so a fault
-        // that survives containment is still reported with its STATUS word.
         let pin_poll = window
             .find("status_pin.is_high()")
             .expect("the pin re-check inside the containment block");

@@ -1,5 +1,3 @@
-//! OpenFFBoard USB trace stream integration.
-
 #![cfg(feature = "trace")]
 
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
@@ -17,12 +15,10 @@ use crate::state::usb_trace::{
     motion_consumer, motion_producer, pending_events,
 };
 
-/// Product string used by trace builds.
 pub(crate) const TRACE_PRODUCT: &str = "FOCI OpenFFBoard (trace)";
 
 static TRACE_PRESSURE: TracePressureRuntime = TracePressureRuntime::new();
 
-/// Enable the lower-rate raw current-path diagnostic frame.
 const CURRENT_PATH_DIAGNOSTIC_ENABLED: bool = cfg!(feature = "trace-current-path");
 
 pub(crate) const EVENT_FIRMWARE_BOOT: u16 = 1;
@@ -105,7 +101,6 @@ pub(crate) fn trace_now_ticks() -> u64 {
     extend_tim5_low(low)
 }
 
-/// Extend a previously sampled TIM5 low word into the trace timestamp domain.
 pub(crate) fn extend_tim5_low(low: u32) -> u64 {
     cortex_m::interrupt::free(|_| unsafe {
         let ext = &mut *core::ptr::addr_of_mut!(TRACE_CLOCK_EXT);
@@ -113,7 +108,6 @@ pub(crate) fn extend_tim5_low(low: u32) -> u64 {
     })
 }
 
-/// Record the trace boot timestamp after TIM5 starts.
 pub(crate) fn note_trace_boot() {
     let boot = trace_now_ticks();
     TRACE_COUNTERS
@@ -157,7 +151,6 @@ fn note_trace_usb_configured_time() {
     );
 }
 
-/// Mark the trace stream configured after USB configuration.
 pub(crate) fn note_usb_configured() {
     note_trace_usb_configured_time();
     TRACE_COUNTERS.configured.store(true, Ordering::Relaxed);
@@ -225,7 +218,6 @@ fn motion_flags() -> u8 {
     }
 }
 
-/// Request a structured event from any RTIC context.
 pub(crate) fn request_event(
     level: u8,
     subsystem_id: u8,
@@ -245,7 +237,6 @@ pub(crate) fn request_event(
         args,
         arg_count,
     };
-    // O(1) critical section: push one fixed-size event or count one drop.
     let queued = cortex_m::interrupt::free(|_| unsafe {
         let queue = pending_events();
         if queue.push_back(event).is_err() {
@@ -310,7 +301,6 @@ fn enqueue_event_frame(event: PendingEvent) {
     enqueue_event(frame);
 }
 
-/// Convert pending multi-producer event requests into event frames.
 pub(crate) fn drain_pending_events() {
     loop {
         let event = cortex_m::interrupt::free(|_| unsafe {
@@ -324,7 +314,6 @@ pub(crate) fn drain_pending_events() {
     }
 }
 
-/// Emit a one-shot event with the measured trace SPI sample duration.
 pub(crate) fn request_spi_duration_event_if_ready() {
     if let Some(event) = TRACE_PRESSURE.take_spi_duration_event() {
         request_event(
@@ -337,7 +326,6 @@ pub(crate) fn request_spi_duration_event_if_ready() {
     }
 }
 
-/// Trace timing diagnostics.
 pub(crate) struct TraceTiming {
     pub(crate) max_step_jitter_ticks: AtomicU32,
     pub(crate) min_deadline_slack_ticks: AtomicI32,
@@ -347,7 +335,6 @@ pub(crate) struct TraceTiming {
 }
 
 impl TraceTiming {
-    /// Create zeroed trace timing counters.
     pub(crate) const fn new() -> Self {
         Self {
             max_step_jitter_ticks: AtomicU32::new(0),
@@ -361,7 +348,6 @@ impl TraceTiming {
 
 pub(crate) static TRACE_TIMING: TraceTiming = TraceTiming::new();
 
-/// Store the last served step tick.
 pub(crate) fn store_last_served_step_tick(ticks: u64) {
     store_split_u64(
         &TRACE_TIMING.last_served_step_tick_low,
@@ -370,7 +356,6 @@ pub(crate) fn store_last_served_step_tick(ticks: u64) {
     );
 }
 
-/// Load the last served step tick.
 pub(crate) fn load_last_served_step_tick() -> u64 {
     load_split_u64(
         &TRACE_TIMING.last_served_step_tick_low,
@@ -378,42 +363,32 @@ pub(crate) fn load_last_served_step_tick() -> u64 {
     )
 }
 
-/// Store the last Klipper command-service tick.
 pub(crate) fn store_last_klipper_command_service_tick(ticks: u64) {
     TRACE_PRESSURE.store_last_command_service_tick(ticks);
 }
 
-/// Load the last Klipper command-service tick.
 pub(crate) fn load_last_klipper_command_service_tick() -> u64 {
     TRACE_PRESSURE.last_command_service_tick()
 }
 
-/// Record the latest successful step queue depth for trace samples.
 pub(crate) fn record_step_queue_depth(queue_len: usize) {
     TRACE_PRESSURE.record_queue_depth(queue_len);
 }
 
-/// Record a TMC SPI error for status frames.
 pub(crate) fn record_spi_error() {
     TRACE_PRESSURE.record_spi_error();
 }
 
-/// Record a TMC STATUS pin interrupt.
 pub(crate) fn record_status_interrupt() {
     TRACE_PRESSURE.record_status_interrupt();
 }
 
-/// Record measured SPI sampling duration.
 pub(crate) fn record_spi_sample_cycles(cycles: u32) {
-    // DWT cycles are CPU-clock cycles. This threshold is sized for the 168 MHz
-    // F407 CPU clock and is intentionally not derived from CLOCK_FREQ, which
-    // is the 84 MHz TIM5/Klipper clock.
-    const TRACE_DETAIL_SKIP_THRESHOLD_CYCLES: u32 = 120_000;
+    const DETAIL_SKIP_THRESHOLD_DWT_CYCLES_AT_168_MHZ: u32 = 120_000;
 
-    TRACE_PRESSURE.record_spi_sample_cycles(cycles, TRACE_DETAIL_SKIP_THRESHOLD_CYCLES);
+    TRACE_PRESSURE.record_spi_sample_cycles(cycles, DETAIL_SKIP_THRESHOLD_DWT_CYCLES_AT_168_MHZ);
 }
 
-/// Record timing for a served step-timer deadline.
 pub(crate) fn record_step_timing(scheduled: u32, actual: u32) {
     let jitter = actual.wrapping_sub(scheduled) as i32;
     let abs = jitter.unsigned_abs();
@@ -447,7 +422,6 @@ pub(crate) fn record_step_timing(scheduled: u32, actual: u32) {
     store_last_served_step_tick(extend_tim5_low(actual));
 }
 
-/// Take per-window step jitter and deadline slack accumulators.
 pub(crate) fn take_jitter_and_slack() -> (u32, i32) {
     let jitter = TRACE_TIMING
         .max_step_jitter_ticks
@@ -459,12 +433,10 @@ pub(crate) fn take_jitter_and_slack() -> (u32, i32) {
     (jitter, normalized_slack)
 }
 
-/// Return true when trace producers should emit samples.
 pub(crate) fn is_configured() -> bool {
     TRACE_COUNTERS.configured.load(Ordering::Relaxed) && foci_usb_stm32::is_configured()
 }
 
-/// Emit stream metadata.
 pub(crate) fn emit_metadata() {
     use core::sync::atomic::Ordering::Relaxed;
     use foci_firmware::trace::stream::*;
@@ -510,7 +482,6 @@ pub(crate) fn emit_metadata() {
     enqueue_motion(frame);
 }
 
-/// Enqueue one characterization-only raw velocity observation.
 pub(crate) fn request_velocity_observation(
     channel: u8,
     sample: foci_firmware::trace::stream::VelocityTraceObservation,
@@ -537,7 +508,6 @@ pub(crate) fn request_velocity_observation(
     enqueue_motion(frame);
 }
 
-/// Enqueue one canonical velocity-sweep record for offline audit.
 pub(crate) fn request_velocity_sweep_evidence(
     channel: u8,
     record: foci_firmware::ankyra::velocity_sweep_encoding::VelocitySweepCanonicalRecord,
@@ -561,7 +531,6 @@ pub(crate) fn request_velocity_sweep_evidence(
     enqueue_motion(frame);
 }
 
-/// Enqueue a motion/counter frame without blocking.
 pub(crate) fn enqueue_motion(frame: FrameBuf) {
     // SAFETY: TMC control is the sole motion-frame producer. The USB task owns
     // the separately split consumer endpoint.
@@ -580,7 +549,6 @@ pub(crate) fn enqueue_motion(frame: FrameBuf) {
     }
 }
 
-/// Enqueue an event frame without blocking.
 pub(crate) fn enqueue_event(frame: FrameBuf) {
     // SAFETY: Pending events are converted, enqueued, and consumed only by the
     // priority-2 USB task.
@@ -674,14 +642,11 @@ where
     read_sub_register_trace(tmc, register, &mut ignored_flags).await
 }
 
-/// Board-local inputs for one OpenFFBoard trace sample.
 #[derive(Clone, Copy)]
 pub(crate) struct TraceSampleContext {
-    /// Whether the runtime currently considers the motor enabled.
     pub(crate) motor_enabled: bool,
 }
 
-/// Sample critical and control-detail trace frames from the 1 ms control tick.
 pub(crate) async fn sample_tick<B>(
     tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
     context: TraceSampleContext,
@@ -932,7 +897,6 @@ fn emit_one_status(
     }
 }
 
-/// Emit board, FOCI, USB, and Klipper status frames when due.
 pub(crate) async fn emit_status_frames<B>(
     tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
     control_tick: u32,
@@ -986,9 +950,6 @@ pub(crate) async fn emit_status_frames<B>(
         missed_or_deferred_step_count: TRACE_TIMING.missed_or_deferred_steps.load(Relaxed),
     });
 
-    // Fields that do not apply to a source kind are encoded as zero. Board and
-    // FOCI frames both carry the full STATUS_FLAGS value by design: the
-    // duplicate bytes are cheaper than making host parsing source-specific.
     let board = StatusSample {
         status_flags,
         status_interrupt_count: counters.status_interrupt_count,
@@ -1055,7 +1016,6 @@ pub(crate) async fn emit_status_frames<B>(
     );
 }
 
-/// Drain at most one 64-byte trace packet to USB.
 pub(crate) fn drain_once() {
     // SAFETY: This is the only trace consumer. Producers only enqueue complete
     // `QueuedFrame` values. `current_tx` is therefore single-consumer state and
