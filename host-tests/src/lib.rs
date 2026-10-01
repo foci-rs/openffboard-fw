@@ -38,6 +38,7 @@ mod commissioning_board_contract_tests {
     const TRIGGER_DOMAIN: &str = include_str!("../../src/trigger_domain.rs");
     const BOARD_INIT: &str = include_str!("../../src/board_init.rs");
     const USB_TRACE: &str = include_str!("../../src/usb_trace.rs");
+    const TMC_HELPERS: &str = include_str!("../../src/helpers/tmc.rs");
     const TMC_DIAGNOSTICS: &str = include_str!("../../src/tmc_diagnostics.rs");
 
     fn extract_fn<'a>(text: &'a str, name: &str) -> &'a str {
@@ -1008,6 +1009,29 @@ mod commissioning_board_contract_tests {
             "StepperTooFarInPast must be reported only from within the Generic-fault \
              arm (no specific TMC fault was observed), not as an unconditional \
              override ahead of fault classification"
+        );
+    }
+
+    #[test]
+    fn tune_handler_rejects_an_unknown_action_code_without_queueing() {
+        let handler = extract_fn(TMC_HELPERS, "foci_tune_inner");
+        let decode = handler
+            .find("AutotuneAction::from_u8(action) else")
+            .expect("tune handler decodes the raw action with AutotuneAction::from_u8");
+        let rejected = &handler[decode..];
+        let reject_end = rejected
+            .find("return;")
+            .expect("rejection arm returns early");
+        let reject_arm = &rejected[..reject_end];
+        assert!(
+            reject_arm.contains("FociCommissionPhase")
+                && reject_arm.contains("CommissionError::InvalidSchedule"),
+            "an undecodable action code must be answered with a FociCommissionPhase \
+             carrying CommissionError::InvalidSchedule"
+        );
+        assert!(
+            !reject_arm.contains("tmc_send") && !reject_arm.contains("try_send_tmc_request"),
+            "the rejection arm must not queue any TMC request"
         );
     }
 }
