@@ -30,7 +30,7 @@ const _: () = assert!(
 pub const PROPORTIONAL_EVIDENCE_SCHEMA_REVISION: u32 = 14;
 const _: () = assert!(
     PROPORTIONAL_EVIDENCE_SCHEMA_REVISION
-        == foci_firmware::commissioning::outer::velocity::combined_plan::PROPORTIONAL_PLAN_SCHEMA_REVISION
+        == foci_firmware::commissioning::outer::velocity::sweep_plan::PROPORTIONAL_PLAN_SCHEMA_REVISION
             as u32
 );
 
@@ -38,7 +38,7 @@ const _: () = assert!(
 pub const INTEGRAL_EVIDENCE_SCHEMA_REVISION: u32 = 13;
 const _: () = assert!(
     INTEGRAL_EVIDENCE_SCHEMA_REVISION
-        == foci_firmware::commissioning::outer::velocity::combined_plan::INTEGRAL_PLAN_SCHEMA_REVISION
+        == foci_firmware::commissioning::outer::velocity::integral_plan::INTEGRAL_PLAN_SCHEMA_REVISION
             as u32
 );
 
