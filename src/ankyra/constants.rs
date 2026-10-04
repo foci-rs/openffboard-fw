@@ -26,7 +26,6 @@ const _: () = assert!(
         == foci_firmware::commissioning::outer::velocity::sweep_plan::ENVELOPE_ABSOLUTE_MARGIN_MREV_S
 );
 
-#[klipper_constant]
 pub const VELOCITY_LIMIT_EVIDENCE_CAPABILITY: u32 = 1;
 const _: () = assert!(
     VELOCITY_LIMIT_EVIDENCE_CAPABILITY
