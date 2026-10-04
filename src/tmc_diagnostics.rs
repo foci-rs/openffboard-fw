@@ -321,6 +321,7 @@ pub(crate) async fn handle_diagnostic_request(
                 homing_active: ctx.homing_active,
                 stepper_active: ctx.stepper_active,
                 saved_voltage_limit: ctx.saved_voltage_limit,
+                adc_vm_offset: crate::tmc_control::board::tmc_state().adc_vm_offset_snapshot(),
             },
             tmc_config: ctx.tmc_config,
             feedback_config: crate::board_config::FEEDBACK_CONFIGS[0],
