@@ -35,14 +35,6 @@ const _: () = assert!(
 );
 
 #[klipper_constant]
-pub const INTEGRAL_EVIDENCE_SCHEMA_REVISION: u32 = 13;
-const _: () = assert!(
-    INTEGRAL_EVIDENCE_SCHEMA_REVISION
-        == foci_firmware::commissioning::outer::velocity::integral_plan::INTEGRAL_PLAN_SCHEMA_REVISION
-            as u32
-);
-
-#[klipper_constant]
 pub const VELOCITY_LIMIT_EVIDENCE_CAPABILITY: u32 = 1;
 const _: () = assert!(
     VELOCITY_LIMIT_EVIDENCE_CAPABILITY
