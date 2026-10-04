@@ -69,6 +69,10 @@ pub(crate) const TMC_CONFIG: foci_firmware::config::TmcConfig = foci_firmware::c
     resistance_scale_metadata_validated: true,
     current_scale_ma_per_lsb: 1.155,
     max_run_current_ma: 20_000,
+    vm_divider_high_ohms: VM_DIVIDER_HIGH_OHMS,
+    vm_divider_low_ohms: VM_DIVIDER_LOW_OHMS,
+    vm_adc_reference_millivolts: VM_ADC_REFERENCE_MILLIVOLTS,
+    vm_adc_center_counts: VM_ADC_CENTER_COUNTS,
 };
 
 const OPENFFBOARD_V13_BBM_REGISTER: u32 = 0x0909;
