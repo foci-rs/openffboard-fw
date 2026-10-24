@@ -22,6 +22,7 @@ mod helpers;
 mod interrupts;
 mod state;
 mod tmc_control;
+#[cfg(feature = "diagnostics")]
 mod tmc_diagnostics;
 mod tmc_dispatch;
 mod transport;
@@ -1616,6 +1617,7 @@ foci_firmware::foci_ankyra_config! {
     context = &'ctx mut crate::firmware_ctx::FirmwareCtx<'ctx>,
     providers = [
         foci_firmware::ankyra::provider::FOCI_FIRMWARE_PROVIDER,
+        foci_firmware::ankyra::provider::FOCI_DIAGNOSTICS_PROVIDER,
         crate::ankyra::provider::BOARD_PROVIDER,
     ],
     board_static_strings = [

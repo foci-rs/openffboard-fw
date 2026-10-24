@@ -8,6 +8,7 @@ use foci_firmware::commission_dispatch::{ReplyPayload, StepperPostAction};
 use foci_firmware::commissioning::outer::velocity::integral_reproduction::IntegralRetentionSlots;
 use foci_firmware::state::stepper::StepperChannelState;
 use foci_firmware::state::tmc::TmcChannelState;
+#[cfg(feature = "diagnostics")]
 use foci_firmware::state::trsync::HOMING_STATE;
 use foci_firmware::tmc::TmcRequest;
 use foci_firmware::tmc_control::dispatch::RegisterRequestError;
@@ -55,6 +56,7 @@ impl foci_firmware::tmc_control::request::CommissionBusyReplySink for OpenFFBoar
         crate::ankyra::replies::emit_terminal_reply(channel, payload);
     }
 
+    #[cfg(feature = "diagnostics")]
     fn emit_busy_diagnostic(&mut self, request: TmcRequest) {
         crate::tmc_diagnostics::emit_commission_busy_diagnostic(request);
     }
@@ -216,6 +218,7 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
         handle_tmc_request(req, tmc).await
     }
 
+    #[cfg(feature = "diagnostics")]
     async fn run_diagnostic_request(
         &mut self,
         req: TmcRequest,
