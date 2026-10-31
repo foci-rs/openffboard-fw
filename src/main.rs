@@ -368,6 +368,13 @@ mod app {
             }
 
             crate::usb_trace::service_trace_mode_changes();
+            // A parked or commissioning channel never reaches the maintenance trace path, so
+            // its frames would never go out there.
+            crate::usb_trace::emit_control_state_frame(
+                0,
+                tmc_state(),
+                driver.runtime.stored_gains(),
+            );
 
             let status_pin_asserted = status_pin.is_high();
             tmc_state()
@@ -725,7 +732,11 @@ mod app {
                     &tmc_control_config,
                     integral_candidate,
                 );
-                Some(driver.drive(unit, &mut backend, ctx_unit).await)
+                let outcome = driver.drive(unit, &mut backend, ctx_unit).await;
+                tmc_state()
+                    .control_state
+                    .stamp(crate::usb_trace::trace_now_ticks());
+                Some(outcome)
             };
             let unit_cycles = cortex_m::peripheral::DWT::cycle_count().wrapping_sub(unit_start);
             scheduler.record(now_us(), unit_cycles);
