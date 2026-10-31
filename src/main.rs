@@ -28,7 +28,6 @@ mod tmc_dispatch;
 mod transport;
 mod trigger_domain;
 mod usb_task;
-#[cfg(feature = "trace")]
 mod usb_trace;
 
 #[rtic::app(device = crate::pac, peripherals = true, dispatchers = [UART4, UART5, USART3])]
@@ -166,10 +165,7 @@ mod app {
         }
 
         crate::board_init::init_tim5_clock();
-        #[cfg(feature = "trace")]
-        {
-            crate::usb_trace::note_trace_boot();
-        }
+        crate::usb_trace::note_trace_boot();
         crate::board_init::init_stepdir_gpio();
         defmt::info!("TIM5 enabled for Klipper clock @ 84 MHz, STEP/DIR GPIO configured");
         Mono::start(84_000_000);
@@ -211,7 +207,6 @@ mod app {
         crate::board_init::enable_usb_clock();
 
         let uid = crate::board_init::read_stm32_uid(ctx.local.uid_str);
-        #[cfg(feature = "trace")]
         crate::usb_trace::set_trace_serial(uid);
 
         // SAFETY: Called exactly once, before any other klipper-usb function.
@@ -406,10 +401,7 @@ mod app {
                     )
                     .await
                 {
-                    #[cfg(feature = "trace")]
-                    {
-                        driver.commission_trace_phase = None;
-                    }
+                    driver.commission_trace_phase = None;
                     {
                         let mut state = driver.runtime.dispatch_state(tmc_state(), stepper_state());
                         apply_stepper_post_action(actions.stepper, &mut state);
@@ -422,10 +414,7 @@ mod app {
 
             if SHUTDOWN_ACTIVE.load(Relaxed) {
                 if !shutdown_safe_state_applied {
-                    #[cfg(feature = "trace")]
-                    {
-                        driver.commission_trace_phase = None;
-                    }
+                    driver.commission_trace_phase = None;
                     {
                         let mut backend = openffboard_backend(tmc, enable_pin);
                         foci_firmware::tmc_control::lifecycle::apply_shutdown_safe_state(
@@ -491,10 +480,7 @@ mod app {
                     },
                 );
                 if commission_was_active {
-                    #[cfg(feature = "trace")]
-                    {
-                        driver.commission_trace_phase = None;
-                    }
+                    driver.commission_trace_phase = None;
                     let mut backend = openffboard_backend(tmc, enable_pin);
                     let mut state = driver.runtime.dispatch_state(tmc_state(), stepper_state());
                     foci_firmware::tmc_control::lifecycle::disarm_motor(&mut backend, &mut state)
@@ -536,7 +522,6 @@ mod app {
                     flags,
                     0,
                 );
-                #[cfg(feature = "trace")]
                 crate::usb_trace::request_event(
                     foci_firmware::trace::events::EVENT_LEVEL_ERROR,
                     foci_firmware::trace::events::SUBSYSTEM_SAFETY_SHUTDOWN,
@@ -710,7 +695,6 @@ mod app {
             let snapshot = scheduler
                 .maintenance_group()
                 .map_or(homing_state, |g| g.homing_snapshot());
-            #[cfg(feature = "trace")]
             let engine_tick_deadline =
                 Mono::now() + fugit::Duration::<u64, 1, 1_000_000>::millis(1);
             let unit_start = cortex_m::peripheral::DWT::cycle_count();
@@ -817,32 +801,29 @@ mod app {
                         driver.runtime.clear_homing_runtime();
                         TMC_DISABLE_SIGNAL.signal(());
                     }
-                    #[cfg(feature = "trace")]
-                    {
-                        let trace_tick = driver.runtime.advance_trace_tick();
-                        let inputs =
-                            foci_firmware::trace::sampling::TraceSampleInputs::from_runtime_trace(
-                                driver.runtime.trace_state(),
-                                trace_tick,
-                            );
-                        crate::usb_trace::sample_tick(
-                            tmc,
-                            crate::usb_trace::TraceSampleContext {
-                                motor_enabled: driver.runtime.is_motor_enabled(),
-                            },
-                            inputs,
-                        )
-                        .await;
-                        crate::usb_trace::emit_status_frames(
-                            tmc,
-                            trace_tick.control_tick,
-                            trace_tick.status_detail_due,
-                        )
-                        .await;
-                        crate::usb_trace::request_spi_duration_event_if_ready();
-                        if trace_tick.metadata_due {
-                            crate::usb_trace::emit_metadata();
-                        }
+                    let trace_tick = driver.runtime.advance_trace_tick();
+                    let inputs =
+                        foci_firmware::trace::sampling::TraceSampleInputs::from_runtime_trace(
+                            driver.runtime.trace_state(),
+                            trace_tick,
+                        );
+                    crate::usb_trace::sample_tick(
+                        tmc,
+                        crate::usb_trace::TraceSampleContext {
+                            motor_enabled: driver.runtime.is_motor_enabled(),
+                        },
+                        inputs,
+                    )
+                    .await;
+                    crate::usb_trace::emit_status_frames(
+                        tmc,
+                        trace_tick.control_tick,
+                        trace_tick.status_detail_due,
+                    )
+                    .await;
+                    crate::usb_trace::request_spi_duration_event_if_ready();
+                    if trace_tick.metadata_due {
+                        crate::usb_trace::emit_metadata();
                     }
                 }
                 UnitOutcome::Audit(result) => {
@@ -908,7 +889,6 @@ mod app {
                             ),
                         }
                     }
-                    #[cfg(feature = "trace")]
                     if driver.commission_trace_phase
                         == Some((
                             foci_firmware::commissioning::types::EngineKind::Commission,
@@ -1156,7 +1136,6 @@ mod app {
                             let loaded_steps = u32::from(m.count);
                             let interval_add = i32::from(m.add);
                             let old_direction = stepper.dir_state();
-                            #[cfg(feature = "trace")]
                             if let Some((old_class, new_class)) = stepper.load_move(m) {
                                 crate::usb_trace::request_event(
                                     foci_firmware::trace::events::EVENT_LEVEL_INFO,
@@ -1166,8 +1145,6 @@ mod app {
                                     3,
                                 );
                             }
-                            #[cfg(not(feature = "trace"))]
-                            stepper.load_move(m);
                             let dir_changed = old_direction != stepper.dir_state();
                             stepper_state()
                                 .interval
@@ -1207,7 +1184,6 @@ mod app {
 
                 let now = read_tim5();
                 let scheduled = stepper.next_step_clock();
-                #[cfg(feature = "trace")]
                 crate::usb_trace::record_step_timing(scheduled, now);
                 match stepper.check_deadline(scheduled, now, CLOCK_FREQ) {
                     Ok(compare) => {
@@ -1224,7 +1200,6 @@ mod app {
                     Err(_) => {
                         crate::state::stepper_diag::record_loaded_segment(0, loaded_steps);
                         crate::state::stepper_diag::record_missed_deadline(0);
-                        #[cfg(feature = "trace")]
                         crate::usb_trace::TRACE_TIMING
                             .missed_or_deferred_steps
                             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1277,7 +1252,6 @@ mod app {
 
             match result {
                 StepEventResult::ScheduleNext { clock, .. } => {
-                    #[cfg(feature = "trace")]
                     crate::usb_trace::record_step_timing(clock, now);
                     arm_stepper_timer_event(td, 0, clock, stepper_slot.take());
                     return;
@@ -1411,7 +1385,6 @@ mod app {
             disarm_timer(td.state_mut());
             return;
         }
-        #[cfg(feature = "trace")]
         crate::usb_trace::TRACE_TIMING
             .missed_or_deferred_steps
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);

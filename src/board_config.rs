@@ -2,7 +2,7 @@
 
 use crate::ankyra::enumerations::Pins;
 
-/// USB product string; trace builds are told apart by their vendor-specific interface.
+/// USB product string reported by the device descriptor and the trace metadata.
 pub(crate) const USB_PRODUCT: &str = "FOCI OpenFFBoard";
 
 pub(crate) const TMC_CHANNEL_COUNT: u8 = 1;
