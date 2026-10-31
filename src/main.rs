@@ -368,8 +368,6 @@ mod app {
             }
 
             crate::usb_trace::service_trace_mode_changes();
-            // A parked or commissioning channel never reaches the maintenance trace path, so
-            // its frames would never go out there.
             crate::usb_trace::emit_control_state_frame(
                 0,
                 tmc_state(),
