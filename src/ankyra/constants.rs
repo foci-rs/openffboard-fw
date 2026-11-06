@@ -7,18 +7,6 @@ pub const CLOCK_FREQ: u32 = 84_000_000;
 
 #[allow(dead_code)]
 #[klipper_constant]
-pub const ENVELOPE_PROPORTIONAL_NUM: u32 = 3;
-
-#[allow(dead_code)]
-#[klipper_constant]
-pub const ENVELOPE_PROPORTIONAL_DEN: u32 = 2;
-
-#[allow(dead_code)]
-#[klipper_constant]
-pub const ENVELOPE_ABSOLUTE_MARGIN_MREV_S: u32 = 2_000;
-
-#[allow(dead_code)]
-#[klipper_constant]
 pub const MCU: &str = "stm32f407xx";
 
 /// Klipper reads this via `get_constant_float`, which parses the wire string, so `u32` is
