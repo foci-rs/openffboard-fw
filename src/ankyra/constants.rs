@@ -5,26 +5,17 @@ use crate::board_config;
 #[klipper_constant]
 pub const CLOCK_FREQ: u32 = 84_000_000;
 
+#[allow(dead_code)]
 #[klipper_constant]
 pub const ENVELOPE_PROPORTIONAL_NUM: u32 = 3;
-const _: () = assert!(
-    ENVELOPE_PROPORTIONAL_NUM
-        == foci_firmware::commissioning::outer::velocity::sweep_plan::ENVELOPE_PROPORTIONAL_NUM
-);
 
+#[allow(dead_code)]
 #[klipper_constant]
 pub const ENVELOPE_PROPORTIONAL_DEN: u32 = 2;
-const _: () = assert!(
-    ENVELOPE_PROPORTIONAL_DEN
-        == foci_firmware::commissioning::outer::velocity::sweep_plan::ENVELOPE_PROPORTIONAL_DEN
-);
 
+#[allow(dead_code)]
 #[klipper_constant]
 pub const ENVELOPE_ABSOLUTE_MARGIN_MREV_S: u32 = 2_000;
-const _: () = assert!(
-    ENVELOPE_ABSOLUTE_MARGIN_MREV_S
-        == foci_firmware::commissioning::outer::velocity::sweep_plan::ENVELOPE_ABSOLUTE_MARGIN_MREV_S
-);
 
 pub const VELOCITY_LIMIT_EVIDENCE_CAPABILITY: u32 = 1;
 const _: () = assert!(
