@@ -17,12 +17,6 @@ pub const ENVELOPE_PROPORTIONAL_DEN: u32 = 2;
 #[klipper_constant]
 pub const ENVELOPE_ABSOLUTE_MARGIN_MREV_S: u32 = 2_000;
 
-pub const VELOCITY_LIMIT_EVIDENCE_CAPABILITY: u32 = 1;
-const _: () = assert!(
-    VELOCITY_LIMIT_EVIDENCE_CAPABILITY
-        == foci_firmware::commissioning::outer::velocity::VELOCITY_LIMIT_EVIDENCE_CAPABILITY_LATCHED_FLAG
-);
-
 #[allow(dead_code)]
 #[klipper_constant]
 pub const MCU: &str = "stm32f407xx";
