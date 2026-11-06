@@ -861,16 +861,12 @@ mod app {
                 }
                 UnitOutcome::Commission { event, next } => {
                     if let Some(event) = event {
-                        // Temporary: the wildcard arm and these allows go once the firmware drops the
-                        // retired outer event variants and the match is exhaustive again.
-                        #[allow(clippy::single_match, clippy::collapsible_match)]
                         match event {
                             foci_firmware::commissioning::schedule::CommissionEvent::PhaseChanged {
                                 oid,
                                 phase_id,
                                 ..
                             } => emit_phase_reply(oid, phase_id),
-                            _ => {}
                         }
                     }
                     if driver.commission_trace_phase
