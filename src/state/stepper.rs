@@ -6,8 +6,8 @@ use foci_klipper::stepper::{HardwareStepper, LogicalStepEvent};
 
 use super::stepper_mapper::{MAPPER_PHASE, PHYSICAL_PULSE_COUNT};
 pub(crate) use super::stepper_mapper::{
-    STEP_TIMER_HZ, assert_physical_pulse_budget, motion_scale_install_admitted,
-    replace_motion_scale_mapper, scheduler_step_deadline_status,
+    assert_physical_pulse_budget, motion_scale_install_admitted, replace_motion_scale_mapper,
+    scheduler_step_deadline_status,
 };
 
 /// Four TIM5 ticks provide the 40 ns minimum high/low pulse phase.
@@ -50,8 +50,8 @@ pub(crate) unsafe fn init_step_queue() {
 ///
 /// # Safety
 ///
-/// Callable only from P2, or from P1 inside `with_trigger_domain` (the
-/// commissioning stimulus): either context excludes every other producer.
+/// Callable only from P2, or from P1 inside `with_trigger_domain`: either
+/// context excludes every other producer.
 pub(crate) unsafe fn step_queue_producer(
     channel: u8,
 ) -> Option<&'static mut foci_klipper::step_queue::Producer<'static, foci_klipper::stepper::StepMove>>
@@ -67,8 +67,8 @@ pub(crate) unsafe fn step_queue_producer(
 }
 
 /// Producer-side HardwareStepper state (direction tracking, prepare_move).
-/// Accessed from usb_task (P2) command handlers, and from the P1
-/// commissioning stimulus inside `with_trigger_domain`.
+/// Accessed from usb_task (P2) command handlers, and from P1 inside
+/// `with_trigger_domain`.
 pub(crate) static mut P2_STEPPERS: [foci_klipper::stepper::HardwareStepper; STEPPER_CHANNEL_COUNT] =
     [const { foci_klipper::stepper::HardwareStepper::new() }];
 
