@@ -5,7 +5,6 @@ ankyra::ankyra_provider! {
         crate::ankyra::handlers::foci::foci_stepper_stats,
         crate::ankyra::handlers::foci::foci_stepper_stop_stats,
         crate::ankyra::handlers::foci::foci_stepper_timing_stats,
-        crate::ankyra::handlers::foci::foci_tune,
     ],
     replies: [],
     outputs: [],
