@@ -4,7 +4,6 @@ use core::sync::atomic::Ordering::Relaxed;
 
 use embassy_stm32::gpio::Output;
 use foci_firmware::commission_dispatch::CommissionRetention;
-use foci_firmware::commissioning::outer::velocity::integral_reproduction::IntegralRetentionSlot;
 use foci_firmware::shutdown::ShutdownReason;
 use foci_firmware::state::trsync::{HOMING_START_CLOCK, HOMING_STATE};
 use foci_firmware::tmc_control::TmcControlRuntime;
@@ -28,7 +27,6 @@ pub(crate) fn drive_ctx<'a>(
     homing_snapshot: u8,
     status_pin_asserted: bool,
     config: &'a TmcControlConfig,
-    integral_candidate: &'a mut IntegralRetentionSlot,
 ) -> DriveCtx<'a> {
     DriveCtx {
         now_us,
@@ -41,7 +39,7 @@ pub(crate) fn drive_ctx<'a>(
         status_pin_asserted,
         status_mask: STATUS_CRITICAL_MASK,
         config,
-        retention: CommissionRetention::new(integral_candidate),
+        retention: CommissionRetention::none(),
     }
 }
 

@@ -59,7 +59,6 @@ mod app {
         TRIGGER_DOMAIN, TRIGGER_TIMER_MIN_LEAD_TICKS, TriggerDomain, arm_timer_at, disarm_timer,
         reprogram_timer, set_timer_active, with_trigger_domain,
     };
-    use foci_firmware::commissioning::outer::velocity::integral_reproduction::IntegralRetentionSlots;
     use foci_firmware::context::stepper::{
         StepperArmCheckBoard, StepperStopCheckBoard, StepperTimerStateBoard,
     };
@@ -92,7 +91,7 @@ mod app {
 
     use foci_firmware::tmc::TmcRequest;
 
-    use crate::board_config::{TMC_CHANNEL_COUNT, TMC_CONFIG};
+    use crate::board_config::TMC_CONFIG;
     use crate::tmc_control::board::{
         openffboard_backend, refresh_velocity_scale, stepper_state, tmc_state,
     };
@@ -104,8 +103,6 @@ mod app {
         app_state: State,
     }
 
-    type IntegralCandidatesTaskLocal = IntegralRetentionSlots<{ TMC_CHANNEL_COUNT as usize }>;
-
     #[local]
     struct Local {
         tmc: Tmc4671Spi<TmcSpiDevice>,
@@ -113,7 +110,6 @@ mod app {
         tmc_status: Input<'static>,
         tmc_rx: Receiver<'static, TmcRequest, TMC_CHANNEL_SIZE>,
         wdg: IndependentWatchdog<'static, peripherals::IWDG>,
-        integral_candidates: IntegralCandidatesTaskLocal,
         adc_internal:
             embassy_stm32::adc::Adc<'static, crate::board_config::InternalTempAdcInstance>,
         temp_channel: embassy_stm32::adc::Temperature,
@@ -258,7 +254,6 @@ mod app {
                 tmc_status,
                 tmc_rx,
                 wdg,
-                integral_candidates: IntegralCandidatesTaskLocal::new(),
                 adc_internal,
                 temp_channel,
                 mcu_temp_calibration,
@@ -294,7 +289,6 @@ mod app {
             tmc_enable,
             tmc_status,
             tmc_rx,
-            integral_candidates,
             driver: foci_firmware::tmc_control::ChannelDriver =
                 foci_firmware::tmc_control::ChannelDriver::new(0),
         ]
@@ -310,7 +304,6 @@ mod app {
         let enable_pin = ctx.local.tmc_enable;
         let status_pin = ctx.local.tmc_status;
         let rx = ctx.local.tmc_rx;
-        let integral_candidates = ctx.local.integral_candidates;
         let driver = ctx.local.driver;
 
         let signals = foci_firmware::tmc_control::TmcControlSignals::new(
@@ -435,7 +428,6 @@ mod app {
                     tmc_state().commission_in_flight.store(false, Relaxed);
                     stepper_stop_from_p1(0);
                     shutdown_safe_state_applied = true;
-                    integral_candidates.invalidate_all();
                 }
                 Mono::delay(1.millis()).await;
                 continue;
@@ -471,7 +463,6 @@ mod app {
             }
 
             if TMC_QUEUE_FLUSH.load(Relaxed) {
-                integral_candidates.invalidate_all();
                 while rx.try_recv().is_ok() {}
                 let commission_was_active = driver.runtime.is_commission_active();
                 crate::tmc_control::effects::apply_actions(
@@ -652,7 +643,6 @@ mod app {
                             enable_pin,
                             &mut driver.runtime,
                             &mut driver.commission_trace_engine_seq,
-                            &mut *integral_candidates,
                         )
                         .await;
                         if let Some(reason) = outcome.shutdown {
@@ -719,15 +709,11 @@ mod app {
                 None
             } else {
                 let mut backend = openffboard_backend(tmc, enable_pin);
-                let integral_candidate = integral_candidates
-                    .slot_mut(0)
-                    .expect("OpenFFBoard channel 0 exists");
                 let ctx_unit = crate::tmc_control::board::drive_ctx(
                     now,
                     snapshot,
                     status_pin_asserted,
                     &tmc_control_config,
-                    integral_candidate,
                 );
                 let outcome = driver.drive(unit, &mut backend, ctx_unit).await;
                 tmc_state()

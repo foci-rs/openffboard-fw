@@ -5,14 +5,13 @@ use core::sync::atomic::Ordering;
 use embassy_stm32::gpio::Output;
 use foci_firmware::autotune::CommissionError;
 use foci_firmware::commission_dispatch::{ReplyPayload, StepperPostAction};
-use foci_firmware::commissioning::outer::velocity::integral_reproduction::IntegralRetentionSlots;
 use foci_firmware::state::stepper::StepperChannelState;
 use foci_firmware::state::tmc::TmcChannelState;
 #[cfg(feature = "diagnostics")]
 use foci_firmware::state::trsync::HOMING_STATE;
 use foci_firmware::tmc::TmcRequest;
 use foci_firmware::tmc_control::dispatch::RegisterRequestError;
-use foci_firmware::tmc_control::request::handle_tmc_control_request_with_stages;
+use foci_firmware::tmc_control::request::handle_tmc_control_request_without_retention;
 use foci_firmware::tmc_control::request::{
     MotionScaleMapperInstallError, TmcPreRequestDisposition, TmcRequestBoard,
 };
@@ -23,7 +22,6 @@ use foci_firmware::tmc_control::{
 use foci_tmc4671::spi::Tmc4671Spi;
 
 use crate::app_types::TmcSpiDevice;
-use crate::board_config::TMC_CHANNEL_COUNT;
 #[cfg(feature = "dev")]
 use crate::helpers::dev::{do_test_spin, tmc_enter_openloop};
 use crate::helpers::stepper::apply_stepper_post_action;
@@ -253,7 +251,6 @@ pub(crate) async fn handle_tmc_control_request(
     enable_pin: &mut Output<'static>,
     runtime: &mut foci_firmware::tmc_control::TmcControlRuntime,
     commission_trace_engine_seq: &mut u32,
-    integral_candidates: &mut IntegralRetentionSlots<{ TMC_CHANNEL_COUNT as usize }>,
 ) -> TmcControlRequestOutcome {
     if req.channel != 0 {
         return TmcControlRequestOutcome::shutdown(
@@ -262,15 +259,11 @@ pub(crate) async fn handle_tmc_control_request(
         );
     }
 
-    let integral_candidate = integral_candidates
-        .slot_mut(req.channel)
-        .expect("validated TMC channel");
     let mut board = OpenFFBoardRequestBoard::new(enable_pin, commission_trace_engine_seq);
-    handle_tmc_control_request_with_stages(
+    handle_tmc_control_request_without_retention(
         req,
         TmcPreRequestDisposition::ContinueRequest,
         runtime,
-        integral_candidate,
         tmc,
         &mut board,
     )
