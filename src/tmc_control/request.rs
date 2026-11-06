@@ -11,7 +11,6 @@ use foci_firmware::state::tmc::TmcChannelState;
 use foci_firmware::state::trsync::HOMING_STATE;
 use foci_firmware::tmc::TmcRequest;
 use foci_firmware::tmc_control::dispatch::RegisterRequestError;
-use foci_firmware::tmc_control::request::handle_tmc_control_request_without_retention;
 use foci_firmware::tmc_control::request::{
     MotionScaleMapperInstallError, TmcPreRequestDisposition, TmcRequestBoard,
 };
@@ -260,7 +259,7 @@ pub(crate) async fn handle_tmc_control_request(
     }
 
     let mut board = OpenFFBoardRequestBoard::new(enable_pin, commission_trace_engine_seq);
-    handle_tmc_control_request_without_retention(
+    foci_firmware::tmc_control::request::handle_tmc_control_request(
         req,
         TmcPreRequestDisposition::ContinueRequest,
         runtime,
