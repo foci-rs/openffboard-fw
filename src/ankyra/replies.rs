@@ -346,40 +346,6 @@ pub(crate) fn emit_trace_mode_state(oid: u8, mode: foci_firmware::trace::samplin
     );
 }
 
-pub(crate) fn emit_velocity_integral_event(
-    oid: u8,
-    event: foci_firmware::commissioning::types::VelocityIntegralEvent,
-) {
-    let mut sink = BoardCommissionReplySink;
-    foci_firmware::commission_dispatch::replies::emit_velocity_integral_event(
-        &mut sink, oid, event,
-    );
-}
-
-pub(crate) fn emit_breakaway_campaign_event(
-    oid: u8,
-    event: foci_firmware::commissioning::types::BreakawayCampaignEvent,
-) {
-    let mut sink = BoardCommissionReplySink;
-    foci_firmware::commission_dispatch::replies::emit_breakaway_campaign_event(
-        &mut sink, oid, event,
-    );
-}
-
-pub(crate) fn emit_velocity_integral_plan(
-    oid: u8,
-    run_sequence: u32,
-    plan: foci_firmware::commissioning::outer::velocity::integral_plan::VelocityIntegralPlan,
-) {
-    let mut sink = BoardCommissionReplySink;
-    foci_firmware::commission_dispatch::replies::emit_velocity_integral_plan(
-        &mut sink,
-        oid,
-        run_sequence,
-        plan,
-    );
-}
-
 pub(crate) fn emit_phase_reply(oid: u8, phase_id: foci_firmware::autotune::CommissionPhase) {
     let mut sink = BoardCommissionReplySink;
     foci_firmware::commission_dispatch::emit_phase_reply(&mut sink, oid, phase_id);
