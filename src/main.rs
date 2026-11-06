@@ -42,6 +42,7 @@ mod app {
     use embassy_stm32::wdg::IndependentWatchdog;
     use embassy_stm32::{bind_interrupts, peripherals};
     use embedded_hal_bus::spi::ExclusiveDevice;
+    use foci_firmware::commissioning::run_types::CommissionPhase;
     use foci_klipper::state::State;
     use foci_tmc4671::spi::Tmc4671Spi;
     use rtic_monotonics::fugit::{self, ExtU64};
@@ -379,7 +380,7 @@ mod app {
                         &mut backend,
                         tmc_state(),
                         stepper_state(),
-                        foci_firmware::autotune::CommissionError::Shutdown,
+                        foci_firmware::commissioning::run_types::CommissionError::Shutdown,
                     )
                     .await;
             }
@@ -872,7 +873,7 @@ mod app {
                     if driver.commission_trace_phase
                         == Some((
                             foci_firmware::commissioning::types::EngineKind::Commission,
-                            foci_firmware::autotune::CommissionPhase::ClosedLoopActivation,
+                            CommissionPhase::ClosedLoopActivation,
                         ))
                     {
                         let trace_tick = driver.runtime.advance_trace_sample_tick();

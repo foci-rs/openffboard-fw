@@ -3,8 +3,8 @@
 use core::sync::atomic::Ordering;
 
 use embassy_stm32::gpio::Output;
-use foci_firmware::autotune::CommissionError;
 use foci_firmware::commission_dispatch::{ReplyPayload, StepperPostAction};
+use foci_firmware::commissioning::run_types::CommissionError;
 use foci_firmware::state::stepper::StepperChannelState;
 use foci_firmware::state::tmc::TmcChannelState;
 #[cfg(feature = "diagnostics")]
