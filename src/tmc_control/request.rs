@@ -97,10 +97,6 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
         crate::board_config::TMC_CONFIG.default_current_filter_hz()
     }
 
-    fn pwm_freq_hz(&self) -> u32 {
-        crate::board_config::TMC_CONFIG.pwm_freq_hz()
-    }
-
     fn motion_scale_queue_empty(&self) -> bool {
         crate::state::stepper::STEP_QUEUE_CHANNEL.is_empty()
     }
