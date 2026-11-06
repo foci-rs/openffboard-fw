@@ -662,55 +662,6 @@ pub(crate) fn emit_control_state_frame(
     });
 }
 
-pub(crate) fn request_velocity_observation(
-    channel: u8,
-    sample: foci_firmware::trace::stream::VelocityTraceObservation,
-) {
-    use foci_firmware::trace::stream::*;
-
-    if !is_configured() {
-        return;
-    }
-
-    let mut payload = [0u8; VELOCITY_OBSERVATION_PAYLOAD_LEN];
-    encode_velocity_observation_payload(&sample, &mut payload);
-    let mut frame = FrameBuf::new();
-    frame.write_header(header(
-        FRAME_TYPE_VELOCITY_OBSERVATION,
-        VELOCITY_OBSERVATION_PAYLOAD_LEN,
-        SOURCE_KIND_FOCI,
-        channel,
-        motion_flags(),
-    ));
-    frame
-        .payload_mut(VELOCITY_OBSERVATION_PAYLOAD_LEN)
-        .copy_from_slice(&payload);
-    enqueue_motion(frame);
-}
-
-pub(crate) fn request_velocity_sweep_evidence(
-    channel: u8,
-    record: foci_firmware::ankyra::velocity_sweep_encoding::VelocitySweepCanonicalRecord,
-) {
-    use foci_firmware::trace::stream::*;
-
-    if !is_configured() {
-        return;
-    }
-
-    let payload = record.as_bytes();
-    let mut frame = FrameBuf::new();
-    frame.write_header(header(
-        FRAME_TYPE_VELOCITY_SWEEP_EVIDENCE,
-        payload.len(),
-        SOURCE_KIND_FOCI,
-        channel,
-        motion_flags(),
-    ));
-    frame.payload_mut(payload.len()).copy_from_slice(payload);
-    enqueue_motion(frame);
-}
-
 pub(crate) fn enqueue_motion(frame: FrameBuf) {
     // SAFETY: TMC control is the sole motion-frame producer. The USB task owns
     // the separately split consumer endpoint.

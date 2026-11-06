@@ -152,13 +152,6 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
         crate::ankyra::replies::emit_terminal_reply(channel, payload);
     }
 
-    fn record_velocity_sweep_trace_record(
-        &mut self,
-        record: foci_firmware::ankyra::velocity_sweep_encoding::VelocitySweepCanonicalRecord,
-    ) {
-        crate::usb_trace::request_velocity_sweep_evidence(0, record);
-    }
-
     fn emit_motor_arm_event(&mut self) {
         crate::usb_trace::request_event(
             foci_firmware::trace::events::EVENT_LEVEL_INFO,
