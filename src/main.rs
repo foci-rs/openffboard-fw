@@ -532,7 +532,7 @@ mod app {
                     Ok(flags) => {
                         defmt::error!("TMC4671 emergency disable: STATUS={:#010x}", flags)
                     }
-                    Err(_) => defmt::error!("TMC4671 emergency disable: STATUS read failed"),
+                    Err(()) => defmt::error!("TMC4671 emergency disable: STATUS read failed"),
                 }
                 let status_pin_asserted = status_pin.is_high();
                 tmc_state()
