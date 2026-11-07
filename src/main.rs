@@ -563,17 +563,17 @@ mod app {
                                 );
                             }
                             foci_firmware::tmc_control::EmergencyDisableFault::Generic => {
-                                if deadline_channel != NO_STEPPER_CHANNEL {
-                                    foci_firmware::dispatch_shutdown!(
-                                        foci_firmware::shutdown::ShutdownReason::StepperTooFarInPast,
-                                        read_tim5(),
-                                        &mut crate::_ankyra_config::Sender
-                                    );
-                                } else {
+                                if deadline_channel == NO_STEPPER_CHANNEL {
                                     ::ankyra::klipper_shutdown_from!(
                                         &mut crate::_ankyra_config::Sender,
                                         "TMC4671 fault",
                                         read_tim5(),
+                                    );
+                                } else {
+                                    foci_firmware::dispatch_shutdown!(
+                                        foci_firmware::shutdown::ShutdownReason::StepperTooFarInPast,
+                                        read_tim5(),
+                                        &mut crate::_ankyra_config::Sender
                                     );
                                 }
                             }
