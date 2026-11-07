@@ -1,4 +1,4 @@
-//! OpenFFBoard effects for shared TMC control runtime actions.
+//! `OpenFFBoard` effects for shared TMC control runtime actions.
 
 use foci_firmware::tmc_control::{BoardAction, BoardActions, ShutdownReason, StepperAction};
 use foci_firmware::tmc_control::{CommissionWaitRequestDisposition, classify_wait_request};

@@ -7,16 +7,16 @@ pub(crate) const USB_PRODUCT: &str = "FOCI OpenFFBoard";
 
 pub(crate) const TMC_CHANNEL_COUNT: u8 = 1;
 
-/// OpenFFBoard v1.3 VM sense divider high-side resistor (R23).
+/// `OpenFFBoard` v1.3 VM sense divider high-side resistor (R23).
 pub(crate) const VM_DIVIDER_HIGH_OHMS: u32 = 71_500;
 
-/// OpenFFBoard v1.3 VM sense divider low-side resistor (R24).
+/// `OpenFFBoard` v1.3 VM sense divider low-side resistor (R24).
 pub(crate) const VM_DIVIDER_LOW_OHMS: u32 = 1_500;
 
-/// TMC4671 ADC_VM reference span in millivolts.
+/// TMC4671 `ADC_VM` reference span in millivolts.
 pub(crate) const VM_ADC_REFERENCE_MILLIVOLTS: u32 = 2_500;
 
-/// Centered positive ADC_VM count span for the TMC4671 16-bit raw ADC.
+/// Centered positive `ADC_VM` count span for the TMC4671 16-bit raw ADC.
 pub(crate) const VM_ADC_CENTER_COUNTS: u32 = 32_767;
 
 pub(crate) fn step_pin_channel(pin: u8) -> Option<u8> {
@@ -41,7 +41,7 @@ pub(crate) fn enable_pin_channel(pin: u32) -> Option<u8> {
     }
 }
 
-/// PWM at 25 kHz: PWM_MAXCNT=3999 with fCLK=25 MHz (TMC4671 datasheet 4.9.3).
+/// PWM at 25 kHz: `PWM_MAXCNT=3999` with fCLK=25 MHz (TMC4671 datasheet 4.9.3).
 const OPENFFBOARD_V13_PWM_MAXCNT: u16 = 3999;
 const OPENFFBOARD_V13_DSADC_MDEC: u16 =
     foci_firmware::config::dsadc_mdec_from_pwm_maxcnt(OPENFFBOARD_V13_PWM_MAXCNT);
@@ -89,7 +89,7 @@ pub(crate) const FEEDBACK_CONFIGS: [foci_firmware::config::FeedbackConfig;
     position_source: foci_firmware::config::FeedbackSource::Abn,
 }; TMC_CHANNEL_COUNT as usize];
 
-/// The internal temperature sensor is wired to ADC1_IN16 only (RM0090).
+/// The internal temperature sensor is wired to `ADC1_IN16` only (RM0090).
 pub(crate) type InternalTempAdcInstance = embassy_stm32::peripherals::ADC1;
 
 pub(crate) fn analog_pin_channel(pin: u8) -> Option<u8> {

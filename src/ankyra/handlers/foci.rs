@@ -48,7 +48,7 @@ fn stepper_execution_snapshot(
 /// Query board-local step queue counters.
 ///
 /// This is intentionally board-local because the counters live next to
-/// OpenFFBoard's TIM5/queue implementation, not in the shared protocol core.
+/// `OpenFFBoard`'s TIM5/queue implementation, not in the shared protocol core.
 #[klipper_command]
 pub fn foci_stepper_stats(ctx: &mut FirmwareCtx<'_>, oid: u8) {
     let Some(snapshot) = stepper_execution_snapshot(ctx, oid) else {

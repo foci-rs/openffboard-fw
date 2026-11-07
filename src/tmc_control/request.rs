@@ -1,4 +1,4 @@
-//! OpenFFBoard TMC control request handling.
+//! `OpenFFBoard` TMC control request handling.
 
 use core::sync::atomic::Ordering;
 

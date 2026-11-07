@@ -1,4 +1,4 @@
-//! OpenFFBoard TMC control shell modules.
+//! `OpenFFBoard` TMC control shell modules.
 
 pub(crate) mod board;
 pub(crate) mod effects;

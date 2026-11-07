@@ -6,7 +6,7 @@ use foci_klipper::pulse_mapper::PulseMapperConfig;
 use foci_klipper::scheduler::SchedulerEventKind;
 use foci_klipper::stepper::{HardwareStepper, MotionScaleConfigError};
 
-/// OpenFFBoard TIM5 input clock in hertz.
+/// `OpenFFBoard` TIM5 input clock in hertz.
 pub(crate) const STEP_TIMER_HZ: u32 = 84_000_000;
 
 /// DIR setup plus two complete high/low pulse periods.
@@ -18,7 +18,7 @@ pub(crate) static PHYSICAL_PULSE_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Last mapper phase published after STEP returned low.
 pub(crate) static MAPPER_PHASE: AtomicI32 = AtomicI32::new(0);
 
-/// Return OpenFFBoard's immutable physical waveform timing.
+/// Return `OpenFFBoard`'s immutable physical waveform timing.
 pub(crate) fn step_pulse_timing() -> StepPulseTiming {
     let timing =
         StepPulseTiming::new(STEP_TIMER_HZ).expect("OpenFFBoard step timing constants are valid");

@@ -18,7 +18,7 @@ pub(crate) const STEP_DIR_SETUP_TICKS: u32 = 8;
 
 pub(crate) use foci_klipper::step_queue::STEP_QUEUE_DEPTH;
 
-/// Number of hardware stepper runtime channels on OpenFFBoard.
+/// Number of hardware stepper runtime channels on `OpenFFBoard`.
 pub(crate) const STEPPER_CHANNEL_COUNT: usize = 1;
 
 /// Lock-free step/dir move queue with explicit producer/consumer ownership.
@@ -45,7 +45,7 @@ pub(crate) unsafe fn init_step_queue() {
 }
 
 /// Borrow the P2-owned producer for `channel`. Returns `None` for any
-/// channel other than 0 (OpenFFBoard has one physical stepper) or if
+/// channel other than 0 (`OpenFFBoard` has one physical stepper) or if
 /// `init_step_queue` has not yet run.
 ///
 /// # Safety
@@ -66,13 +66,13 @@ pub(crate) unsafe fn step_queue_producer(
     producer_slot.as_mut()
 }
 
-/// Producer-side HardwareStepper state (direction tracking, prepare_move).
-/// Accessed from usb_task (P2) command handlers, and from P1 inside
+/// Producer-side `HardwareStepper` state (direction tracking, `prepare_move`).
+/// Accessed from `usb_task` (P2) command handlers, and from P1 inside
 /// `with_trigger_domain`.
 pub(crate) static mut P2_STEPPERS: [foci_klipper::stepper::HardwareStepper; STEPPER_CHANNEL_COUNT] =
     [const { foci_klipper::stepper::HardwareStepper::new() }];
 
-/// P3-local HardwareStepper state (active segment, step execution).
+/// P3-local `HardwareStepper` state (active segment, step execution).
 /// Only accessed from TIM5 CC1 ISR (P3).
 pub(crate) static mut ISR_STEPPERS: [foci_klipper::stepper::HardwareStepper;
     STEPPER_CHANNEL_COUNT] = [const { foci_klipper::stepper::HardwareStepper::new() }];
@@ -81,7 +81,7 @@ pub(crate) static mut ISR_STEPPERS: [foci_klipper::stepper::HardwareStepper;
 ///
 /// # Safety
 ///
-/// Callers must uphold OpenFFBoard's per-channel RTIC access discipline for
+/// Callers must uphold `OpenFFBoard`'s per-channel RTIC access discipline for
 /// the returned stepper state and must not create overlapping mutable
 /// references to the same channel.
 #[inline]
@@ -102,7 +102,7 @@ pub(crate) unsafe fn p2_stepper(
 ///
 /// # Safety
 ///
-/// Callers must uphold OpenFFBoard's per-channel RTIC access discipline for
+/// Callers must uphold `OpenFFBoard`'s per-channel RTIC access discipline for
 /// the returned stepper state and must not create overlapping mutable
 /// references to the same channel.
 #[inline]

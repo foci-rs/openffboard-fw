@@ -92,7 +92,7 @@ where
     });
 }
 
-/// Sample the MCU_TEMP analog-in channel if it is due, sending an
+/// Sample the `MCU_TEMP` analog-in channel if it is due, sending an
 /// `analog_in_state` reply. Returns `true` if sustained out-of-range
 /// readings require the caller to enter the shutdown state -- this
 /// function itself has no access to `app_state` and must not dispatch a

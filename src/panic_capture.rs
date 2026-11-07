@@ -1,25 +1,25 @@
-//! Probe-free panic and HardFault capture.
+//! Probe-free panic and `HardFault` capture.
 //!
 //! Persists the fault into a no-init CCMRAM record that survives the warm
 //! reset, then hands it to [`foci_firmware::diagnostic`] at startup so the
 //! connect-time register dump reports it to the host over the ordinary command
 //! transport.
 //!
-//! CCMRAM (0x1000_0000) is core-coupled RAM the startup code never clears; it
+//! CCMRAM (`0x1000_0000`) is core-coupled RAM the startup code never clears; it
 //! retains its contents across an `SCB::sys_reset` or watchdog reset while
 //! power is held. The 32-bit magic guards against reading uninitialised RAM as
 //! a record on the first cold boot.
 //!
 //! The record carries no message string: a Rust panic is located by its source
 //! `line` plus the FNV-1a `file_hash` of the panic path (match against hashed
-//! candidate paths), and a HardFault by its `pc` (resolve with `addr2line`
+//! candidate paths), and a `HardFault` by its `pc` (resolve with `addr2line`
 //! against the ELF). That keeps the wire reply a fixed scalar layout.
 
 use core::ptr::addr_of_mut;
 
 use foci_firmware::diagnostic::{LastPanic, last_panic_kind};
 
-/// Marks a slot that holds a valid captured record ("FpAN").
+/// Marks a slot that holds a valid captured record ("`FpAN`").
 const PANIC_MAGIC: u32 = 0x4670_414E;
 
 const FNV1A_OFFSET: u32 = 0x811c_9dc5;
@@ -61,7 +61,7 @@ static mut PANIC_PERSIST: PanicPersist = PanicPersist {
 };
 
 /// Persist a record and reset. `SAFETY`: only ever called from the panic or
-/// HardFault handler, i.e. single-threaded with no concurrent access to the
+/// `HardFault` handler, i.e. single-threaded with no concurrent access to the
 /// no-init slot.
 unsafe fn persist_and_reset(kind: u8, line: u32, pc: u32, file_hash: u32) -> ! {
     let slot = addr_of_mut!(PANIC_PERSIST);

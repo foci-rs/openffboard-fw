@@ -1,4 +1,4 @@
-//! OpenFFBoard USB trace stream integration.
+//! `OpenFFBoard` USB trace stream integration.
 
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
 
@@ -93,7 +93,7 @@ fn load_split_u64(low: &AtomicU32, high: &AtomicU32) -> u64 {
 /// section because every trace timestamp in a session must be monotonic. The
 /// half-window wrap heuristic assumes this function is called at least once
 /// per TIM5 wrap; the 1 ms tick satisfies that during normal operation and USB
-/// configuration is expected well before the first 51.1 s OpenFFBoard F407
+/// configuration is expected well before the first 51.1 s `OpenFFBoard` F407
 /// TIM5 wrap at the 84 MHz APB1 timer clock.
 pub(crate) fn trace_now_ticks() -> u64 {
     let low = crate::helpers::lifecycle::read_tim5();

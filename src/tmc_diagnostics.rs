@@ -1,4 +1,4 @@
-//! OpenFFBoard active diagnostic reply glue.
+//! `OpenFFBoard` active diagnostic reply glue.
 
 use crate::app::Mono;
 use embassy_stm32::gpio::Output;

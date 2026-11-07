@@ -1,4 +1,4 @@
-//! Board-bring-up helpers for OpenFFBoard.
+//! Board-bring-up helpers for `OpenFFBoard`.
 
 use embassy_stm32::Peri;
 use embassy_stm32::gpio::{AfType, Flex, Input, Level, Output, Pull, Speed};
@@ -51,7 +51,7 @@ pub fn paint_stack() {
 
 /// Read the STM32 96-bit unique device ID and format as a hex string.
 ///
-/// The UID is at 0x1FFF_7A10 on STM32F4. Returns a 24-character hex
+/// The UID is at `0x1FFF_7A10` on STM32F4. Returns a 24-character hex
 /// string. Reads the 12 raw bytes sequentially (matching
 /// Klipper/Katapult convention) and outputs high nibble first for each
 /// byte.
@@ -69,7 +69,7 @@ pub fn read_stm32_uid(buf: &mut [u8; 24]) -> &str {
 }
 
 /// Build the embassy-stm32 clock configuration for 168 MHz SYSCLK,
-/// 48 MHz USB: HSE 8 MHz → PLL → 168 MHz, USB uses PLL1_Q.
+/// 48 MHz USB: HSE 8 MHz → PLL → 168 MHz, USB uses `PLL1_Q`.
 pub fn rcc_config() -> embassy_stm32::Config {
     use embassy_stm32::rcc::*;
 
@@ -224,8 +224,8 @@ pub fn enable_dwt_cyccnt() {
 const SPI_DMA_INTERRUPT_PRIORITY: embassy_stm32::interrupt::Priority =
     embassy_stm32::interrupt::Priority::P15;
 
-/// Confirm the SPI1 RX/TX DMA completion interrupts (DMA2_STREAM2,
-/// DMA2_STREAM3) are configured below the RTIC P3 hard-real-time ceiling
+/// Confirm the SPI1 RX/TX DMA completion interrupts (`DMA2_STREAM2`,
+/// `DMA2_STREAM3`) are configured below the RTIC P3 hard-real-time ceiling
 /// (TIM5/USB/STATUS -- raw NVIC priority `0xD0` on this 4-priority-bit part,
 /// `Priority::P13` in Embassy's encoding).
 ///

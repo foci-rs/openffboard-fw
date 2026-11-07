@@ -1,4 +1,4 @@
-//! OpenFFBoard commissioning backend hooks.
+//! `OpenFFBoard` commissioning backend hooks.
 //!
 //! Board-specific hooks provide `Mono`, shutdown signal, configuration, and
 //! trace integration to the shared firmware commissioning backend core.

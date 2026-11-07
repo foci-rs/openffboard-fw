@@ -1,4 +1,4 @@
-//! OpenFFBoard TMC control board accessors.
+//! `OpenFFBoard` TMC control board accessors.
 
 use core::sync::atomic::Ordering::Relaxed;
 
