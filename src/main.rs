@@ -530,7 +530,7 @@ mod app {
                 );
                 match status_flags {
                     Ok(flags) => {
-                        defmt::error!("TMC4671 emergency disable: STATUS={:#010x}", flags)
+                        defmt::error!("TMC4671 emergency disable: STATUS={:#010x}", flags);
                     }
                     Err(()) => defmt::error!("TMC4671 emergency disable: STATUS read failed"),
                 }
@@ -894,7 +894,7 @@ mod app {
                     match next {
                         CommissionNext::PollNow => scheduler.set_commission_due(0, Some(now_us())),
                         CommissionNext::WaitUntil(deadline_us) => {
-                            scheduler.set_commission_due(0, Some(deadline_us))
+                            scheduler.set_commission_due(0, Some(deadline_us));
                         }
                         CommissionNext::Yield => {
                             scheduler.note_commission_yield(0);

@@ -22,7 +22,7 @@ fn attach_consumer(consumer: Consumer<'static, StepMove>) {
         // SAFETY: exclusive access from the critical section; `consumer`
         // is `STEP_QUEUE_CHANNEL`'s own value.
         unsafe { crate::state::stepper::STEP_QUEUE_CHANNEL.give_consumer(consumer) }
-    })
+    });
 }
 
 /// Outcome of `with_consumer_locked`.

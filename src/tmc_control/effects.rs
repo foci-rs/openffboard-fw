@@ -76,10 +76,10 @@ where
         BoardAction::Stepper(StepperAction::None) => {}
         BoardAction::Stepper(StepperAction::StopNow) => stepper_stop_from_p1(0),
         BoardAction::Stepper(StepperAction::ArmCheck { .. }) => {
-            defmt::panic!("ArmCheck requires SPI/backend state and must be handled inline")
+            defmt::panic!("ArmCheck requires SPI/backend state and must be handled inline");
         }
         BoardAction::Stepper(StepperAction::ApplyPostAction(_)) => {
-            defmt::warn!("TMC runtime post-action requires dispatch state; handled inline")
+            defmt::warn!("TMC runtime post-action requires dispatch state; handled inline");
         }
     }
 }
