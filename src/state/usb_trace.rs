@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, Ordering};
 
 use foci_firmware::trace::stream::FrameBuf;
 
-use crate::usb_trace_policy::TraceModeRequests;
+use foci_firmware::trace::usb_trace_policy::TraceModeRequests;
 
 /// Motion/counter queue depth in frames.
 pub(crate) const MOTION_QUEUE_DEPTH: usize = 32;
