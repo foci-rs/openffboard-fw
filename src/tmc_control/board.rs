@@ -21,12 +21,12 @@ use crate::commissioning_backend::OpenFFBoardBackend;
 pub(crate) const STATUS_CRITICAL_MASK: u32 = 1 << 26;
 
 /// Assemble one drive-context borrow for the control loop's current tick.
-pub(crate) fn drive_ctx<'a>(
+pub(crate) fn drive_ctx(
     now_us: u64,
     homing_snapshot: u8,
     status_pin_asserted: bool,
-    config: &'a TmcControlConfig,
-) -> DriveCtx<'a> {
+    config: &TmcControlConfig,
+) -> DriveCtx<'_> {
     DriveCtx {
         now_us,
         homing_active: HOMING_STATE.load(Relaxed) != 0,
