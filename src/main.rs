@@ -884,8 +884,7 @@ mod app {
                             || {
                                 engine_tick_deadline
                                     .checked_duration_since(Mono::now())
-                                    .map(|d| d.to_micros())
-                                    .unwrap_or(0)
+                                    .map_or(0, |d| d.to_micros())
                             },
                             || Mono::now() > engine_tick_deadline,
                         )
