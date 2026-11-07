@@ -349,7 +349,10 @@ pub(crate) fn request_commission_event(
 }
 
 fn enqueue_event_frame(event: PendingEvent) {
-    use foci_firmware::trace::stream::*;
+    use foci_firmware::trace::stream::{
+        EVENT_PAYLOAD_LEN, EventSample, FLAG_DROP_GAP_BEFORE_THIS_FRAME, FRAME_TYPE_EVENT,
+        SOURCE_INDEX_NA, SOURCE_KIND_BOARD,
+    };
 
     let sample = EventSample {
         level: event.level,
@@ -516,7 +519,9 @@ pub(crate) fn is_configured() -> bool {
 /// Emit stream metadata. Control-task context only: it uses the motion-queue producer.
 pub(crate) fn emit_metadata() {
     use core::sync::atomic::Ordering::Relaxed;
-    use foci_firmware::trace::stream::*;
+    use foci_firmware::trace::stream::{
+        FRAME_TYPE_METADATA, FrameBuf, SOURCE_INDEX_NA, SOURCE_KIND_BOARD,
+    };
 
     if !is_configured() {
         return;
@@ -618,7 +623,9 @@ fn try_enqueue_control_state(
     channel: u8,
     sample: &foci_firmware::trace::control_state::ControlStateSample,
 ) -> Result<(), QueueFull> {
-    use foci_firmware::trace::stream::*;
+    use foci_firmware::trace::stream::{
+        CONTROL_STATE_PAYLOAD_LEN, FRAME_TYPE_CONTROL_STATE, FrameBuf, SOURCE_KIND_FOCI,
+    };
 
     // SAFETY: TMC control is the sole motion-frame producer, so room seen by `ready` cannot
     // be taken before the enqueue below.
@@ -778,8 +785,14 @@ where
     B: embedded_hal_async::spi::SpiDevice<u8>,
 {
     use core::sync::atomic::Ordering::Relaxed;
-    use foci_firmware::trace::stream::*;
-    use foci_tmc4671::registers::*;
+    use foci_firmware::trace::stream::{
+        CONTROL_DETAIL_PAYLOAD_LEN, ControlDetailSample, FRAME_TYPE_CONTROL_DETAIL, FrameBuf,
+        SOURCE_KIND_FOCI, control_detail_due, encode_control_detail_payload,
+    };
+    use foci_tmc4671::registers::{
+        INTERIM_PIDIN_TARGET_VELOCITY, INTERIM_PIDOUT_TARGET_FLUX, INTERIM_PIDOUT_TARGET_TORQUE,
+        INTERIM_PIDOUT_TARGET_VELOCITY,
+    };
 
     if !control_detail_due(
         control_tick,
@@ -844,8 +857,17 @@ pub(crate) async fn sample_tick<B>(
     B: embedded_hal_async::spi::SpiDevice<u8>,
 {
     use core::sync::atomic::Ordering::Relaxed;
-    use foci_firmware::trace::stream::*;
-    use foci_tmc4671::registers::*;
+    use foci_firmware::trace::stream::{
+        CRITICAL_PAYLOAD_LEN, CURRENT_PATH_PAYLOAD_LEN, CriticalSample, CurrentPathSample,
+        FRAME_TYPE_CRITICAL, FRAME_TYPE_CURRENT_PATH, FrameBuf, SOURCE_KIND_FOCI, current_path_due,
+        encode_critical_payload, encode_current_path_payload,
+    };
+    use foci_tmc4671::registers::{
+        INTERIM_ADC_I1_I0, INTERIM_FOC_IQ_ID, INTERIM_FOC_IWY_IUX, INTERIM_FOC_UQ_UD,
+        INTERIM_FOC_UQ_UD_LIMITED, INTERIM_PID_TORQUE_TARGET_TORQUE_ACTUAL,
+        PID_ERROR_PID_POSITION_ERROR, PID_ERROR_PID_VELOCITY_ERROR, PID_POSITION_ACTUAL,
+        PID_VELOCITY_ACTUAL,
+    };
 
     if !is_configured() {
         return;
@@ -1014,7 +1036,7 @@ fn emit_one_status(
     sample: foci_firmware::trace::stream::StatusSample,
     force: bool,
 ) {
-    use foci_firmware::trace::stream::*;
+    use foci_firmware::trace::stream::{FRAME_TYPE_STATUS, STATUS_PAYLOAD_LEN};
 
     let previous = unsafe {
         let ptr = core::ptr::addr_of!(LAST_STATUS).cast::<transport::StatusSnapshot>();
@@ -1056,7 +1078,10 @@ pub(crate) async fn emit_status_frames<B>(
     B: embedded_hal_async::spi::SpiDevice<u8>,
 {
     use core::sync::atomic::Ordering::Relaxed;
-    use foci_firmware::trace::stream::*;
+    use foci_firmware::trace::stream::{
+        SOURCE_INDEX_NA, SOURCE_KIND_BOARD, SOURCE_KIND_FOCI, SOURCE_KIND_KLIPPER, SOURCE_KIND_USB,
+        StatusSample,
+    };
     use foci_tmc4671::registers::STATUS_FLAGS;
 
     if !is_configured() {

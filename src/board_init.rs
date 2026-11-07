@@ -71,7 +71,10 @@ pub fn read_stm32_uid(buf: &mut [u8; 24]) -> &str {
 /// Build the embassy-stm32 clock configuration for 168 MHz SYSCLK,
 /// 48 MHz USB: HSE 8 MHz → PLL → 168 MHz, USB uses `PLL1_Q`.
 pub fn rcc_config() -> embassy_stm32::Config {
-    use embassy_stm32::rcc::*;
+    use embassy_stm32::rcc::{
+        AHBPrescaler, APBPrescaler, Hse, HseMode, Pll, PllMul, PllPDiv, PllPreDiv, PllQDiv,
+        PllSource, Sysclk,
+    };
 
     let mut config = embassy_stm32::Config::default();
     config.rcc.hse = Some(Hse {

@@ -50,12 +50,15 @@ mod app {
     use rtic_sync::channel::Receiver;
 
     use crate::app_types::{CycleDelay, TmcSpiDevice};
-    use crate::helpers::lifecycle::*;
-    use crate::helpers::stepper::*;
-    use crate::helpers::stepper_diag::*;
-    use crate::helpers::trsync::*;
-    use crate::state::stepper::*;
-    use crate::state::tmc::*;
+    use crate::helpers::lifecycle::read_tim5;
+    use crate::helpers::stepper::{
+        STEPPER_RECONCILE_PENDING, STEPPER_RECONCILE_WAKE, apply_stepper_post_action,
+        stepper_stop_from_p1,
+    };
+    use crate::helpers::stepper_diag::{UNKNOWN_QUEUE_LEN, record_stepper_event};
+    use crate::helpers::trsync::gpio_read_pin;
+    use crate::state::stepper::isr_stepper;
+    use crate::state::tmc::{TMC_CHANNEL_SIZE, TMC_REQUEST_SENDER};
     use crate::trigger_domain::{
         TRIGGER_DOMAIN, TRIGGER_TIMER_MIN_LEAD_TICKS, TriggerDomain, arm_timer_at, disarm_timer,
         reprogram_timer, set_timer_active, with_trigger_domain,
@@ -65,10 +68,16 @@ mod app {
     };
     use foci_firmware::context::stepper_reconcile::drain_stepper_reconciliation;
     use foci_firmware::diagnostic::StepperEventReason;
-    use foci_firmware::state::lifecycle::*;
+    use foci_firmware::state::lifecycle::{
+        FAULT_ACTIVE, REPORT_PENDING, SHUTDOWN_ACTIVE, STATS_SEND_TIME, STATS_SEND_TIME_HIGH,
+        STEPPER_DIAG_PENDING,
+    };
     use foci_firmware::state::stepper::{NO_STEPPER_CHANNEL, STEPPER_DEADLINE_MISS_CHANNEL};
     use foci_firmware::state::tmc::{TMC_DISABLE_SIGNAL, TMC_QUEUE_FLUSH};
-    use foci_firmware::state::trsync::*;
+    use foci_firmware::state::trsync::{
+        ENDSTOP_PIN_IDS, HOMING_REENTER_PENDING, HOMING_STATE, HOMING_TRIGGERED,
+        step_held_for_homing,
+    };
     use foci_firmware::stepper_runtime::StepDeadlineStatus;
 
     bind_interrupts!(struct Irqs {
