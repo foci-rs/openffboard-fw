@@ -690,9 +690,10 @@ mod app {
             let Some(unit) = scheduler.pick(now, homing_state) else {
                 continue;
             };
-            let snapshot = scheduler
-                .maintenance_group()
-                .map_or(homing_state, |g| g.homing_snapshot());
+            let snapshot = scheduler.maintenance_group().map_or(
+                homing_state,
+                foci_firmware::tmc_control::MaintenanceGroup::homing_snapshot,
+            );
             let engine_tick_deadline =
                 Mono::now() + fugit::Duration::<u64, 1, 1_000_000>::millis(1);
             let unit_start = cortex_m::peripheral::DWT::cycle_count();
@@ -1492,7 +1493,7 @@ mod app {
                         td.state_mut()
                             .trsync
                             .iter_mut()
-                            .filter_map(|ts| ts.take_report()),
+                            .filter_map(foci_klipper::trigger::TrSyncRuntime::take_report),
                     );
                 });
             },
