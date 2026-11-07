@@ -10,14 +10,14 @@ pub struct CycleDelay;
 
 impl embedded_hal_async::delay::DelayNs for CycleDelay {
     async fn delay_ns(&mut self, ns: u32) {
-        let cycles = (ns as u64 * 168 / 1000) as u32;
+        let cycles = (u64::from(ns) * 168 / 1000) as u32;
         cortex_m::asm::delay(cycles);
     }
 }
 
 impl embedded_hal::delay::DelayNs for CycleDelay {
     fn delay_ns(&mut self, ns: u32) {
-        let cycles = (ns as u64 * 168 / 1000) as u32;
+        let cycles = (u64::from(ns) * 168 / 1000) as u32;
         cortex_m::asm::delay(cycles);
     }
 }
