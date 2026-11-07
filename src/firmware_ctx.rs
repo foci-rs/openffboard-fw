@@ -144,8 +144,9 @@ impl StepperResetBoard for OpenFfboardStepperBoard {
                 stats.steps = stats.steps.saturating_add(u32::from(m.count));
             }
         }) {
-            ConsumerBorrow::Borrowed(()) => {}
-            ConsumerBorrow::PendingHandoff | ConsumerBorrow::DrainInFlight => {}
+            ConsumerBorrow::Borrowed(())
+            | ConsumerBorrow::PendingHandoff
+            | ConsumerBorrow::DrainInFlight => {}
         }
         Ok(stats)
     }
