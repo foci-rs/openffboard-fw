@@ -536,11 +536,10 @@ mod app {
                     [flags as i32, 0, 0, 0],
                     1,
                 );
-                match status_flags {
-                    Ok(flags) => {
-                        defmt::error!("TMC4671 emergency disable: STATUS={:#010x}", flags);
-                    }
-                    Err(()) => defmt::error!("TMC4671 emergency disable: STATUS read failed"),
+                if let Ok(flags) = status_flags {
+                    defmt::error!("TMC4671 emergency disable: STATUS={:#010x}", flags);
+                } else {
+                    defmt::error!("TMC4671 emergency disable: STATUS read failed");
                 }
                 let status_pin_asserted = status_pin.is_high();
                 tmc_state()
@@ -1119,93 +1118,87 @@ mod app {
         loop {
             if !stepper.has_active_segment() {
                 // SAFETY: P3 is the sole consumer while motor_armed is true.
-                let loaded_steps =
-                    match unsafe { crate::state::stepper::STEP_QUEUE_CHANNEL.isr_dequeue() } {
-                        Some(m) => {
-                            let loaded_steps = u32::from(m.count);
-                            let interval_add = i32::from(m.add);
-                            let old_direction = stepper.dir_state();
-                            if let Some((old_class, new_class)) = stepper.load_move(m) {
-                                crate::usb_trace::request_event(
-                                    foci_firmware::trace::events::EVENT_LEVEL_INFO,
-                                    foci_firmware::trace::events::SUBSYSTEM_STEP_TIMER,
-                                    foci_firmware::trace::events::EVENT_PHASE_BOUNDARY,
-                                    [0, old_class as i32, new_class as i32, 0],
-                                    3,
-                                );
-                            }
-                            let dir_changed = old_direction != stepper.dir_state();
-                            stepper_state()
-                                .interval
-                                .store(stepper.current_interval(), Relaxed);
-                            stepper_state().interval_add.store(interval_add, Relaxed);
-                            let dir_val = if stepper.dir_state() {
-                                embassy_stm32::pac::gpio::vals::Odr::HIGH
-                            } else {
-                                embassy_stm32::pac::gpio::vals::Odr::LOW
-                            };
-                            gpio_a.odr().modify(|w| w.set_odr(0, dir_val));
-                            if dir_changed {
-                                tmc_state().feedforward_reset.store(true, Relaxed);
-                            }
-                            loaded_steps
-                        }
-                        None => {
-                            stepper.mark_idle();
-                            crate::state::stepper_diag::record_queue_empty(0);
-                            if HOMING_STATE.load(Relaxed) != 0 {
-                                record_stepper_event(
-                                    StepperEventReason::QueueEmpty,
-                                    0,
-                                    read_tim5(),
-                                    0,
-                                    0,
-                                    0,
-                                );
-                            }
-                            stepper_state().interval.store(0, Relaxed);
-                            stepper_state().interval_add.store(0, Relaxed);
-                            tmc_state().pid_error_sums_clear.store(true, Relaxed);
-                            set_timer_active(td.state_mut(), 0, false);
-                            return;
-                        }
+                let loaded_steps = if let Some(m) =
+                    unsafe { crate::state::stepper::STEP_QUEUE_CHANNEL.isr_dequeue() }
+                {
+                    let loaded_steps = u32::from(m.count);
+                    let interval_add = i32::from(m.add);
+                    let old_direction = stepper.dir_state();
+                    if let Some((old_class, new_class)) = stepper.load_move(m) {
+                        crate::usb_trace::request_event(
+                            foci_firmware::trace::events::EVENT_LEVEL_INFO,
+                            foci_firmware::trace::events::SUBSYSTEM_STEP_TIMER,
+                            foci_firmware::trace::events::EVENT_PHASE_BOUNDARY,
+                            [0, old_class as i32, new_class as i32, 0],
+                            3,
+                        );
+                    }
+                    let dir_changed = old_direction != stepper.dir_state();
+                    stepper_state()
+                        .interval
+                        .store(stepper.current_interval(), Relaxed);
+                    stepper_state().interval_add.store(interval_add, Relaxed);
+                    let dir_val = if stepper.dir_state() {
+                        embassy_stm32::pac::gpio::vals::Odr::HIGH
+                    } else {
+                        embassy_stm32::pac::gpio::vals::Odr::LOW
                     };
+                    gpio_a.odr().modify(|w| w.set_odr(0, dir_val));
+                    if dir_changed {
+                        tmc_state().feedforward_reset.store(true, Relaxed);
+                    }
+                    loaded_steps
+                } else {
+                    stepper.mark_idle();
+                    crate::state::stepper_diag::record_queue_empty(0);
+                    if HOMING_STATE.load(Relaxed) != 0 {
+                        record_stepper_event(
+                            StepperEventReason::QueueEmpty,
+                            0,
+                            read_tim5(),
+                            0,
+                            0,
+                            0,
+                        );
+                    }
+                    stepper_state().interval.store(0, Relaxed);
+                    stepper_state().interval_add.store(0, Relaxed);
+                    tmc_state().pid_error_sums_clear.store(true, Relaxed);
+                    set_timer_active(td.state_mut(), 0, false);
+                    return;
+                };
 
                 let now = read_tim5();
                 let scheduled = stepper.next_step_clock();
                 crate::usb_trace::record_step_timing(scheduled, now);
-                match stepper.check_deadline(scheduled, now, CLOCK_FREQ) {
-                    Ok(compare) => {
-                        crate::state::stepper_diag::record_loaded_segment_timing(
-                            0,
-                            loaded_steps,
-                            now,
-                            scheduled,
-                            compare,
-                        );
-                        arm_stepper_timer_event(td, 0, compare, stepper_slot.take());
-                        return;
-                    }
-                    Err(_) => {
-                        crate::state::stepper_diag::record_loaded_segment(0, loaded_steps);
-                        crate::state::stepper_diag::record_missed_deadline(0);
-                        crate::usb_trace::TRACE_TIMING
-                            .missed_or_deferred_steps
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                        record_stepper_event(
-                            StepperEventReason::MissedDeadlineLoad,
-                            0,
-                            now,
-                            UNKNOWN_QUEUE_LEN,
-                            scheduled,
-                            now,
-                        );
-                        set_timer_active(td.state_mut(), 0, false);
-                        STEPPER_DEADLINE_MISS_CHANNEL.store(0, Relaxed);
-                        TMC_DISABLE_SIGNAL.signal(());
-                        return;
-                    }
+                if let Ok(compare) = stepper.check_deadline(scheduled, now, CLOCK_FREQ) {
+                    crate::state::stepper_diag::record_loaded_segment_timing(
+                        0,
+                        loaded_steps,
+                        now,
+                        scheduled,
+                        compare,
+                    );
+                    arm_stepper_timer_event(td, 0, compare, stepper_slot.take());
+                    return;
                 }
+                crate::state::stepper_diag::record_loaded_segment(0, loaded_steps);
+                crate::state::stepper_diag::record_missed_deadline(0);
+                crate::usb_trace::TRACE_TIMING
+                    .missed_or_deferred_steps
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                record_stepper_event(
+                    StepperEventReason::MissedDeadlineLoad,
+                    0,
+                    now,
+                    UNKNOWN_QUEUE_LEN,
+                    scheduled,
+                    now,
+                );
+                set_timer_active(td.state_mut(), 0, false);
+                STEPPER_DEADLINE_MISS_CHANNEL.store(0, Relaxed);
+                TMC_DISABLE_SIGNAL.signal(());
+                return;
             }
 
             if step_held_for_homing(stepper.next_step_clock()) {
