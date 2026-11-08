@@ -1075,6 +1075,21 @@ pub(crate) async fn emit_status_frames<B>(
 ) where
     B: embedded_hal_async::spi::SpiDevice<u8>,
 {
+    const STATUS_PID_LIMIT_MASK: u32 = (1 << 0)
+        | (1 << 2)
+        | (1 << 3)
+        | (1 << 4)
+        | (1 << 6)
+        | (1 << 7)
+        | (1 << 8)
+        | (1 << 10)
+        | (1 << 11)
+        | (1 << 12)
+        | (1 << 14)
+        | (1 << 15);
+    const STATUS_IPARK_LIMIT_MASK: u32 = (1 << 16) | (1 << 17) | (1 << 18);
+    const STATUS_PWM_LIMIT_MASK: u32 = (1 << 24) | (1 << 25);
+    const STATUS_ADC_CLIP_MASK: u32 = (1 << 26) | (1 << 27);
     use core::sync::atomic::Ordering::Relaxed;
     use foci_firmware::trace::stream::{
         SOURCE_INDEX_NA, SOURCE_KIND_BOARD, SOURCE_KIND_FOCI, SOURCE_KIND_KLIPPER, SOURCE_KIND_USB,
@@ -1096,21 +1111,6 @@ pub(crate) async fn emit_status_frames<B>(
     // path must never write this register. Table 30 marks bit 19 as reserved;
     // do not introduce a PLL-not-locked bit without separate silicon evidence.
     let status_flags = read_register_counting_errors(tmc, STATUS_FLAGS).await;
-    const STATUS_PID_LIMIT_MASK: u32 = (1 << 0)
-        | (1 << 2)
-        | (1 << 3)
-        | (1 << 4)
-        | (1 << 6)
-        | (1 << 7)
-        | (1 << 8)
-        | (1 << 10)
-        | (1 << 11)
-        | (1 << 12)
-        | (1 << 14)
-        | (1 << 15);
-    const STATUS_IPARK_LIMIT_MASK: u32 = (1 << 16) | (1 << 17) | (1 << 18);
-    const STATUS_PWM_LIMIT_MASK: u32 = (1 << 24) | (1 << 25);
-    const STATUS_ADC_CLIP_MASK: u32 = (1 << 26) | (1 << 27);
     let clipping_flags = status_flags
         & (STATUS_PID_LIMIT_MASK
             | STATUS_IPARK_LIMIT_MASK

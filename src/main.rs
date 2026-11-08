@@ -629,6 +629,7 @@ mod app {
             let selected = select(rx.recv(), control_sleep).await;
 
             if let Either::First(Ok(req)) = selected {
+                use foci_firmware::tmc_control::CommissionWaitRequestDisposition;
                 let commissioning = matches!(
                     driver.mode(),
                     ChannelMode::Commissioning | ChannelMode::Restore
@@ -638,7 +639,6 @@ mod app {
                 } else {
                     foci_firmware::tmc_control::CommissionWaitRequestDisposition::Cancel
                 };
-                use foci_firmware::tmc_control::CommissionWaitRequestDisposition;
                 match disposition {
                     CommissionWaitRequestDisposition::Cancel => {
                         if commissioning {
@@ -746,8 +746,8 @@ mod app {
                     scheduler.set_mode(0, ChannelMode::Ready, now_us());
                 }
                 UnitOutcome::Parked(reason) => {
-                    scheduler.set_mode(0, ChannelMode::Parked, now_us());
                     use crate::tmc_control::board::ParkShutdown;
+                    scheduler.set_mode(0, ChannelMode::Parked, now_us());
                     let park = crate::tmc_control::board::park_shutdown(reason);
                     let clock = read_tim5();
                     ctx.shared.app_state.lock(|state| {
