@@ -110,6 +110,7 @@ pub(crate) fn lease_snapshot(now: u32) -> LeaseSnapshot {
     use foci_firmware::state::lifecycle::{HAS_RECEIVED_VALID_CLOCK, LAST_HOST_LIVENESS_TICKS};
 
     let any_enabled = crate::tmc_control::board::tmc_state()
+        .arming
         .enable_pin_asserted
         .load(Relaxed);
     let has_received_valid_clock = HAS_RECEIVED_VALID_CLOCK.load(Relaxed);
@@ -216,6 +217,7 @@ mod tests {
         HAS_RECEIVED_VALID_CLOCK.store(false, Relaxed);
         LAST_HOST_LIVENESS_TICKS.store(0, Relaxed);
         crate::tmc_control::board::tmc_state()
+            .arming
             .enable_pin_asserted
             .store(false, Relaxed);
         guard
@@ -233,6 +235,7 @@ mod tests {
     fn lease_snapshot_matches_lease_expired_when_stale() {
         let _guard = reset_lease_state();
         crate::tmc_control::board::tmc_state()
+            .arming
             .enable_pin_asserted
             .store(true, Relaxed);
         HAS_RECEIVED_VALID_CLOCK.store(true, Relaxed);
@@ -252,6 +255,7 @@ mod tests {
     fn lease_snapshot_not_expired_when_enabled_and_recent() {
         let _guard = reset_lease_state();
         crate::tmc_control::board::tmc_state()
+            .arming
             .enable_pin_asserted
             .store(true, Relaxed);
         HAS_RECEIVED_VALID_CLOCK.store(true, Relaxed);
@@ -268,6 +272,7 @@ mod tests {
     fn lease_snapshot_expired_when_no_clock_ever_received() {
         let _guard = reset_lease_state();
         crate::tmc_control::board::tmc_state()
+            .arming
             .enable_pin_asserted
             .store(true, Relaxed);
 
@@ -281,6 +286,7 @@ mod tests {
     fn lease_snapshot_not_expired_when_last_liveness_races_ahead_of_now() {
         let _guard = reset_lease_state();
         crate::tmc_control::board::tmc_state()
+            .arming
             .enable_pin_asserted
             .store(true, Relaxed);
         HAS_RECEIVED_VALID_CLOCK.store(true, Relaxed);
@@ -297,6 +303,7 @@ mod tests {
     fn lease_expired_false_when_enabled_and_recent() {
         let _guard = reset_lease_state();
         crate::tmc_control::board::tmc_state()
+            .arming
             .enable_pin_asserted
             .store(true, Relaxed);
         HAS_RECEIVED_VALID_CLOCK.store(true, Relaxed);
@@ -308,6 +315,7 @@ mod tests {
     fn lease_expired_true_when_enabled_and_stale() {
         let _guard = reset_lease_state();
         crate::tmc_control::board::tmc_state()
+            .arming
             .enable_pin_asserted
             .store(true, Relaxed);
         HAS_RECEIVED_VALID_CLOCK.store(true, Relaxed);
@@ -319,6 +327,7 @@ mod tests {
     fn lease_expired_true_when_enabled_and_no_clock_ever_received() {
         let _guard = reset_lease_state();
         crate::tmc_control::board::tmc_state()
+            .arming
             .enable_pin_asserted
             .store(true, Relaxed);
         assert!(lease_expired(0));
@@ -328,6 +337,7 @@ mod tests {
     fn lease_expired_does_not_self_clear_while_still_enabled_and_stale() {
         let _guard = reset_lease_state();
         crate::tmc_control::board::tmc_state()
+            .arming
             .enable_pin_asserted
             .store(true, Relaxed);
         HAS_RECEIVED_VALID_CLOCK.store(true, Relaxed);
@@ -341,6 +351,7 @@ mod tests {
     fn lease_expired_transitions_true_across_an_advancing_sequence() {
         let _guard = reset_lease_state();
         crate::tmc_control::board::tmc_state()
+            .arming
             .enable_pin_asserted
             .store(true, Relaxed);
         HAS_RECEIVED_VALID_CLOCK.store(true, Relaxed);

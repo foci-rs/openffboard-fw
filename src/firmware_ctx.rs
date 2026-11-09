@@ -88,6 +88,7 @@ impl StepperQueueBoard for OpenFfboardStepperBoard {
 
     fn motor_armed(&self, _channel: u8) -> bool {
         tmc_state()
+            .arming
             .motor_armed
             .load(core::sync::atomic::Ordering::Relaxed)
     }
@@ -502,6 +503,7 @@ impl TmcHost for FirmwareCtx<'_> {
             return Err(foci_firmware::motion_scale::MotionScaleRejection::InvalidChannel);
         }
         if tmc_state()
+            .arming
             .motor_armed
             .load(core::sync::atomic::Ordering::Relaxed)
         {

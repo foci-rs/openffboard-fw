@@ -377,6 +377,7 @@ mod app {
 
             let status_pin_asserted = status_pin.is_high();
             tmc_state()
+                .arming
                 .status_pin_asserted
                 .store(status_pin_asserted, Relaxed);
 
@@ -549,6 +550,7 @@ mod app {
                 }
                 let status_pin_asserted = status_pin.is_high();
                 tmc_state()
+                    .arming
                     .status_pin_asserted
                     .store(status_pin_asserted, Relaxed);
                 if status_pin_asserted || TMC_DISABLE_SIGNAL.signaled() {
@@ -967,6 +969,7 @@ mod app {
 
         fn motor_armed(&self, _channel: u8) -> bool {
             tmc_state()
+                .arming
                 .motor_armed
                 .load(core::sync::atomic::Ordering::Relaxed)
         }
@@ -1111,7 +1114,7 @@ mod app {
         let mut stepper_slot = slot;
         let gpio_b = embassy_stm32::pac::GPIOB;
         gpio_b.bsrr().write(|w| w.set_br(11, true));
-        if FAULT_ACTIVE.load(Relaxed) || !tmc_state().motor_armed.load(Relaxed) {
+        if FAULT_ACTIVE.load(Relaxed) || !tmc_state().arming.motor_armed.load(Relaxed) {
             set_timer_active(td.state_mut(), 0, false);
             stepper_state().interval.store(0, Relaxed);
             stepper_state().interval_add.store(0, Relaxed);
