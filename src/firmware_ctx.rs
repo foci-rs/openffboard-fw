@@ -59,7 +59,7 @@ impl StepperQueueBoard for OpenFfboardStepperBoard {
 
     fn motion_scale_configured(&self, channel: u8) -> Result<bool, CommandError> {
         self.queue_stepper_index(channel)?;
-        Ok(tmc_state().motion_scale_configured())
+        Ok(tmc_state().motion_scale.configured())
     }
 
     fn prepare_and_enqueue(
