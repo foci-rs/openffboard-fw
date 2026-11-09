@@ -540,7 +540,7 @@ mod app {
                     foci_firmware::trace::events::EVENT_LEVEL_ERROR,
                     foci_firmware::trace::events::SUBSYSTEM_SAFETY_SHUTDOWN,
                     crate::usb_trace::EVENT_STATUS_INTERRUPT,
-                    [flags as i32, 0, 0, 0],
+                    [flags.cast_signed(), 0, 0, 0],
                     1,
                 );
                 if let Ok(flags) = status_flags {
@@ -1426,8 +1426,8 @@ mod app {
                     return;
                 }
                 process_trigger_timer(td, event.kind, event.wake_clock, need_report, stepper_slot);
-                let elapsed = read_tim5().wrapping_sub(dispatch_start) as i32;
-                if elapsed >= TIM5_SCHEDULER_REPEAT_TICKS as i32 {
+                let elapsed = read_tim5().wrapping_sub(dispatch_start).cast_signed();
+                if elapsed >= TIM5_SCHEDULER_REPEAT_TICKS.cast_signed() {
                     defer_tim5_scheduler(td);
                     return;
                 }

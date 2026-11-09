@@ -469,7 +469,7 @@ pub(crate) fn record_spi_sample_cycles(cycles: u32) {
 }
 
 pub(crate) fn record_step_timing(scheduled: u32, actual: u32) {
-    let jitter = actual.wrapping_sub(scheduled) as i32;
+    let jitter = actual.wrapping_sub(scheduled).cast_signed();
     let abs = jitter.unsigned_abs();
     let mut current = TRACE_TIMING.max_step_jitter_ticks.load(Ordering::Relaxed);
     while abs > current {
@@ -483,7 +483,7 @@ pub(crate) fn record_step_timing(scheduled: u32, actual: u32) {
             Err(next) => current = next,
         }
     }
-    let slack = scheduled.wrapping_sub(actual) as i32;
+    let slack = scheduled.wrapping_sub(actual).cast_signed();
     let mut min = TRACE_TIMING
         .min_deadline_slack_ticks
         .load(Ordering::Relaxed);
@@ -895,14 +895,20 @@ pub(crate) async fn sample_tick<B>(
     let mut sample_flags = 0u8;
 
     let step_position = stepper.position.load(Relaxed);
-    let position_actual =
-        read_register_trace(tmc, PID_POSITION_ACTUAL, &mut sample_flags).await as i32;
+    let position_actual = read_register_trace(tmc, PID_POSITION_ACTUAL, &mut sample_flags)
+        .await
+        .cast_signed();
     let position_error =
-        read_sub_register_trace(tmc, PID_ERROR_PID_POSITION_ERROR, &mut sample_flags).await as i32;
-    let pid_velocity_actual =
-        read_register_trace(tmc, PID_VELOCITY_ACTUAL, &mut sample_flags).await as i32;
+        read_sub_register_trace(tmc, PID_ERROR_PID_POSITION_ERROR, &mut sample_flags)
+            .await
+            .cast_signed();
+    let pid_velocity_actual = read_register_trace(tmc, PID_VELOCITY_ACTUAL, &mut sample_flags)
+        .await
+        .cast_signed();
     let velocity_error =
-        read_sub_register_trace(tmc, PID_ERROR_PID_VELOCITY_ERROR, &mut sample_flags).await as i32;
+        read_sub_register_trace(tmc, PID_ERROR_PID_VELOCITY_ERROR, &mut sample_flags)
+            .await
+            .cast_signed();
     let interim_pid_torque_target_actual = read_sub_register_trace(
         tmc,
         INTERIM_PID_TORQUE_TARGET_TORQUE_ACTUAL,
