@@ -395,7 +395,7 @@ mod app {
 
             let emergency_pending =
                 TMC_DISABLE_SIGNAL.signaled() || FAULT_ACTIVE.load(Relaxed) || status_pin_asserted;
-            if !emergency_pending && tmc_state().cancel_requested.load(Relaxed) {
+            if !emergency_pending && tmc_state().commissioning.cancel_requested.load(Relaxed) {
                 let mut backend = openffboard_backend(tmc, enable_pin);
                 if let Some(foci_firmware::commission_dispatch::CommissionOutcome::Terminal {
                     reply,
@@ -434,7 +434,10 @@ mod app {
                         )
                         .await;
                     }
-                    tmc_state().commission_in_flight.store(false, Relaxed);
+                    tmc_state()
+                        .commissioning
+                        .commission_in_flight
+                        .store(false, Relaxed);
                     stepper_stop_from_p1(0);
                     shutdown_safe_state_applied = true;
                 }
@@ -493,7 +496,10 @@ mod app {
                     foci_firmware::tmc_control::lifecycle::disarm_motor(&mut backend, &mut state)
                         .await;
                 }
-                tmc_state().commission_in_flight.store(false, Relaxed);
+                tmc_state()
+                    .commissioning
+                    .commission_in_flight
+                    .store(false, Relaxed);
                 defmt::info!("TMC request queue flushed after config_reset");
             }
 
@@ -600,7 +606,7 @@ mod app {
                     TMC_DISABLE_SIGNAL.signaled(),
                     FAULT_ACTIVE.load(Relaxed),
                     crate::tmc_control::effects::lease_expired(read_tim5()),
-                    tmc_state().cancel_requested.load(Relaxed),
+                    tmc_state().commissioning.cancel_requested.load(Relaxed),
                 );
                 if let Some(exit) = exit {
                     if !matches!(
@@ -643,7 +649,10 @@ mod app {
                     CommissionWaitRequestDisposition::Cancel => {
                         if commissioning {
                             enable_pin.set_low();
-                            tmc_state().commission_in_flight.store(false, Relaxed);
+                            tmc_state()
+                                .commissioning
+                                .commission_in_flight
+                                .store(false, Relaxed);
                         }
                         let outcome = handle_tmc_control_request(
                             req,
