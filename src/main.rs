@@ -802,8 +802,8 @@ mod app {
                         homing,
                         foci_firmware::tmc_control::HomingMaintenanceResult::FailClosed
                     ) {
-                        tmc_state().homing_clamp_active.store(false, Relaxed);
-                        tmc_state().stall_latched.store(false, Relaxed);
+                        tmc_state().homing.homing_clamp_active.store(false, Relaxed);
+                        tmc_state().homing.stall_latched.store(false, Relaxed);
                         driver.runtime.clear_homing_runtime();
                         TMC_DISABLE_SIGNAL.signal(());
                     }
@@ -1263,7 +1263,7 @@ mod app {
                 let read_pin = || -> bool {
                     match crate::ankyra::enumerations::Pins::try_from(pin_id) {
                         Ok(crate::ankyra::enumerations::Pins::STALL0) => {
-                            tmc_state().stall_latched.load(Relaxed)
+                            tmc_state().homing.stall_latched.load(Relaxed)
                         }
                         _ if pin_id != 0xFF => gpio_read_pin(pin_id),
                         _ => false,
