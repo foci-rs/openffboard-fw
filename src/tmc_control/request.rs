@@ -202,7 +202,10 @@ impl TmcRequestBoard<TmcSpiDevice> for OpenFFBoardRequestBoard<'_> {
     ) {
         let homing_active = HOMING_STATE.load(Ordering::Relaxed) != 0;
         let stepper_active = stepper_state().timer_active_mirror.load(Ordering::Relaxed);
-        let saved_voltage_limit = tmc_state().voltage_limit_cfg.load(Ordering::Relaxed);
+        let saved_voltage_limit = tmc_state()
+            .host_config
+            .voltage_limit_cfg
+            .load(Ordering::Relaxed);
         match crate::tmc_diagnostics::handle_diagnostic_request(
             req,
             crate::tmc_diagnostics::DiagnosticContext {
