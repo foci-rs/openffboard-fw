@@ -1154,7 +1154,10 @@ mod app {
                     };
                     gpio_a.odr().modify(|w| w.set_odr(0, dir_val));
                     if dir_changed {
-                        tmc_state().feedforward_reset.store(true, Relaxed);
+                        tmc_state()
+                            .feedforward
+                            .feedforward_reset
+                            .store(true, Relaxed);
                     }
                     loaded_steps
                 } else {
