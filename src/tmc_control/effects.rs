@@ -60,15 +60,15 @@ where
     F: FnMut(ShutdownReason),
 {
     for action in actions {
-        apply_action(action, &mut enter_shutdown);
+        apply_action(&action, &mut enter_shutdown);
     }
 }
 
-fn apply_action<F>(action: BoardAction, enter_shutdown: &mut F)
+fn apply_action<F>(action: &BoardAction, enter_shutdown: &mut F)
 where
     F: FnMut(ShutdownReason),
 {
-    match action {
+    match *action {
         BoardAction::Shutdown(reason) => enter_shutdown(reason),
         BoardAction::SignalEmergencyDisable => {
             foci_firmware::state::tmc::TMC_DISABLE_SIGNAL.signal(());

@@ -716,8 +716,8 @@ mod app {
                 Mono::now() + fugit::Duration::<u64, 1, 1_000_000>::millis(1);
             let unit_start = cortex_m::peripheral::DWT::cycle_count();
             let outcome = if unit.class == UnitClass::MaintenanceFinalize {
-                foci_firmware::tmc_control::TmcControlRuntime::advance_homing_state_after_channels(
-                    foci_firmware::tmc_control::TmcControlHomingRefs::new(
+                foci_firmware::tmc_control::TmcControlRuntime::advance_homing_state_after_channels_ref(
+                    &foci_firmware::tmc_control::TmcControlHomingRefs::new(
                         &HOMING_STATE,
                         &HOMING_TRIGGERED,
                         &HOMING_REENTER_PENDING,

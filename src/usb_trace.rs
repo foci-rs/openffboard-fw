@@ -377,7 +377,7 @@ fn enqueue_event_frame(event: PendingEvent) {
         ),
         sample,
     );
-    enqueue_event(frame);
+    enqueue_event(&frame);
 }
 
 pub(crate) fn drain_pending_events() {
@@ -530,7 +530,7 @@ pub(crate) fn emit_metadata() {
     let Ok(sources) = transport::canonical_sources(TRACE_CHANNEL_COUNT as u8) else {
         return;
     };
-    let Ok(payload) = transport::build_metadata_payload(transport::TraceMetadataInputs {
+    let Ok(payload) = transport::build_metadata_payload_ref(&transport::TraceMetadataInputs {
         skipped_sample_counter_count: 3,
         clock_freq: crate::ankyra::constants::CLOCK_FREQ,
         critical_hz: trace_mode().critical_hz(),
@@ -561,7 +561,7 @@ pub(crate) fn emit_metadata() {
         0,
     ));
     frame.payload_mut(payload.len()).copy_from_slice(&payload);
-    enqueue_motion(frame);
+    enqueue_motion(&frame);
     crate::tmc_control::board::tmc_state()
         .control_state
         .mark_snapshot();
@@ -656,7 +656,7 @@ fn try_enqueue_control_state(
     frame
         .payload_mut(CONTROL_STATE_PAYLOAD_LEN)
         .copy_from_slice(&payload);
-    enqueue_motion(frame);
+    enqueue_motion(&frame);
     Ok(())
 }
 
@@ -679,7 +679,7 @@ pub(crate) fn emit_control_state_frame(
     });
 }
 
-pub(crate) fn enqueue_motion(frame: FrameBuf) {
+pub(crate) fn enqueue_motion(frame: &FrameBuf) {
     // SAFETY: TMC control is the sole motion-frame producer. The USB task owns
     // the separately split consumer endpoint.
     unsafe {
@@ -697,7 +697,7 @@ pub(crate) fn enqueue_motion(frame: FrameBuf) {
     }
 }
 
-pub(crate) fn enqueue_event(frame: FrameBuf) {
+pub(crate) fn enqueue_event(frame: &FrameBuf) {
     // SAFETY: Pending events are converted, enqueued, and consumed only by the
     // priority-2 USB task.
     unsafe {
@@ -849,7 +849,7 @@ where
     frame
         .payload_mut(CONTROL_DETAIL_PAYLOAD_LEN)
         .copy_from_slice(&payload);
-    enqueue_motion(frame);
+    enqueue_motion(&frame);
 }
 
 #[derive(Clone, Copy)]
@@ -952,7 +952,7 @@ pub(crate) async fn sample_tick<B>(
     frame
         .payload_mut(CRITICAL_PAYLOAD_LEN)
         .copy_from_slice(&payload);
-    enqueue_motion(frame);
+    enqueue_motion(&frame);
 
     if current_path_due(
         mode.current_path(),
@@ -986,7 +986,7 @@ pub(crate) async fn sample_tick<B>(
         frame
             .payload_mut(CURRENT_PATH_PAYLOAD_LEN)
             .copy_from_slice(&payload);
-        enqueue_motion(frame);
+        enqueue_motion(&frame);
     }
 
     emit_control_detail(tmc, inputs.control_tick).await;
@@ -1064,7 +1064,7 @@ fn emit_one_status(
         ),
         sample,
     );
-    enqueue_motion(frame);
+    enqueue_motion(&frame);
     unsafe {
         let ptr = core::ptr::addr_of_mut!(LAST_STATUS).cast::<transport::StatusSnapshot>();
         core::ptr::write(
