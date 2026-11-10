@@ -734,7 +734,7 @@ fn dequeue_next_frame() -> Option<QueuedFrame> {
 
 async fn read_register_trace<B>(
     tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
-    register: foci_tmc4671::registers::Register,
+    register: impl foci_tmc4671::registers::ReadableRegister,
     sample_flags: &mut u8,
 ) -> u32
 where
@@ -768,7 +768,7 @@ where
 
 async fn read_register_counting_errors<B>(
     tmc: &mut foci_tmc4671::spi::Tmc4671Spi<B>,
-    register: foci_tmc4671::registers::Register,
+    register: impl foci_tmc4671::registers::ReadableRegister,
 ) -> u32
 where
     B: embedded_hal_async::spi::SpiDevice<u8>,
