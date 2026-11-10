@@ -269,7 +269,7 @@ pub(crate) async fn handle_tmc_control_request(
 }
 
 /// Emit the shared busy-only response without granting hardware capabilities.
-pub(crate) fn handle_commission_wait_reject(req: TmcRequest) -> TmcControlRequestOutcome {
+pub(crate) fn handle_commission_wait_reject(req: &TmcRequest) -> TmcControlRequestOutcome {
     foci_firmware::tmc_control::request::handle_commission_wait_reject(
         req,
         &mut OpenFFBoardBusyReplySink,
